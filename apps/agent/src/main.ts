@@ -44,6 +44,7 @@ type StoredPairing = {
 
 type AgentConfig = {
   relayUrl: string;
+  agentId: string;
   hostId?: string;
   encryptedAgentToken?: string;
   encryptedSyncKey?: string;
@@ -158,7 +159,11 @@ async function loadConfig(): Promise<void> {
   try {
     config = JSON.parse(await fs.readFile(configPath, "utf8")) as AgentConfig;
   } catch {
-    config = { relayUrl: process.env.ANYTIMEVIBE_RELAY_URL ?? "", workspaces: [], sequence: 0 };
+    config = { relayUrl: process.env.ANYTIMEVIBE_RELAY_URL ?? "", agentId: crypto.randomUUID(), workspaces: [], sequence: 0 };
+  }
+  if (!config.agentId) {
+    config.agentId = crypto.randomUUID();
+    await saveConfig();
   }
   config.workspaces ??= [];
   config.sequence ??= 0;
@@ -208,6 +213,7 @@ async function startPairing(): Promise<PublicState> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       secret,
+      agentId: config.agentId,
       agentName: os.hostname(),
       platform: `${process.platform} ${os.release()}`,
       codexVersion,
@@ -344,8 +350,8 @@ function isAllowedWorkspace(requestedPath: string): boolean {
 }
 
 async function handleCommand(command: ClientCommand): Promise<void> {
-  await ensureCodex();
   try {
+    await ensureCodex();
     if (command.type === "task.create") {
       if (!isAllowedWorkspace(command.cwd)) throw new Error("工作目录不在代理白名单中");
       const started = await codex!.request("thread/start", {
@@ -370,6 +376,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "turn.start") {
+      await codex!.request("thread/resume", { threadId: command.threadId });
       const result = await codex!.request("turn/start", {
         threadId: command.threadId,
         clientUserMessageId: command.commandId,
@@ -379,6 +386,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "turn.steer") {
+      await codex!.request("thread/resume", { threadId: command.threadId });
       pendingPrompts.set(command.threadId, command.prompt);
       await codex!.request("turn/steer", {
         threadId: command.threadId,

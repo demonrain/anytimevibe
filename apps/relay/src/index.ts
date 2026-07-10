@@ -36,6 +36,7 @@ const loginBody = z.object({
 
 const agentPairBody = z.object({
   secret: z.string().min(24),
+  agentId: z.string().uuid(),
   agentName: z.string().trim().min(1).max(120),
   platform: z.string().trim().min(1).max(80),
   codexVersion: z.string().trim().min(1).max(80),
@@ -252,10 +253,10 @@ async function main(): Promise<void> {
     const id = randomUUID();
     await sql`
       INSERT INTO pairings (
-        id, code, secret_hash, agent_name, platform, codex_version,
+        id, code, secret_hash, agent_id, agent_name, platform, codex_version,
         agent_public_key, expires_at
       ) VALUES (
-        ${id}, ${code}, ${hashToken(body.secret)}, ${body.agentName}, ${body.platform},
+        ${id}, ${code}, ${hashToken(body.secret)}, ${body.agentId}, ${body.agentName}, ${body.platform},
         ${body.codexVersion}, ${sql.json(body.agentPublicKey as never)}, now() + interval '10 minutes'
       )
     `;
@@ -312,8 +313,6 @@ async function main(): Promise<void> {
     const body = claimBody.parse(request.body);
     const { pairingId } = request.params as { pairingId: string };
     const agentToken = randomToken();
-    const hostId = randomUUID();
-
     const result = await sql.begin(async (transaction) => {
       const rows = await transaction<Array<Record<string, unknown>>>`
         SELECT * FROM pairings
@@ -322,14 +321,34 @@ async function main(): Promise<void> {
       `;
       const pairing = rows[0];
       if (!pairing) return null;
-      await transaction`
-        INSERT INTO hosts (
-          id, user_id, name, platform, codex_version, agent_public_key, agent_token_hash
-        ) VALUES (
-          ${hostId}, ${user.id}, ${String(pairing.agentName)}, ${String(pairing.platform)},
-          ${String(pairing.codexVersion)}, ${transaction.json(pairing.agentPublicKey as never)}, ${hashToken(agentToken)}
-        )
+      const agentId = String(pairing.agentId);
+      const existingHosts = await transaction<Array<{ id: string }>>`
+        SELECT id FROM hosts
+        WHERE user_id = ${user.id} AND agent_id = ${agentId} AND revoked_at IS NULL
+        LIMIT 1
+        FOR UPDATE
       `;
+      const hostId = existingHosts[0]?.id ?? randomUUID();
+      if (existingHosts.length) {
+        await transaction`DELETE FROM sync_events WHERE host_id = ${hostId}`;
+        await transaction`
+          UPDATE hosts SET
+            name = ${String(pairing.agentName)}, platform = ${String(pairing.platform)},
+            codex_version = ${String(pairing.codexVersion)},
+            agent_public_key = ${transaction.json(pairing.agentPublicKey as never)},
+            agent_token_hash = ${hashToken(agentToken)}, revoked_at = NULL
+          WHERE id = ${hostId}
+        `;
+      } else {
+        await transaction`
+          INSERT INTO hosts (
+            id, user_id, agent_id, name, platform, codex_version, agent_public_key, agent_token_hash
+          ) VALUES (
+            ${hostId}, ${user.id}, ${agentId}, ${String(pairing.agentName)}, ${String(pairing.platform)},
+            ${String(pairing.codexVersion)}, ${transaction.json(pairing.agentPublicKey as never)}, ${hashToken(agentToken)}
+          )
+        `;
+      }
       await transaction`
         UPDATE pairings SET
           status = 'claimed', user_id = ${user.id}, host_id = ${hostId},

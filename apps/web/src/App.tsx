@@ -183,6 +183,7 @@ export function App() {
   const [composerOpen, setComposerOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
+  const autoSyncedHostsRef = useRef(new Set<string>());
 
   useEffect(() => {
     api<Health>("/api/health").then(async (value) => {
@@ -274,7 +275,16 @@ export function App() {
         try {
           const parsed = JSON.parse(String(message.data));
           if (parsed.type === "relay.host_status") {
-            updateHostStatus(String(parsed.hostId), Boolean(parsed.online));
+            const hostId = String(parsed.hostId);
+            const online = Boolean(parsed.online);
+            updateHostStatus(hostId, online);
+            if (online && !autoSyncedHostsRef.current.has(hostId)) {
+              autoSyncedHostsRef.current.add(hostId);
+              syncHostTasks(hostId).catch((syncError) => {
+                autoSyncedHostsRef.current.delete(hostId);
+                setError(syncError.message);
+              });
+            }
             return;
           }
           if (parsed.type === "relay.error") {
@@ -289,6 +299,7 @@ export function App() {
       connection.onclose = () => {
         if (socketRef.current !== connection || stopped) return;
         socketRef.current = null;
+        autoSyncedHostsRef.current.clear();
         reconnectTimerRef.current = window.setTimeout(connect, 1800);
       };
       connection.onerror = () => connection.close();
@@ -431,6 +442,12 @@ function TaskConversation({ task, online, onCommand }: { task: Task; online: boo
   const running = Boolean(task.activeTurnId);
   const lastMessageLength = task.messages.at(-1)?.text.length ?? 0;
 
+  function submitPrompt() {
+    if (!prompt.trim() || online !== true) return;
+    onCommand(running && task.activeTurnId ? { type: "turn.steer", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId, prompt: prompt.trim() } : { type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: prompt.trim() });
+    setPrompt("");
+  }
+
   useLayoutEffect(() => {
     const stream = messageStreamRef.current;
     if (!stream || tab !== "chat") return;
@@ -463,12 +480,15 @@ function TaskConversation({ task, online, onCommand }: { task: Task; online: boo
     </div> : <DiffView diff={task.diff} />}
     <form className="composer" onSubmit={(event) => {
       event.preventDefault();
-      if (!prompt.trim() || online !== true) return;
-      onCommand(running && task.activeTurnId ? { type: "turn.steer", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId, prompt: prompt.trim() } : { type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: prompt.trim() });
-      setPrompt("");
+      submitPrompt();
     }}>
-      <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"} />
-      <div><small>{online === null ? "正在确认主机状态…" : running ? "任务运行中，可追加指令或停止" : "沿用本机 Codex 沙箱和审批策略"}</small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>停止</button>}<button className="send" disabled={online !== true || !prompt.trim()}>发送</button></div>
+      <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => {
+        if (event.ctrlKey && event.key === "Enter") {
+          event.preventDefault();
+          submitPrompt();
+        }
+      }} placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"} />
+      <div><small>{online === null ? "正在确认主机状态…" : running ? "任务运行中，可追加指令或停止" : "沿用本机 Codex 沙箱和审批策略"}<span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 发送</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>停止</button>}<button className="send" disabled={online !== true || !prompt.trim()}>发送</button></div>
     </form>
   </>;
 }

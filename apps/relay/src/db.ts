@@ -33,6 +33,7 @@ export async function ensureSchema(sql: Database): Promise<void> {
     CREATE TABLE IF NOT EXISTS hosts (
       id uuid PRIMARY KEY,
       user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      agent_id uuid,
       name text NOT NULL,
       platform text NOT NULL,
       codex_version text NOT NULL,
@@ -43,11 +44,14 @@ export async function ensureSchema(sql: Database): Promise<void> {
       revoked_at timestamptz
     );
     CREATE INDEX IF NOT EXISTS hosts_user_id_idx ON hosts(user_id);
+    ALTER TABLE hosts ADD COLUMN IF NOT EXISTS agent_id uuid;
+    CREATE UNIQUE INDEX IF NOT EXISTS hosts_user_agent_id_idx ON hosts(user_id, agent_id) WHERE agent_id IS NOT NULL AND revoked_at IS NULL;
 
     CREATE TABLE IF NOT EXISTS pairings (
       id uuid PRIMARY KEY,
       code text NOT NULL UNIQUE,
       secret_hash text NOT NULL,
+      agent_id uuid,
       agent_name text NOT NULL,
       platform text NOT NULL,
       codex_version text NOT NULL,
@@ -62,6 +66,7 @@ export async function ensureSchema(sql: Database): Promise<void> {
       created_at timestamptz NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS pairings_code_idx ON pairings(code);
+    ALTER TABLE pairings ADD COLUMN IF NOT EXISTS agent_id uuid;
 
     CREATE TABLE IF NOT EXISTS sync_events (
       id bigserial PRIMARY KEY,
