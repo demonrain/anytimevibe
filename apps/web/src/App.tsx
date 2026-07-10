@@ -395,6 +395,7 @@ export function App() {
     <aside className="rail">
       <div className="rail-heading"><span>远程主机</span><button onClick={() => setPairingOpen(true)}>＋</button></div>
       <div className="host-list">
+        <button className="host-add-mobile" onClick={() => setPairingOpen(true)}>＋ 添加电脑</button>
         {hosts.map((host) => <div key={host.id} className={`host-row ${host.id === selectedHostId ? "active" : ""}`}>
           <button className="host-pill" onClick={() => { setSelectedHostId(host.id); setSelectedTaskId(null); }}>
             <span className={`status-dot ${(runtime[host.id]?.online ?? host.online) ? "online" : ""}`} />

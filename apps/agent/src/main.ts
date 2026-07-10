@@ -609,7 +609,11 @@ async function addWorkspace(): Promise<PublicState> {
 function handleError(error: unknown): void {
   const detail = error instanceof Error ? error.message : String(error);
   console.error(error);
-  updateState({ status: publicState.status === "incompatible" ? "incompatible" : "offline", detail });
+  const connected = socket?.readyState === WebSocket.OPEN;
+  updateState({
+    status: publicState.status === "incompatible" ? "incompatible" : connected ? "online" : "offline",
+    detail: connected ? `代理在线，但有一项操作失败：${detail}` : detail
+  });
 }
 
 let updateListenersRegistered = false;
