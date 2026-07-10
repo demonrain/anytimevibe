@@ -26,6 +26,18 @@ npm install -g @openai/codex@0.144
 codex login
 ```
 
+## 客户端自动更新
+
+Agent 启动后会通过中继服务读取 `UPDATE_FEED_URL`，每 6 小时检查一次更新。发现新版本后在后台下载，下载完成会打开控制面板并显示“重启并更新”。服务端需配置：
+
+```dotenv
+WINDOWS_CLIENT_URL=https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent-Setup.exe
+MAC_CLIENT_URL=https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent.dmg
+UPDATE_FEED_URL=https://github.com/demonrain/anytimevibe/releases/latest/download
+```
+
+发布 Tag 后，GitHub Actions 会构建客户端并上传安装包、blockmap、`latest.yml` 和 `latest-mac.yml`。生产分发应配置 Windows 代码签名以及 Apple Developer ID 签名、公证，否则系统安全提示和 macOS 自动更新可能受限。
+
 ## macOS 客户端
 
 macOS Agent 功能与 Windows 版一致，支持菜单栏常驻、登录启动、环境检测、配对和工作区白名单。构建命令：
@@ -134,7 +146,7 @@ https://你的域名
 安装包位置：
 
 ```text
-apps/agent/release/AnytimeVibe Agent Setup 0.1.0.exe
+apps/agent/release/AnytimeVibe-Agent-Setup.exe
 ```
 
 ### 4.1 安装步骤
@@ -245,7 +257,7 @@ iOS 上的 Web Push 需要以已安装到主屏幕的 PWA 形式运行。
 ### 9.1 查看对话
 
 - `YOU` 表示从 PWA 发出的指令。
-- `CODEX` 表示 Codex 的流式回复。
+- `CODEX` 表示上次同步得到的 Codex 完整回复。任务执行期间 Web 端只显示“处理中”。
 - `SYSTEM` 表示计划等系统型线程内容。
 - 任务卡片显示最近状态、消息摘要、工作区和待审批数量。
 
@@ -453,13 +465,13 @@ pnpm --filter @anytimevibe/agent package:win
 文件：
 
 ```text
-AnytimeVibe Agent Setup 0.1.0.exe
+AnytimeVibe-Agent-Setup.exe
 ```
 
 SHA256：
 
 ```text
-553D7D9EFD203C769ED5E155486E7274473AB04C68E162C24B1BFCC9279E4E6D
+69CB13A055147BAC976E03321B888FFFB9B47D4918CDE7AF022DB2DDFB0EDE5E
 ```
 
 后续重新构建安装包后，文件哈希会发生变化，应以实际发布渠道提供的新哈希为准。

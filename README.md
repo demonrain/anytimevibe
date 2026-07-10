@@ -1,6 +1,6 @@
 # AnytimeVibe
 
-AnytimeVibe 是一个多用户远程 Codex 工作台。移动端 PWA 通过 VPS 中继连接 Windows 或 macOS 托盘代理，支持任务下发、对话同步、流式回复、Diff、停止或追加指令以及远程审批。
+AnytimeVibe 是一个多用户远程 Codex 工作台。移动端 PWA 通过 VPS 中继连接 Windows 或 macOS 托盘代理，支持任务下发、处理状态、完成通知、历史同步、停止或追加指令以及远程审批。
 
 中继只保存和转发端到端加密信封。Codex 登录信息、项目源码和同步密钥不会作为明文上传。
 
@@ -39,7 +39,7 @@ docker compose up -d --build
 ## 桌面客户端
 
 ```text
-apps/agent/release/AnytimeVibe Agent Setup 0.1.0.exe
+apps/agent/release/AnytimeVibe-Agent-Setup.exe
 ```
 
 macOS 客户端需要在 macOS 或 GitHub Actions 的 `macos-latest` 环境构建：

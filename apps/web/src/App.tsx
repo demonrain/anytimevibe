@@ -21,7 +21,7 @@ import {
 import { api, websocketUrl } from "./api";
 import { getHostKey, removeHostKey, saveHostKey } from "./key-store";
 
-type Health = { ok: boolean; needsSetup: boolean; registrationEnabled: boolean; vapidPublicKey: string | null };
+type Health = { ok: boolean; needsSetup: boolean; registrationEnabled: boolean; vapidPublicKey: string | null; clientDownloads: { windows: string | null; mac: string | null } };
 type User = { id: string; username: string };
 type Host = {
   id: string;
@@ -124,6 +124,11 @@ function ErrorBanner({ message, clear }: { message: string; clear(): void }) {
   return <button className="error-banner" onClick={clear}>{message}<span>关闭</span></button>;
 }
 
+function ClientDownloads({ downloads }: { downloads: Health["clientDownloads"] }) {
+  if (!downloads.windows && !downloads.mac) return null;
+  return <div className="client-downloads"><span>桌面客户端</span>{downloads.windows && <a href={downloads.windows}>Windows</a>}{downloads.mac && <a href={downloads.mac}>macOS</a>}</div>;
+}
+
 function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticated(user: User): void }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -156,6 +161,7 @@ function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticat
       <h1>离开电脑，<br />任务不用停。</h1>
       <p>连接自己的 Windows 或 macOS 主机，继续 Codex 对话、处理审批、查看代码 Diff。云端只负责转发密文。</p>
       <div className="signal-line"><span />端到端加密连接</div>
+      <ClientDownloads downloads={health.clientDownloads} />
     </section>
     <form className="auth-card" onSubmit={submit}>
       <div className="mark">AV</div>
@@ -376,6 +382,7 @@ export function App() {
     <header className="topbar">
       <div className="brand"><span>AV</span><div><strong>AnytimeVibe</strong><small>REMOTE CODE DESK</small></div></div>
       <div className="top-actions">
+        <ClientDownloads downloads={health.clientDownloads} />
         <button className="quiet" onClick={() => subscribePush(health.vapidPublicKey).catch((pushError) => setError(pushError.message))}>开启通知</button>
         <div className="account-menu">
           <button className="avatar" title={user.username} aria-expanded={accountOpen} onClick={() => setAccountOpen((open) => !open)}>{user.username.slice(0, 1).toUpperCase()}</button>
@@ -475,6 +482,7 @@ function TaskConversation({ task, online, onCommand }: { task: Task; online: boo
       stickToBottomRef.current = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 90;
     }}>
       {task.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><span>{message.role === "user" ? "YOU" : message.role === "assistant" ? "CODEX" : "SYSTEM"}</span><pre>{message.text}</pre></article>)}
+      {running && <article className="processing-card"><span className="processing-spinner" /><div><strong>远程主机正在处理</strong><p>Codex 正在电脑端执行任务。为保持页面稳定，处理过程不会实时同步；任务完成后会更新状态并发送通知。</p></div></article>}
       {task.approvals.map((approval) => <article className="approval-card" key={String(approval.requestId)}>
         <div className="approval-label">ACTION REQUIRED</div><h3>{approval.title}</h3><pre>{approval.detail}</pre>
         <div className="approval-actions"><button onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "decline" })}>拒绝</button><button className="approve" onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "accept" })}>允许一次</button></div>
@@ -491,7 +499,7 @@ function TaskConversation({ task, online, onCommand }: { task: Task; online: boo
           submitPrompt();
         }
       }} placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"} />
-      <div><small>{online === null ? "正在确认主机状态…" : running ? "任务运行中，可追加指令或停止" : "沿用本机 Codex 沙箱和审批策略"}<span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 发送</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>停止</button>}<button className="send" disabled={online !== true || !prompt.trim()}>发送</button></div>
+      <div><small>{online === null ? "正在确认主机状态…" : running ? "任务正在电脑端处理，可追加指令或停止" : "沿用本机 Codex 沙箱和审批策略"}<span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 发送</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>停止</button>}<button className="send" disabled={online !== true || !prompt.trim()}>发送</button></div>
     </form>
   </>;
 }

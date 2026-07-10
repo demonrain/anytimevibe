@@ -168,9 +168,15 @@ async function main(): Promise<void> {
       ok: true,
       needsSetup: count === 0,
       registrationEnabled: config.REGISTRATION_ENABLED && count < config.MAX_USERS,
+      clientDownloads: {
+        windows: config.WINDOWS_CLIENT_URL ?? null,
+        mac: config.MAC_CLIENT_URL ?? null
+      },
       vapidPublicKey: config.VAPID_PUBLIC_KEY ?? null
     };
   });
+
+  app.get("/api/agent/config", async () => ({ updateFeedUrl: config.UPDATE_FEED_URL ?? null }));
 
   app.post("/api/setup", { config: { rateLimit: { max: 5, timeWindow: "15 minutes" } } }, async (request, reply) => {
     const body = setupBody.parse(request.body);
