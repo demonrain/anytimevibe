@@ -34,6 +34,11 @@ const loginBody = z.object({
   password: z.string().min(1)
 });
 
+const registerBody = z.object({
+  username: z.string().trim().min(3).max(64).regex(/^[a-zA-Z0-9_.-]+$/),
+  password: z.string().min(10).max(256)
+});
+
 const agentPairBody = z.object({
   secret: z.string().min(24),
   agentId: z.string().uuid(),
@@ -162,6 +167,7 @@ async function main(): Promise<void> {
     return {
       ok: true,
       needsSetup: count === 0,
+      registrationEnabled: config.REGISTRATION_ENABLED && count < config.MAX_USERS,
       vapidPublicKey: config.VAPID_PUBLIC_KEY ?? null
     };
   });
@@ -188,7 +194,7 @@ async function main(): Promise<void> {
   app.post("/api/auth/login", { config: { rateLimit: { max: 8, timeWindow: "15 minutes" } } }, async (request, reply) => {
     const body = loginBody.parse(request.body);
     const rows = await sql<Array<{ id: string; username: string; passwordHash: string }>>`
-      SELECT id, username, password_hash FROM users WHERE username = ${body.username} LIMIT 1
+      SELECT id, username, password_hash FROM users WHERE lower(username) = lower(${body.username}) LIMIT 1
     `;
     const user = rows[0];
     if (!user || !(await verifyPassword(user.passwordHash, body.password))) {
@@ -201,6 +207,28 @@ async function main(): Promise<void> {
     `;
     setSessionCookie(reply, token, config.NODE_ENV === "production");
     return { user: { id: user.id, username: user.username } };
+  });
+
+  app.post("/api/auth/register", { config: { rateLimit: { max: 5, timeWindow: "1 hour" } } }, async (request, reply) => {
+    if (!config.REGISTRATION_ENABLED) return reply.code(403).send({ error: "registration_disabled" });
+    const body = registerBody.parse(request.body);
+    const countRows = await sql<Array<{ count: number }>>`SELECT count(*)::int AS count FROM users`;
+    if ((countRows[0]?.count ?? 0) >= config.MAX_USERS) return reply.code(403).send({ error: "user_limit_reached" });
+    const userId = randomUUID();
+    const passwordHash = await hashPassword(body.password);
+    try {
+      await sql`INSERT INTO users (id, username, password_hash) VALUES (${userId}, ${body.username}, ${passwordHash})`;
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") return reply.code(409).send({ error: "username_taken" });
+      throw error;
+    }
+    const token = randomToken();
+    await sql`
+      INSERT INTO sessions (id, user_id, token_hash, expires_at)
+      VALUES (${randomUUID()}, ${userId}, ${hashToken(token)}, now() + ${`${SESSION_DAYS} days`}::interval)
+    `;
+    setSessionCookie(reply, token, config.NODE_ENV === "production");
+    return reply.code(201).send({ user: { id: userId, username: body.username } });
   });
 
   app.post("/api/auth/logout", async (request, reply) => {

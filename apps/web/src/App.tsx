@@ -21,7 +21,7 @@ import {
 import { api, websocketUrl } from "./api";
 import { getHostKey, removeHostKey, saveHostKey } from "./key-store";
 
-type Health = { ok: boolean; needsSetup: boolean; vapidPublicKey: string | null };
+type Health = { ok: boolean; needsSetup: boolean; registrationEnabled: boolean; vapidPublicKey: string | null };
 type User = { id: string; username: string };
 type Host = {
   id: string;
@@ -130,13 +130,15 @@ function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticat
   const [setupToken, setSetupToken] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [registering, setRegistering] = useState(false);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     setLoading(true);
     setError("");
     try {
-      const response = await api<{ user: User }>(health.needsSetup ? "/api/setup" : "/api/auth/login", {
+      const endpoint = health.needsSetup ? "/api/setup" : registering ? "/api/auth/register" : "/api/auth/login";
+      const response = await api<{ user: User }>(endpoint, {
         method: "POST",
         body: JSON.stringify(health.needsSetup ? { username, password, setupToken } : { username, password })
       });
@@ -152,18 +154,19 @@ function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticat
     <section className="auth-story">
       <p className="eyebrow">YOUR CODE, STILL MOVING</p>
       <h1>离开电脑，<br />任务不用停。</h1>
-      <p>连接自己的 Windows 主机，继续 Codex 对话、处理审批、查看代码 Diff。云端只负责转发密文。</p>
+      <p>连接自己的 Windows 或 macOS 主机，继续 Codex 对话、处理审批、查看代码 Diff。云端只负责转发密文。</p>
       <div className="signal-line"><span />端到端加密连接</div>
     </section>
     <form className="auth-card" onSubmit={submit}>
       <div className="mark">AV</div>
-      <h2>{health.needsSetup ? "初始化个人空间" : "进入 AnytimeVibe"}</h2>
-      <p>{health.needsSetup ? "设置完成后，一次性令牌将不再使用。" : "使用你的个人账号继续远程任务。"}</p>
+      <h2>{health.needsSetup ? "初始化服务" : registering ? "创建个人空间" : "进入 AnytimeVibe"}</h2>
+      <p>{health.needsSetup ? "创建首个管理员账号。" : registering ? "注册后即可配对自己的电脑，数据与其他用户隔离。" : "使用你的个人账号继续远程任务。"}</p>
       {health.needsSetup && <label>设置令牌<input value={setupToken} onChange={(event) => setSetupToken(event.target.value)} required /></label>}
       <label>用户名<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
-      <label>密码<input type="password" autoComplete={health.needsSetup ? "new-password" : "current-password"} minLength={health.needsSetup ? 10 : undefined} value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
+      <label>密码<input type="password" autoComplete={health.needsSetup || registering ? "new-password" : "current-password"} minLength={health.needsSetup || registering ? 10 : undefined} value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
       {error && <p className="form-error">{error}</p>}
-      <button className="primary" disabled={loading}>{loading ? "处理中…" : health.needsSetup ? "创建空间" : "登录"}</button>
+      <button className="primary" disabled={loading}>{loading ? "处理中…" : health.needsSetup ? "创建管理员" : registering ? "注册并登录" : "登录"}</button>
+      {!health.needsSetup && health.registrationEnabled && <button type="button" className="auth-switch" onClick={() => { setRegistering((value) => !value); setError(""); }}>{registering ? "已有账号？返回登录" : "没有账号？立即注册"}</button>}
     </form>
   </main>;
 }
@@ -532,7 +535,7 @@ function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): voi
   }
 
   return <div className="modal-backdrop"><section className="modal">
-    <button className="modal-close" onClick={onClose}>×</button><p className="eyebrow">PAIR A HOST</p><h2>连接 Windows 代理</h2>
+    <button className="modal-close" onClick={onClose}>×</button><p className="eyebrow">PAIR A HOST</p><h2>连接电脑代理</h2>
     {!info ? <><p>在电脑端 AnytimeVibe 托盘窗口生成六位配对码。</p><input className="pair-code" inputMode="numeric" maxLength={6} value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ""))} placeholder="000000" /><button className="primary" disabled={code.length !== 6 || loading} onClick={inspect}>{loading ? "查询中…" : "检查配对码"}</button></> : <div className="pair-preview"><span className="computer-icon">▣</span><h3>{info.agentName}</h3><p>{info.platform} · {info.codexVersion}</p><button className="primary" disabled={loading} onClick={claim}>{loading ? "正在交换密钥…" : "确认并连接"}</button></div>}
     {error && <p className="form-error">{error}</p>}
   </section></div>;

@@ -32,7 +32,7 @@ button { color: inherit; }
 label { display: grid; gap: 7px; font-size: 13px; font-weight: 750; }
 input, textarea, select { width: 100%; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.72); padding: 13px 14px; outline: none; color: var(--ink); }
 input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shadow: 0 0 0 3px rgba(45,118,83,.12); }
-.form-error { color: #a63223 !important; background: #fff0eb; padding: 10px 12px; border-radius: 10px; font-size: 13px; }
+.form-error { color: #a63223 !important; background: #fff0eb; padding: 10px 12px; border-radius: 10px; font-size: 13px; }.auth-switch { border: 0; background: transparent; color: var(--moss); font-weight: 800; cursor: pointer; padding: 4px; }
 .loading-screen { min-height: 100vh; display: grid; place-content: center; justify-items: center; gap: 20px; }
 .pulse { width: 56px; height: 56px; border-radius: 50%; background: var(--rust); animation: pulse 1.25s infinite; }
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: 250px 1fr; grid-template-rows: 78px 1fr; }

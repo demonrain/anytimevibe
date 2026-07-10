@@ -1,7 +1,7 @@
 {
   "name": "@anytimevibe/agent",
   "version": "0.1.0",
-  "description": "Windows bridge for encrypted remote Codex sessions",
+  "description": "Windows and macOS bridge for encrypted remote Codex sessions",
   "author": "AnytimeVibe",
   "private": true,
   "main": "dist/main.js",
@@ -10,7 +10,8 @@
     "build": "tsup src/main.ts src/preload.ts --format cjs --platform node --external electron --sourcemap --clean",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "package:dir": "pnpm build && electron-builder --win --dir",
-    "package:win": "pnpm build && electron-builder --win nsis"
+    "package:win": "pnpm build && electron-builder --win nsis",
+    "package:mac": "pnpm build && electron-builder --mac dmg zip --x64 --arm64"
   },
   "dependencies": {
     "@anytimevibe/protocol": "workspace:*",
@@ -28,6 +29,7 @@
     "directories": { "output": "release" },
     "files": ["dist/**/*", "package.json"],
     "win": { "target": "nsis", "signAndEditExecutable": false },
+    "mac": { "target": ["dmg", "zip"], "category": "public.app-category.developer-tools", "identity": null },
     "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true }
   }
 }

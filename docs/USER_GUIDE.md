@@ -1,5 +1,41 @@
 # AnytimeVibe 使用手册
 
+> 当前版本支持开放注册、Windows 与 macOS Agent。服务管理员可通过 `REGISTRATION_ENABLED` 和 `MAX_USERS` 控制注册。
+
+## 多用户注册
+
+首个账号仍通过 `SETUP_TOKEN` 初始化，并作为服务管理员持有。初始化完成后，登录页会在注册开启且未达到人数上限时显示“立即注册”。每个用户只能看到和操作自己配对的主机、密文事件和 Push 订阅。
+
+服务端配置：
+
+```dotenv
+REGISTRATION_ENABLED=true
+MAX_USERS=100
+```
+
+公开提供服务前，请阅读 [多用户容量评估](CAPACITY.md)，并补充密码重置、验证码或邀请制和滥用处置策略。
+
+## 客户端环境检测
+
+Agent 启动后会检测 Node.js、Codex CLI 和兼容版本。若 Node.js 缺失，“安装 Node.js”会打开官方下载页；若 Codex 缺失或版本不兼容，“一键安装兼容版 Codex”会打开系统终端并执行安装与登录命令。安装完成后点击“重新检测”。
+
+当前适配器要求 `codex-cli 0.144.x`。环境安装会使用：
+
+```bash
+npm install -g @openai/codex@0.144
+codex login
+```
+
+## macOS 客户端
+
+macOS Agent 功能与 Windows 版一致，支持菜单栏常驻、登录启动、环境检测、配对和工作区白名单。构建命令：
+
+```bash
+pnpm --filter @anytimevibe/agent package:mac
+```
+
+输出位于 `apps/agent/release/`，包含 DMG 和 ZIP。当前构建未配置 Apple Developer ID 签名和公证，公开分发前必须增加签名、公证和自动更新。
+
 - 手册版本：`v0.1`
 - 适用产品：AnytimeVibe MVP
 - 适用 Codex：`codex-cli 0.144.x`
@@ -423,7 +459,7 @@ AnytimeVibe Agent Setup 0.1.0.exe
 SHA256：
 
 ```text
-C4A217DEA42CDC0381BD7CF310A3AD1A2A36366871D35EEDA4CE406F37D6DEE8
+553D7D9EFD203C769ED5E155486E7274473AB04C68E162C24B1BFCC9279E4E6D
 ```
 
 后续重新构建安装包后，文件哈希会发生变化，应以实际发布渠道提供的新哈希为准。

@@ -19,6 +19,7 @@ export async function ensureSchema(sql: Database): Promise<void> {
       password_hash text NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users(lower(username));
 
     CREATE TABLE IF NOT EXISTS sessions (
       id uuid PRIMARY KEY,

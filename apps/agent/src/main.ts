@@ -6,9 +6,10 @@ import {
   Menu,
   nativeImage,
   safeStorage,
+  shell,
   Tray
 } from "electron";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -64,6 +65,16 @@ type PublicState = {
   hostId?: string | undefined;
   codexVersion: string;
   workspaces: Workspace[];
+  environment: EnvironmentState;
+};
+
+type EnvironmentState = {
+  platform: "windows" | "macos" | "other";
+  nodeInstalled: boolean;
+  nodeVersion?: string;
+  codexInstalled: boolean;
+  codexVersion?: string;
+  codexCompatible: boolean;
 };
 
 let windowRef: BrowserWindow | null = null;
@@ -72,7 +83,8 @@ let config: AgentConfig;
 let configPath = "";
 let codexCommand = "codex.cmd";
 let codexVersion = "unknown";
-let publicState: PublicState = { relayUrl: "", status: "unconfigured", detail: "请先配置中继地址。", codexVersion, workspaces: [] };
+const initialEnvironment: EnvironmentState = { platform: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "other", nodeInstalled: false, codexInstalled: false, codexCompatible: false };
+let publicState: PublicState = { relayUrl: "", status: "unconfigured", detail: "请先配置中继地址。", codexVersion, workspaces: [], environment: initialEnvironment };
 let socket: WebSocket | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let pairingTimer: NodeJS.Timeout | null = null;
@@ -83,7 +95,7 @@ const pendingPrompts = new Map<string, string>();
 const pendingRequestTypes = new Map<string, "command" | "file" | "permission" | "input">();
 
 function encryptSecret(value: string): string {
-  if (!safeStorage.isEncryptionAvailable()) throw new Error("Windows 安全存储当前不可用");
+  if (!safeStorage.isEncryptionAvailable()) throw new Error("系统安全存储当前不可用");
   return safeStorage.encryptString(value).toString("base64");
 }
 
@@ -146,11 +158,11 @@ function createWindow(): void {
 
 function rendererHtml(): string {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>AnytimeVibe Agent</title><style>
-  :root{font-family:"Bahnschrift","Aptos",sans-serif;color:#17211b;background:#f2eadb}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 90% 0,rgba(226,88,50,.18),transparent 31%),#f2eadb}.shell{padding:30px}.head{display:flex;align-items:center;gap:13px;margin-bottom:28px}.mark{width:48px;height:48px;display:grid;place-items:center;background:#e25832;color:white;font-weight:900;border-radius:15px 15px 4px 15px}.head h1{font:700 24px Rockwell,serif;margin:0}.head p{margin:3px 0 0;color:#6b726b;font-size:11px;letter-spacing:.1em}.card{background:#fffaf0;border:1px solid rgba(23,33,27,.15);border-radius:20px;padding:21px;margin-bottom:15px;box-shadow:0 14px 35px rgba(34,39,31,.07)}.status{display:flex;align-items:center;justify-content:space-between}.status b{text-transform:uppercase;font-size:11px;letter-spacing:.12em}.dot{width:10px;height:10px;border-radius:50%;background:#999}.dot.online{background:#3bab70;box-shadow:0 0 0 6px rgba(59,171,112,.13)}.detail{color:#6b726b;font-size:13px;line-height:1.5}.pair{font:900 47px/1 monospace;letter-spacing:.2em;text-align:center;padding-left:.2em;color:#e25832;margin:18px 0}.row{display:flex;gap:9px}input{flex:1;border:1px solid rgba(23,33,27,.17);border-radius:10px;padding:12px;background:white}button{border:0;border-radius:10px;padding:11px 14px;background:#17211b;color:white;font-weight:800;cursor:pointer}button.secondary{background:#e7ddcd;color:#17211b}.workspaces{display:grid;gap:8px}.workspace{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;background:#eee6d8;border-radius:10px}.workspace div{min-width:0}.workspace strong,.workspace small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.workspace small{color:#747a73;margin-top:3px}.workspace button{padding:5px 8px;background:transparent;color:#a43b25}.meta{font:11px/1.6 "Cascadia Code",monospace;color:#687068}.empty{text-align:center;color:#777;padding:14px}h2{font:700 17px Rockwell,serif;margin:0 0 13px}</style></head><body><main class="shell"><div class="head"><div class="mark">AV</div><div><h1>AnytimeVibe Agent</h1><p>WINDOWS REMOTE BRIDGE</p></div></div><section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section><section class="card"><h2>中继服务器</h2><div class="row"><input id="relay" placeholder="https://vibe.example.com"><button id="saveRelay">保存</button></div><div id="pairBox"></div></section><section class="card"><div class="status"><h2>允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><div id="workspaces" class="workspaces"></div></section></main><script>
-  const api=window.anytimeVibe;const status=document.querySelector('#status');const dot=document.querySelector('#dot');const detail=document.querySelector('#detail');const relay=document.querySelector('#relay');const pairBox=document.querySelector('#pairBox');const workspaces=document.querySelector('#workspaces');const meta=document.querySelector('#meta');
-  function render(state){status.textContent=state.status;dot.className='dot '+(state.status==='online'?'online':'');detail.textContent=state.detail;relay.value=state.relayUrl||'';meta.textContent='Codex '+state.codexVersion+(state.hostId?' · Host '+state.hostId:'');pairBox.innerHTML=state.pairingCode?'<div class="pair">'+state.pairingCode+'</div><p class="detail">在移动端输入配对码。配对码约十分钟后失效。</p>':'<button id="startPair">生成配对码</button>';document.querySelector('#startPair')?.addEventListener('click',()=>api.startPairing());workspaces.innerHTML=state.workspaces.length?state.workspaces.map(w=>'<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button data-id="'+w.id+'">移除</button></div>').join(''):'<div class="empty">尚未允许任何目录</div>';workspaces.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>api.removeWorkspace(button.dataset.id)));}
+  :root{font-family:"Bahnschrift","Aptos",sans-serif;color:#17211b;background:#f2eadb}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 90% 0,rgba(226,88,50,.18),transparent 31%),#f2eadb}.shell{padding:30px}.head{display:flex;align-items:center;gap:13px;margin-bottom:28px}.mark{width:48px;height:48px;display:grid;place-items:center;background:#e25832;color:white;font-weight:900;border-radius:15px 15px 4px 15px}.head h1{font:700 24px Rockwell,serif;margin:0}.head p{margin:3px 0 0;color:#6b726b;font-size:11px;letter-spacing:.1em}.card{background:#fffaf0;border:1px solid rgba(23,33,27,.15);border-radius:20px;padding:21px;margin-bottom:15px;box-shadow:0 14px 35px rgba(34,39,31,.07)}.status{display:flex;align-items:center;justify-content:space-between}.status b{text-transform:uppercase;font-size:11px;letter-spacing:.12em}.dot{width:10px;height:10px;border-radius:50%;background:#999}.dot.online,.check.ok:before{background:#3bab70;box-shadow:0 0 0 6px rgba(59,171,112,.13)}.detail{color:#6b726b;font-size:13px;line-height:1.5}.pair{font:900 47px/1 monospace;letter-spacing:.2em;text-align:center;padding-left:.2em;color:#e25832;margin:18px 0}.row{display:flex;gap:9px;flex-wrap:wrap}input{flex:1;border:1px solid rgba(23,33,27,.17);border-radius:10px;padding:12px;background:white}button{border:0;border-radius:10px;padding:11px 14px;background:#17211b;color:white;font-weight:800;cursor:pointer}button.secondary{background:#e7ddcd;color:#17211b}.checks{display:grid;gap:10px;margin:12px 0}.check{display:flex;align-items:center;gap:10px;padding:10px 12px;background:#eee6d8;border-radius:10px}.check:before{content:"";width:9px;height:9px;border-radius:50%;background:#d35a3b}.check span{margin-left:auto;color:#687068;font:11px "Cascadia Code",monospace}.workspaces{display:grid;gap:8px}.workspace{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;background:#eee6d8;border-radius:10px}.workspace div{min-width:0}.workspace strong,.workspace small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.workspace small{color:#747a73;margin-top:3px}.workspace button{padding:5px 8px;background:transparent;color:#a43b25}.meta{font:11px/1.6 "Cascadia Code",monospace;color:#687068}.empty{text-align:center;color:#777;padding:14px}h2{font:700 17px Rockwell,serif;margin:0 0 13px}</style></head><body><main class="shell"><div class="head"><div class="mark">AV</div><div><h1>AnytimeVibe Agent</h1><p>${process.platform === "darwin" ? "MACOS" : "WINDOWS"} REMOTE BRIDGE</p></div></div><section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section><section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="environmentActions" class="row"></div></section><section class="card"><h2>中继服务器</h2><div class="row"><input id="relay" placeholder="https://vibe.example.com"><button id="saveRelay">保存</button></div><div id="pairBox"></div></section><section class="card"><div class="status"><h2>允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><div id="workspaces" class="workspaces"></div></section></main><script>
+  const api=window.anytimeVibe;const status=document.querySelector('#status');const dot=document.querySelector('#dot');const detail=document.querySelector('#detail');const relay=document.querySelector('#relay');const pairBox=document.querySelector('#pairBox');const workspaces=document.querySelector('#workspaces');const meta=document.querySelector('#meta');const environment=document.querySelector('#environment');const environmentActions=document.querySelector('#environmentActions');
+  function render(state){status.textContent=state.status;dot.className='dot '+(state.status==='online'?'online':'');detail.textContent=state.detail;relay.value=state.relayUrl||'';meta.textContent='Codex '+state.codexVersion+(state.hostId?' · Host '+state.hostId:'');const env=state.environment;environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+(env.nodeVersion||'未安装')+'</span></div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span></div>';environmentActions.innerHTML=(!env.nodeInstalled?'<button data-install="node">安装 Node.js</button>':'')+(env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex">一键安装兼容版 Codex</button>':'');environmentActions.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>api.installEnvironment(button.dataset.install)));pairBox.innerHTML=state.pairingCode?'<div class="pair">'+state.pairingCode+'</div><p class="detail">在移动端输入配对码。配对码约十分钟后失效。</p>':'<button id="startPair" '+(!env.codexCompatible?'disabled':'')+'>生成配对码</button>';document.querySelector('#startPair')?.addEventListener('click',()=>api.startPairing());workspaces.innerHTML=state.workspaces.length?state.workspaces.map(w=>'<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button data-id="'+w.id+'">移除</button></div>').join(''):'<div class="empty">尚未允许任何目录</div>';workspaces.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>api.removeWorkspace(button.dataset.id)));}
   function escapeHtml(value){return value.replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));}
-  document.querySelector('#saveRelay').addEventListener('click',()=>api.setRelayUrl(relay.value));document.querySelector('#addWorkspace').addEventListener('click',()=>api.addWorkspace());api.onState(render);api.getState().then(render);
+  document.querySelector('#saveRelay').addEventListener('click',()=>api.setRelayUrl(relay.value));document.querySelector('#addWorkspace').addEventListener('click',()=>api.addWorkspace());document.querySelector('#recheck').addEventListener('click',()=>api.checkEnvironment());api.onState(render);api.getState().then(render);
   </script></body></html>`;
 }
 
@@ -170,29 +182,77 @@ async function loadConfig(): Promise<void> {
   publicState = { ...publicState, relayUrl: config.relayUrl, workspaces: config.workspaces };
 }
 
-async function findCodex(): Promise<void> {
-  if (process.env.CODEX_COMMAND) codexCommand = normalizeWindowsCommandPath(process.env.CODEX_COMMAND);
-  else if (process.platform === "win32") {
-    const result = await execFileAsync("where.exe", ["codex.cmd"]);
-    codexCommand = normalizeWindowsCommandPath(result.stdout.split(/\r?\n/).find(Boolean)?.trim() ?? "codex.cmd");
-  }
-  let result: Awaited<ReturnType<typeof execFileAsync>>;
+async function commandVersion(command: string, args: string[]): Promise<string | null> {
   try {
-    result = process.platform === "win32"
-      ? await execFileAsync(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(codexCommand, ["--version"]), {
-          windowsHide: true,
-          windowsVerbatimArguments: true
-        })
-      : await execFileAsync(codexCommand, ["--version"]);
+    const result = process.platform === "win32"
+      ? await execFileAsync(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(command, args), { windowsHide: true, windowsVerbatimArguments: true })
+      : await execFileAsync(command, args);
+    return String(result.stdout).trim();
   } catch {
-    throw new Error(`无法运行 Codex CLI：${codexCommand}。请确认 Codex 已安装，并且 CODEX_COMMAND 配置正确。`);
+    return null;
   }
-  const versionOutput = typeof result.stdout === "string" ? result.stdout : result.stdout.toString("utf8");
-  codexVersion = versionOutput.trim().replace(/^codex-cli\s+/, "");
-  if (!/^0\.144\./.test(codexVersion)) {
-    updateState({ status: "incompatible", detail: `当前仅支持 codex-cli 0.144.x，检测到 ${codexVersion}。` });
+}
+
+async function findOnPath(command: string): Promise<string | null> {
+  if (process.platform === "win32") {
+    try {
+      const result = await execFileAsync("where.exe", [command]);
+      return result.stdout.split(/\r?\n/).find(Boolean)?.trim() ?? null;
+    } catch { return null; }
+  }
+  try {
+    const result = await execFileAsync("/bin/zsh", ["-lc", `command -v ${command}`]);
+    return result.stdout.trim() || null;
+  } catch { return null; }
+}
+
+async function detectEnvironment(): Promise<EnvironmentState> {
+  const nodeCommand = await findOnPath(process.platform === "win32" ? "node.exe" : "node");
+  const nodeOutput = nodeCommand ? await commandVersion(nodeCommand, ["--version"]) : null;
+  const configuredCodex = process.env.CODEX_COMMAND ? normalizeWindowsCommandPath(process.env.CODEX_COMMAND) : null;
+  const discoveredCodex = configuredCodex ?? await findOnPath(process.platform === "win32" ? "codex.cmd" : "codex");
+  if (discoveredCodex) codexCommand = normalizeWindowsCommandPath(discoveredCodex);
+  const codexOutput = discoveredCodex ? await commandVersion(codexCommand, ["--version"]) : null;
+  const detectedVersion = codexOutput?.replace(/^codex-cli\s+/, "");
+  if (detectedVersion) codexVersion = detectedVersion;
+  return {
+    platform: initialEnvironment.platform,
+    nodeInstalled: Boolean(nodeOutput),
+    ...(nodeOutput ? { nodeVersion: nodeOutput } : {}),
+    codexInstalled: Boolean(detectedVersion),
+    ...(detectedVersion ? { codexVersion: detectedVersion } : {}),
+    codexCompatible: Boolean(detectedVersion && /^0\.144\./.test(detectedVersion))
+  };
+}
+
+async function findCodex(): Promise<void> {
+  const environment = await detectEnvironment();
+  updateState({ environment });
+  if (!environment.nodeInstalled) throw new Error("未检测到 Node.js，请先完成环境安装。");
+  if (!environment.codexInstalled) throw new Error("未检测到 Codex CLI，请点击环境检测区域的一键安装。");
+  if (!environment.codexCompatible) {
+    updateState({ status: "incompatible", detail: `当前仅支持 codex-cli 0.144.x，检测到 ${environment.codexVersion}。`, environment });
     throw new Error("Unsupported Codex version");
   }
+}
+
+async function installEnvironment(target: "node" | "codex"): Promise<void> {
+  if (target === "node") {
+    await shell.openExternal("https://nodejs.org/en/download");
+    return;
+  }
+  if (process.platform === "win32") {
+    const installCommand = "npm install -g @openai/codex@0.144; if ($LASTEXITCODE -eq 0) { codex login }";
+    spawn("powershell.exe", ["-NoExit", "-Command", installCommand], { detached: true, windowsHide: false, stdio: "ignore" }).unref();
+    return;
+  }
+  if (process.platform === "darwin") {
+    const installCommand = "npm install -g @openai/codex@0.144 && codex login";
+    await execFileAsync("osascript", ["-e", `tell application \"Terminal\" to do script \"${installCommand}\"`]);
+    await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+    return;
+  }
+  throw new Error("当前系统暂不支持一键打开安装终端。");
 }
 
 async function ensurePairingKeys(): Promise<void> {
@@ -561,6 +621,20 @@ function registerIpc(): void {
     return publicState;
   });
   ipcMain.handle("agent:reconnect", async () => { await connect(true); return publicState; });
+  ipcMain.handle("agent:check-environment", async () => {
+    const environment = await detectEnvironment();
+    updateState({
+      environment,
+      status: environment.codexCompatible ? (config.hostId ? "offline" : "unconfigured") : "incompatible",
+      detail: environment.codexCompatible ? "Codex 环境检测通过。" : "环境尚未就绪，请按提示完成安装。"
+    });
+    return publicState;
+  });
+  ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex") => {
+    if (target !== "node" && target !== "codex") throw new Error("未知的安装目标");
+    await installEnvironment(target);
+    return publicState;
+  });
 }
 
 app.whenReady().then(async () => {
@@ -568,7 +642,9 @@ app.whenReady().then(async () => {
   registerIpc();
   app.setLoginItemSettings({ openAtLogin: true });
   const trayImage = nativeImage.createFromDataURL("data:image/svg+xml;base64," + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="15" fill="#17211b"/><path d="M13 20h38v25H13z" fill="#f2eadb"/><path d="m19 27 7 5-7 6" fill="none" stroke="#e25832" stroke-width="5"/><path d="M31 39h14" stroke="#2d7653" stroke-width="5"/></svg>').toString("base64"));
-  tray = new Tray(trayImage.resize({ width: 18, height: 18 }));
+  const trayIcon = trayImage.resize({ width: 18, height: 18 });
+  if (process.platform === "darwin") trayIcon.setTemplateImage(true);
+  tray = new Tray(trayIcon);
   tray.on("double-click", showWindow);
   createWindow();
   try {

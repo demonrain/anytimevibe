@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld("anytimeVibe", {
   addWorkspace: () => ipcRenderer.invoke("agent:add-workspace"),
   removeWorkspace: (id: string) => ipcRenderer.invoke("agent:remove-workspace", id),
   reconnect: () => ipcRenderer.invoke("agent:reconnect"),
+  checkEnvironment: () => ipcRenderer.invoke("agent:check-environment"),
+  installEnvironment: (target: "node" | "codex") => ipcRenderer.invoke("agent:install-environment", target),
   onState: (listener: (state: unknown) => void) => {
     const wrapped = (_event: unknown, state: unknown) => listener(state);
     ipcRenderer.on("agent:state", wrapped);

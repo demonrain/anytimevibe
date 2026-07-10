@@ -8,6 +8,8 @@ const configSchema = z.object({
   SETUP_TOKEN: z.string().min(16),
   COOKIE_SECRET: z.string().min(24),
   PUBLIC_ORIGIN: z.string().url(),
+  REGISTRATION_ENABLED: z.string().default("true").transform((value) => value === "true"),
+  MAX_USERS: z.coerce.number().int().positive().default(100),
   VAPID_PUBLIC_KEY: z.string().optional(),
   VAPID_PRIVATE_KEY: z.string().optional(),
   VAPID_SUBJECT: z.string().default("mailto:admin@localhost")
