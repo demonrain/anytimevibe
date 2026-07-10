@@ -468,6 +468,9 @@ async function main(): Promise<void> {
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof z.ZodError) return reply.code(400).send({ error: "invalid_request", details: error.flatten() });
+    if ((error as { code?: string }).code === "FST_ERR_CTP_EMPTY_JSON_BODY") {
+      return reply.code(400).send({ error: "empty_json_body" });
+    }
     app.log.error(error);
     return reply.code(500).send({ error: "internal_error" });
   });

@@ -401,7 +401,15 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       else codex!.respond(command.requestId, { decision: command.decision });
       return;
     }
-    if (command.type === "sync.request") await syncAllThreads();
+    if (command.type === "sync.request") {
+      const threadCount = await syncAllThreads();
+      await publish({
+        type: "sync.completed",
+        eventId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(),
+        threadCount
+      }, false);
+    }
   } catch (error) {
     await publish({
       type: "error",
@@ -486,12 +494,14 @@ async function publishThread(threadId: string): Promise<void> {
   await publish({ type: "thread.snapshot", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), ...snapshot }, true);
 }
 
-async function syncAllThreads(): Promise<void> {
+async function syncAllThreads(): Promise<number> {
   await ensureCodex();
   const response = await codex!.request("thread/list", { limit: 100, sortDirection: "desc" });
-  for (const thread of response.data ?? []) {
+  const threads = response.data ?? [];
+  for (const thread of threads) {
     try { await publishThread(thread.id); } catch (error) { handleError(error); }
   }
+  return threads.length;
 }
 
 async function publish(event: AgentEvent, persist: boolean, hint?: "approval" | "completed"): Promise<void> {

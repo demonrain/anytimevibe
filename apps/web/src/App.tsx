@@ -60,6 +60,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     next.workspaces = event.workspaces;
     return next;
   }
+  if (event.type === "sync.completed") return next;
   if (event.type === "thread.snapshot") {
     const existing = next.tasks[event.threadId];
     next.tasks[event.threadId] = {
@@ -181,6 +182,7 @@ export function App() {
   const [pairingOpen, setPairingOpen] = useState(false);
   const [composerOpen, setComposerOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
 
   useEffect(() => {
     api<Health>("/api/health").then(async (value) => {
@@ -196,10 +198,22 @@ export function App() {
     const key = await getHostKey(envelope.hostId);
     if (!key) return;
     const event = agentEventSchema.parse(await openEnvelope<AgentEvent>(key, envelope));
-    setRuntime((current) => ({
-      ...current,
-      [envelope.hostId]: reduceEvent(current[envelope.hostId] ?? emptyRuntime(), event)
-    }));
+    if (event.type === "sync.completed") {
+      setSyncStatus((current) => ({ ...current, [envelope.hostId]: `已同步 ${event.threadCount} 个任务` }));
+      window.setTimeout(() => {
+        setSyncStatus((current) => {
+          if (!current[envelope.hostId]?.startsWith("已同步")) return current;
+          const next = { ...current };
+          delete next[envelope.hostId];
+          return next;
+        });
+      }, 3000);
+    } else {
+      setRuntime((current) => ({
+        ...current,
+        [envelope.hostId]: reduceEvent(current[envelope.hostId] ?? emptyRuntime(), event)
+      }));
+    }
     if (envelope.persist) localStorage.setItem(`sync:${envelope.hostId}`, String(envelope.sequence));
   });
 
@@ -321,6 +335,20 @@ export function App() {
     setSelectedTaskId(null);
   }
 
+  async function syncHostTasks(hostId: string) {
+    setSyncStatus((current) => ({ ...current, [hostId]: "同步中…" }));
+    try {
+      await sendCommand(hostId, { type: "sync.request", commandId: crypto.randomUUID() });
+    } catch (syncError) {
+      setSyncStatus((current) => {
+        const next = { ...current };
+        delete next[hostId];
+        return next;
+      });
+      throw syncError;
+    }
+  }
+
   if (!health) return <main className="loading-screen"><div className="pulse" /><p>正在建立安全工作区…</p>{error && <ErrorBanner message={error} clear={() => setError("")} />}</main>;
   if (!user) return <AuthScreen health={health} onAuthenticated={setUser} />;
 
@@ -363,7 +391,10 @@ export function App() {
       <section className="task-column">
         <div className="section-title">
           <div><p className="eyebrow">TASK STREAM</p><h1>{activeHost?.name ?? "尚未连接主机"}</h1></div>
-          <button className="new-task" disabled={!activeHost || activeRuntime.online !== true} onClick={() => setComposerOpen(true)}>新任务</button>
+          <div className="section-actions">
+            <button className="sync-tasks" disabled={!activeHost || activeRuntime.online !== true || syncStatus[activeHost.id] === "同步中…"} onClick={() => activeHost && syncHostTasks(activeHost.id).catch((syncError) => setError(syncError.message))}>{activeHost ? syncStatus[activeHost.id] ?? "同步任务" : "同步任务"}</button>
+            <button className="new-task" disabled={!activeHost || activeRuntime.online !== true} onClick={() => setComposerOpen(true)}>新任务</button>
+          </div>
         </div>
         <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? "主机在线，命令将立即执行" : activeRuntime.online === false ? "主机离线，仅可查看已同步记录" : "正在确认主机状态…"}</div>
         <div className="task-list">
@@ -394,6 +425,7 @@ function TaskConversation({ task, online, onCommand }: { task: Task; online: boo
   const [prompt, setPrompt] = useState("");
   const [tab, setTab] = useState<"chat" | "diff">("chat");
   const messageStreamRef = useRef<HTMLDivElement | null>(null);
+  const messageEndRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const previousThreadRef = useRef(task.threadId);
   const running = Boolean(task.activeTurnId);
@@ -404,7 +436,13 @@ function TaskConversation({ task, online, onCommand }: { task: Task; online: boo
     if (!stream || tab !== "chat") return;
     const changedThread = previousThreadRef.current !== task.threadId;
     previousThreadRef.current = task.threadId;
-    if (changedThread || stickToBottomRef.current) stream.scrollTop = stream.scrollHeight;
+    if (changedThread || stickToBottomRef.current) {
+      const frame = window.requestAnimationFrame(() => {
+        messageEndRef.current?.scrollIntoView({ block: "end" });
+        stream.scrollTop = stream.scrollHeight;
+      });
+      return () => window.cancelAnimationFrame(frame);
+    }
   }, [task.threadId, task.messages.length, lastMessageLength, task.approvals.length, tab]);
 
   return <>
@@ -421,6 +459,7 @@ function TaskConversation({ task, online, onCommand }: { task: Task; online: boo
         <div className="approval-label">ACTION REQUIRED</div><h3>{approval.title}</h3><pre>{approval.detail}</pre>
         <div className="approval-actions"><button onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "decline" })}>拒绝</button><button className="approve" onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "accept" })}>允许一次</button></div>
       </article>)}
+      <div className="message-end" ref={messageEndRef} />
     </div> : <DiffView diff={task.diff} />}
     <form className="composer" onSubmit={(event) => {
       event.preventDefault();

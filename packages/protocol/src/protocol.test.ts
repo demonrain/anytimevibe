@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  agentEventSchema,
   base64ToBytes,
   createEnvelope,
   derivePairingKey,
@@ -70,5 +71,17 @@ describe("protocol crypto", () => {
       }
     });
     expect(response.host.id).toBe(hostId);
+  });
+
+  it("accepts task synchronization completion events", () => {
+    const event = agentEventSchema.parse({
+      type: "sync.completed",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadCount: 12
+    });
+    expect(event.type).toBe("sync.completed");
+    if (event.type !== "sync.completed") throw new Error("Unexpected event type");
+    expect(event.threadCount).toBe(12);
   });
 });

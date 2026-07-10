@@ -80,6 +80,10 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     detail: z.string().optional()
   }),
   eventBase.extend({
+    type: z.literal("sync.completed"),
+    threadCount: z.number().int().nonnegative()
+  }),
+  eventBase.extend({
     type: z.literal("thread.snapshot"),
     threadId: z.string(),
     title: z.string(),
