@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent, useState } from "react";
+import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 import {
   agentEventSchema,
   base64ToBytes,
@@ -19,7 +19,7 @@ import {
   type Workspace
 } from "@anytimevibe/protocol";
 import { api, websocketUrl } from "./api";
-import { getHostKey, saveHostKey } from "./key-store";
+import { getHostKey, removeHostKey, saveHostKey } from "./key-store";
 
 type Health = { ok: boolean; needsSetup: boolean; vapidPublicKey: string | null };
 type User = { id: string; username: string };
@@ -44,12 +44,12 @@ type Task = {
   approvals: Approval[];
 };
 type HostRuntime = {
-  online: boolean;
+  online: boolean | null;
   workspaces: Workspace[];
   tasks: Record<string, Task>;
 };
 
-function emptyRuntime(online = false): HostRuntime {
+function emptyRuntime(online: boolean | null = null): HostRuntime {
   return { online, workspaces: [], tasks: {} };
 }
 
@@ -174,10 +174,13 @@ export function App() {
   const [runtime, setRuntime] = useState<Record<string, HostRuntime>>({});
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-  const [socket, setSocket] = useState<WebSocket | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const hostOfflineTimersRef = useRef(new Map<string, number>());
   const [error, setError] = useState("");
   const [pairingOpen, setPairingOpen] = useState(false);
   const [composerOpen, setComposerOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
 
   useEffect(() => {
     api<Health>("/api/health").then(async (value) => {
@@ -200,12 +203,39 @@ export function App() {
     if (envelope.persist) localStorage.setItem(`sync:${envelope.hostId}`, String(envelope.sequence));
   });
 
+  const updateHostStatus = useEffectEvent((hostId: string, online: boolean) => {
+    const pendingTimer = hostOfflineTimersRef.current.get(hostId);
+    if (pendingTimer) window.clearTimeout(pendingTimer);
+    hostOfflineTimersRef.current.delete(hostId);
+    if (online) {
+      setRuntime((current) => ({
+        ...current,
+        [hostId]: { ...(current[hostId] ?? emptyRuntime()), online: true }
+      }));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      hostOfflineTimersRef.current.delete(hostId);
+      setRuntime((current) => ({
+        ...current,
+        [hostId]: { ...(current[hostId] ?? emptyRuntime()), online: false }
+      }));
+    }, 1500);
+    hostOfflineTimersRef.current.set(hostId, timer);
+  });
+
   const loadHosts = useEffectEvent(async () => {
     const response = await api<{ hosts: Host[] }>("/api/hosts");
     setHosts(response.hosts);
     setRuntime((current) => {
       const next = { ...current };
-      for (const host of response.hosts) next[host.id] = { ...(next[host.id] ?? emptyRuntime()), online: host.online };
+      for (const host of response.hosts) {
+        const existing = next[host.id];
+        next[host.id] = {
+          ...(existing ?? emptyRuntime(host.online ? true : null)),
+          online: host.online ? true : existing?.online ?? null
+        };
+      }
       return next;
     });
     setSelectedHostId((current) => current ?? response.hosts[0]?.id ?? null);
@@ -221,40 +251,74 @@ export function App() {
   useEffect(() => {
     if (!user) return;
     loadHosts().catch((loadError) => setError(loadError.message));
-    const connection = new WebSocket(websocketUrl("/ws/client"));
-    connection.onmessage = (message) => {
-      try {
-        const parsed = JSON.parse(String(message.data));
-        if (parsed.type === "relay.host_status") {
-          setRuntime((current) => ({
-            ...current,
-            [parsed.hostId]: { ...(current[parsed.hostId] ?? emptyRuntime()), online: Boolean(parsed.online) }
-          }));
-          return;
+    let stopped = false;
+    const connect = () => {
+      if (stopped) return;
+      const connection = new WebSocket(websocketUrl("/ws/client"));
+      socketRef.current = connection;
+      connection.onmessage = (message) => {
+        try {
+          const parsed = JSON.parse(String(message.data));
+          if (parsed.type === "relay.host_status") {
+            updateHostStatus(String(parsed.hostId), Boolean(parsed.online));
+            return;
+          }
+          if (parsed.type === "relay.error") {
+            setError(parsed.error === "host_offline" ? "远程主机当前离线。" : "中继拒绝了这条消息。");
+            return;
+          }
+          handleEnvelope(parsed as EncryptedEnvelope).catch((openError) => setError(`无法解密远程事件：${openError.message}`));
+        } catch {
+          setError("收到无法识别的中继消息。");
         }
-        if (parsed.type === "relay.error") {
-          setError(parsed.error === "host_offline" ? "远程主机当前离线。" : "中继拒绝了这条消息。");
-          return;
-        }
-        handleEnvelope(parsed as EncryptedEnvelope).catch((openError) => setError(`无法解密远程事件：${openError.message}`));
-      } catch {
-        setError("收到无法识别的中继消息。");
-      }
+      };
+      connection.onclose = () => {
+        if (socketRef.current !== connection || stopped) return;
+        socketRef.current = null;
+        reconnectTimerRef.current = window.setTimeout(connect, 1800);
+      };
+      connection.onerror = () => connection.close();
     };
-    connection.onclose = () => setSocket(null);
-    connection.onerror = () => setError("实时连接已断开，正在等待页面重连。");
-    setSocket(connection);
-    return () => connection.close();
+    connect();
+    return () => {
+      stopped = true;
+      if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
+      for (const timer of hostOfflineTimersRef.current.values()) window.clearTimeout(timer);
+      hostOfflineTimersRef.current.clear();
+      const connection = socketRef.current;
+      socketRef.current = null;
+      connection?.close();
+    };
   }, [user]);
 
   async function sendCommand(hostId: string, command: ClientCommand) {
     const parsed = clientCommandSchema.parse(command);
     const key = await getHostKey(hostId);
     if (!key) throw new Error("此浏览器没有该主机的解密密钥，请重新配对。");
-    if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("实时连接尚未建立。");
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("实时连接尚未建立，请稍后重试。");
     const sequence = Number(localStorage.getItem(`command:${hostId}`) ?? 0) + 1;
     localStorage.setItem(`command:${hostId}`, String(sequence));
     socket.send(JSON.stringify(await createEnvelope(hostId, sequence, key, parsed)));
+  }
+
+  async function logout() {
+    await api("/api/auth/logout", { method: "POST" });
+    location.reload();
+  }
+
+  async function deleteHost(host: Host) {
+    if (!window.confirm(`确定删除设备“${host.name}”吗？该设备的云端加密同步记录也会被删除。`)) return;
+    await api(`/api/hosts/${host.id}`, { method: "DELETE" });
+    await removeHostKey(host.id);
+    setHosts((current) => current.filter((item) => item.id !== host.id));
+    setRuntime((current) => {
+      const next = { ...current };
+      delete next[host.id];
+      return next;
+    });
+    setSelectedHostId((current) => current === host.id ? hosts.find((item) => item.id !== host.id)?.id ?? null : current);
+    setSelectedTaskId(null);
   }
 
   if (!health) return <main className="loading-screen"><div className="pulse" /><p>正在建立安全工作区…</p>{error && <ErrorBanner message={error} clear={() => setError("")} />}</main>;
@@ -271,17 +335,26 @@ export function App() {
       <div className="brand"><span>AV</span><div><strong>AnytimeVibe</strong><small>REMOTE CODE DESK</small></div></div>
       <div className="top-actions">
         <button className="quiet" onClick={() => subscribePush(health.vapidPublicKey).catch((pushError) => setError(pushError.message))}>开启通知</button>
-        <button className="avatar" title={user.username} onClick={async () => { await api("/api/auth/logout", { method: "POST" }); location.reload(); }}>{user.username.slice(0, 1).toUpperCase()}</button>
+        <div className="account-menu">
+          <button className="avatar" title={user.username} aria-expanded={accountOpen} onClick={() => setAccountOpen((open) => !open)}>{user.username.slice(0, 1).toUpperCase()}</button>
+          {accountOpen && <div className="account-popover">
+            <div><strong>{user.username}</strong><small>个人空间</small></div>
+            <button onClick={() => logout().catch((logoutError) => setError(logoutError.message))}>退出登录</button>
+          </div>}
+        </div>
       </div>
     </header>
 
     <aside className="rail">
       <div className="rail-heading"><span>远程主机</span><button onClick={() => setPairingOpen(true)}>＋</button></div>
       <div className="host-list">
-        {hosts.map((host) => <button key={host.id} className={`host-pill ${host.id === selectedHostId ? "active" : ""}`} onClick={() => { setSelectedHostId(host.id); setSelectedTaskId(null); }}>
-          <span className={`status-dot ${(runtime[host.id]?.online ?? host.online) ? "online" : ""}`} />
-          <span><strong>{host.name}</strong><small>{host.codexVersion}</small></span>
-        </button>)}
+        {hosts.map((host) => <div key={host.id} className={`host-row ${host.id === selectedHostId ? "active" : ""}`}>
+          <button className="host-pill" onClick={() => { setSelectedHostId(host.id); setSelectedTaskId(null); }}>
+            <span className={`status-dot ${(runtime[host.id]?.online ?? host.online) ? "online" : ""}`} />
+            <span><strong>{host.name}</strong><small>{host.codexVersion}</small></span>
+          </button>
+          <button className="host-delete" title={`删除 ${host.name}`} aria-label={`删除设备 ${host.name}`} onClick={() => deleteHost(host).catch((deleteError) => setError(deleteError.message))}>×</button>
+        </div>)}
         {!hosts.length && <button className="empty-host" onClick={() => setPairingOpen(true)}>连接第一台电脑</button>}
       </div>
     </aside>
@@ -290,9 +363,9 @@ export function App() {
       <section className="task-column">
         <div className="section-title">
           <div><p className="eyebrow">TASK STREAM</p><h1>{activeHost?.name ?? "尚未连接主机"}</h1></div>
-          <button className="new-task" disabled={!activeHost || !activeRuntime.online} onClick={() => setComposerOpen(true)}>新任务</button>
+          <button className="new-task" disabled={!activeHost || activeRuntime.online !== true} onClick={() => setComposerOpen(true)}>新任务</button>
         </div>
-        <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online ? "主机在线，命令将立即执行" : "主机离线，仅可查看已同步记录"}</div>
+        <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? "主机在线，命令将立即执行" : activeRuntime.online === false ? "主机离线，仅可查看已同步记录" : "正在确认主机状态…"}</div>
         <div className="task-list">
           {tasks.map((task) => <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => setSelectedTaskId(task.threadId)}>
             <div className="task-meta"><span>{task.status}</span><time>{new Date(task.updatedAt * 1000).toLocaleString()}</time></div>
@@ -317,16 +390,32 @@ export function App() {
   </div>;
 }
 
-function TaskConversation({ task, online, onCommand }: { task: Task; online: boolean; onCommand(command: ClientCommand): void }) {
+function TaskConversation({ task, online, onCommand }: { task: Task; online: boolean | null; onCommand(command: ClientCommand): void }) {
   const [prompt, setPrompt] = useState("");
   const [tab, setTab] = useState<"chat" | "diff">("chat");
+  const messageStreamRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
+  const previousThreadRef = useRef(task.threadId);
   const running = Boolean(task.activeTurnId);
+  const lastMessageLength = task.messages.at(-1)?.text.length ?? 0;
+
+  useLayoutEffect(() => {
+    const stream = messageStreamRef.current;
+    if (!stream || tab !== "chat") return;
+    const changedThread = previousThreadRef.current !== task.threadId;
+    previousThreadRef.current = task.threadId;
+    if (changedThread || stickToBottomRef.current) stream.scrollTop = stream.scrollHeight;
+  }, [task.threadId, task.messages.length, lastMessageLength, task.approvals.length, tab]);
+
   return <>
     <div className="conversation-head">
       <div><p className="eyebrow">THREAD</p><h2>{task.title}</h2><code>{task.cwd}</code></div>
       <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>对话</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>Diff</button></div>
     </div>
-    {tab === "chat" ? <div className="message-stream">
+    {tab === "chat" ? <div className="message-stream" ref={messageStreamRef} onScroll={(event) => {
+      const stream = event.currentTarget;
+      stickToBottomRef.current = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 90;
+    }}>
       {task.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><span>{message.role === "user" ? "YOU" : message.role === "assistant" ? "CODEX" : "SYSTEM"}</span><pre>{message.text}</pre></article>)}
       {task.approvals.map((approval) => <article className="approval-card" key={String(approval.requestId)}>
         <div className="approval-label">ACTION REQUIRED</div><h3>{approval.title}</h3><pre>{approval.detail}</pre>
@@ -335,12 +424,12 @@ function TaskConversation({ task, online, onCommand }: { task: Task; online: boo
     </div> : <DiffView diff={task.diff} />}
     <form className="composer" onSubmit={(event) => {
       event.preventDefault();
-      if (!prompt.trim() || !online) return;
+      if (!prompt.trim() || online !== true) return;
       onCommand(running && task.activeTurnId ? { type: "turn.steer", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId, prompt: prompt.trim() } : { type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: prompt.trim() });
       setPrompt("");
     }}>
-      <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={online ? running ? "给当前任务追加方向…" : "继续这个任务…" : "主机离线"} disabled={!online} />
-      <div><small>{running ? "任务运行中，可追加指令或停止" : "沿用本机 Codex 沙箱和审批策略"}</small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>停止</button>}<button className="send" disabled={!online || !prompt.trim()}>发送</button></div>
+      <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"} />
+      <div><small>{online === null ? "正在确认主机状态…" : running ? "任务运行中，可追加指令或停止" : "沿用本机 Codex 沙箱和审批策略"}</small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>停止</button>}<button className="send" disabled={online !== true || !prompt.trim()}>发送</button></div>
     </form>
   </>;
 }

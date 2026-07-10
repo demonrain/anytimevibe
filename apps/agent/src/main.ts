@@ -260,14 +260,23 @@ function wsUrl(relayUrl: string): string {
   return relayUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
 }
 
-async function connect(): Promise<void> {
+async function connect(force = false): Promise<void> {
   if (!config.hostId || !config.encryptedAgentToken || !config.encryptedSyncKey) {
     if (config.pairing) schedulePairingPoll();
     return;
   }
   if (!/^0\.144\./.test(codexVersion)) return;
-  socket?.close();
-  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (!force && socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  const previousSocket = socket;
+  socket = null;
+  if (previousSocket) {
+    previousSocket.removeAllListeners();
+    previousSocket.close();
+  }
   syncKey ??= await importAesKey(base64ToBytes(decryptSecret(config.encryptedSyncKey)));
   updateState({ status: "connecting", detail: "正在连接加密中继…", hostId: config.hostId });
   const token = decryptSecret(config.encryptedAgentToken);
@@ -275,22 +284,38 @@ async function connect(): Promise<void> {
     headers: { authorization: `Bearer ${token}` }
   });
   socket = connection;
-  connection.on("open", async () => {
-    updateState({ status: "online", detail: "代理在线。Codex 凭据和项目文件均保留在本机。" });
-    await ensureCodex();
-    await publishHostStatus();
-    await syncAllThreads();
+  connection.on("open", () => {
+    if (socket !== connection) return connection.close();
+    void (async () => {
+      updateState({ status: "online", detail: "代理在线。Codex 凭据和项目文件均保留在本机。" });
+      await ensureCodex();
+      await publishHostStatus();
+      await syncAllThreads();
+    })().catch((error) => {
+      handleError(error);
+      connection.close();
+    });
   });
   connection.on("message", (data) => handleRelayMessage(String(data)).catch(handleError));
-  connection.on("close", () => scheduleReconnect("中继连接已断开，正在重试。"));
-  connection.on("error", () => scheduleReconnect("无法连接中继，正在重试。"));
+  connection.on("close", () => {
+    if (socket !== connection) return;
+    socket = null;
+    scheduleReconnect("中继连接已断开，正在重试。");
+  });
+  connection.on("error", () => {
+    if (socket === connection) updateState({ status: "offline", detail: "无法连接中继，正在重试。" });
+    connection.close();
+  });
 }
 
 function scheduleReconnect(detail: string): void {
   if (publicState.status === "incompatible") return;
   updateState({ status: "offline", detail });
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(() => connect().catch(handleError), 5000 + Math.floor(Math.random() * 2500));
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect().catch(handleError);
+  }, 1800 + Math.floor(Math.random() * 1200));
 }
 
 async function ensureCodex(): Promise<void> {
@@ -517,7 +542,7 @@ function registerIpc(): void {
     await publishHostStatus();
     return publicState;
   });
-  ipcMain.handle("agent:reconnect", async () => { await connect(); return publicState; });
+  ipcMain.handle("agent:reconnect", async () => { await connect(true); return publicState; });
 }
 
 app.whenReady().then(async () => {
