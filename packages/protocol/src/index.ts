@@ -160,6 +160,20 @@ export type PairingClaim = {
   wrappedSyncKey: WrappedPayload;
 };
 
+export const pairingClaimResponseSchema = z.object({
+  host: z.object({
+    id: z.string().uuid().optional(),
+    hostId: z.string().uuid().optional(),
+    name: z.string().min(1),
+    platform: z.string().min(1),
+    codexVersion: z.string().min(1)
+  }).refine((host) => Boolean(host.id ?? host.hostId), {
+    message: "Pairing response is missing a host identifier"
+  }).transform((host) => ({ ...host, id: host.id ?? host.hostId! }))
+});
+
+export type PairingClaimResponse = z.infer<typeof pairingClaimResponseSchema>;
+
 export type WrappedPayload = {
   nonce: string;
   ciphertext: string;

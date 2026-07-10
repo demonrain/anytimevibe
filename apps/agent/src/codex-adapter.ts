@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
+import { windowsCmdArguments } from "./windows-command";
 
 type RpcId = string | number;
 type JsonObject = Record<string, any>;
@@ -17,9 +18,14 @@ export class CodexAdapter {
 
   async start(): Promise<void> {
     if (this.process) return;
-    const child = spawn(this.codexCommand, ["app-server", "--stdio"], {
+    const isWindows = process.platform === "win32";
+    const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : this.codexCommand;
+    const args = isWindows
+      ? windowsCmdArguments(this.codexCommand, ["app-server", "--stdio"])
+      : ["app-server", "--stdio"];
+    const child = spawn(executable, args, {
       windowsHide: true,
-      shell: process.platform === "win32",
+      windowsVerbatimArguments: isWindows,
       stdio: ["pipe", "pipe", "pipe"]
     });
     this.process = child;

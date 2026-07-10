@@ -6,6 +6,7 @@ import {
   generatePairingKeyPair,
   importAesKey,
   openEnvelope,
+  pairingClaimResponseSchema,
   randomKeyBytes
 } from "./index";
 
@@ -56,5 +57,18 @@ describe("protocol crypto", () => {
 
   it("decodes URL-safe base64 keys", () => {
     expect(base64ToBytes("-_8")).toEqual(new Uint8Array([251, 255]));
+  });
+
+  it("normalizes legacy pairing responses that use hostId", () => {
+    const hostId = crypto.randomUUID();
+    const response = pairingClaimResponseSchema.parse({
+      host: {
+        hostId,
+        name: "DEV-PC",
+        platform: "win32",
+        codexVersion: "0.144.1"
+      }
+    });
+    expect(response.host.id).toBe(hostId);
   });
 });

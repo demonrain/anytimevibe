@@ -338,7 +338,13 @@ async function main(): Promise<void> {
           agent_token = ${sealSecret(agentToken, config.COOKIE_SECRET)}
         WHERE id = ${pairingId}
       `;
-      return { hostId, name: pairing.agentName, platform: pairing.platform, codexVersion: pairing.codexVersion };
+      return {
+        id: hostId,
+        hostId,
+        name: pairing.agentName,
+        platform: pairing.platform,
+        codexVersion: pairing.codexVersion
+      };
     });
     if (!result) return reply.code(404).send({ error: "pairing_not_found" });
     return { host: result };

@@ -11,6 +11,7 @@ function openDatabase(): Promise<IDBDatabase> {
 }
 
 export async function saveHostKey(hostId: string, key: CryptoKey): Promise<void> {
+  if (!hostId) throw new Error("配对响应缺少主机 ID，无法保存浏览器加密密钥。");
   const database = await openDatabase();
   await new Promise<void>((resolve, reject) => {
     const transaction = database.transaction(STORE_NAME, "readwrite");

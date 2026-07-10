@@ -31,6 +31,7 @@ import {
   type Workspace
 } from "@anytimevibe/protocol";
 import { CodexAdapter, threadToSnapshot } from "./codex-adapter";
+import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
 const execFileAsync = promisify(execFile);
 
@@ -165,15 +166,24 @@ async function loadConfig(): Promise<void> {
 }
 
 async function findCodex(): Promise<void> {
-  if (process.env.CODEX_COMMAND) codexCommand = process.env.CODEX_COMMAND;
+  if (process.env.CODEX_COMMAND) codexCommand = normalizeWindowsCommandPath(process.env.CODEX_COMMAND);
   else if (process.platform === "win32") {
     const result = await execFileAsync("where.exe", ["codex.cmd"]);
-    codexCommand = result.stdout.split(/\r?\n/).find(Boolean)?.trim() ?? "codex.cmd";
+    codexCommand = normalizeWindowsCommandPath(result.stdout.split(/\r?\n/).find(Boolean)?.trim() ?? "codex.cmd");
   }
-  const result = process.platform === "win32"
-    ? await execFileAsync("cmd.exe", ["/d", "/s", "/c", `"${codexCommand}" --version`])
-    : await execFileAsync(codexCommand, ["--version"]);
-  codexVersion = result.stdout.trim().replace(/^codex-cli\s+/, "");
+  let result: Awaited<ReturnType<typeof execFileAsync>>;
+  try {
+    result = process.platform === "win32"
+      ? await execFileAsync(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(codexCommand, ["--version"]), {
+          windowsHide: true,
+          windowsVerbatimArguments: true
+        })
+      : await execFileAsync(codexCommand, ["--version"]);
+  } catch {
+    throw new Error(`无法运行 Codex CLI：${codexCommand}。请确认 Codex 已安装，并且 CODEX_COMMAND 配置正确。`);
+  }
+  const versionOutput = typeof result.stdout === "string" ? result.stdout : result.stdout.toString("utf8");
+  codexVersion = versionOutput.trim().replace(/^codex-cli\s+/, "");
   if (!/^0\.144\./.test(codexVersion)) {
     updateState({ status: "incompatible", detail: `当前仅支持 codex-cli 0.144.x，检测到 ${codexVersion}。` });
     throw new Error("Unsupported Codex version");

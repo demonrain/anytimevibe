@@ -10,6 +10,7 @@ import {
   generatePairingKeyPair,
   importAesKey,
   openEnvelope,
+  pairingClaimResponseSchema,
   randomKeyBytes,
   type AgentEvent,
   type ClientCommand,
@@ -371,10 +372,10 @@ function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): voi
       const pairingKey = await derivePairingKey(keyPair.privateKey, info.agentPublicKey, info.pairingId);
       const syncBytes = randomKeyBytes();
       const wrappedSyncKey = await encryptPayload(pairingKey, { syncKey: bytesToBase64(syncBytes) }, info.pairingId);
-      const result = await api<{ host: Host }>(`/api/pairings/${info.pairingId}/claim`, {
+      const result = pairingClaimResponseSchema.parse(await api<unknown>(`/api/pairings/${info.pairingId}/claim`, {
         method: "POST",
         body: JSON.stringify({ clientPublicKey, wrappedSyncKey })
-      });
+      }));
       await saveHostKey(result.host.id, await importAesKey(syncBytes));
       onPaired();
     } catch (claimError) {
