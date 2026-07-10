@@ -1,0 +1,11 @@
+node_modules/
+.pnpm-store/
+.playwright-cli/
+dist/
+.vite/
+coverage/
+.env
+*.log
+*.tsbuildinfo
+apps/agent/release/
+apps/relay/data/

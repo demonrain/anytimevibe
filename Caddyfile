@@ -1,0 +1,7 @@
+{$DOMAIN:localhost} {
+  encode zstd gzip
+
+  @relay path /api/* /ws/*
+  reverse_proxy @relay relay:8787
+  reverse_proxy web:80
+}

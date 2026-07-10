@@ -1,0 +1,28 @@
+{
+  "name": "@anytimevibe/relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsup src/index.ts --format esm --platform node --sourcemap --clean",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@anytimevibe/protocol": "workspace:*",
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/rate-limit": "^10.3.0",
+    "@fastify/websocket": "^11.2.0",
+    "argon2": "^0.43.1",
+    "fastify": "^5.4.0",
+    "postgres": "^3.4.7",
+    "web-push": "^3.6.7",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/web-push": "^3.6.4",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.3"
+  }
+}

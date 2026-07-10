@@ -1,0 +1,17 @@
+{
+  "name": "AnytimeVibe",
+  "short_name": "AnytimeVibe",
+  "description": "远程继续你的 Codex 任务",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f2eadb",
+  "theme_color": "#f2eadb",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

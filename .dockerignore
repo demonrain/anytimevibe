@@ -1,0 +1,7 @@
+node_modules
+**/node_modules
+**/dist
+apps/agent/release
+.git
+.env
+*.log

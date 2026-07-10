@@ -1,0 +1,8 @@
+packages:
+  - apps/*
+  - packages/*
+onlyBuiltDependencies:
+  - argon2
+  - electron
+  - electron-winstaller
+  - esbuild
