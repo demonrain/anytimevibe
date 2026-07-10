@@ -49,7 +49,10 @@ const agentPairBody = z.object({
 });
 
 const claimBody = z.object({
-  clientPublicKey: z.record(z.unknown()),
+  clientPublicKey: z.record(z.unknown())
+});
+
+const authorizePairingBody = z.object({
   wrappedSyncKey: z.object({ nonce: z.string().min(1), ciphertext: z.string().min(1) })
 });
 
@@ -314,8 +317,26 @@ async function main(): Promise<void> {
       clientPublicKey: pairing.clientPublicKey,
       wrappedSyncKey: pairing.wrappedSyncKey
     };
-    await sql`UPDATE pairings SET agent_token = NULL, status = 'consumed' WHERE id = ${pairingId}`;
     return response;
+  });
+
+  app.post("/api/agent/pairings/:pairingId/authorize", async (request, reply) => {
+    const { pairingId } = request.params as { pairingId: string };
+    const { secret } = request.query as { secret?: string };
+    if (!secret) return reply.code(401).send({ error: "missing_secret" });
+    const body = authorizePairingBody.parse(request.body);
+    const rows = await sql<Array<Record<string, unknown>>>`
+      SELECT id, secret_hash, status FROM pairings WHERE id = ${pairingId} AND expires_at > now() LIMIT 1
+    `;
+    const pairing = rows[0];
+    if (!pairing || hashToken(secret) !== pairing.secretHash || pairing.status !== "claimed") {
+      return reply.code(404).send({ error: "pairing_not_found" });
+    }
+    await sql`
+      UPDATE pairings SET wrapped_sync_key = ${sql.json(body.wrappedSyncKey as never)}, status = 'authorized'
+      WHERE id = ${pairingId}
+    `;
+    return { ok: true };
   });
 
   app.get("/api/pairings/code/:code", async (request, reply) => {
@@ -356,6 +377,10 @@ async function main(): Promise<void> {
       const pairing = rows[0];
       if (!pairing) return null;
       const agentId = String(pairing.agentId);
+      const owners = await transaction<Array<{ id: string; userId: string }>>`
+        SELECT id, user_id FROM hosts WHERE agent_id = ${agentId} AND revoked_at IS NULL LIMIT 1 FOR UPDATE
+      `;
+      if (owners[0] && owners[0].userId !== user.id) return { forbidden: true as const };
       const existingHosts = await transaction<Array<{ id: string }>>`
         SELECT id FROM hosts
         WHERE user_id = ${user.id} AND agent_id = ${agentId} AND revoked_at IS NULL
@@ -364,7 +389,6 @@ async function main(): Promise<void> {
       `;
       const hostId = existingHosts[0]?.id ?? randomUUID();
       if (existingHosts.length) {
-        await transaction`DELETE FROM sync_events WHERE host_id = ${hostId}`;
         await transaction`
           UPDATE hosts SET
             name = ${String(pairing.agentName)}, platform = ${String(pairing.platform)},
@@ -387,11 +411,11 @@ async function main(): Promise<void> {
         UPDATE pairings SET
           status = 'claimed', user_id = ${user.id}, host_id = ${hostId},
           client_public_key = ${transaction.json(body.clientPublicKey as never)},
-          wrapped_sync_key = ${transaction.json(body.wrappedSyncKey as never)},
+          wrapped_sync_key = NULL,
           agent_token = ${sealSecret(agentToken, config.COOKIE_SECRET)}
         WHERE id = ${pairingId}
       `;
-      return {
+      return { forbidden: false as const,
         id: hostId,
         hostId,
         name: pairing.agentName,
@@ -400,7 +424,22 @@ async function main(): Promise<void> {
       };
     });
     if (!result) return reply.code(404).send({ error: "pairing_not_found" });
+    if (result.forbidden) return reply.code(409).send({ error: "host_owned_by_another_user" });
     return { host: result };
+  });
+
+  app.get("/api/pairings/:pairingId/status", async (request, reply) => {
+    const user = await requireUser(sql, request, reply);
+    if (!user) return;
+    const { pairingId } = request.params as { pairingId: string };
+    const rows = await sql<Array<Record<string, unknown>>>`
+      SELECT status, host_id, wrapped_sync_key FROM pairings
+      WHERE id = ${pairingId} AND user_id = ${user.id} AND expires_at > now() LIMIT 1
+    `;
+    const pairing = rows[0];
+    if (!pairing) return reply.code(404).send({ error: "pairing_not_found" });
+    if (pairing.status !== "authorized") return { status: pairing.status };
+    return { status: "authorized", hostId: pairing.hostId, wrappedSyncKey: pairing.wrappedSyncKey };
   });
 
   app.get("/api/sync/:hostId", async (request, reply) => {

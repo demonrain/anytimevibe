@@ -2,16 +2,14 @@ import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "re
 import {
   agentEventSchema,
   base64ToBytes,
-  bytesToBase64,
   clientCommandSchema,
   createEnvelope,
+  decryptPayload,
   derivePairingKey,
-  encryptPayload,
   generatePairingKeyPair,
   importAesKey,
   openEnvelope,
   pairingClaimResponseSchema,
-  randomKeyBytes,
   type AgentEvent,
   type ClientCommand,
   type EncryptedEnvelope,
@@ -529,12 +527,20 @@ function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): voi
       const keyPair = await generatePairingKeyPair();
       const clientPublicKey = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
       const pairingKey = await derivePairingKey(keyPair.privateKey, info.agentPublicKey, info.pairingId);
-      const syncBytes = randomKeyBytes();
-      const wrappedSyncKey = await encryptPayload(pairingKey, { syncKey: bytesToBase64(syncBytes) }, info.pairingId);
       const result = pairingClaimResponseSchema.parse(await api<unknown>(`/api/pairings/${info.pairingId}/claim`, {
         method: "POST",
-        body: JSON.stringify({ clientPublicKey, wrappedSyncKey })
+        body: JSON.stringify({ clientPublicKey })
       }));
+      let authorization: { status: string; hostId?: string; wrappedSyncKey?: { nonce: string; ciphertext: string } } | null = null;
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        const status = await api<{ status: string; hostId?: string; wrappedSyncKey?: { nonce: string; ciphertext: string } }>(`/api/pairings/${info.pairingId}/status`);
+        authorization = status;
+        if (status.status === "authorized") break;
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      }
+      if (!authorization?.wrappedSyncKey) throw new Error("等待电脑授权超时，请确认 Agent 保持在线后重试。");
+      const unwrapped = await decryptPayload<{ syncKey: string }>(pairingKey, authorization.wrappedSyncKey, info.pairingId);
+      const syncBytes = base64ToBytes(unwrapped.syncKey);
       await saveHostKey(result.host.id, await importAesKey(syncBytes));
       onPaired();
     } catch (claimError) {

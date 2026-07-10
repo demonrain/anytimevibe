@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   agentEventSchema,
   base64ToBytes,
+  bytesToBase64,
   createEnvelope,
+  decryptPayload,
   derivePairingKey,
+  encryptPayload,
   generatePairingKeyPair,
   importAesKey,
   openEnvelope,
@@ -44,6 +47,21 @@ describe("protocol crypto", () => {
       encrypted
     );
     expect(new Uint8Array(decrypted)).toEqual(raw);
+  });
+
+  it("authorizes the same host key to multiple browser devices", async () => {
+    const agent = await generatePairingKeyPair();
+    const hostKey = randomKeyBytes();
+    for (const pairingId of [crypto.randomUUID(), crypto.randomUUID()]) {
+      const browser = await generatePairingKeyPair();
+      const agentPublic = await crypto.subtle.exportKey("jwk", agent.publicKey);
+      const browserPublic = await crypto.subtle.exportKey("jwk", browser.publicKey);
+      const agentPairingKey = await derivePairingKey(agent.privateKey, browserPublic, pairingId);
+      const browserPairingKey = await derivePairingKey(browser.privateKey, agentPublic, pairingId);
+      const wrapped = await encryptPayload(agentPairingKey, { syncKey: bytesToBase64(hostKey) }, pairingId);
+      const unwrapped = await decryptPayload<{ syncKey: string }>(browserPairingKey, wrapped, pairingId);
+      expect(unwrapped.syncKey).toBe(bytesToBase64(hostKey));
+    }
   });
 
   it("rejects tampered ciphertext", async () => {

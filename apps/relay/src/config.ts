@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 const optionalUrl = z.preprocess((value) => value === "" ? undefined : value, z.string().url().optional());
+const urlWithDefault = (fallback: string) => z.preprocess((value) => value === "" ? undefined : value, z.string().url().default(fallback));
 
 const configSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -12,8 +13,8 @@ const configSchema = z.object({
   PUBLIC_ORIGIN: z.string().url(),
   REGISTRATION_ENABLED: z.string().default("true").transform((value) => value === "true"),
   MAX_USERS: z.coerce.number().int().positive().default(100),
-  WINDOWS_CLIENT_URL: optionalUrl,
-  MAC_CLIENT_URL: optionalUrl,
+  WINDOWS_CLIENT_URL: urlWithDefault("https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent-Setup.exe"),
+  MAC_CLIENT_URL: urlWithDefault("https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent.dmg"),
   UPDATE_FEED_URL: optionalUrl,
   VAPID_PUBLIC_KEY: z.string().optional(),
   VAPID_PRIVATE_KEY: z.string().optional(),

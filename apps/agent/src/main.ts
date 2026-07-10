@@ -22,11 +22,12 @@ import {
   bytesToBase64,
   clientCommandSchema,
   createEnvelope,
-  decryptPayload,
   derivePairingKey,
+  encryptPayload,
   generatePairingKeyPair,
   importAesKey,
   openEnvelope,
+  randomKeyBytes,
   type AgentEvent,
   type ClientCommand,
   type EncryptedEnvelope,
@@ -321,14 +322,23 @@ async function pollPairing(): Promise<void> {
   const privateJwk = JSON.parse(decryptSecret(config.encryptedPrivateKey!)) as JsonWebKey;
   const privateKey = await crypto.subtle.importKey("jwk", privateJwk, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
   const pairingKey = await derivePairingKey(privateKey, result.clientPublicKey as JsonWebKey, pairing.id);
-  const unwrapped = await decryptPayload<{ syncKey: string }>(pairingKey, result.wrappedSyncKey, pairing.id);
+  const syncKeyValue = config.encryptedSyncKey
+    ? decryptSecret(config.encryptedSyncKey)
+    : bytesToBase64(randomKeyBytes());
+  const wrappedSyncKey = await encryptPayload(pairingKey, { syncKey: syncKeyValue }, pairing.id);
+  const authorization = await fetch(`${config.relayUrl}/api/agent/pairings/${pairing.id}/authorize?secret=${encodeURIComponent(pairing.secret)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ wrappedSyncKey })
+  });
+  if (!authorization.ok) throw new Error(`浏览器密钥授权失败：HTTP ${authorization.status}`);
   config.hostId = String(result.hostId);
   config.encryptedAgentToken = encryptSecret(String(result.agentToken));
-  config.encryptedSyncKey = encryptSecret(unwrapped.syncKey);
+  config.encryptedSyncKey = encryptSecret(syncKeyValue);
   delete config.pairing;
   await saveConfig();
-  syncKey = await importAesKey(base64ToBytes(unwrapped.syncKey));
-  updateState({ status: "connecting", detail: "配对完成，正在建立实时连接。", hostId: config.hostId, pairingCode: undefined, pairingExpiresAt: undefined });
+  syncKey = await importAesKey(base64ToBytes(syncKeyValue));
+  updateState({ status: "connecting", detail: "新浏览器已获得主机密钥授权，正在建立连接。", hostId: config.hostId, pairingCode: undefined, pairingExpiresAt: undefined });
   await connect();
 }
 
