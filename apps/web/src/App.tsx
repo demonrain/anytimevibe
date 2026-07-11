@@ -48,6 +48,16 @@ type HostRuntime = {
   tasks: Record<string, Task>;
 };
 
+function taskStatusMeta(status: string): { label: string; tone: string } {
+  const normalized = status.toLowerCase().replace(/[\s_-]/g, "");
+  if (["active", "running", "inprogress", "processing"].includes(normalized)) return { label: "进行中", tone: "active" };
+  if (["completed", "complete", "success", "succeeded"].includes(normalized)) return { label: "已完成", tone: "completed" };
+  if (["failed", "error"].includes(normalized)) return { label: "失败", tone: "failed" };
+  if (["interrupted", "cancelled", "canceled", "stopped"].includes(normalized)) return { label: "已停止", tone: "stopped" };
+  if (["idle", "pending", "queued", "notstarted"].includes(normalized)) return { label: "待处理", tone: "pending" };
+  return { label: status || "未知状态", tone: "unknown" };
+}
+
 function emptyRuntime(online: boolean | null = null): HostRuntime {
   return { online, workspaces: [], tasks: {} };
 }
@@ -429,18 +439,18 @@ export function App() {
         <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? "主机在线，命令将立即执行" : activeRuntime.online === false ? "主机离线，仅可查看已同步记录" : "正在确认主机状态…"}</div>
         <label className="permission-select">Codex 权限<select value={permissionMode} onChange={(event) => { const mode = event.target.value as PermissionMode; setPermissionMode(mode); localStorage.setItem("permission-mode", mode); }}><option value="inherit">跟随客户端配置</option><option value="full-access">Full Access</option><option value="workspace-write">Workspace Write</option><option value="read-only">Read Only</option></select></label>
         <div className="task-list">
-          {tasks.map((task) => <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>
-            <div className="task-meta"><span>{task.status}</span><time>{new Date(task.updatedAt * 1000).toLocaleString()}</time></div>
+          {tasks.map((task) => { const status = taskStatusMeta(task.status); return <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>
+            <div className="task-meta"><span className={`task-status ${status.tone}`}>{status.label}</span><time>{new Date(task.updatedAt * 1000).toLocaleString()}</time></div>
             <h3>{task.title}</h3>
             <p>{task.messages.at(-1)?.text || task.cwd}</p>
             <div className="task-foot"><code>{shortPath(task.cwd)}</code>{task.approvals.length > 0 && <b>{task.approvals.length} 个审批</b>}</div>
-          </button>)}
+          </button>; })}
           {!tasks.length && <div className="empty-state"><span>&gt;_</span><h3>等待第一条远程任务</h3><p>选择白名单工作区，向本机 Codex 下发任务。</p></div>}
         </div>
       </section>
 
       <section className="conversation-column">
-        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
+        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} onPermissionModeChange={(mode) => { setPermissionMode(mode); localStorage.setItem("permission-mode", mode); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
       </section>
     </main>
 
@@ -452,7 +462,7 @@ export function App() {
   </div>;
 }
 
-function TaskConversation({ task, online, visible, permissionMode, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; permissionMode: PermissionMode; onBack(): void; onCommand(command: ClientCommand): void }) {
+function TaskConversation({ task, online, visible, permissionMode, onPermissionModeChange, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; permissionMode: PermissionMode; onPermissionModeChange(mode: PermissionMode): void; onBack(): void; onCommand(command: ClientCommand): void }) {
   const [prompt, setPrompt] = useState("");
   const [pendingPrompt, setPendingPrompt] = useState("");
   const [pendingMessageCount, setPendingMessageCount] = useState(0);
@@ -463,6 +473,7 @@ function TaskConversation({ task, online, visible, permissionMode, onBack, onCom
   const [tab, setTab] = useState<"chat" | "diff">("chat");
   const messageStreamRef = useRef<HTMLDivElement | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
+  const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const stickToBottomRef = useRef(true);
   const previousThreadRef = useRef(task.threadId);
   const running = Boolean(task.activeTurnId);
@@ -499,6 +510,14 @@ function TaskConversation({ task, online, visible, permissionMode, onBack, onCom
     const latestMessage = task.messages.at(-1);
     if (pendingPrompt && task.messages.length > pendingMessageCount && latestMessage?.role === "user" && latestMessage.text === pendingPrompt) setPendingPrompt("");
   }, [pendingMessageCount, pendingPrompt, task.messages]);
+
+  useLayoutEffect(() => {
+    const textarea = composerTextareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > 220 ? "auto" : "hidden";
+  }, [prompt]);
 
   useLayoutEffect(() => {
     const stream = messageStreamRef.current;
@@ -539,13 +558,13 @@ function TaskConversation({ task, online, visible, permissionMode, onBack, onCom
       event.preventDefault();
       submitPrompt();
     }}>
-      <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => {
+      <textarea ref={composerTextareaRef} value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => {
         if (event.ctrlKey && event.key === "Enter") {
           event.preventDefault();
           submitPrompt();
         }
       }} placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"} />
-      <div><small>{online === null ? "正在确认主机状态…" : running ? "任务正在电脑端处理，可排队或结束等待" : permissionMode === "inherit" ? "沿用客户端 Codex 沙箱和审批策略" : `当前权限：${permissionMode}`}<span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 发送</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>结束等待</button>}<button className="send" disabled={online !== true || !prompt.trim()}>发送</button></div>
+      <div><small><label className="composer-permission">当前权限<select value={permissionMode} onChange={(event) => onPermissionModeChange(event.target.value as PermissionMode)}><option value="inherit">跟随客户端</option><option value="full-access">Full Access</option><option value="workspace-write">Workspace Write</option><option value="read-only">Read Only</option></select></label><span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 发送</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>结束等待</button>}<button className="send" disabled={online !== true || !prompt.trim()}>发送</button></div>
     </form>
   </>;
 }
