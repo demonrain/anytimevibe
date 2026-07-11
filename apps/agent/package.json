@@ -32,10 +32,12 @@
     },
     "files": [
       "dist/**/*",
+      "assets/**/*",
       "package.json"
     ],
     "win": {
       "target": "nsis",
+      "icon": "assets/icon.png",
       "artifactName": "AnytimeVibe-Agent-Setup.${ext}",
       "signAndEditExecutable": false
     },
@@ -44,6 +46,7 @@
         "dmg",
         "zip"
       ],
+      "icon": "assets/icon.png",
       "artifactName": "AnytimeVibe-Agent.${ext}",
       "category": "public.app-category.developer-tools"
     },

@@ -182,7 +182,7 @@ function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticat
       <ClientDownloads downloads={health.clientDownloads} />
     </section>
     <form className="auth-card" onSubmit={submit}>
-      <div className="mark">AV</div>
+      <div className="mark" aria-hidden="true"><img src="/icon.svg" alt="" /></div>
       <h2>{health.needsSetup ? "初始化服务" : registering ? "创建个人空间" : "进入 AnytimeVibe"}</h2>
       <p>{health.needsSetup ? "创建首个管理员账号。" : registering ? "注册后即可配对自己的电脑，数据与其他用户隔离。" : "使用你的个人账号继续远程任务。"}</p>
       {health.needsSetup && <label>设置令牌<input value={setupToken} onChange={(event) => setSetupToken(event.target.value)} required /></label>}
@@ -244,6 +244,19 @@ export function App() {
         });
       }, 3000);
     } else {
+      if (event.type === "host.status" && event.name) {
+        setHosts((current) => {
+          const host = current.find((item) => item.id === envelope.hostId);
+          if (host && host.name !== event.name) {
+            void api(`/api/hosts/${envelope.hostId}`, {
+              method: "PATCH",
+              body: JSON.stringify({ name: event.name })
+            }).catch(() => undefined);
+            return current.map((item) => item.id === envelope.hostId ? { ...item, name: event.name } : item);
+          }
+          return current;
+        });
+      }
       setRuntime((current) => ({
         ...current,
         [envelope.hostId]: reduceEvent(current[envelope.hostId] ?? emptyRuntime(), event)
@@ -381,6 +394,17 @@ export function App() {
     setMobilePane("hosts");
   }
 
+  async function renameHost(host: Host) {
+    const nextName = window.prompt("为这台客户端设置一个好记的名称", host.name)?.trim();
+    if (!nextName || nextName === host.name) return;
+    if (nextName.length > 64) throw new Error("名称最多 64 个字符");
+    const response = await api<{ host: { id: string; name: string } }>(`/api/hosts/${host.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name: nextName })
+    });
+    setHosts((current) => current.map((item) => item.id === host.id ? { ...item, name: response.host.name } : item));
+  }
+
   async function syncHostTasks(hostId: string) {
     setSyncStatus((current) => ({ ...current, [hostId]: "同步中…" }));
     try {
@@ -406,7 +430,7 @@ export function App() {
   return <div className="app-shell">
     {error && <ErrorBanner message={error} clear={() => setError("")} />}
     <header className="topbar">
-      <div className="brand"><span>AV</span><div><strong>AnytimeVibe</strong><small>REMOTE CODE DESK</small></div></div>
+      <div className="brand"><span className="brand-mark" aria-hidden="true"><img src="/icon.svg" alt="" /></span><div><strong>AnytimeVibe</strong><small>REMOTE CODE DESK</small></div></div>
       <div className="top-actions">
         <ClientDownloads downloads={health.clientDownloads} />
         <button className="quiet" onClick={() => subscribePush(health.vapidPublicKey).catch((pushError) => setError(pushError.message))}>开启通知</button>
@@ -429,6 +453,7 @@ export function App() {
             <span className={`status-dot ${(runtime[host.id]?.online ?? host.online) ? "online" : ""}`} />
             <span><strong>{host.name}</strong><small>{host.codexVersion}</small></span>
           </button>
+          <button className="host-rename" title={`重命名 ${host.name}`} aria-label={`重命名设备 ${host.name}`} onClick={() => renameHost(host).catch((renameError) => setError(renameError.message))}>✎</button>
           <button className="host-delete" title={`删除 ${host.name}`} aria-label={`删除设备 ${host.name}`} onClick={() => deleteHost(host).catch((deleteError) => setError(deleteError.message))}>×</button>
         </div>)}
         {!hosts.length && <button className="empty-host" onClick={() => setPairingOpen(true)}>连接第一台电脑</button>}

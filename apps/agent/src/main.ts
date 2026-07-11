@@ -10,7 +10,7 @@ import {
   Tray
 } from "electron";
 import { execFile, spawn } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -37,6 +37,7 @@ import { CodexAdapter, codexPermissionParams, threadStartParams, threadToSnapsho
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
 const execFileAsync = promisify(execFile);
+const DEFAULT_RELAY_URL = "https://vibe.demonrain.top";
 
 type StoredPairing = {
   id: string;
@@ -48,6 +49,7 @@ type StoredPairing = {
 type AgentConfig = {
   relayUrl: string;
   agentId: string;
+  displayName: string;
   hostId?: string;
   encryptedAgentToken?: string;
   encryptedSyncKey?: string;
@@ -60,6 +62,7 @@ type AgentConfig = {
 
 type PublicState = {
   relayUrl: string;
+  displayName: string;
   status: "unconfigured" | "waiting_pairing" | "pairing" | "connecting" | "online" | "offline" | "incompatible";
   detail: string;
   pairingCode?: string | undefined;
@@ -112,7 +115,16 @@ let configPath = "";
 let codexCommand = "codex.cmd";
 let codexVersion = "unknown";
 const initialEnvironment: EnvironmentState = { platform: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "other", nodeInstalled: false, codexInstalled: false, codexCompatible: false };
-let publicState: PublicState = { relayUrl: "", status: "unconfigured", detail: "请先配置中继地址。", codexVersion, workspaces: [], environment: initialEnvironment, update: { status: "idle" }, tasks: [] };
+let publicState: PublicState = { relayUrl: DEFAULT_RELAY_URL, displayName: "", status: "unconfigured", detail: "请先配置中继地址。", codexVersion, workspaces: [], environment: initialEnvironment, update: { status: "idle" }, tasks: [] };
+
+function productIconPath(): string {
+  return path.join(__dirname, "..", "assets", "icon.png");
+}
+
+function resolvedDisplayName(): string {
+  const name = config?.displayName?.trim();
+  return name || os.hostname();
+}
 let socket: WebSocket | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let pairingTimer: NodeJS.Timeout | null = null;
@@ -207,16 +219,24 @@ async function saveConfig(): Promise<void> {
 }
 
 function updateState(patch: Partial<PublicState>): void {
-  publicState = { ...publicState, ...patch, relayUrl: config.relayUrl, codexVersion, workspaces: config.workspaces };
+  publicState = {
+    ...publicState,
+    ...patch,
+    relayUrl: config.relayUrl,
+    displayName: resolvedDisplayName(),
+    codexVersion,
+    workspaces: config.workspaces
+  };
   windowRef?.webContents.send("agent:state", publicState);
   rebuildTray();
 }
 
 function rebuildTray(): void {
   if (!tray) return;
-  tray.setToolTip(`AnytimeVibe Agent · ${publicState.status}`);
+  tray.setToolTip(`${resolvedDisplayName()} · ${publicState.status}`);
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: `状态：${publicState.status}`, enabled: false },
+    { label: `名称：${resolvedDisplayName()}`, enabled: false },
     { label: "打开控制面板", click: () => showWindow() },
     { label: "添加工作区", click: () => addWorkspace() },
     { label: "重新连接", click: () => connect().catch(handleError) },
@@ -232,19 +252,25 @@ function showWindow(): void {
 }
 
 function createWindow(): void {
+  const icon = nativeImage.createFromPath(productIconPath());
   windowRef = new BrowserWindow({
-    width: 620,
-    height: 720,
-    minWidth: 520,
-    minHeight: 600,
+    width: 440,
+    height: 560,
+    minWidth: 400,
+    minHeight: 480,
+    resizable: true,
+    maximizable: false,
     backgroundColor: "#f2eadb",
     title: "AnytimeVibe Agent",
+    autoHideMenuBar: true,
+    ...(icon.isEmpty() ? {} : { icon }),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false
     }
   });
+  windowRef.setMenuBarVisibility(false);
   windowRef.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(rendererHtml())}`);
   windowRef.on("close", (event) => {
     if (!quitting) {
@@ -255,32 +281,168 @@ function createWindow(): void {
 }
 
 function rendererHtml(): string {
+  const platformLabel = process.platform === "darwin" ? "MACOS" : "WINDOWS";
+  const iconDataUrl = (() => {
+    try {
+      return `data:image/png;base64,${readFileSync(productIconPath()).toString("base64")}`;
+    } catch {
+      return "";
+    }
+  })();
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>AnytimeVibe Agent</title><style>
-  :root{font-family:"Bahnschrift","Aptos",sans-serif;color:#17211b;background:#f2eadb}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 90% 0,rgba(226,88,50,.18),transparent 31%),#f2eadb}.shell{padding:30px}.head{display:flex;align-items:center;gap:13px;margin-bottom:28px}.mark{width:48px;height:48px;display:grid;place-items:center;background:#e25832;color:white;font-weight:900;border-radius:15px 15px 4px 15px}.head h1{font:700 24px Rockwell,serif;margin:0}.head p{margin:3px 0 0;color:#6b726b;font-size:11px;letter-spacing:.1em}.card{background:#fffaf0;border:1px solid rgba(23,33,27,.15);border-radius:20px;padding:21px;margin-bottom:15px;box-shadow:0 14px 35px rgba(34,39,31,.07)}.status{display:flex;align-items:center;justify-content:space-between}.status b{text-transform:uppercase;font-size:11px;letter-spacing:.12em}.dot{width:10px;height:10px;border-radius:50%;background:#999}.dot.online,.check.ok:before{background:#3bab70;box-shadow:0 0 0 6px rgba(59,171,112,.13)}.detail{color:#6b726b;font-size:13px;line-height:1.5}.pair{font:900 47px/1 monospace;letter-spacing:.2em;text-align:center;padding-left:.2em;color:#e25832;margin:18px 0}.row{display:flex;gap:9px;flex-wrap:wrap}input{flex:1;border:1px solid rgba(23,33,27,.17);border-radius:10px;padding:12px;background:white}button{border:0;border-radius:10px;padding:11px 14px;background:#17211b;color:white;font-weight:800;cursor:pointer}button.secondary{background:#e7ddcd;color:#17211b}.checks{display:grid;gap:10px;margin:12px 0}.check{display:flex;align-items:center;gap:10px;padding:10px 12px;background:#eee6d8;border-radius:10px}.check:before{content:"";width:9px;height:9px;border-radius:50%;background:#d35a3b}.check span{margin-left:auto;color:#687068;font:11px "Cascadia Code",monospace}.workspaces{display:grid;gap:8px}.workspace{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;background:#eee6d8;border-radius:10px}.workspace div{min-width:0}.workspace strong,.workspace small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.workspace small{color:#747a73;margin-top:3px}.workspace button{padding:5px 8px;background:transparent;color:#a43b25}.meta{font:11px/1.6 "Cascadia Code",monospace;color:#687068}.empty{text-align:center;color:#777;padding:14px}h2{font:700 17px Rockwell,serif;margin:0 0 13px}</style></head><body><main class="shell"><div class="head"><div class="mark">AV</div><div><h1>AnytimeVibe Agent</h1><p>${process.platform === "darwin" ? "MACOS" : "WINDOWS"} REMOTE BRIDGE</p></div></div><section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section><section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="environmentActions" class="row"></div></section><section class="card"><h2>中继服务器</h2><div class="row"><input id="relay" placeholder="https://vibe.example.com"><button id="saveRelay">保存</button></div><div id="pairBox"></div></section><section class="card"><div class="status"><h2>允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><div id="workspaces" class="workspaces"></div></section></main><script>
-  document.head.insertAdjacentHTML('beforeend','<style>body{overflow-x:hidden}.shell,.card,.workspaces,.workspace{width:100%;min-width:0}.card,.workspace{overflow:hidden}.status{min-width:0;gap:12px}.workspace{align-items:center}.workspace div{flex:1 1 auto;min-width:0;overflow:hidden}.workspace strong,.workspace small{max-width:100%}.workspace button{flex:0 0 auto}</style>');const api=window.anytimeVibe;const status=document.querySelector('#status');const dot=document.querySelector('#dot');const detail=document.querySelector('#detail');const relay=document.querySelector('#relay');const pairBox=document.querySelector('#pairBox');const workspaces=document.querySelector('#workspaces');const meta=document.querySelector('#meta');const environment=document.querySelector('#environment');const environmentActions=document.querySelector('#environmentActions');const updateBox=document.createElement('div');environmentActions.after(updateBox);const activityBox=document.createElement('section');activityBox.className='card';meta.closest('.card').after(activityBox);const taskBox=document.createElement('section');taskBox.className='card';activityBox.after(taskBox);let tasksOpen=false;
-  function render(state){status.textContent=state.status;dot.className='dot '+(state.status==='online'?'online':'');detail.textContent=state.detail;relay.value=state.relayUrl||'';meta.textContent='Codex '+state.codexVersion+(state.hostId?' · Host '+state.hostId:'');const env=state.environment;environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+(env.nodeVersion||'未安装')+'</span></div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span></div>';environmentActions.innerHTML=(!env.nodeInstalled?'<button data-install="node">安装 Node.js</button>':'')+(env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex">一键安装兼容版 Codex</button>':'');environmentActions.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>api.installEnvironment(button.dataset.install)));pairBox.innerHTML=state.pairingCode?'<div class="pair">'+state.pairingCode+'</div><p class="detail">在移动端输入配对码。配对码约十分钟后失效。</p>':'<button id="startPair" '+(!env.codexCompatible?'disabled':'')+'>生成配对码</button>';document.querySelector('#startPair')?.addEventListener('click',()=>api.startPairing());workspaces.innerHTML=state.workspaces.length?state.workspaces.map(w=>'<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button data-id="'+w.id+'">移除</button></div>').join(''):'<div class="empty">尚未允许任何目录</div>';workspaces.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>api.removeWorkspace(button.dataset.id)));}
-  function escapeHtml(value){return value.replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));}
-  function renderUpdate(update){const labels={idle:'自动更新',checking:'正在检查更新',available:'发现新版本',downloading:'后台下载更新',ready:'更新已就绪',error:'更新检查失败'};updateBox.innerHTML='<div class="check '+(update.status==='ready'?'ok':'')+'"><b>'+labels[update.status]+'</b><span>'+(update.version||update.message||(update.progress!==undefined?update.progress+'%':''))+'</span></div><div class="row"><button id="checkUpdate" class="secondary">检查更新</button>'+(update.status==='ready'?'<button id="installUpdate">重启并更新</button>':'')+'</div>';document.querySelector('#checkUpdate')?.addEventListener('click',()=>api.checkUpdate());document.querySelector('#installUpdate')?.addEventListener('click',()=>api.installUpdate());}
-  function renderActivity(activity){if(!activity){activityBox.style.display='none';return}activityBox.style.display='block';const labels={processing:'处理中',completed:'已完成',failed:'失败',interrupted:'已停止'};activityBox.innerHTML='<div class="status"><h2>当前远程任务</h2><b>'+labels[activity.status]+'</b></div><p class="detail"><strong>'+escapeHtml(activity.title)+'</strong><br>'+escapeHtml(activity.prompt)+'</p><pre style="max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#17211b;color:#e8eee8;border-radius:12px;padding:14px;font:12px/1.55 Cascadia Code,monospace">'+escapeHtml(activity.output||'等待 Codex 输出…')+'</pre>';const output=activityBox.querySelector('pre');output.scrollTop=output.scrollHeight;}
-  function renderTasks(tasks){taskBox.innerHTML='<div class="status"><h2>任务</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?'收起':'任务菜单')+' · '+tasks.length+'</button></div>'+(tasksOpen?(tasks.length?'<div style="display:grid;gap:8px">'+tasks.map(task=>'<div class="workspace"><div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div><button data-relay="'+escapeHtml(task.threadId)+'">接力</button></div>').join('')+'</div>':'<div class="empty">暂无可接力任务</div>'):'');document.querySelector('#toggleTasks')?.addEventListener('click',()=>{tasksOpen=!tasksOpen;renderTasks(tasks)});taskBox.querySelectorAll('[data-relay]').forEach(button=>button.addEventListener('click',()=>api.relayTask(button.dataset.relay)));}
-  document.querySelector('#saveRelay').addEventListener('click',()=>api.setRelayUrl(relay.value));document.querySelector('#addWorkspace').addEventListener('click',()=>api.addWorkspace());document.querySelector('#recheck').addEventListener('click',()=>api.checkEnvironment());api.onState(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});api.getState().then(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});
+  :root{font-family:"Bahnschrift","Aptos","Segoe UI",sans-serif;color:#17211b;background:#f2eadb}
+  *{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}
+  body{background:radial-gradient(circle at 92% 0,rgba(226,88,50,.16),transparent 34%),#f2eadb}
+  .shell{height:100%;padding:14px 14px 12px;display:flex;flex-direction:column;gap:8px;overflow:hidden}
+  .head{display:flex;align-items:center;gap:10px;flex:0 0 auto}
+  .mark{width:34px;height:34px;border-radius:10px;overflow:hidden;background:#17211b;flex:0 0 auto;box-shadow:0 6px 14px rgba(23,33,27,.16)}
+  .mark img{width:100%;height:100%;display:block;object-fit:cover}
+  .head h1{font:700 16px Rockwell,serif;margin:0;line-height:1.1}
+  .head p{margin:2px 0 0;color:#6b726b;font-size:9px;letter-spacing:.12em}
+  .card{background:#fffaf0;border:1px solid rgba(23,33,27,.12);border-radius:12px;padding:10px 11px;box-shadow:0 8px 18px rgba(34,39,31,.05);flex:0 0 auto}
+  .card.grow{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+  .status{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
+  .status b{text-transform:uppercase;font-size:10px;letter-spacing:.1em}
+  .dot{width:8px;height:8px;border-radius:50%;background:#999;flex:0 0 auto}
+  .dot.online{background:#3bab70;box-shadow:0 0 0 4px rgba(59,171,112,.14)}
+  .detail{color:#6b726b;font-size:11px;line-height:1.4;margin:6px 0 0}
+  .meta{font:10px/1.4 "Cascadia Code",monospace;color:#687068;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  h2{font:700 12px Rockwell,serif;margin:0}
+  .row{display:flex;gap:6px;align-items:center;min-width:0}
+  .row.wrap{flex-wrap:wrap}
+  input{flex:1 1 auto;min-width:0;border:1px solid rgba(23,33,27,.15);border-radius:8px;padding:7px 9px;background:white;font-size:12px}
+  button{border:0;border-radius:8px;padding:7px 10px;background:#17211b;color:white;font-weight:800;font-size:11px;cursor:pointer;white-space:nowrap;flex:0 0 auto}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.secondary{background:#e7ddcd;color:#17211b}
+  button.ghost{background:transparent;color:#a43b25;padding:4px 6px}
+  .checks{display:grid;gap:5px;margin-top:7px}
+  .check{display:flex;align-items:center;gap:7px;padding:6px 8px;background:#eee6d8;border-radius:8px;font-size:11px;min-width:0}
+  .check:before{content:"";width:7px;height:7px;border-radius:50%;background:#d35a3b;flex:0 0 auto}
+  .check.ok:before{background:#3bab70}
+  .check b{font-weight:800}
+  .check span{margin-left:auto;color:#687068;font:10px "Cascadia Code",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%}
+  .update-row{display:flex;align-items:center;gap:6px;margin-top:6px;min-width:0}
+  .update-row .check{flex:1 1 auto;margin:0}
+  .pair{font:900 28px/1 monospace;letter-spacing:.18em;text-align:center;color:#e25832;margin:8px 0 4px;padding-left:.18em}
+  .workspaces{display:grid;gap:5px;margin-top:7px;overflow:auto;min-height:0}
+  .workspace{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px;background:#eee6d8;border-radius:8px;min-width:0}
+  .workspace div{flex:1 1 auto;min-width:0;overflow:hidden}
+  .workspace strong,.workspace small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .workspace small{color:#747a73;margin-top:1px;font-size:10px}
+  .empty{text-align:center;color:#888;padding:8px;font-size:11px}
+  .stack{display:grid;gap:6px;margin-top:6px}
+  .label{font-size:10px;font-weight:800;color:#6b726b;letter-spacing:.04em}
+  pre.activity{margin:6px 0 0;max-height:88px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#17211b;color:#e8eee8;border-radius:8px;padding:8px;font:10px/1.45 Cascadia Code,monospace}
+  </style></head><body><main class="shell">
+  <div class="head">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1>AnytimeVibe Agent</h1><p>${platformLabel} REMOTE BRIDGE</p></div></div>
+  <section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
+  <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="environmentActions" class="row wrap" style="margin-top:6px"></div><div id="updateBox" class="update-row"></div></section>
+  <section class="card"><h2>中继与配对</h2><div class="stack"><div class="label">中继服务器</div><div class="row"><input id="relay" placeholder="https://vibe.demonrain.top"><button id="startPair" class="secondary">生成配对码</button><button id="saveRelay">保存</button></div><div id="pairBox"></div><div class="label">客户端名称</div><div class="row"><input id="displayName" placeholder="例如：公司电脑" maxlength="64"><button id="saveName" class="secondary">保存名称</button></div></div></section>
+  <section class="card grow"><div class="status"><h2>允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><div id="workspaces" class="workspaces"></div></section>
+  <section class="card" id="activityBox" style="display:none"></section>
+  <section class="card" id="taskBox"></section>
+  </main><script>
+  const api=window.anytimeVibe;
+  const status=document.querySelector('#status');
+  const dot=document.querySelector('#dot');
+  const detail=document.querySelector('#detail');
+  const relay=document.querySelector('#relay');
+  const displayName=document.querySelector('#displayName');
+  const pairBox=document.querySelector('#pairBox');
+  const startPair=document.querySelector('#startPair');
+  const workspaces=document.querySelector('#workspaces');
+  const meta=document.querySelector('#meta');
+  const environment=document.querySelector('#environment');
+  const environmentActions=document.querySelector('#environmentActions');
+  const updateBox=document.querySelector('#updateBox');
+  const activityBox=document.querySelector('#activityBox');
+  const taskBox=document.querySelector('#taskBox');
+  let tasksOpen=false;
+  let lastTasks=[];
+  function escapeHtml(value){return String(value||'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));}
+  function render(state){
+    status.textContent=state.status;
+    dot.className='dot '+(state.status==='online'?'online':'');
+    detail.textContent=state.detail;
+    if(document.activeElement!==relay) relay.value=state.relayUrl||'';
+    if(document.activeElement!==displayName) displayName.value=state.displayName||'';
+    meta.textContent='Codex '+state.codexVersion+(state.hostId?' · '+String(state.hostId).slice(0,8):'');
+    const env=state.environment;
+    environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+escapeHtml(env.nodeVersion||'未安装')+'</span></div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+escapeHtml(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span></div>';
+    environmentActions.innerHTML=(!env.nodeInstalled?'<button data-install="node">安装 Node.js</button>':'')+(env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex">安装兼容版 Codex</button>':'');
+    environmentActions.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>api.installEnvironment(button.dataset.install)));
+    startPair.disabled=!env.codexCompatible||!state.relayUrl;
+    pairBox.innerHTML=state.pairingCode?'<div class="pair">'+escapeHtml(state.pairingCode)+'</div><p class="detail">在 Web 端输入配对码，约 10 分钟后失效。</p>':'';
+    workspaces.innerHTML=state.workspaces.length?state.workspaces.map(w=>'<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button class="ghost" data-id="'+escapeHtml(w.id)+'">移除</button></div>').join(''):'<div class="empty">尚未允许任何目录</div>';
+    workspaces.querySelectorAll('button[data-id]').forEach(button=>button.addEventListener('click',()=>api.removeWorkspace(button.dataset.id)));
+  }
+  function renderUpdate(update){
+    const labels={idle:'自动更新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败'};
+    const text=update.version||update.message||(update.progress!==undefined?update.progress+'%':'后台自动检查');
+    updateBox.innerHTML='<div class="check '+(update.status==='ready'?'ok':'')+'"><b>'+labels[update.status]+'</b><span>'+escapeHtml(text)+'</span></div><button id="checkUpdate" class="secondary">检查更新</button>'+(update.status==='ready'?'<button id="installUpdate">重启并更新</button>':'');
+    document.querySelector('#checkUpdate')?.addEventListener('click',()=>api.checkUpdate());
+    document.querySelector('#installUpdate')?.addEventListener('click',()=>api.installUpdate());
+  }
+  function renderActivity(activity){
+    if(!activity){activityBox.style.display='none';activityBox.innerHTML='';return}
+    activityBox.style.display='block';
+    const labels={processing:'处理中',completed:'已完成',failed:'失败',interrupted:'已停止'};
+    activityBox.innerHTML='<div class="status"><h2>当前远程任务</h2><b>'+labels[activity.status]+'</b></div><p class="detail"><strong>'+escapeHtml(activity.title)+'</strong> · '+escapeHtml(activity.prompt)+'</p><pre class="activity">'+escapeHtml(activity.output||'等待 Codex 输出…')+'</pre>';
+    const output=activityBox.querySelector('pre');
+    output.scrollTop=output.scrollHeight;
+  }
+  function renderTasks(tasks){
+    lastTasks=tasks||[];
+    taskBox.innerHTML='<div class="status"><h2>任务接力</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?'收起':'展开')+' · '+lastTasks.length+'</button></div>'+(tasksOpen?(lastTasks.length?'<div class="workspaces" style="margin-top:7px">'+lastTasks.map(task=>'<div class="workspace"><div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div><button data-relay="'+escapeHtml(task.threadId)+'">接力</button></div>').join('')+'</div>':'<div class="empty">暂无可接力任务</div>'):'');
+    document.querySelector('#toggleTasks')?.addEventListener('click',()=>{tasksOpen=!tasksOpen;renderTasks(lastTasks)});
+    taskBox.querySelectorAll('[data-relay]').forEach(button=>button.addEventListener('click',()=>api.relayTask(button.dataset.relay)));
+  }
+  document.querySelector('#saveRelay').addEventListener('click',()=>api.setRelayUrl(relay.value));
+  document.querySelector('#saveName').addEventListener('click',()=>api.setDisplayName(displayName.value));
+  startPair.addEventListener('click',()=>api.startPairing());
+  document.querySelector('#addWorkspace').addEventListener('click',()=>api.addWorkspace());
+  document.querySelector('#recheck').addEventListener('click',()=>api.checkEnvironment());
+  api.onState(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});
+  api.getState().then(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});
   </script></body></html>`;
 }
+
 
 async function loadConfig(): Promise<void> {
   configPath = path.join(app.getPath("userData"), "agent-config.json");
   try {
     config = JSON.parse(await fs.readFile(configPath, "utf8")) as AgentConfig;
   } catch {
-    config = { relayUrl: process.env.ANYTIMEVIBE_RELAY_URL ?? "", agentId: crypto.randomUUID(), workspaces: [], sequence: 0 };
+    config = {
+      relayUrl: process.env.ANYTIMEVIBE_RELAY_URL ?? DEFAULT_RELAY_URL,
+      agentId: crypto.randomUUID(),
+      displayName: os.hostname(),
+      workspaces: [],
+      sequence: 0
+    };
   }
+  let dirty = false;
   if (!config.agentId) {
     config.agentId = crypto.randomUUID();
-    await saveConfig();
+    dirty = true;
+  }
+  if (!config.relayUrl) {
+    config.relayUrl = process.env.ANYTIMEVIBE_RELAY_URL ?? DEFAULT_RELAY_URL;
+    dirty = true;
+  }
+  if (!config.displayName?.trim()) {
+    config.displayName = os.hostname();
+    dirty = true;
   }
   config.workspaces ??= [];
   config.sequence ??= 0;
-  publicState = { ...publicState, relayUrl: config.relayUrl, workspaces: config.workspaces };
+  if (dirty) await saveConfig();
+  publicState = {
+    ...publicState,
+    relayUrl: config.relayUrl,
+    displayName: resolvedDisplayName(),
+    workspaces: config.workspaces
+  };
 }
 
 async function commandVersion(command: string, args: string[]): Promise<string | null> {
@@ -375,7 +537,7 @@ async function startPairing(): Promise<PublicState> {
     body: JSON.stringify({
       secret,
       agentId: config.agentId,
-      agentName: os.hostname(),
+      agentName: resolvedDisplayName(),
       platform: `${process.platform} ${os.release()}`,
       codexVersion,
       agentPublicKey: config.publicKey
@@ -688,7 +850,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
 async function publishHostStatus(): Promise<void> {
   await publish({
     type: "host.status", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), online: true,
-    name: os.hostname(), platform: `${process.platform} ${os.release()}`, codexVersion,
+    name: resolvedDisplayName(), platform: `${process.platform} ${os.release()}`, codexVersion,
     workspaces: config.workspaces
   }, true);
 }
@@ -819,6 +981,15 @@ function registerIpc(): void {
     void checkForAgentUpdate().catch((error) => updateState({ update: { status: "error", message: error.message } }));
     return publicState;
   });
+  ipcMain.handle("agent:set-display-name", async (_event, displayName: string) => {
+    const normalized = String(displayName ?? "").trim().slice(0, 64);
+    if (!normalized) throw new Error("客户端名称不能为空");
+    config.displayName = normalized;
+    await saveConfig();
+    updateState({ displayName: normalized, detail: `客户端名称已更新为“${normalized}”。` });
+    if (socket?.readyState === WebSocket.OPEN) await publishHostStatus();
+    return publicState;
+  });
   ipcMain.handle("agent:start-pairing", () => startPairing());
   ipcMain.handle("agent:add-workspace", () => addWorkspace());
   ipcMain.handle("agent:remove-workspace", async (_event, id: string) => {
@@ -855,9 +1026,17 @@ function registerIpc(): void {
 app.whenReady().then(async () => {
   await loadConfig();
   registerIpc();
+  if (process.platform === "darwin") {
+    Menu.setApplicationMenu(Menu.buildFromTemplate([{ role: "appMenu" }]));
+  } else {
+    Menu.setApplicationMenu(null);
+  }
   app.setLoginItemSettings({ openAtLogin: true });
-  const trayImage = nativeImage.createFromDataURL("data:image/svg+xml;base64," + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="15" fill="#17211b"/><path d="M13 20h38v25H13z" fill="#f2eadb"/><path d="m19 27 7 5-7 6" fill="none" stroke="#e25832" stroke-width="5"/><path d="M31 39h14" stroke="#2d7653" stroke-width="5"/></svg>').toString("base64"));
-  const trayIcon = trayImage.resize({ width: 18, height: 18 });
+  const productIcon = nativeImage.createFromPath(productIconPath());
+  const traySource = productIcon.isEmpty()
+    ? nativeImage.createFromDataURL("data:image/svg+xml;base64," + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="15" fill="#17211b"/><path d="M13 20h38v25H13z" fill="#f2eadb"/><path d="m19 27 7 5-7 6" fill="none" stroke="#e25832" stroke-width="5"/><path d="M31 39h14" stroke="#2d7653" stroke-width="5"/></svg>').toString("base64"))
+    : productIcon;
+  const trayIcon = traySource.resize({ width: 18, height: 18 });
   if (process.platform === "darwin") trayIcon.setTemplateImage(true);
   tray = new Tray(trayIcon);
   tray.on("double-click", showWindow);

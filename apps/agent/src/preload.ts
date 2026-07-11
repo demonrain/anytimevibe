@@ -3,6 +3,7 @@ import { contextBridge, ipcRenderer } from "electron";
 contextBridge.exposeInMainWorld("anytimeVibe", {
   getState: () => ipcRenderer.invoke("agent:get-state"),
   setRelayUrl: (relayUrl: string) => ipcRenderer.invoke("agent:set-relay-url", relayUrl),
+  setDisplayName: (displayName: string) => ipcRenderer.invoke("agent:set-display-name", displayName),
   startPairing: () => ipcRenderer.invoke("agent:start-pairing"),
   addWorkspace: () => ipcRenderer.invoke("agent:add-workspace"),
   removeWorkspace: (id: string) => ipcRenderer.invoke("agent:remove-workspace", id),

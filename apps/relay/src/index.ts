@@ -279,6 +279,20 @@ async function main(): Promise<void> {
     return { ok: true };
   });
 
+  app.patch("/api/hosts/:hostId", async (request, reply) => {
+    const user = await requireUser(sql, request, reply);
+    if (!user) return;
+    const { hostId } = request.params as { hostId: string };
+    const body = z.object({ name: z.string().trim().min(1).max(64) }).parse(request.body);
+    const result = await sql<Array<{ id: string; name: string }>>`
+      UPDATE hosts SET name = ${body.name}
+      WHERE id = ${hostId} AND user_id = ${user.id} AND revoked_at IS NULL
+      RETURNING id, name
+    `;
+    if (!result.length) return reply.code(404).send({ error: "host_not_found" });
+    return { host: result[0] };
+  });
+
   app.post("/api/agent/pairings", async (request, reply) => {
     const body = agentPairBody.parse(request.body);
     let code = pairingCode();

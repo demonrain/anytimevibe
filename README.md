@@ -9,6 +9,7 @@ AnytimeVibe 是一个多用户远程 Codex 工作台。移动端 PWA 通过 VPS 
 - [产品文档](docs/PRODUCT.md)
 - [使用手册](docs/USER_GUIDE.md)
 - [多用户容量评估](docs/CAPACITY.md)
+- [服务端更新源配置说明](docs/UPDATE_FEED.md)
 
 ## 当前范围
 
@@ -16,6 +17,8 @@ AnytimeVibe 是一个多用户远程 Codex 工作台。移动端 PWA 通过 VPS 
 - 支持 Codex CLI `0.144.x`。
 - 只允许操作代理端明确添加的工作区。
 - 主机离线时可以查看已同步历史，不会排队执行离线命令。
+- 客户端可自定义显示名称，便于在多台电脑间区分。
+- 桌面客户端支持自动更新（由服务端 `UPDATE_FEED_URL` 配置更新源）。
 - 不提供任意终端、文件编辑、远程桌面或 Codex 桌面 UI 自动化。
 
 ## 快速验证
@@ -36,7 +39,11 @@ docker compose up -d --build
 
 部署前需要配置 `DOMAIN`、`POSTGRES_PASSWORD`、`SETUP_TOKEN`、`COOKIE_SECRET` 和 VAPID 密钥。完整步骤参见[使用手册](docs/USER_GUIDE.md)。
 
+客户端自动更新相关变量（`UPDATE_FEED_URL`、`WINDOWS_CLIENT_URL`、`MAC_CLIENT_URL`）参见[更新源配置说明](docs/UPDATE_FEED.md)。
+
 ## 桌面客户端
+
+默认中继地址：`https://vibe.demonrain.top`（可在控制面板修改）。
 
 ```text
 apps/agent/release/AnytimeVibe-Agent-Setup.exe
@@ -49,3 +56,10 @@ pnpm --filter @anytimevibe/agent package:mac
 ```
 
 当前安装包未签名，Windows 可能显示 SmartScreen 提示。
+
+### 客户端界面要点
+
+- 无 File / Edit / View 菜单栏，托盘常驻。
+- 可设置客户端名称（配对与 Web 主机列表显示）。
+- 生成配对码与保存中继地址同一行；自动更新状态与「检查更新」同一行。
+- 统一产品图标用于托盘、安装包、Web 与 PWA。

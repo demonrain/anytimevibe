@@ -1,6 +1,6 @@
 # AnytimeVibe 使用手册
 
-> 当前版本支持开放注册、Windows 与 macOS Agent。服务管理员可通过 `REGISTRATION_ENABLED` 和 `MAX_USERS` 控制注册。
+> 当前版本支持开放注册、Windows 与 macOS Agent、客户端自定义名称、紧凑控制面板与服务端可配置自动更新。服务管理员可通过 `REGISTRATION_ENABLED` 和 `MAX_USERS` 控制注册。
 
 ## 多用户注册
 
@@ -40,7 +40,9 @@ codex login
 
 ## 客户端自动更新
 
-Agent 启动后会通过中继服务读取 `UPDATE_FEED_URL`，每 6 小时检查一次更新。发现新版本后在后台下载，下载完成会打开控制面板并显示“重启并更新”。服务端需配置：
+Agent 启动后会通过中继服务读取 `UPDATE_FEED_URL`，每 6 小时检查一次更新。控制面板将自动更新状态与「检查更新」并排显示；发现新版本后在后台下载，下载完成会打开控制面板并显示「重启并更新」。
+
+服务端需配置：
 
 ```dotenv
 WINDOWS_CLIENT_URL=https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent-Setup.exe
@@ -48,7 +50,20 @@ MAC_CLIENT_URL=https://github.com/demonrain/anytimevibe/releases/latest/download
 UPDATE_FEED_URL=https://github.com/demonrain/anytimevibe/releases/latest/download
 ```
 
+完整的更新源目录结构、托管方式、发布流程与排错见 [服务端更新源配置说明](UPDATE_FEED.md)。
+
 发布 Tag 后，GitHub Actions 会构建客户端并上传安装包、blockmap、`latest.yml` 和 `latest-mac.yml`。生产分发应配置 Windows 代码签名以及 Apple Developer ID 签名、公证，否则系统安全提示和 macOS 自动更新可能受限。
+
+## 客户端名称
+
+每台 Agent 可以设置易记的「客户端名称」，用于配对展示和 Web 主机列表：
+
+1. 打开 Agent 控制面板。
+2. 在「客户端名称」输入例如 `公司电脑`、`家里台式`。
+3. 点击「保存名称」。
+4. 之后生成配对码时，Web 端会看到该名称。
+
+已连接的主机也可以在 Web 主机列表中点击 ✎ 重命名。Agent 再次上线并同步状态时，会以 Agent 当前名称为准更新展示。
 
 ## Web 与本机任务状态同步
 
@@ -68,7 +83,7 @@ pnpm --filter @anytimevibe/agent package:mac
 
 输出位于 `apps/agent/release/`，包含 DMG 和 ZIP。当前构建未配置 Apple Developer ID 签名和公证，公开分发前必须增加签名、公证和自动更新。
 
-- 手册版本：`v0.1`
+- 手册版本：`v0.2`
 - 适用产品：AnytimeVibe MVP
 - 适用 Codex：`codex-cli 0.144.x`
 
@@ -182,26 +197,23 @@ apps/agent/release/AnytimeVibe-Agent-Setup.exe
 
 ### 4.2 代理启动行为
 
-- 代理显示托盘图标和控制面板。
+- 代理显示统一产品图标的托盘入口和紧凑控制面板。
+- 控制面板无 File / Edit / View 菜单栏。
 - 安装后会配置为当前 Windows 用户登录时自动启动。
 - 关闭控制面板只会隐藏窗口，不会退出托盘代理。
 - 如需完全退出，在托盘菜单选择“退出”。
+- 默认中继地址为 `https://vibe.demonrain.top`，可按需修改。
 
 ## 5. 配置中继并配对
 
 ### 5.1 在电脑端配置
 
 1. 打开 AnytimeVibe Agent 控制面板。
-2. 在“中继服务器”输入完整地址，例如：
-
-```text
-https://vibe.example.com
-```
-
-3. 点击“保存”。
-4. 确认面板显示 Codex 版本为 `0.144.x`。
-5. 点击“生成配对码”。
-6. 记下六位配对码。
+2. 确认或修改中继服务器地址（默认 `https://vibe.demonrain.top`）。
+3. 可选：设置「客户端名称」并保存，便于在 Web 端识别。
+4. 同一行中可点击「生成配对码」或「保存」。
+5. 确认面板显示 Codex 版本为 `0.144.x`。
+6. 点击「生成配对码」并记下六位配对码。
 
 配对码约十分钟后失效。失效后重新生成即可。
 
