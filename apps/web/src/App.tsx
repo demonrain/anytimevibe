@@ -143,8 +143,16 @@ function ErrorBanner({ message, clear }: { message: string; clear(): void }) {
 }
 
 function ClientDownloads({ downloads }: { downloads: Health["clientDownloads"] }) {
-  if (!downloads.windows && !downloads.mac) return null;
-  return <div className="client-downloads"><span>桌面客户端</span>{downloads.windows && <a href={downloads.windows}>Windows</a>}{downloads.mac && <a href={downloads.mac}>macOS</a>}</div>;
+  if (!downloads.windows && !downloads.mac) {
+    return <div className="client-downloads"><span>桌面客户端</span><button type="button" className="client-download-soon" onClick={() => window.alert("macOS 客户端正在准备中，敬请期待。")}>macOS · 敬请期待</button></div>;
+  }
+  return <div className="client-downloads">
+    <span>桌面客户端</span>
+    {downloads.windows && <a href={downloads.windows}>Windows</a>}
+    {downloads.mac
+      ? <a href={downloads.mac}>macOS</a>
+      : <button type="button" className="client-download-soon" title="敬请期待" onClick={() => window.alert("macOS 客户端正在准备中，敬请期待。当前可先使用 Windows 版随码。")}>macOS · 敬请期待</button>}
+  </div>;
 }
 
 function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticated(user: User): void }) {
