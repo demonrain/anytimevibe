@@ -197,6 +197,7 @@ export function App() {
   function selectTask(threadId: string) {
     setSelectedTaskId(threadId);
     setMobilePane("conversation");
+    window.scrollTo({ top: 0, behavior: "instant" });
   }
 
   useEffect(() => {
@@ -439,7 +440,7 @@ export function App() {
       </section>
 
       <section className="conversation-column">
-        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} onBack={() => setMobilePane("tasks")} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
+        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
       </section>
     </main>
 
