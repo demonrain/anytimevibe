@@ -345,8 +345,9 @@ function rendererHtml(): string {
   .check{display:flex;align-items:center;gap:7px;padding:6px 8px;background:#eee6d8;border-radius:8px;font-size:11px;min-width:0}
   .check:before{content:"";width:7px;height:7px;border-radius:50%;background:#d35a3b;flex:0 0 auto}
   .check.ok:before{background:#3bab70}
-  .check b{font-weight:800}
-  .check span{margin-left:auto;color:#687068;font:10px "Cascadia Code",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%}
+  .check b{font-weight:800;flex:0 0 auto}
+  .check span{margin-left:auto;color:#687068;font:10px "Cascadia Code",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:48%}
+  .check button{flex:0 0 auto;padding:5px 8px;font-size:10px}
   .update-row{display:flex;align-items:center;gap:6px;margin-top:6px;min-width:0}
   .update-row .check{flex:1 1 auto;margin:0}
   .pair{font:900 28px/1 monospace;letter-spacing:.18em;text-align:center;color:#e25832;margin:8px 0 4px;padding-left:.18em}
@@ -362,7 +363,7 @@ function rendererHtml(): string {
   </style></head><body><main class="shell">
   <div class="head">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1>随码</h1><p>随时续上你的代码 · ${platformLabel}</p></div></div>
   <section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
-  <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="environmentActions" class="row wrap" style="margin-top:6px"></div><div id="updateBox" class="update-row"></div></section>
+  <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="updateBox" class="update-row"></div></section>
   <section class="card"><h2>中继与配对</h2><div class="stack"><div class="label">中继服务器</div><div class="row"><input id="relay" placeholder="https://vibe.demonrain.top"><button id="startPair" class="secondary">生成配对码</button><button id="saveRelay">保存</button></div><div id="pairBox"></div><div class="label">客户端名称</div><div class="row"><input id="displayName" placeholder="例如：公司电脑" maxlength="64"><button id="saveName" class="secondary">保存名称</button></div></div></section>
   <section class="card grow"><div class="status"><h2>允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><div id="workspaces" class="workspaces"></div></section>
   <section class="card" id="activityBox" style="display:none"></section>
@@ -379,7 +380,6 @@ function rendererHtml(): string {
   const workspaces=document.querySelector('#workspaces');
   const meta=document.querySelector('#meta');
   const environment=document.querySelector('#environment');
-  const environmentActions=document.querySelector('#environmentActions');
   const updateBox=document.querySelector('#updateBox');
   const activityBox=document.querySelector('#activityBox');
   const taskBox=document.querySelector('#taskBox');
@@ -394,9 +394,10 @@ function rendererHtml(): string {
     if(document.activeElement!==displayName) displayName.value=state.displayName||'';
     meta.textContent='Codex '+state.codexVersion+(state.hostId?' · '+String(state.hostId).slice(0,8):'');
     const env=state.environment;
-    environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+escapeHtml(env.nodeVersion||'未安装')+'</span></div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+escapeHtml(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span></div>';
-    environmentActions.innerHTML=(!env.nodeInstalled?'<button data-install="node">安装 Node.js</button>':'')+(env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex">安装兼容版 Codex</button>':'');
-    environmentActions.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>api.installEnvironment(button.dataset.install)));
+    const nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">安装 Node.js</button>':'';
+    const codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">安装兼容版 Codex</button>':'';
+    environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+escapeHtml(env.nodeVersion||'未安装')+'</span>'+nodeAction+'</div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+escapeHtml(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span>'+codexAction+'</div>';
+    environment.querySelectorAll('button[data-install]').forEach(button=>button.addEventListener('click',()=>api.installEnvironment(button.dataset.install)));
     startPair.disabled=!env.codexCompatible||!state.relayUrl;
     pairBox.innerHTML=state.pairingCode?'<div class="pair">'+escapeHtml(state.pairingCode)+'</div><p class="detail">在 Web 端输入配对码，约 10 分钟后失效。</p>':'';
     workspaces.innerHTML=state.workspaces.length?state.workspaces.map(w=>'<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button class="ghost" data-id="'+escapeHtml(w.id)+'">移除</button></div>').join(''):'<div class="empty">尚未允许任何目录</div>';
@@ -471,12 +472,69 @@ async function loadConfig(): Promise<void> {
   };
 }
 
+let cachedLoginPath: string | null = null;
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** GUI apps on macOS often miss Homebrew/nvm PATH; rebuild from login shell + common locations. */
+async function resolveLoginPath(): Promise<string> {
+  if (cachedLoginPath) return cachedLoginPath;
+  const parts = new Set((process.env.PATH ?? "").split(path.delimiter).filter(Boolean));
+  const home = os.homedir();
+  for (const dir of [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    path.join(home, ".local", "bin"),
+    path.join(home, ".nvm", "current", "bin"),
+    path.join(home, ".fnm", "current", "bin"),
+    path.join(home, ".volta", "bin"),
+    path.join(home, ".asdf", "shims"),
+    path.join(home, "Library", "Application Support", "fnm", "aliases", "default")
+  ]) {
+    parts.add(dir);
+  }
+  if (process.platform !== "win32") {
+    for (const shell of ["/bin/zsh", "/bin/bash"]) {
+      try {
+        const result = await execFileAsync(shell, ["-ilc", "printf %s \"$PATH\""], {
+          env: process.env,
+          timeout: 8_000,
+          maxBuffer: 1024 * 1024
+        });
+        for (const segment of String(result.stdout).trim().split(path.delimiter)) {
+          if (segment) parts.add(segment);
+        }
+        break;
+      } catch {
+        // try next shell
+      }
+    }
+  }
+  cachedLoginPath = [...parts].join(path.delimiter);
+  return cachedLoginPath;
+}
+
 async function commandVersion(command: string, args: string[]): Promise<string | null> {
   try {
+    const loginPath = process.platform === "win32" ? process.env.PATH : await resolveLoginPath();
     const result = process.platform === "win32"
       ? await execFileAsync(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(command, args), { windowsHide: true, windowsVerbatimArguments: true })
-      : await execFileAsync(command, args);
-    return String(result.stdout).trim();
+      : await execFileAsync(command, args, {
+        env: { ...process.env, PATH: loginPath ?? process.env.PATH },
+        timeout: 8_000
+      });
+    const text = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+    return text || null;
   } catch {
     return null;
   }
@@ -487,22 +545,54 @@ async function findOnPath(command: string): Promise<string | null> {
     try {
       const result = await execFileAsync("where.exe", [command]);
       return result.stdout.split(/\r?\n/).find(Boolean)?.trim() ?? null;
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
-  try {
-    const result = await execFileAsync("/bin/zsh", ["-lc", `command -v ${command}`]);
-    return result.stdout.trim() || null;
-  } catch { return null; }
+
+  const loginPath = await resolveLoginPath();
+  const candidates: string[] = [];
+  for (const dir of loginPath.split(path.delimiter)) {
+    if (dir) candidates.push(path.join(dir, command));
+  }
+  // Prefer well-known install locations even if PATH is incomplete.
+  candidates.unshift(
+    path.join("/opt/homebrew/bin", command),
+    path.join("/usr/local/bin", command),
+    path.join("/usr/bin", command)
+  );
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (await pathExists(candidate)) return candidate;
+  }
+
+  for (const shell of ["/bin/zsh", "/bin/bash"]) {
+    try {
+      const result = await execFileAsync(shell, ["-ilc", `command -v ${command}`], {
+        env: { ...process.env, PATH: loginPath },
+        timeout: 8_000
+      });
+      const found = String(result.stdout).trim().split(/\r?\n/).find(Boolean);
+      if (found && !found.includes("not found") && await pathExists(found)) return found;
+    } catch {
+      // try next shell
+    }
+  }
+  return null;
 }
 
 async function detectEnvironment(): Promise<EnvironmentState> {
+  // Reset PATH cache so "重新检测" picks up newly installed tools.
+  cachedLoginPath = null;
   const nodeCommand = await findOnPath(process.platform === "win32" ? "node.exe" : "node");
   const nodeOutput = nodeCommand ? await commandVersion(nodeCommand, ["--version"]) : null;
   const configuredCodex = process.env.CODEX_COMMAND ? normalizeWindowsCommandPath(process.env.CODEX_COMMAND) : null;
   const discoveredCodex = configuredCodex ?? await findOnPath(process.platform === "win32" ? "codex.cmd" : "codex");
   if (discoveredCodex) codexCommand = normalizeWindowsCommandPath(discoveredCodex);
   const codexOutput = discoveredCodex ? await commandVersion(codexCommand, ["--version"]) : null;
-  const detectedVersion = codexOutput?.replace(/^codex-cli\s+/, "");
+  const detectedVersion = codexOutput?.replace(/^codex-cli\s+/i, "").trim();
   if (detectedVersion) codexVersion = detectedVersion;
   return {
     platform: initialEnvironment.platform,
