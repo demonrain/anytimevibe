@@ -1,70 +1,70 @@
-﻿{
-    "name":  "@anytimevibe/agent",
-    "version":  "0.4.6",
-    "description":  "闅忕爜妗岄潰浠ｇ悊锛氬湪 Windows / macOS 涓婂畨鍏ㄦ帴鍔涜繙绋?Codex 浠诲姟",
-    "author":  "闅忕爜",
-    "private":  true,
-    "main":  "dist/main.js",
-    "scripts":  {
-                    "dev":  "pnpm build \u0026\u0026 electron .",
-                    "build":  "tsup src/main.ts src/preload.ts --format cjs --platform node --external electron --sourcemap --clean",
-                    "typecheck":  "tsc -p tsconfig.json --noEmit",
-                    "package:dir":  "pnpm build \u0026\u0026 electron-builder --win --dir",
-                    "package:win":  "pnpm build \u0026\u0026 electron-builder --win nsis",
-                    "package:mac":  "pnpm build \u0026\u0026 electron-builder --mac dmg zip --universal"
-                },
-    "dependencies":  {
-                         "@anytimevibe/protocol":  "workspace:*",
-                         "electron-updater":  "6.6.2",
-                         "ws":  "^8.18.3",
-                         "zod":  "^3.25.76"
-                     },
-    "devDependencies":  {
-                            "@types/ws":  "^8.18.1",
-                            "electron":  "^36.5.0",
-                            "electron-builder":  "^26.0.12"
-                        },
-    "build":  {
-                  "appId":  "com.anytimevibe.agent",
-                  "productName":  "闅忕爜",
-                  "directories":  {
-                                      "output":  "release"
-                                  },
-                  "files":  [
-                                "dist/**/*",
-                                "assets/**/*",
-                                "package.json"
-                            ],
-                  "win":  {
-                              "target":  "nsis",
-                              "icon":  "assets/icon.ico",
-                              "artifactName":  "AnytimeVibe-Agent-Setup.${ext}",
-                              "signAndEditExecutable":  true,
-                              "signExecutable":  false
-                          },
-                  "mac":  {
-                              "target":  [
-                                             "dmg",
-                                             "zip"
-                                         ],
-                              "icon":  "assets/icon.png",
-                              "artifactName":  "AnytimeVibe-Agent.${ext}",
-                              "category":  "public.app-category.developer-tools"
-                          },
-                  "publish":  [
-                                  {
-                                      "provider":  "generic",
-                                      "url":  "https://updates.anytimevibe.invalid"
-                                  }
-                              ],
-                  "nsis":  {
-                               "oneClick":  false,
-                               "allowToChangeInstallationDirectory":  true,
-                               "shortcutName":  "闅忕爜",
-                               "uninstallDisplayName":  "闅忕爜",
-                               "installerIcon":  "assets/icon.ico",
-                               "uninstallerIcon":  "assets/icon.ico",
-                               "installerHeaderIcon":  "assets/icon.ico"
-                           }
-              }
+{
+  "name": "@anytimevibe/agent",
+  "version": "0.4.6",
+  "description": "随码桌面代理：在 Windows / macOS 上安全接力远程 Codex 任务",
+  "author": "随码",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "dev": "pnpm build && electron .",
+    "build": "tsup src/main.ts src/preload.ts --format cjs --platform node --external electron --sourcemap --clean",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "package:dir": "pnpm build && electron-builder --win --dir",
+    "package:win": "pnpm build && electron-builder --win nsis",
+    "package:mac": "pnpm build && electron-builder --mac dmg zip --universal"
+  },
+  "dependencies": {
+    "@anytimevibe/protocol": "workspace:*",
+    "electron-updater": "6.6.2",
+    "ws": "^8.18.3",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "electron": "^36.5.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.anytimevibe.agent",
+    "productName": "随码",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico",
+      "artifactName": "AnytimeVibe-Agent-Setup.${ext}",
+      "signAndEditExecutable": true,
+      "signExecutable": false
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "assets/icon.png",
+      "artifactName": "AnytimeVibe-Agent.${ext}",
+      "category": "public.app-category.developer-tools"
+    },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://updates.anytimevibe.invalid"
+      }
+    ],
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "随码",
+      "uninstallDisplayName": "随码",
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico"
+    }
+  }
 }
