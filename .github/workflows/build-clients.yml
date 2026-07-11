@@ -9,6 +9,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
@@ -27,11 +28,11 @@ jobs:
               apps/agent/release/latest-mac.yml
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
         with:
           version: 10.17.1
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm
@@ -45,6 +46,7 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.path }}
+          if-no-files-found: error
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -53,10 +55,33 @@ jobs:
     permissions:
       contents: write
     steps:
+      # gh release create needs a git checkout for repository context.
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
-          path: release
+          path: release-assets
           merge-multiple: true
-      - run: gh release create "$GITHUB_REF_NAME" release/* --generate-notes
+      - name: Publish GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mapfile -t assets < <(find release-assets -type f | sort)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "No release assets found under release-assets/"
+            exit 1
+          fi
+          echo "Publishing ${#assets[@]} asset(s) to ${GITHUB_REF_NAME}:"
+          printf ' - %s\n' "${assets[@]}"
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists; uploading assets..."
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            echo "Creating release ${GITHUB_REF_NAME}..."
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --generate-notes \
+              --title "随码 ${GITHUB_REF_NAME}" \
+              --latest
+          fi
