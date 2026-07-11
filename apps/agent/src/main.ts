@@ -254,8 +254,8 @@ function showWindow(): void {
 function createWindow(): void {
   const icon = nativeImage.createFromPath(productIconPath());
   windowRef = new BrowserWindow({
-    width: 440,
-    height: 560,
+    width: 460,
+    height: 640,
     minWidth: 400,
     minHeight: 480,
     resizable: true,
@@ -291,16 +291,16 @@ function rendererHtml(): string {
   })();
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>AnytimeVibe Agent</title><style>
   :root{font-family:"Bahnschrift","Aptos","Segoe UI",sans-serif;color:#17211b;background:#f2eadb}
-  *{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}
-  body{background:radial-gradient(circle at 92% 0,rgba(226,88,50,.16),transparent 34%),#f2eadb}
-  .shell{height:100%;padding:14px 14px 12px;display:flex;flex-direction:column;gap:8px;overflow:hidden}
-  .head{display:flex;align-items:center;gap:10px;flex:0 0 auto}
+  *{box-sizing:border-box}html,body{margin:0;min-height:100%}
+  body{overflow-x:hidden;overflow-y:auto;background:radial-gradient(circle at 92% 0,rgba(226,88,50,.16),transparent 34%),#f2eadb}
+  .shell{padding:14px 14px 16px;display:flex;flex-direction:column;gap:8px}
+  .head{display:flex;align-items:center;gap:10px}
   .mark{width:34px;height:34px;border-radius:10px;overflow:hidden;background:#17211b;flex:0 0 auto;box-shadow:0 6px 14px rgba(23,33,27,.16)}
   .mark img{width:100%;height:100%;display:block;object-fit:cover}
   .head h1{font:700 16px Rockwell,serif;margin:0;line-height:1.1}
   .head p{margin:2px 0 0;color:#6b726b;font-size:9px;letter-spacing:.12em}
-  .card{background:#fffaf0;border:1px solid rgba(23,33,27,.12);border-radius:12px;padding:10px 11px;box-shadow:0 8px 18px rgba(34,39,31,.05);flex:0 0 auto}
-  .card.grow{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+  .card{background:#fffaf0;border:1px solid rgba(23,33,27,.12);border-radius:12px;padding:10px 11px;box-shadow:0 8px 18px rgba(34,39,31,.05)}
+  .card.grow{display:flex;flex-direction:column}
   .status{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
   .status b{text-transform:uppercase;font-size:10px;letter-spacing:.1em}
   .dot{width:8px;height:8px;border-radius:50%;background:#999;flex:0 0 auto}
@@ -324,7 +324,7 @@ function rendererHtml(): string {
   .update-row{display:flex;align-items:center;gap:6px;margin-top:6px;min-width:0}
   .update-row .check{flex:1 1 auto;margin:0}
   .pair{font:900 28px/1 monospace;letter-spacing:.18em;text-align:center;color:#e25832;margin:8px 0 4px;padding-left:.18em}
-  .workspaces{display:grid;gap:5px;margin-top:7px;overflow:auto;min-height:0}
+  .workspaces{display:grid;gap:5px;margin-top:7px}
   .workspace{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px;background:#eee6d8;border-radius:8px;min-width:0}
   .workspace div{flex:1 1 auto;min-width:0;overflow:hidden}
   .workspace strong,.workspace small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -332,7 +332,7 @@ function rendererHtml(): string {
   .empty{text-align:center;color:#888;padding:8px;font-size:11px}
   .stack{display:grid;gap:6px;margin-top:6px}
   .label{font-size:10px;font-weight:800;color:#6b726b;letter-spacing:.04em}
-  pre.activity{margin:6px 0 0;max-height:88px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#17211b;color:#e8eee8;border-radius:8px;padding:8px;font:10px/1.45 Cascadia Code,monospace}
+  pre.activity{margin:6px 0 0;max-height:160px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#17211b;color:#e8eee8;border-radius:8px;padding:8px;font:10px/1.45 Cascadia Code,monospace}
   </style></head><body><main class="shell">
   <div class="head">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1>AnytimeVibe Agent</h1><p>${platformLabel} REMOTE BRIDGE</p></div></div>
   <section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
