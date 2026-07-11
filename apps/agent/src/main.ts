@@ -60,7 +60,7 @@ type AgentConfig = {
 
 type PublicState = {
   relayUrl: string;
-  status: "unconfigured" | "pairing" | "connecting" | "online" | "offline" | "incompatible";
+  status: "unconfigured" | "waiting_pairing" | "pairing" | "connecting" | "online" | "offline" | "incompatible";
   detail: string;
   pairingCode?: string | undefined;
   pairingExpiresAt?: number | undefined;
@@ -311,7 +311,7 @@ async function pollPairing(): Promise<void> {
   if (pairing.expiresAt <= Date.now()) {
     delete config.pairing;
     await saveConfig();
-    updateState({ status: "offline", detail: "配对码已过期，请重新生成。", pairingCode: undefined, pairingExpiresAt: undefined });
+    updateState({ status: "waiting_pairing", detail: "配对码已过期，请重新生成配对码。", pairingCode: undefined, pairingExpiresAt: undefined });
     return;
   }
   const response = await fetch(`${config.relayUrl}/api/agent/pairings/${pairing.id}?secret=${encodeURIComponent(pairing.secret)}`);
@@ -349,6 +349,7 @@ function wsUrl(relayUrl: string): string {
 async function connect(force = false): Promise<void> {
   if (!config.hostId || !config.encryptedAgentToken || !config.encryptedSyncKey) {
     if (config.pairing) schedulePairingPoll();
+    else updateState({ status: "waiting_pairing", detail: "等待配对连接，请生成配对码并在 Web 端完成授权。" });
     return;
   }
   if (!/^0\.144\./.test(codexVersion)) return;
@@ -396,6 +397,10 @@ async function connect(force = false): Promise<void> {
 
 function scheduleReconnect(detail: string): void {
   if (publicState.status === "incompatible") return;
+  if (!config.hostId || !config.encryptedAgentToken || !config.encryptedSyncKey) {
+    updateState({ status: "waiting_pairing", detail: "等待配对连接，请生成配对码并在 Web 端完成授权。" });
+    return;
+  }
   updateState({ status: "offline", detail });
   if (reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
@@ -659,7 +664,8 @@ function registerIpc(): void {
     if (!/^https?:\/\//.test(normalized)) throw new Error("中继地址必须以 http:// 或 https:// 开头");
     config.relayUrl = normalized;
     await saveConfig();
-    updateState({ relayUrl: normalized, status: config.hostId ? "offline" : "unconfigured", detail: config.hostId ? "中继地址已更新，请重新连接。" : "中继地址已保存，请生成配对码。" });
+    const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
+    updateState({ relayUrl: normalized, status: paired ? "offline" : "waiting_pairing", detail: paired ? "中继地址已更新，请重新连接。" : "中继地址已保存，正在等待配对连接。" });
     void checkForAgentUpdate().catch((error) => updateState({ update: { status: "error", message: error.message } }));
     return publicState;
   });
@@ -675,10 +681,11 @@ function registerIpc(): void {
   ipcMain.handle("agent:reconnect", async () => { await connect(true); return publicState; });
   ipcMain.handle("agent:check-environment", async () => {
     const environment = await detectEnvironment();
+    const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
     updateState({
       environment,
-      status: environment.codexCompatible ? (config.hostId ? "offline" : "unconfigured") : "incompatible",
-      detail: environment.codexCompatible ? "Codex 环境检测通过。" : "环境尚未就绪，请按提示完成安装。"
+      status: environment.codexCompatible ? (paired ? "offline" : config.relayUrl ? "waiting_pairing" : "unconfigured") : "incompatible",
+      detail: environment.codexCompatible ? (paired ? "Codex 环境检测通过。" : "Codex 环境已就绪，正在等待配对连接。") : "环境尚未就绪，请按提示完成安装。"
     });
     return publicState;
   });
@@ -705,7 +712,12 @@ app.whenReady().then(async () => {
   setInterval(() => void checkForAgentUpdate().catch(() => undefined), 6 * 60 * 60 * 1000).unref();
   try {
     await findCodex();
-    updateState({ codexVersion, detail: config.relayUrl ? "Codex 已就绪。" : "请先配置中继地址。" });
+    const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
+    updateState({
+      codexVersion,
+      status: !config.relayUrl ? "unconfigured" : config.pairing ? "pairing" : paired ? "offline" : "waiting_pairing",
+      detail: !config.relayUrl ? "请先配置中继地址。" : config.pairing ? "等待 Web 端确认配对。" : paired ? "Codex 已就绪，正在连接中继。" : "Codex 已就绪，等待配对连接。"
+    });
     if (config.pairing) schedulePairingPoll();
     if (config.hostId) await connect();
   } catch (error) {

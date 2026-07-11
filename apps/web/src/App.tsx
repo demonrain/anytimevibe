@@ -191,6 +191,14 @@ export function App() {
   const [accountOpen, setAccountOpen] = useState(false);
   const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
   const autoSyncedHostsRef = useRef(new Set<string>());
+  const conversationColumnRef = useRef<HTMLElement | null>(null);
+
+  function selectTask(threadId: string) {
+    setSelectedTaskId(threadId);
+    if (window.matchMedia("(max-width: 980px)").matches) {
+      window.requestAnimationFrame(() => conversationColumnRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    }
+  }
 
   useEffect(() => {
     api<Health>("/api/health").then(async (value) => {
@@ -418,7 +426,7 @@ export function App() {
         </div>
         <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? "主机在线，命令将立即执行" : activeRuntime.online === false ? "主机离线，仅可查看已同步记录" : "正在确认主机状态…"}</div>
         <div className="task-list">
-          {tasks.map((task) => <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => setSelectedTaskId(task.threadId)}>
+          {tasks.map((task) => <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>
             <div className="task-meta"><span>{task.status}</span><time>{new Date(task.updatedAt * 1000).toLocaleString()}</time></div>
             <h3>{task.title}</h3>
             <p>{task.messages.at(-1)?.text || task.cwd}</p>
@@ -428,7 +436,7 @@ export function App() {
         </div>
       </section>
 
-      <section className="conversation-column">
+      <section className="conversation-column" ref={conversationColumnRef}>
         {activeTask ? <TaskConversation task={activeTask} online={activeRuntime.online} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
       </section>
     </main>
