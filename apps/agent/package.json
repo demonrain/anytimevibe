@@ -1,13 +1,14 @@
 {
   "name": "@anytimevibe/agent",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "随码桌面代理：在 Windows / macOS 上安全接力远程 Codex 任务",
   "author": "随码",
   "private": true,
   "main": "dist/main.js",
   "scripts": {
     "dev": "pnpm build && electron .",
-    "build": "tsup src/main.ts src/preload.ts --format cjs --platform node --external electron --sourcemap --clean",
+    "build:protocol": "pnpm -C ../../packages/protocol run build",
+    "build": "pnpm run build:protocol && tsup",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "package:dir": "pnpm build && electron-builder --win --dir",
     "package:win": "pnpm build && electron-builder --win nsis",

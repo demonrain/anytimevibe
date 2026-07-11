@@ -37,6 +37,8 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Workspace packages are gitignored under dist/; build protocol before packaging the agent.
+      - run: pnpm --filter @anytimevibe/protocol build
       - if: startsWith(github.ref, 'refs/tags/v')
         run: node -e "const fs=require('fs');const file='apps/agent/package.json';const pkg=require('./'+file);pkg.version=process.env.RELEASE_VERSION.replace(/^v/,'');fs.writeFileSync(file,JSON.stringify(pkg,null,2)+'\n')"
         env:
