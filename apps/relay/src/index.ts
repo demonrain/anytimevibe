@@ -144,7 +144,7 @@ async function main(): Promise<void> {
     `;
     const payload = JSON.stringify({
       title: hint === "approval" ? "远程任务需要处理" : "远程任务已完成",
-      body: hint === "approval" ? "打开 AnytimeVibe 查看审批请求。" : "打开 AnytimeVibe 查看结果。",
+      body: hint === "approval" ? "打开随码查看审批请求。" : "打开随码查看结果。",
       url: "/"
     });
     await Promise.all(subscriptions.map(async (subscription) => {

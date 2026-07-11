@@ -1,7 +1,7 @@
 {
-  "name": "AnytimeVibe",
-  "short_name": "AnytimeVibe",
-  "description": "远程继续你的 Codex 任务",
+  "name": "随码",
+  "short_name": "随码",
+  "description": "随时续上你的代码 · 远程安全接力 Codex 任务",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#f2eadb",

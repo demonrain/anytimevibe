@@ -2,7 +2,7 @@ self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
 self.addEventListener("push", (event) => {
   const data = event.data ? event.data.json() : {};
-  event.waitUntil(self.registration.showNotification(data.title || "AnytimeVibe", {
+  event.waitUntil(self.registration.showNotification(data.title || "随码", {
     body: data.body || "远程任务状态已更新。",
     icon: "/icon-192.png",
     badge: "/icon-192.png",

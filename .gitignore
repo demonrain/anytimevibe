@@ -8,4 +8,5 @@ coverage/
 *.log
 *.tsbuildinfo
 apps/agent/release/
+apps/agent/release-*/
 apps/relay/data/

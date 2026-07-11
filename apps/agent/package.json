@@ -1,8 +1,8 @@
 {
   "name": "@anytimevibe/agent",
   "version": "0.4.5",
-  "description": "Windows and macOS bridge for encrypted remote Codex sessions",
-  "author": "AnytimeVibe",
+  "description": "随码桌面代理：在 Windows / macOS 上安全接力远程 Codex 任务",
+  "author": "随码",
   "private": true,
   "main": "dist/main.js",
   "scripts": {
@@ -26,7 +26,7 @@
   },
   "build": {
     "appId": "com.anytimevibe.agent",
-    "productName": "AnytimeVibe Agent",
+    "productName": "随码",
     "directories": {
       "output": "release"
     },

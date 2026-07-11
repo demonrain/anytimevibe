@@ -1,6 +1,8 @@
-# AnytimeVibe
+# 随码（AnytimeVibe）
 
-AnytimeVibe 是一个多用户远程 Codex 工作台。移动端 PWA 通过 VPS 中继连接 Windows 或 macOS 托盘代理，支持任务下发、处理状态、完成通知、历史同步、停止或追加指令以及远程审批。
+**离开电脑，任务不用停。** · **随时续上你的代码。**
+
+随码是一个多用户远程 Codex 工作台。移动端 PWA 通过 VPS 中继连接 Windows 或 macOS 托盘代理，支持任务下发、处理状态、完成通知、历史同步、停止或追加指令以及远程审批。
 
 中继只保存和转发端到端加密信封。Codex 登录信息、项目源码和同步密钥不会作为明文上传。
 
@@ -8,6 +10,7 @@ AnytimeVibe 是一个多用户远程 Codex 工作台。移动端 PWA 通过 VPS 
 
 - [产品文档](docs/PRODUCT.md)
 - [使用手册](docs/USER_GUIDE.md)
+- [品牌与 Slogan](docs/BRANDING.md)
 - [多用户容量评估](docs/CAPACITY.md)
 - [服务端更新源配置说明](docs/UPDATE_FEED.md)
 
@@ -41,13 +44,15 @@ docker compose up -d --build
 
 客户端自动更新相关变量（`UPDATE_FEED_URL`、`WINDOWS_CLIENT_URL`、`MAC_CLIENT_URL`）参见[更新源配置说明](docs/UPDATE_FEED.md)。
 
-## 桌面客户端
+## 桌面客户端（随码）
 
 默认中继地址：`https://vibe.demonrain.top`（可在控制面板修改）。
 
 ```text
 apps/agent/release/AnytimeVibe-Agent-Setup.exe
 ```
+
+安装后程序显示为 **随码**。安装包文件名仍使用工程标识 `AnytimeVibe-Agent-Setup.exe`，便于更新源与 GitHub Release 兼容。
 
 macOS 客户端需要在 macOS 或 GitHub Actions 的 `macos-latest` 环境构建：
 

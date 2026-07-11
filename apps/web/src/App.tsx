@@ -175,16 +175,16 @@ function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticat
 
   return <main className="auth-shell">
     <section className="auth-story">
-      <p className="eyebrow">YOUR CODE, STILL MOVING</p>
+      <p className="eyebrow">随码 · 随时续码</p>
       <h1>离开电脑，<br />任务不用停。</h1>
-      <p>连接自己的 Windows 或 macOS 主机，继续 Codex 对话、处理审批、查看代码 Diff。云端只负责转发密文。</p>
-      <div className="signal-line"><span />端到端加密连接</div>
+      <p>连接自己的 Windows 或 macOS 主机，继续 Codex 对话、处理审批、查看代码 Diff。云端只负责转发密文，源码与密钥留在本机。</p>
+      <div className="signal-line"><span />端到端加密 · 本机执行</div>
       <ClientDownloads downloads={health.clientDownloads} />
     </section>
     <form className="auth-card" onSubmit={submit}>
       <div className="mark" aria-hidden="true"><img src="/icon.svg" alt="" /></div>
-      <h2>{health.needsSetup ? "初始化服务" : registering ? "创建个人空间" : "进入 AnytimeVibe"}</h2>
-      <p>{health.needsSetup ? "创建首个管理员账号。" : registering ? "注册后即可配对自己的电脑，数据与其他用户隔离。" : "使用你的个人账号继续远程任务。"}</p>
+      <h2>{health.needsSetup ? "初始化服务" : registering ? "创建个人空间" : "进入随码"}</h2>
+      <p>{health.needsSetup ? "创建首个管理员账号，开启你的随码服务。" : registering ? "注册后即可配对自己的电脑，数据与其他用户隔离。" : "登录后随时接住本机 Codex 任务。"}</p>
       {health.needsSetup && <label>设置令牌<input value={setupToken} onChange={(event) => setSetupToken(event.target.value)} required /></label>}
       <label>用户名<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
       <label>密码<input type="password" autoComplete={health.needsSetup || registering ? "new-password" : "current-password"} minLength={health.needsSetup || registering ? 10 : undefined} value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
@@ -419,7 +419,7 @@ export function App() {
     }
   }
 
-  if (!health) return <main className="loading-screen"><div className="pulse" /><p>正在建立安全工作区…</p>{error && <ErrorBanner message={error} clear={() => setError("")} />}</main>;
+  if (!health) return <main className="loading-screen"><div className="pulse" /><p>正在进入随码安全工作区…</p>{error && <ErrorBanner message={error} clear={() => setError("")} />}</main>;
   if (!user) return <AuthScreen health={health} onAuthenticated={setUser} />;
 
   const activeHost = hosts.find((host) => host.id === selectedHostId) ?? null;
@@ -430,7 +430,7 @@ export function App() {
   return <div className="app-shell">
     {error && <ErrorBanner message={error} clear={() => setError("")} />}
     <header className="topbar">
-      <div className="brand"><span className="brand-mark" aria-hidden="true"><img src="/icon.svg" alt="" /></span><div><strong>AnytimeVibe</strong><small>REMOTE CODE DESK</small></div></div>
+      <div className="brand"><span className="brand-mark" aria-hidden="true"><img src="/icon.svg" alt="" /></span><div><strong>随码</strong><small>随时续上你的代码</small></div></div>
       <div className="top-actions">
         <ClientDownloads downloads={health.clientDownloads} />
         <button className="quiet" onClick={() => subscribePush(health.vapidPublicKey).catch((pushError) => setError(pushError.message))}>开启通知</button>
@@ -651,7 +651,7 @@ function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): voi
 
   return <div className="modal-backdrop"><section className="modal">
     <button className="modal-close" onClick={onClose}>×</button><p className="eyebrow">PAIR A HOST</p><h2>连接电脑代理</h2>
-    {!info ? <><p>在电脑端 AnytimeVibe 托盘窗口生成六位配对码。</p><input className="pair-code" inputMode="numeric" maxLength={6} value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ""))} placeholder="000000" /><button className="primary" disabled={code.length !== 6 || loading} onClick={inspect}>{loading ? "查询中…" : "检查配对码"}</button></> : <div className="pair-preview"><span className="computer-icon">▣</span><h3>{info.agentName}</h3><p>{info.platform} · {info.codexVersion}</p><button className="primary" disabled={loading} onClick={claim}>{loading ? "正在交换密钥…" : "确认并连接"}</button></div>}
+    {!info ? <><p>在电脑端打开随码托盘窗口，点击「生成配对码」。</p><input className="pair-code" inputMode="numeric" maxLength={6} value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ""))} placeholder="000000" /><button className="primary" disabled={code.length !== 6 || loading} onClick={inspect}>{loading ? "查询中…" : "检查配对码"}</button></> : <div className="pair-preview"><span className="computer-icon">▣</span><h3>{info.agentName}</h3><p>{info.platform} · {info.codexVersion}</p><button className="primary" disabled={loading} onClick={claim}>{loading ? "正在交换密钥…" : "确认并连接"}</button></div>}
     {error && <p className="form-error">{error}</p>}
   </section></div>;
 }

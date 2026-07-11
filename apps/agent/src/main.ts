@@ -261,7 +261,7 @@ function createWindow(): void {
     resizable: true,
     maximizable: false,
     backgroundColor: "#f2eadb",
-    title: "AnytimeVibe Agent",
+    title: "随码",
     autoHideMenuBar: true,
     ...(icon.isEmpty() ? {} : { icon }),
     webPreferences: {
@@ -289,7 +289,7 @@ function rendererHtml(): string {
       return "";
     }
   })();
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>AnytimeVibe Agent</title><style>
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>随码</title><style>
   :root{font-family:"Bahnschrift","Aptos","Segoe UI",sans-serif;color:#17211b;background:#f2eadb}
   *{box-sizing:border-box}html,body{margin:0;min-height:100%}
   body{overflow-x:hidden;overflow-y:auto;background:radial-gradient(circle at 92% 0,rgba(226,88,50,.16),transparent 34%),#f2eadb}
@@ -334,7 +334,7 @@ function rendererHtml(): string {
   .label{font-size:10px;font-weight:800;color:#6b726b;letter-spacing:.04em}
   pre.activity{margin:6px 0 0;max-height:160px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#17211b;color:#e8eee8;border-radius:8px;padding:8px;font:10px/1.45 Cascadia Code,monospace}
   </style></head><body><main class="shell">
-  <div class="head">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1>AnytimeVibe Agent</h1><p>${platformLabel} REMOTE BRIDGE</p></div></div>
+  <div class="head">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1>随码</h1><p>随时续上你的代码 · ${platformLabel}</p></div></div>
   <section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
   <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="environmentActions" class="row wrap" style="margin-top:6px"></div><div id="updateBox" class="update-row"></div></section>
   <section class="card"><h2>中继与配对</h2><div class="stack"><div class="label">中继服务器</div><div class="row"><input id="relay" placeholder="https://vibe.demonrain.top"><button id="startPair" class="secondary">生成配对码</button><button id="saveRelay">保存</button></div><div id="pairBox"></div><div class="label">客户端名称</div><div class="row"><input id="displayName" placeholder="例如：公司电脑" maxlength="64"><button id="saveName" class="secondary">保存名称</button></div></div></section>
