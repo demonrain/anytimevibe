@@ -182,7 +182,7 @@ export function App() {
   const [runtime, setRuntime] = useState<Record<string, HostRuntime>>({});
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-  const [mobilePane, setMobilePane] = useState<"tasks" | "conversation">("tasks");
+  const [mobilePane, setMobilePane] = useState<"hosts" | "tasks" | "conversation">("hosts");
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const hostOfflineTimersRef = useRef(new Map<string, number>());
@@ -356,7 +356,7 @@ export function App() {
     });
     setSelectedHostId((current) => current === host.id ? hosts.find((item) => item.id !== host.id)?.id ?? null : current);
     setSelectedTaskId(null);
-    setMobilePane("tasks");
+    setMobilePane("hosts");
   }
 
   async function syncHostTasks(hostId: string) {
@@ -415,6 +415,7 @@ export function App() {
 
     <main className={`workspace mobile-${mobilePane}`}>
       <section className="task-column">
+        <button className="mobile-level-back" type="button" onClick={() => setMobilePane("hosts")}>‹ 客户端</button>
         <div className="section-title">
           <div><p className="eyebrow">TASK STREAM</p><h1>{activeHost?.name ?? "尚未连接主机"}</h1></div>
           <div className="section-actions">
@@ -435,7 +436,7 @@ export function App() {
       </section>
 
       <section className="conversation-column">
-        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} onBack={() => setMobilePane("tasks")} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
+        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} onBack={() => setMobilePane("tasks")} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
       </section>
     </main>
 
@@ -447,7 +448,7 @@ export function App() {
   </div>;
 }
 
-function TaskConversation({ task, online, onBack, onCommand }: { task: Task; online: boolean | null; onBack(): void; onCommand(command: ClientCommand): void }) {
+function TaskConversation({ task, online, visible, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; onBack(): void; onCommand(command: ClientCommand): void }) {
   const [prompt, setPrompt] = useState("");
   const [pendingPrompt, setPendingPrompt] = useState("");
   const [pendingMessageCount, setPendingMessageCount] = useState(0);
@@ -500,14 +501,15 @@ function TaskConversation({ task, online, onBack, onCommand }: { task: Task; onl
     if (!stream || tab !== "chat") return;
     const changedThread = previousThreadRef.current !== task.threadId;
     previousThreadRef.current = task.threadId;
-    if (changedThread || stickToBottomRef.current) {
+    if (changedThread || visible || stickToBottomRef.current) {
       const frame = window.requestAnimationFrame(() => {
-        messageEndRef.current?.scrollIntoView({ block: "end" });
-        stream.scrollTop = stream.scrollHeight;
+        window.requestAnimationFrame(() => {
+          stream.scrollTop = stream.scrollHeight;
+        });
       });
       return () => window.cancelAnimationFrame(frame);
     }
-  }, [task.threadId, task.messages.length, lastMessageLength, task.approvals.length, pendingPrompt, tab]);
+  }, [task.threadId, task.messages.length, lastMessageLength, task.approvals.length, pendingPrompt, tab, visible]);
 
   return <>
     <div className="conversation-head">

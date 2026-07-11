@@ -69,7 +69,16 @@ type PublicState = {
   workspaces: Workspace[];
   environment: EnvironmentState;
   update: UpdateState;
+  tasks: AgentTask[];
   activity?: ActivityState;
+};
+
+type AgentTask = {
+  threadId: string;
+  title: string;
+  cwd: string;
+  status: string;
+  updatedAt: number;
 };
 
 type ActivityState = {
@@ -103,7 +112,7 @@ let configPath = "";
 let codexCommand = "codex.cmd";
 let codexVersion = "unknown";
 const initialEnvironment: EnvironmentState = { platform: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "other", nodeInstalled: false, codexInstalled: false, codexCompatible: false };
-let publicState: PublicState = { relayUrl: "", status: "unconfigured", detail: "请先配置中继地址。", codexVersion, workspaces: [], environment: initialEnvironment, update: { status: "idle" } };
+let publicState: PublicState = { relayUrl: "", status: "unconfigured", detail: "请先配置中继地址。", codexVersion, workspaces: [], environment: initialEnvironment, update: { status: "idle" }, tasks: [] };
 let socket: WebSocket | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let pairingTimer: NodeJS.Timeout | null = null;
@@ -248,12 +257,13 @@ function createWindow(): void {
 function rendererHtml(): string {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>AnytimeVibe Agent</title><style>
   :root{font-family:"Bahnschrift","Aptos",sans-serif;color:#17211b;background:#f2eadb}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 90% 0,rgba(226,88,50,.18),transparent 31%),#f2eadb}.shell{padding:30px}.head{display:flex;align-items:center;gap:13px;margin-bottom:28px}.mark{width:48px;height:48px;display:grid;place-items:center;background:#e25832;color:white;font-weight:900;border-radius:15px 15px 4px 15px}.head h1{font:700 24px Rockwell,serif;margin:0}.head p{margin:3px 0 0;color:#6b726b;font-size:11px;letter-spacing:.1em}.card{background:#fffaf0;border:1px solid rgba(23,33,27,.15);border-radius:20px;padding:21px;margin-bottom:15px;box-shadow:0 14px 35px rgba(34,39,31,.07)}.status{display:flex;align-items:center;justify-content:space-between}.status b{text-transform:uppercase;font-size:11px;letter-spacing:.12em}.dot{width:10px;height:10px;border-radius:50%;background:#999}.dot.online,.check.ok:before{background:#3bab70;box-shadow:0 0 0 6px rgba(59,171,112,.13)}.detail{color:#6b726b;font-size:13px;line-height:1.5}.pair{font:900 47px/1 monospace;letter-spacing:.2em;text-align:center;padding-left:.2em;color:#e25832;margin:18px 0}.row{display:flex;gap:9px;flex-wrap:wrap}input{flex:1;border:1px solid rgba(23,33,27,.17);border-radius:10px;padding:12px;background:white}button{border:0;border-radius:10px;padding:11px 14px;background:#17211b;color:white;font-weight:800;cursor:pointer}button.secondary{background:#e7ddcd;color:#17211b}.checks{display:grid;gap:10px;margin:12px 0}.check{display:flex;align-items:center;gap:10px;padding:10px 12px;background:#eee6d8;border-radius:10px}.check:before{content:"";width:9px;height:9px;border-radius:50%;background:#d35a3b}.check span{margin-left:auto;color:#687068;font:11px "Cascadia Code",monospace}.workspaces{display:grid;gap:8px}.workspace{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;background:#eee6d8;border-radius:10px}.workspace div{min-width:0}.workspace strong,.workspace small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.workspace small{color:#747a73;margin-top:3px}.workspace button{padding:5px 8px;background:transparent;color:#a43b25}.meta{font:11px/1.6 "Cascadia Code",monospace;color:#687068}.empty{text-align:center;color:#777;padding:14px}h2{font:700 17px Rockwell,serif;margin:0 0 13px}</style></head><body><main class="shell"><div class="head"><div class="mark">AV</div><div><h1>AnytimeVibe Agent</h1><p>${process.platform === "darwin" ? "MACOS" : "WINDOWS"} REMOTE BRIDGE</p></div></div><section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section><section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="environmentActions" class="row"></div></section><section class="card"><h2>中继服务器</h2><div class="row"><input id="relay" placeholder="https://vibe.example.com"><button id="saveRelay">保存</button></div><div id="pairBox"></div></section><section class="card"><div class="status"><h2>允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><div id="workspaces" class="workspaces"></div></section></main><script>
-  const api=window.anytimeVibe;const status=document.querySelector('#status');const dot=document.querySelector('#dot');const detail=document.querySelector('#detail');const relay=document.querySelector('#relay');const pairBox=document.querySelector('#pairBox');const workspaces=document.querySelector('#workspaces');const meta=document.querySelector('#meta');const environment=document.querySelector('#environment');const environmentActions=document.querySelector('#environmentActions');const updateBox=document.createElement('div');environmentActions.after(updateBox);const activityBox=document.createElement('section');activityBox.className='card';meta.closest('.card').after(activityBox);
+  const api=window.anytimeVibe;const status=document.querySelector('#status');const dot=document.querySelector('#dot');const detail=document.querySelector('#detail');const relay=document.querySelector('#relay');const pairBox=document.querySelector('#pairBox');const workspaces=document.querySelector('#workspaces');const meta=document.querySelector('#meta');const environment=document.querySelector('#environment');const environmentActions=document.querySelector('#environmentActions');const updateBox=document.createElement('div');environmentActions.after(updateBox);const activityBox=document.createElement('section');activityBox.className='card';meta.closest('.card').after(activityBox);const taskBox=document.createElement('section');taskBox.className='card';activityBox.after(taskBox);let tasksOpen=false;
   function render(state){status.textContent=state.status;dot.className='dot '+(state.status==='online'?'online':'');detail.textContent=state.detail;relay.value=state.relayUrl||'';meta.textContent='Codex '+state.codexVersion+(state.hostId?' · Host '+state.hostId:'');const env=state.environment;environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+(env.nodeVersion||'未安装')+'</span></div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span></div>';environmentActions.innerHTML=(!env.nodeInstalled?'<button data-install="node">安装 Node.js</button>':'')+(env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex">一键安装兼容版 Codex</button>':'');environmentActions.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>api.installEnvironment(button.dataset.install)));pairBox.innerHTML=state.pairingCode?'<div class="pair">'+state.pairingCode+'</div><p class="detail">在移动端输入配对码。配对码约十分钟后失效。</p>':'<button id="startPair" '+(!env.codexCompatible?'disabled':'')+'>生成配对码</button>';document.querySelector('#startPair')?.addEventListener('click',()=>api.startPairing());workspaces.innerHTML=state.workspaces.length?state.workspaces.map(w=>'<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button data-id="'+w.id+'">移除</button></div>').join(''):'<div class="empty">尚未允许任何目录</div>';workspaces.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>api.removeWorkspace(button.dataset.id)));}
   function escapeHtml(value){return value.replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));}
   function renderUpdate(update){const labels={idle:'自动更新',checking:'正在检查更新',available:'发现新版本',downloading:'后台下载更新',ready:'更新已就绪',error:'更新检查失败'};updateBox.innerHTML='<div class="check '+(update.status==='ready'?'ok':'')+'"><b>'+labels[update.status]+'</b><span>'+(update.version||update.message||(update.progress!==undefined?update.progress+'%':''))+'</span></div><div class="row"><button id="checkUpdate" class="secondary">检查更新</button>'+(update.status==='ready'?'<button id="installUpdate">重启并更新</button>':'')+'</div>';document.querySelector('#checkUpdate')?.addEventListener('click',()=>api.checkUpdate());document.querySelector('#installUpdate')?.addEventListener('click',()=>api.installUpdate());}
   function renderActivity(activity){if(!activity){activityBox.style.display='none';return}activityBox.style.display='block';const labels={processing:'处理中',completed:'已完成',failed:'失败',interrupted:'已停止'};activityBox.innerHTML='<div class="status"><h2>当前远程任务</h2><b>'+labels[activity.status]+'</b></div><p class="detail"><strong>'+escapeHtml(activity.title)+'</strong><br>'+escapeHtml(activity.prompt)+'</p><pre style="max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#17211b;color:#e8eee8;border-radius:12px;padding:14px;font:12px/1.55 Cascadia Code,monospace">'+escapeHtml(activity.output||'等待 Codex 输出…')+'</pre>';const output=activityBox.querySelector('pre');output.scrollTop=output.scrollHeight;}
-  document.querySelector('#saveRelay').addEventListener('click',()=>api.setRelayUrl(relay.value));document.querySelector('#addWorkspace').addEventListener('click',()=>api.addWorkspace());document.querySelector('#recheck').addEventListener('click',()=>api.checkEnvironment());api.onState(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity)});api.getState().then(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity)});
+  function renderTasks(tasks){taskBox.innerHTML='<div class="status"><h2>任务</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?'收起':'任务菜单')+' · '+tasks.length+'</button></div>'+(tasksOpen?(tasks.length?'<div style="display:grid;gap:8px">'+tasks.map(task=>'<div class="workspace"><div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div><button data-relay="'+escapeHtml(task.threadId)+'">接力</button></div>').join('')+'</div>':'<div class="empty">暂无可接力任务</div>'):'');document.querySelector('#toggleTasks')?.addEventListener('click',()=>{tasksOpen=!tasksOpen;renderTasks(tasks)});taskBox.querySelectorAll('[data-relay]').forEach(button=>button.addEventListener('click',()=>api.relayTask(button.dataset.relay)));}
+  document.querySelector('#saveRelay').addEventListener('click',()=>api.setRelayUrl(relay.value));document.querySelector('#addWorkspace').addEventListener('click',()=>api.addWorkspace());document.querySelector('#recheck').addEventListener('click',()=>api.checkEnvironment());api.onState(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});api.getState().then(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});
   </script></body></html>`;
 }
 
@@ -681,6 +691,8 @@ async function publishHostStatus(): Promise<void> {
 async function publishThread(threadId: string): Promise<void> {
   const result = await codex!.request("thread/read", { threadId, includeTurns: true });
   const snapshot = threadToSnapshot(result.thread);
+  const task: AgentTask = { threadId: snapshot.threadId, title: snapshot.title, cwd: snapshot.cwd, status: snapshot.status, updatedAt: snapshot.updatedAt };
+  updateState({ tasks: [task, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)].sort((left, right) => right.updatedAt - left.updatedAt).slice(0, 100) });
   await publish({ type: "thread.snapshot", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), ...snapshot }, true);
 }
 
@@ -692,6 +704,33 @@ async function syncAllThreads(): Promise<number> {
     try { await publishThread(thread.id); } catch (error) { handleError(error); }
   }
   return threads.length;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+async function relayTaskToCli(threadId: string): Promise<void> {
+  const task = publicState.tasks.find((item) => item.threadId === threadId);
+  if (!task) throw new Error("任务不存在，请先同步任务列表。");
+  if (process.platform === "win32") {
+    const child = spawn(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(codexCommand, ["resume", threadId]), {
+      cwd: task.cwd || undefined,
+      detached: true,
+      windowsHide: false,
+      windowsVerbatimArguments: true,
+      stdio: "ignore"
+    });
+    child.unref();
+    return;
+  }
+  if (process.platform === "darwin") {
+    const command = `cd ${shellQuote(task.cwd || os.homedir())} && ${shellQuote(codexCommand)} resume ${shellQuote(threadId)}`;
+    await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`]);
+    await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+    return;
+  }
+  throw new Error("当前系统暂不支持启动接力终端。");
 }
 
 async function publish(event: AgentEvent, persist: boolean, hint?: "approval" | "completed"): Promise<void> {
@@ -802,6 +841,10 @@ function registerIpc(): void {
   });
   ipcMain.handle("agent:check-update", async () => { await checkForAgentUpdate(); return publicState; });
   ipcMain.handle("agent:install-update", () => autoUpdater.quitAndInstall(false, true));
+  ipcMain.handle("agent:relay-task", async (_event, threadId: string) => {
+    await relayTaskToCli(threadId);
+    return publicState;
+  });
 }
 
 app.whenReady().then(async () => {

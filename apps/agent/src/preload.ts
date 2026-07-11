@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld("anytimeVibe", {
   installEnvironment: (target: "node" | "codex") => ipcRenderer.invoke("agent:install-environment", target),
   checkUpdate: () => ipcRenderer.invoke("agent:check-update"),
   installUpdate: () => ipcRenderer.invoke("agent:install-update"),
+  relayTask: (threadId: string) => ipcRenderer.invoke("agent:relay-task", threadId),
   onState: (listener: (state: unknown) => void) => {
     const wrapped = (_event: unknown, state: unknown) => listener(state);
     ipcRenderer.on("agent:state", wrapped);
