@@ -32,8 +32,7 @@ electron-updater 访问 updateFeedUrl
 ```dotenv
 # 客户端安装包下载入口（Web 登录页展示）
 WINDOWS_CLIENT_URL=https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent-Setup.exe
-# 暂无 macOS 包时留空，Web 显示「敬请期待」
-MAC_CLIENT_URL=
+MAC_CLIENT_URL=https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent.dmg
 
 # Agent 自动更新源（目录 URL，不要指向具体 .exe）
 UPDATE_FEED_URL=https://github.com/demonrain/anytimevibe/releases/latest/download
