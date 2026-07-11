@@ -21,7 +21,7 @@ import { api, websocketUrl } from "./api";
 import { getHostKey, removeHostKey, saveHostKey } from "./key-store";
 
 type Health = { ok: boolean; needsSetup: boolean; registrationEnabled: boolean; vapidPublicKey: string | null; clientDownloads: { windows: string | null; mac: string | null } };
-type User = { id: string; username: string };
+type User = { id: string; username: string; isAdmin?: boolean };
 type Host = {
   id: string;
   name: string;
@@ -445,7 +445,8 @@ export function App() {
         <div className="account-menu">
           <button className="avatar" title={user.username} aria-expanded={accountOpen} onClick={() => setAccountOpen((open) => !open)}>{user.username.slice(0, 1).toUpperCase()}</button>
           {accountOpen && <div className="account-popover">
-            <div><strong>{user.username}</strong><small>个人空间</small></div>
+            <div><strong>{user.username}</strong><small>{user.isAdmin ? "管理员" : "个人空间"}</small></div>
+            {user.isAdmin && <a className="account-link" href="/admin">管理后台</a>}
             <button onClick={() => logout().catch((logoutError) => setError(logoutError.message))}>退出登录</button>
           </div>}
         </div>

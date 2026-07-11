@@ -20,6 +20,9 @@ export async function ensureSchema(sql: Database): Promise<void> {
       created_at timestamptz NOT NULL DEFAULT now()
     );
     CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users(lower(username));
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin boolean NOT NULL DEFAULT false;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_at timestamptz;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS note text;
 
     CREATE TABLE IF NOT EXISTS sessions (
       id uuid PRIMARY KEY,
@@ -90,5 +93,28 @@ export async function ensureSchema(sql: Database): Promise<void> {
       created_at timestamptz NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS push_subscriptions_user_id_idx ON push_subscriptions(user_id);
+
+    CREATE TABLE IF NOT EXISTS admin_audit_logs (
+      id uuid PRIMARY KEY,
+      admin_id uuid REFERENCES users(id) ON DELETE SET NULL,
+      action text NOT NULL,
+      target_type text,
+      target_id text,
+      detail jsonb,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS admin_audit_logs_created_at_idx ON admin_audit_logs(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS service_settings (
+      key text PRIMARY KEY,
+      value jsonb NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      updated_by uuid REFERENCES users(id) ON DELETE SET NULL
+    );
+
+    -- Bootstrap: first existing user becomes admin if none are marked yet.
+    UPDATE users SET is_admin = true
+    WHERE id = (SELECT id FROM users ORDER BY created_at ASC LIMIT 1)
+      AND NOT EXISTS (SELECT 1 FROM users WHERE is_admin = true);
   `);
 }

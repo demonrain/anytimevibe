@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import webPush from "web-push";
 import { z } from "zod";
 import { encryptedEnvelopeSchema, type EncryptedEnvelope } from "@anytimevibe/protocol";
+import { registerAdminRoutes, resolveRegistrationPolicy } from "./admin.js";
 import { loadConfig } from "./config.js";
 import { createDatabase, ensureSchema, type Database } from "./db.js";
 import { hashPassword, hashToken, openSecret, randomToken, safeEqual, sealSecret, verifyPassword } from "./security.js";
@@ -13,7 +14,7 @@ import { hashPassword, hashToken, openSecret, randomToken, safeEqual, sealSecret
 const SESSION_COOKIE = "av_session";
 const SESSION_DAYS = 30;
 
-type User = { id: string; username: string };
+type User = { id: string; username: string; isAdmin: boolean };
 
 type SocketLike = {
   readyState: number;
@@ -78,15 +79,17 @@ function setSessionCookie(reply: FastifyReply, token: string, secure: boolean): 
 async function userFromRequest(sql: Database, request: FastifyRequest): Promise<User | null> {
   const token = request.cookies[SESSION_COOKIE];
   if (!token) return null;
-  const rows = await sql<User[]>`
-    SELECT users.id, users.username
+  const rows = await sql<Array<{ id: string; username: string; isAdmin: boolean; disabledAt: string | null }>>`
+    SELECT users.id, users.username, users.is_admin, users.disabled_at
     FROM sessions
     JOIN users ON users.id = sessions.user_id
     WHERE sessions.token_hash = ${hashToken(token)}
       AND sessions.expires_at > now()
     LIMIT 1
   `;
-  return rows[0] ?? null;
+  const user = rows[0];
+  if (!user || user.disabledAt) return null;
+  return { id: user.id, username: user.username, isAdmin: user.isAdmin };
 }
 
 async function requireUser(
@@ -167,10 +170,11 @@ async function main(): Promise<void> {
   app.get("/api/health", async () => {
     const rows = await sql<Array<{ count: number }>>`SELECT count(*)::int AS count FROM users`;
     const count = rows[0]?.count ?? 0;
+    const policy = await resolveRegistrationPolicy(sql, config.REGISTRATION_ENABLED, config.MAX_USERS);
     return {
       ok: true,
       needsSetup: count === 0,
-      registrationEnabled: config.REGISTRATION_ENABLED && count < config.MAX_USERS,
+      registrationEnabled: policy.registrationEnabled && count < policy.maxUsers,
       clientDownloads: {
         windows: config.WINDOWS_CLIENT_URL ?? null,
         mac: config.MAC_CLIENT_URL ?? null
@@ -190,43 +194,45 @@ async function main(): Promise<void> {
 
     const userId = randomUUID();
     const passwordHash = await hashPassword(body.password);
-    await sql`INSERT INTO users (id, username, password_hash) VALUES (${userId}, ${body.username}, ${passwordHash})`;
+    await sql`INSERT INTO users (id, username, password_hash, is_admin) VALUES (${userId}, ${body.username}, ${passwordHash}, true)`;
     const token = randomToken();
     await sql`
       INSERT INTO sessions (id, user_id, token_hash, expires_at)
       VALUES (${randomUUID()}, ${userId}, ${hashToken(token)}, now() + ${`${SESSION_DAYS} days`}::interval)
     `;
     setSessionCookie(reply, token, config.NODE_ENV === "production");
-    return { user: { id: userId, username: body.username } };
+    return { user: { id: userId, username: body.username, isAdmin: true } };
   });
 
   app.post("/api/auth/login", { config: { rateLimit: { max: 8, timeWindow: "15 minutes" } } }, async (request, reply) => {
     const body = loginBody.parse(request.body);
-    const rows = await sql<Array<{ id: string; username: string; passwordHash: string }>>`
-      SELECT id, username, password_hash FROM users WHERE lower(username) = lower(${body.username}) LIMIT 1
+    const rows = await sql<Array<{ id: string; username: string; passwordHash: string; isAdmin: boolean; disabledAt: string | null }>>`
+      SELECT id, username, password_hash, is_admin, disabled_at FROM users WHERE lower(username) = lower(${body.username}) LIMIT 1
     `;
     const user = rows[0];
     if (!user || !(await verifyPassword(user.passwordHash, body.password))) {
       return reply.code(401).send({ error: "invalid_credentials" });
     }
+    if (user.disabledAt) return reply.code(403).send({ error: "account_disabled" });
     const token = randomToken();
     await sql`
       INSERT INTO sessions (id, user_id, token_hash, expires_at)
       VALUES (${randomUUID()}, ${user.id}, ${hashToken(token)}, now() + ${`${SESSION_DAYS} days`}::interval)
     `;
     setSessionCookie(reply, token, config.NODE_ENV === "production");
-    return { user: { id: user.id, username: user.username } };
+    return { user: { id: user.id, username: user.username, isAdmin: user.isAdmin } };
   });
 
   app.post("/api/auth/register", { config: { rateLimit: { max: 5, timeWindow: "1 hour" } } }, async (request, reply) => {
-    if (!config.REGISTRATION_ENABLED) return reply.code(403).send({ error: "registration_disabled" });
+    const policy = await resolveRegistrationPolicy(sql, config.REGISTRATION_ENABLED, config.MAX_USERS);
+    if (!policy.registrationEnabled) return reply.code(403).send({ error: "registration_disabled" });
     const body = registerBody.parse(request.body);
     const countRows = await sql<Array<{ count: number }>>`SELECT count(*)::int AS count FROM users`;
-    if ((countRows[0]?.count ?? 0) >= config.MAX_USERS) return reply.code(403).send({ error: "user_limit_reached" });
+    if ((countRows[0]?.count ?? 0) >= policy.maxUsers) return reply.code(403).send({ error: "user_limit_reached" });
     const userId = randomUUID();
     const passwordHash = await hashPassword(body.password);
     try {
-      await sql`INSERT INTO users (id, username, password_hash) VALUES (${userId}, ${body.username}, ${passwordHash})`;
+      await sql`INSERT INTO users (id, username, password_hash, is_admin) VALUES (${userId}, ${body.username}, ${passwordHash}, false)`;
     } catch (error) {
       if ((error as { code?: string }).code === "23505") return reply.code(409).send({ error: "username_taken" });
       throw error;
@@ -237,7 +243,7 @@ async function main(): Promise<void> {
       VALUES (${randomUUID()}, ${userId}, ${hashToken(token)}, now() + ${`${SESSION_DAYS} days`}::interval)
     `;
     setSessionCookie(reply, token, config.NODE_ENV === "production");
-    return reply.code(201).send({ user: { id: userId, username: body.username } });
+    return reply.code(201).send({ user: { id: userId, username: body.username, isAdmin: false } });
   });
 
   app.post("/api/auth/logout", async (request, reply) => {
@@ -252,6 +258,19 @@ async function main(): Promise<void> {
     if (!user) return;
     return { user };
   });
+
+  registerAdminRoutes(app, {
+    sql,
+    agentSockets,
+    clientSockets,
+    envRegistrationEnabled: config.REGISTRATION_ENABLED,
+    envMaxUsers: config.MAX_USERS,
+    publicOrigin: config.PUBLIC_ORIGIN,
+    windowsClientUrl: config.WINDOWS_CLIENT_URL,
+    macClientUrl: config.MAC_CLIENT_URL,
+    updateFeedUrl: config.UPDATE_FEED_URL,
+    vapidConfigured: Boolean(config.VAPID_PUBLIC_KEY && config.VAPID_PRIVATE_KEY)
+  }, SESSION_COOKIE);
 
   app.get("/api/hosts", async (request, reply) => {
     const user = await requireUser(sql, request, reply);

@@ -10,6 +10,7 @@
 
 - [产品文档](docs/PRODUCT.md)
 - [使用手册](docs/USER_GUIDE.md)
+- [管理后台](docs/ADMIN.md)
 - [品牌与 Slogan](docs/BRANDING.md)
 - [多用户容量评估](docs/CAPACITY.md)
 - [服务端更新源配置说明](docs/UPDATE_FEED.md)
