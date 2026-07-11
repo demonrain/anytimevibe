@@ -118,7 +118,32 @@ const initialEnvironment: EnvironmentState = { platform: process.platform === "w
 let publicState: PublicState = { relayUrl: DEFAULT_RELAY_URL, displayName: "", status: "unconfigured", detail: "请先配置中继地址。", codexVersion, workspaces: [], environment: initialEnvironment, update: { status: "idle" }, tasks: [] };
 
 function productIconPath(): string {
+  const candidates = [
+    path.join(__dirname, "..", "assets", "icon.ico"),
+    path.join(__dirname, "..", "assets", "icon.png"),
+    path.join(process.resourcesPath, "assets", "icon.ico"),
+    path.join(process.resourcesPath, "assets", "icon.png")
+  ];
+  for (const candidate of candidates) {
+    try {
+      readFileSync(candidate);
+      return candidate;
+    } catch {
+      // try next
+    }
+  }
   return path.join(__dirname, "..", "assets", "icon.png");
+}
+
+function loadProductIcon() {
+  const fromFile = nativeImage.createFromPath(productIconPath());
+  if (!fromFile.isEmpty()) return fromFile;
+  return nativeImage.createFromDataURL(
+    "data:image/svg+xml;base64," +
+      Buffer.from(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="15" fill="#17211b"/><path d="M13 20h38v25H13z" fill="#f2eadb"/><path d="m19 27 7 5-7 6" fill="none" stroke="#e25832" stroke-width="5"/><path d="M31 39h14" stroke="#2d7653" stroke-width="5"/><circle cx="46" cy="24" r="3" fill="#3bab70"/></svg>'
+      ).toString("base64")
+  );
 }
 
 function resolvedDisplayName(): string {
@@ -252,7 +277,7 @@ function showWindow(): void {
 }
 
 function createWindow(): void {
-  const icon = nativeImage.createFromPath(productIconPath());
+  const icon = loadProductIcon();
   windowRef = new BrowserWindow({
     width: 460,
     height: 640,
@@ -263,13 +288,14 @@ function createWindow(): void {
     backgroundColor: "#f2eadb",
     title: "随码",
     autoHideMenuBar: true,
-    ...(icon.isEmpty() ? {} : { icon }),
+    icon,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false
     }
   });
+  if (process.platform === "win32") windowRef.setIcon(icon);
   windowRef.setMenuBarVisibility(false);
   windowRef.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(rendererHtml())}`);
   windowRef.on("close", (event) => {
@@ -1023,6 +1049,11 @@ function registerIpc(): void {
   });
 }
 
+// Windows taskbar title/icon rely on AppUserModelID + embedded exe resources.
+if (process.platform === "win32") {
+  app.setAppUserModelId("com.anytimevibe.agent");
+}
+
 app.whenReady().then(async () => {
   await loadConfig();
   registerIpc();
@@ -1032,14 +1063,15 @@ app.whenReady().then(async () => {
     Menu.setApplicationMenu(null);
   }
   app.setLoginItemSettings({ openAtLogin: true });
-  const productIcon = nativeImage.createFromPath(productIconPath());
-  const traySource = productIcon.isEmpty()
-    ? nativeImage.createFromDataURL("data:image/svg+xml;base64," + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="15" fill="#17211b"/><path d="M13 20h38v25H13z" fill="#f2eadb"/><path d="m19 27 7 5-7 6" fill="none" stroke="#e25832" stroke-width="5"/><path d="M31 39h14" stroke="#2d7653" stroke-width="5"/></svg>').toString("base64"))
-    : productIcon;
-  const trayIcon = traySource.resize({ width: 18, height: 18 });
+  const traySource = loadProductIcon();
+  const trayIcon = traySource.resize({ width: 16, height: 16 });
   if (process.platform === "darwin") trayIcon.setTemplateImage(true);
   tray = new Tray(trayIcon);
+  tray.setToolTip("随码");
   tray.on("double-click", showWindow);
+  tray.on("click", () => {
+    if (process.platform === "win32") showWindow();
+  });
   createWindow();
   void checkForAgentUpdate().catch((error) => updateState({ update: { status: "error", message: error.message } }));
   setInterval(() => void checkForAgentUpdate().catch(() => undefined), 6 * 60 * 60 * 1000).unref();
