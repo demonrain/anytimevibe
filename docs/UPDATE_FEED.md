@@ -32,7 +32,8 @@ electron-updater 访问 updateFeedUrl
 ```dotenv
 # 客户端安装包下载入口（Web 登录页展示）
 WINDOWS_CLIENT_URL=https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent-Setup.exe
-MAC_CLIENT_URL=https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent.dmg
+# 暂无 macOS 包时留空，Web 显示「敬请期待」
+MAC_CLIENT_URL=
 
 # Agent 自动更新源（目录 URL，不要指向具体 .exe）
 UPDATE_FEED_URL=https://github.com/demonrain/anytimevibe/releases/latest/download
@@ -42,7 +43,7 @@ UPDATE_FEED_URL=https://github.com/demonrain/anytimevibe/releases/latest/downloa
 |------|------|------|
 | `UPDATE_FEED_URL` | 否 | 更新元数据与安装包所在目录的 HTTPS URL |
 | `WINDOWS_CLIENT_URL` | 否 | Web 端 Windows 下载链接 |
-| `MAC_CLIENT_URL` | 否 | Web 端 macOS 下载链接 |
+| `MAC_CLIENT_URL` | 否 | Web 端 macOS 下载链接；留空则显示「敬请期待」 |
 
 修改后需重新加载中继环境变量并重启：
 
