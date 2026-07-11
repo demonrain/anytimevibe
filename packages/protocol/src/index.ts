@@ -26,13 +26,16 @@ export const workspaceSchema = z.object({
 export type Workspace = z.infer<typeof workspaceSchema>;
 
 const commandBase = z.object({ commandId: z.string().uuid() });
+export const permissionModeSchema = z.enum(["inherit", "full-access", "workspace-write", "read-only"]);
+export type PermissionMode = z.infer<typeof permissionModeSchema>;
 
 export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
     type: z.literal("task.create"),
     cwd: z.string().min(1),
     prompt: z.string().min(1),
-    title: z.string().min(1).max(160).optional()
+    title: z.string().min(1).max(160).optional(),
+    permissionMode: permissionModeSchema.optional()
   }),
   commandBase.extend({
     type: z.literal("thread.resume"),
@@ -41,7 +44,8 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
     type: z.literal("turn.start"),
     threadId: z.string().min(1),
-    prompt: z.string().min(1)
+    prompt: z.string().min(1),
+    permissionMode: permissionModeSchema.optional()
   }),
   commandBase.extend({
     type: z.literal("turn.steer"),

@@ -33,7 +33,7 @@ import {
   type EncryptedEnvelope,
   type Workspace
 } from "@anytimevibe/protocol";
-import { CodexAdapter, threadStartParams, threadToSnapshot } from "./codex-adapter";
+import { CodexAdapter, codexPermissionParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
 const execFileAsync = promisify(execFile);
@@ -530,7 +530,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     await ensureCodex();
     if (command.type === "task.create") {
       if (!isAllowedWorkspace(command.cwd)) throw new Error("工作目录不在代理白名单中");
-      const started = await codex!.request("thread/start", threadStartParams(command.cwd));
+      const started = await codex!.request("thread/start", threadStartParams(command.cwd, command.permissionMode));
       const thread = started.thread;
       localThreadId = thread.id;
       if (command.title) await codex!.request("thread/name/set", { threadId: thread.id, name: command.title });
@@ -550,7 +550,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "turn.start") {
-      await codex!.request("thread/resume", { threadId: command.threadId });
+      await codex!.request("thread/resume", { threadId: command.threadId, ...codexPermissionParams(command.permissionMode) });
       startLocalActivity(command.threadId, command.prompt, "继续远程任务");
       const result = await codex!.request("turn/start", {
         threadId: command.threadId,
@@ -574,7 +574,12 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "turn.interrupt") {
-      await codex!.request("turn/interrupt", { threadId: command.threadId, turnId: command.turnId });
+      await Promise.race([
+        codex!.request("turn/interrupt", { threadId: command.threadId, turnId: command.turnId }).catch(() => undefined),
+        new Promise((resolve) => setTimeout(resolve, 5000))
+      ]);
+      finishLocalActivity(command.threadId, "interrupted");
+      await publish({ type: "turn.completed", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: command.turnId, status: "interrupted" }, true, "completed");
       return;
     }
     if (command.type === "approval.resolve") {

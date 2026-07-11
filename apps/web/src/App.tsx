@@ -14,6 +14,7 @@ import {
   type ClientCommand,
   type EncryptedEnvelope,
   type PairingPublicInfo,
+  type PermissionMode,
   type Workspace
 } from "@anytimevibe/protocol";
 import { api, websocketUrl } from "./api";
@@ -191,6 +192,7 @@ export function App() {
   const [composerOpen, setComposerOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => (localStorage.getItem("permission-mode") as PermissionMode | null) ?? "inherit");
   const autoSyncedHostsRef = useRef(new Set<string>());
   function selectTask(threadId: string) {
     setSelectedTaskId(threadId);
@@ -424,6 +426,7 @@ export function App() {
           </div>
         </div>
         <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? "主机在线，命令将立即执行" : activeRuntime.online === false ? "主机离线，仅可查看已同步记录" : "正在确认主机状态…"}</div>
+        <label className="permission-select">Codex 权限<select value={permissionMode} onChange={(event) => { const mode = event.target.value as PermissionMode; setPermissionMode(mode); localStorage.setItem("permission-mode", mode); }}><option value="inherit">跟随客户端配置</option><option value="full-access">Full Access</option><option value="workspace-write">Workspace Write</option><option value="read-only">Read Only</option></select></label>
         <div className="task-list">
           {tasks.map((task) => <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>
             <div className="task-meta"><span>{task.status}</span><time>{new Date(task.updatedAt * 1000).toLocaleString()}</time></div>
@@ -436,19 +439,19 @@ export function App() {
       </section>
 
       <section className="conversation-column">
-        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} onBack={() => setMobilePane("tasks")} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
+        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} onBack={() => setMobilePane("tasks")} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
       </section>
     </main>
 
     {pairingOpen && <PairingDialog onClose={() => setPairingOpen(false)} onPaired={async () => { setPairingOpen(false); await loadHosts(); }} />}
     {composerOpen && activeHost && <NewTaskDialog host={activeHost} workspaces={activeRuntime.workspaces} onClose={() => setComposerOpen(false)} onCreate={async (cwd, prompt, title) => {
-      await sendCommand(activeHost.id, { type: "task.create", commandId: crypto.randomUUID(), cwd, prompt, ...(title ? { title } : {}) });
+      await sendCommand(activeHost.id, { type: "task.create", commandId: crypto.randomUUID(), cwd, prompt, permissionMode, ...(title ? { title } : {}) });
       setComposerOpen(false);
     }} />}
   </div>;
 }
 
-function TaskConversation({ task, online, visible, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; onBack(): void; onCommand(command: ClientCommand): void }) {
+function TaskConversation({ task, online, visible, permissionMode, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; permissionMode: PermissionMode; onBack(): void; onCommand(command: ClientCommand): void }) {
   const [prompt, setPrompt] = useState("");
   const [pendingPrompt, setPendingPrompt] = useState("");
   const [pendingMessageCount, setPendingMessageCount] = useState(0);
@@ -472,7 +475,7 @@ function TaskConversation({ task, online, visible, onBack, onCommand }: { task: 
     else {
       setPendingPrompt(submittedPrompt);
       setPendingMessageCount(task.messages.length);
-      onCommand({ type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: submittedPrompt });
+      onCommand({ type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: submittedPrompt, permissionMode });
     }
     setPrompt("");
   }
@@ -488,8 +491,8 @@ function TaskConversation({ task, online, visible, onBack, onCommand }: { task: 
     setPendingPrompt(nextPrompt);
     setPendingMessageCount(task.messages.length);
     stickToBottomRef.current = true;
-    onCommand({ type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: nextPrompt });
-  }, [commandQueue, online, onCommand, pendingPrompt, running, task.threadId]);
+    onCommand({ type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: nextPrompt, permissionMode });
+  }, [commandQueue, online, onCommand, pendingPrompt, permissionMode, running, task.threadId]);
 
   useEffect(() => {
     const latestMessage = task.messages.at(-1);
@@ -541,7 +544,7 @@ function TaskConversation({ task, online, visible, onBack, onCommand }: { task: 
           submitPrompt();
         }
       }} placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"} />
-      <div><small>{online === null ? "正在确认主机状态…" : running ? "任务正在电脑端处理，可追加指令或停止" : "沿用本机 Codex 沙箱和审批策略"}<span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 发送</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>停止</button>}<button className="send" disabled={online !== true || !prompt.trim()}>发送</button></div>
+      <div><small>{online === null ? "正在确认主机状态…" : running ? "任务正在电脑端处理，可排队或结束等待" : permissionMode === "inherit" ? "沿用客户端 Codex 沙箱和审批策略" : `当前权限：${permissionMode}`}<span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 发送</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>结束等待</button>}<button className="send" disabled={online !== true || !prompt.trim()}>发送</button></div>
     </form>
   </>;
 }

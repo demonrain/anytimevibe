@@ -1,13 +1,20 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { windowsCmdArguments } from "./windows-command";
+import type { PermissionMode } from "@anytimevibe/protocol";
 
 type RpcId = string | number;
 type JsonObject = Record<string, any>;
 
-export function threadStartParams(cwd: string): { cwd: string } {
-  // Permission and approval fields are intentionally omitted so Codex uses config.toml.
-  return { cwd };
+export function codexPermissionParams(permissionMode: PermissionMode = "inherit"): Record<string, string> {
+  if (permissionMode === "full-access") return { approvalPolicy: "never", sandbox: "danger-full-access" };
+  if (permissionMode === "workspace-write") return { approvalPolicy: "on-request", sandbox: "workspace-write" };
+  if (permissionMode === "read-only") return { approvalPolicy: "on-request", sandbox: "read-only" };
+  return {};
+}
+
+export function threadStartParams(cwd: string, permissionMode: PermissionMode = "inherit"): { cwd: string; approvalPolicy?: string; sandbox?: string } {
+  return { cwd, ...codexPermissionParams(permissionMode) };
 }
 
 export class CodexAdapter {
