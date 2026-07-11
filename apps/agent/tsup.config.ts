@@ -7,8 +7,8 @@ export default defineConfig({
   target: "es2022",
   sourcemap: true,
   clean: true,
-  // Keep Electron runtime modules external; bundle workspace protocol so
-  // packaged apps do not depend on monorepo node_modules paths.
-  external: ["electron", "electron-updater", "ws"],
-  noExternal: ["@anytimevibe/protocol"]
+  // Electron provides its own runtime. Bundle every npm dependency so
+  // packaged apps never resolve monorepo/workspace paths inside app.asar.
+  external: ["electron"],
+  noExternal: [/.*/]
 });

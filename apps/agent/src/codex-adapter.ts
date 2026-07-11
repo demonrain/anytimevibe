@@ -38,7 +38,9 @@ export class CodexAdapter {
     const child = spawn(executable, args, {
       windowsHide: true,
       windowsVerbatimArguments: isWindows,
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      // Inherit process PATH (agent refreshes login-shell PATH on macOS GUI launches).
+      env: process.env
     });
     this.process = child;
     createInterface({ input: child.stdout }).on("line", (line) => this.handleLine(line));
@@ -55,7 +57,7 @@ export class CodexAdapter {
     child.on("error", (error) => this.onExit(error.message));
 
     await this.request("initialize", {
-      clientInfo: { name: "anytimevibe-agent", title: "随码", version: "0.4.5" },
+      clientInfo: { name: "anytimevibe-agent", title: "随码", version: "0.4.9" },
       capabilities: { experimentalApi: false, requestAttestation: false }
     });
     this.notify("initialized");

@@ -583,9 +583,16 @@ async function findOnPath(command: string): Promise<string | null> {
   return null;
 }
 
+/** Apply login-shell PATH to the process so child apps (codex shebang -> node) work on macOS GUI launches. */
+async function applyLoginPathToProcess(): Promise<void> {
+  if (process.platform === "win32") return;
+  cachedLoginPath = null;
+  process.env.PATH = await resolveLoginPath();
+}
+
 async function detectEnvironment(): Promise<EnvironmentState> {
   // Reset PATH cache so "重新检测" picks up newly installed tools.
-  cachedLoginPath = null;
+  await applyLoginPathToProcess();
   const nodeCommand = await findOnPath(process.platform === "win32" ? "node.exe" : "node");
   const nodeOutput = nodeCommand ? await commandVersion(nodeCommand, ["--version"]) : null;
   const configuredCodex = process.env.CODEX_COMMAND ? normalizeWindowsCommandPath(process.env.CODEX_COMMAND) : null;
@@ -668,51 +675,68 @@ async function startPairing(): Promise<PublicState> {
   return publicState;
 }
 
+let pairingPollInFlight = false;
+
 function schedulePairingPoll(): void {
   if (pairingTimer) clearTimeout(pairingTimer);
   pairingTimer = setTimeout(() => pollPairing().catch(handleError), 1800);
 }
 
 async function pollPairing(): Promise<void> {
+  if (pairingPollInFlight) return;
   const pairing = config.pairing;
   if (!pairing) return;
-  if (pairing.expiresAt <= Date.now()) {
+  pairingPollInFlight = true;
+  try {
+    if (pairing.expiresAt <= Date.now()) {
+      delete config.pairing;
+      await saveConfig();
+      updateState({ status: "waiting_pairing", detail: "配对码已过期，请重新生成配对码。", pairingCode: undefined, pairingExpiresAt: undefined });
+      return;
+    }
+    const response = await fetch(`${config.relayUrl}/api/agent/pairings/${pairing.id}?secret=${encodeURIComponent(pairing.secret)}`);
+    if (!response.ok) throw new Error(`配对状态查询失败：HTTP ${response.status}`);
+    const result = await response.json() as Record<string, any>;
+    if (result.status === "consumed") throw new Error("配对凭据已被读取但代理未完成保存，请重新生成配对码。");
+    if (result.status !== "claimed") {
+      schedulePairingPoll();
+      return;
+    }
+    // Claim ownership of this pairing immediately to prevent concurrent poll races.
     delete config.pairing;
     await saveConfig();
-    updateState({ status: "waiting_pairing", detail: "配对码已过期，请重新生成配对码。", pairingCode: undefined, pairingExpiresAt: undefined });
-    return;
+    updateState({ pairingCode: undefined, pairingExpiresAt: undefined });
+
+    const privateJwk = JSON.parse(decryptSecret(config.encryptedPrivateKey!)) as JsonWebKey;
+    const privateKey = await crypto.subtle.importKey("jwk", privateJwk, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+    const pairingKey = await derivePairingKey(privateKey, result.clientPublicKey as JsonWebKey, pairing.id);
+    const syncKeyValue = config.encryptedSyncKey
+      ? decryptSecret(config.encryptedSyncKey)
+      : bytesToBase64(randomKeyBytes());
+    const wrappedSyncKey = await encryptPayload(pairingKey, { syncKey: syncKeyValue }, pairing.id);
+    const authorization = await fetch(`${config.relayUrl}/api/agent/pairings/${pairing.id}/authorize?secret=${encodeURIComponent(pairing.secret)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ wrappedSyncKey })
+    });
+    if (!authorization.ok) throw new Error(`浏览器密钥授权失败：HTTP ${authorization.status}`);
+    config.hostId = String(result.hostId);
+    config.encryptedAgentToken = encryptSecret(String(result.agentToken));
+    config.encryptedSyncKey = encryptSecret(syncKeyValue);
+    await saveConfig();
+    syncKey = await importAesKey(base64ToBytes(syncKeyValue));
+    updateState({ status: "connecting", detail: "新浏览器已获得主机密钥授权，正在建立连接。", hostId: config.hostId });
+    await connect(true);
+  } finally {
+    pairingPollInFlight = false;
   }
-  const response = await fetch(`${config.relayUrl}/api/agent/pairings/${pairing.id}?secret=${encodeURIComponent(pairing.secret)}`);
-  if (!response.ok) throw new Error(`配对状态查询失败：HTTP ${response.status}`);
-  const result = await response.json() as Record<string, any>;
-  if (result.status === "consumed") throw new Error("配对凭据已被读取但代理未完成保存，请重新生成配对码。");
-  if (result.status !== "claimed") return schedulePairingPoll();
-  const privateJwk = JSON.parse(decryptSecret(config.encryptedPrivateKey!)) as JsonWebKey;
-  const privateKey = await crypto.subtle.importKey("jwk", privateJwk, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
-  const pairingKey = await derivePairingKey(privateKey, result.clientPublicKey as JsonWebKey, pairing.id);
-  const syncKeyValue = config.encryptedSyncKey
-    ? decryptSecret(config.encryptedSyncKey)
-    : bytesToBase64(randomKeyBytes());
-  const wrappedSyncKey = await encryptPayload(pairingKey, { syncKey: syncKeyValue }, pairing.id);
-  const authorization = await fetch(`${config.relayUrl}/api/agent/pairings/${pairing.id}/authorize?secret=${encodeURIComponent(pairing.secret)}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ wrappedSyncKey })
-  });
-  if (!authorization.ok) throw new Error(`浏览器密钥授权失败：HTTP ${authorization.status}`);
-  config.hostId = String(result.hostId);
-  config.encryptedAgentToken = encryptSecret(String(result.agentToken));
-  config.encryptedSyncKey = encryptSecret(syncKeyValue);
-  delete config.pairing;
-  await saveConfig();
-  syncKey = await importAesKey(base64ToBytes(syncKeyValue));
-  updateState({ status: "connecting", detail: "新浏览器已获得主机密钥授权，正在建立连接。", hostId: config.hostId, pairingCode: undefined, pairingExpiresAt: undefined });
-  await connect();
 }
 
 function wsUrl(relayUrl: string): string {
   return relayUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
 }
+
+let connecting = false;
 
 async function connect(force = false): Promise<void> {
   if (!config.hostId || !config.encryptedAgentToken || !config.encryptedSyncKey) {
@@ -720,19 +744,41 @@ async function connect(force = false): Promise<void> {
     else updateState({ status: "waiting_pairing", detail: "等待配对连接，请生成配对码并在 Web 端完成授权。" });
     return;
   }
-  if (!/^0\.144\./.test(codexVersion)) return;
+  // Refresh toolchain paths before deciding compatibility (important on macOS GUI launches).
+  await applyLoginPathToProcess();
+  if (!/^0\.144\./.test(codexVersion)) {
+    const environment = await detectEnvironment();
+    updateState({ environment });
+    if (!environment.codexCompatible) {
+      updateState({
+        status: "incompatible",
+        detail: environment.codexInstalled
+          ? `当前仅支持 codex-cli 0.144.x，检测到 ${environment.codexVersion}。`
+          : "未检测到兼容的 Codex CLI，中继将暂不连接。"
+      });
+      return;
+    }
+  }
   if (!force && socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+  if (connecting && !force) return;
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  connecting = true;
   const previousSocket = socket;
   socket = null;
   if (previousSocket) {
     previousSocket.removeAllListeners();
     previousSocket.close();
   }
-  syncKey ??= await importAesKey(base64ToBytes(decryptSecret(config.encryptedSyncKey)));
+  try {
+    syncKey ??= await importAesKey(base64ToBytes(decryptSecret(config.encryptedSyncKey)));
+  } catch (error) {
+    connecting = false;
+    handleError(error);
+    return;
+  }
   updateState({ status: "connecting", detail: "正在连接加密中继…", hostId: config.hostId });
   const token = decryptSecret(config.encryptedAgentToken);
   const connection = new WebSocket(`${wsUrl(config.relayUrl)}/ws/agent?hostId=${encodeURIComponent(config.hostId)}`, {
@@ -740,25 +786,38 @@ async function connect(force = false): Promise<void> {
   });
   socket = connection;
   connection.on("open", () => {
+    connecting = false;
     if (socket !== connection) return connection.close();
+    // Keep the relay socket online even if Codex bootstrap fails, otherwise macOS
+    // (missing GUI PATH / codex shebang) will flap between offline and reconnect.
     void (async () => {
       updateState({ status: "online", detail: "代理在线。Codex 凭据和项目文件均保留在本机。" });
-      await ensureCodex();
-      await publishHostStatus();
-      await syncAllThreads();
-    })().catch((error) => {
-      handleError(error);
-      connection.close();
-    });
+      try {
+        await ensureCodex();
+        await publishHostStatus();
+        await syncAllThreads();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        updateState({
+          status: "online",
+          detail: `中继已连接，但 Codex 尚未就绪：${message}`
+        });
+      }
+    })();
   });
   connection.on("message", (data) => handleRelayMessage(String(data)).catch(handleError));
-  connection.on("close", () => {
+  connection.on("close", (code, reason) => {
+    connecting = false;
     if (socket !== connection) return;
     socket = null;
-    scheduleReconnect("中继连接已断开，正在重试。");
+    const why = reason?.toString?.() || `code ${code}`;
+    scheduleReconnect(`中继连接已断开（${why}），正在重试。`);
   });
-  connection.on("error", () => {
-    if (socket === connection) updateState({ status: "offline", detail: "无法连接中继，正在重试。" });
+  connection.on("error", (error) => {
+    connecting = false;
+    if (socket === connection) {
+      updateState({ status: "offline", detail: `无法连接中继：${error.message || "网络错误"}，正在重试。` });
+    }
     connection.close();
   });
 }
@@ -779,9 +838,23 @@ function scheduleReconnect(detail: string): void {
 
 async function ensureCodex(): Promise<void> {
   if (codex) return;
+  await applyLoginPathToProcess();
+  if (!/^0\.144\./.test(codexVersion)) {
+    const environment = await detectEnvironment();
+    updateState({ environment });
+    if (!environment.codexCompatible) {
+      throw new Error(environment.codexInstalled
+        ? `Codex 版本不兼容（需要 0.144.x，当前 ${environment.codexVersion}）`
+        : "未检测到 Codex CLI");
+    }
+  }
   codex = new CodexAdapter(codexCommand, (message) => handleCodexMessage(message).catch(handleError), (detail) => {
     codex = null;
-    updateState({ status: "offline", detail });
+    // Do not tear down the relay socket when Codex exits; keep online for reconnect of Codex only.
+    updateState({
+      status: socket?.readyState === WebSocket.OPEN ? "online" : publicState.status,
+      detail: `Codex 已停止：${detail}`
+    });
   });
   await codex.start();
 }
@@ -1065,6 +1138,23 @@ function registerUpdateListeners(): void {
     showWindow();
   });
   autoUpdater.on("error", (error) => updateState({ update: { status: "error", message: error.message } }));
+  // Required so window close handlers do not cancel quitAndInstall by hide-to-tray.
+  // electron-updater emits this event; typings may lag behind runtime.
+  (autoUpdater as NodeJS.EventEmitter).on("before-quit-for-update", () => {
+    quitting = true;
+  });
+}
+
+function installDownloadedUpdate(): void {
+  // Prevent tray-hide close handler from blocking electron-updater quit.
+  quitting = true;
+  try {
+    autoUpdater.quitAndInstall(false, true);
+  } catch (error) {
+    quitting = false;
+    const message = error instanceof Error ? error.message : String(error);
+    updateState({ update: { status: "error", message: `无法启动安装：${message}` } });
+  }
 }
 
 async function checkForAgentUpdate(): Promise<void> {
@@ -1132,7 +1222,10 @@ function registerIpc(): void {
     return publicState;
   });
   ipcMain.handle("agent:check-update", async () => { await checkForAgentUpdate(); return publicState; });
-  ipcMain.handle("agent:install-update", () => autoUpdater.quitAndInstall(false, true));
+  ipcMain.handle("agent:install-update", () => {
+    installDownloadedUpdate();
+    return publicState;
+  });
   ipcMain.handle("agent:relay-task", async (_event, threadId: string) => {
     await relayTaskToCli(threadId);
     return publicState;
