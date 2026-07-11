@@ -49,13 +49,22 @@ type HostRuntime = {
 };
 
 function taskStatusMeta(status: string): { label: string; tone: string } {
-  const normalized = status.toLowerCase().replace(/[\s_-]/g, "");
+  let statusType = status;
+  try {
+    const parsed = JSON.parse(status) as { type?: unknown };
+    if (typeof parsed.type === "string") statusType = parsed.type;
+  } catch {
+    // Plain string statuses are expected for turn events.
+  }
+  const normalized = statusType.toLowerCase().replace(/[\s_-]/g, "");
   if (["active", "running", "inprogress", "processing"].includes(normalized)) return { label: "进行中", tone: "active" };
   if (["completed", "complete", "success", "succeeded"].includes(normalized)) return { label: "已完成", tone: "completed" };
   if (["failed", "error"].includes(normalized)) return { label: "失败", tone: "failed" };
   if (["interrupted", "cancelled", "canceled", "stopped"].includes(normalized)) return { label: "已停止", tone: "stopped" };
-  if (["idle", "pending", "queued", "notstarted"].includes(normalized)) return { label: "待处理", tone: "pending" };
-  return { label: status || "未知状态", tone: "unknown" };
+  if (normalized === "idle") return { label: "空闲", tone: "idle" };
+  if (normalized === "notloaded") return { label: "未加载", tone: "not-loaded" };
+  if (["pending", "queued", "notstarted"].includes(normalized)) return { label: "待处理", tone: "pending" };
+  return { label: statusType || "未知状态", tone: "unknown" };
 }
 
 function emptyRuntime(online: boolean | null = null): HostRuntime {
