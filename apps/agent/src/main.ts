@@ -33,7 +33,7 @@ import {
   type EncryptedEnvelope,
   type Workspace
 } from "@anytimevibe/protocol";
-import { CodexAdapter, threadToSnapshot } from "./codex-adapter";
+import { CodexAdapter, threadStartParams, threadToSnapshot } from "./codex-adapter";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
 const execFileAsync = promisify(execFile);
@@ -485,11 +485,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     await ensureCodex();
     if (command.type === "task.create") {
       if (!isAllowedWorkspace(command.cwd)) throw new Error("工作目录不在代理白名单中");
-      const started = await codex!.request("thread/start", {
-        cwd: command.cwd,
-        approvalPolicy: "on-request",
-        sandbox: "workspace-write"
-      });
+      const started = await codex!.request("thread/start", threadStartParams(command.cwd));
       const thread = started.thread;
       localThreadId = thread.id;
       if (command.title) await codex!.request("thread/name/set", { threadId: thread.id, name: command.title });

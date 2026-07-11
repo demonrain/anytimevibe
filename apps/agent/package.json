@@ -1,6 +1,6 @@
 {
   "name": "@anytimevibe/agent",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Windows and macOS bridge for encrypted remote Codex sessions",
   "author": "AnytimeVibe",
   "private": true,

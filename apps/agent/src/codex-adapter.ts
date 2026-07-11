@@ -5,6 +5,11 @@ import { windowsCmdArguments } from "./windows-command";
 type RpcId = string | number;
 type JsonObject = Record<string, any>;
 
+export function threadStartParams(cwd: string): { cwd: string } {
+  // Permission and approval fields are intentionally omitted so Codex uses config.toml.
+  return { cwd };
+}
+
 export class CodexAdapter {
   private process: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;
