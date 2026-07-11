@@ -114,12 +114,47 @@ const pendingPrompts = new Map<string, string>();
 const pendingRequestTypes = new Map<string, "command" | "file" | "permission" | "input">();
 let activityOutputBuffer = "";
 let activityFlushTimer: NodeJS.Timeout | null = null;
+const activityItems = new Map<string, string>();
 
 function startLocalActivity(threadId: string, prompt: string, title = "远程任务"): void {
   activityOutputBuffer = "";
+  activityItems.clear();
   if (activityFlushTimer) clearTimeout(activityFlushTimer);
   activityFlushTimer = null;
   updateState({ activity: { threadId, title, prompt, status: "processing", output: "" } });
+}
+
+function appendLocalActivityStage(threadId: string, text: string): void {
+  if (!text.trim()) return;
+  appendLocalActivity(threadId, `${activityOutputBuffer || publicState.activity?.output ? "\n\n" : ""}${text.trim()}`);
+}
+
+function activityItemKey(params: Record<string, any>): string {
+  return String(params.item?.id ?? params.itemId ?? "");
+}
+
+function activityItemLabel(item: Record<string, any>): string | null {
+  if (item.type === "agentMessage") return "Codex 回复";
+  if (item.type === "commandExecution") return `执行命令\n${String(item.command ?? "").trim()}`;
+  if (item.type === "fileChange") {
+    const paths = (item.changes ?? []).map((change: Record<string, any>) => change.path).filter(Boolean).join("\n");
+    return `修改文件${paths ? `\n${paths}` : ""}`;
+  }
+  if (item.type === "mcpToolCall") return `调用工具\n${String(item.tool ?? item.name ?? "")}`;
+  if (item.type === "webSearch") return `搜索资料\n${String(item.query ?? "")}`;
+  return null;
+}
+
+function activityItemResult(item: Record<string, any>): string {
+  if (item.type === "agentMessage") return "";
+  if (item.type === "commandExecution") {
+    const output = String(item.aggregatedOutput ?? item.output ?? "").trim();
+    return output ? `命令输出\n${output}` : `命令${item.status ? ` ${item.status}` : "已完成"}`;
+  }
+  if (item.type === "fileChange") return `文件修改${item.status ? ` ${item.status}` : "已完成"}`;
+  if (item.type === "mcpToolCall") return `工具调用${item.status ? ` ${item.status}` : "已完成"}`;
+  if (item.type === "webSearch") return "搜索完成";
+  return "";
 }
 
 function appendLocalActivity(threadId: string, delta: string): void {
@@ -563,6 +598,26 @@ async function handleCommand(command: ClientCommand): Promise<void> {
 }
 
 async function handleCodexMessage(message: Record<string, any>): Promise<void> {
+  if (message.method === "item/started") {
+    const params = message.params ?? {};
+    const item = params.item ?? {};
+    const label = activityItemLabel(item);
+    const key = activityItemKey(params);
+    if (label && key && !activityItems.has(key)) {
+      activityItems.set(key, item.type);
+      appendLocalActivityStage(String(params.threadId), `▶ ${label}`);
+    }
+  }
+  if (message.method === "item/completed") {
+    const params = message.params ?? {};
+    const item = params.item ?? {};
+    const key = activityItemKey(params);
+    if (key && activityItems.has(key)) {
+      activityItems.delete(key);
+      const result = activityItemResult(item);
+      if (result) appendLocalActivityStage(String(params.threadId), `✓ ${result}`);
+    }
+  }
   if (message.method === "item/agentMessage/delta") {
     appendLocalActivity(String(message.params.threadId), String(message.params.delta ?? ""));
   }

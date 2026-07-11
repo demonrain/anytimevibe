@@ -182,6 +182,7 @@ export function App() {
   const [runtime, setRuntime] = useState<Record<string, HostRuntime>>({});
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [mobilePane, setMobilePane] = useState<"tasks" | "conversation">("tasks");
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const hostOfflineTimersRef = useRef(new Map<string, number>());
@@ -191,13 +192,9 @@ export function App() {
   const [accountOpen, setAccountOpen] = useState(false);
   const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
   const autoSyncedHostsRef = useRef(new Set<string>());
-  const conversationColumnRef = useRef<HTMLElement | null>(null);
-
   function selectTask(threadId: string) {
     setSelectedTaskId(threadId);
-    if (window.matchMedia("(max-width: 980px)").matches) {
-      window.requestAnimationFrame(() => conversationColumnRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
-    }
+    setMobilePane("conversation");
   }
 
   useEffect(() => {
@@ -359,6 +356,7 @@ export function App() {
     });
     setSelectedHostId((current) => current === host.id ? hosts.find((item) => item.id !== host.id)?.id ?? null : current);
     setSelectedTaskId(null);
+    setMobilePane("tasks");
   }
 
   async function syncHostTasks(hostId: string) {
@@ -405,7 +403,7 @@ export function App() {
       <div className="host-list">
         <button className="host-add-mobile" onClick={() => setPairingOpen(true)}>＋ 添加电脑</button>
         {hosts.map((host) => <div key={host.id} className={`host-row ${host.id === selectedHostId ? "active" : ""}`}>
-          <button className="host-pill" onClick={() => { setSelectedHostId(host.id); setSelectedTaskId(null); }}>
+          <button className="host-pill" onClick={() => { setSelectedHostId(host.id); setSelectedTaskId(null); setMobilePane("tasks"); }}>
             <span className={`status-dot ${(runtime[host.id]?.online ?? host.online) ? "online" : ""}`} />
             <span><strong>{host.name}</strong><small>{host.codexVersion}</small></span>
           </button>
@@ -415,7 +413,7 @@ export function App() {
       </div>
     </aside>
 
-    <main className="workspace">
+    <main className={`workspace mobile-${mobilePane}`}>
       <section className="task-column">
         <div className="section-title">
           <div><p className="eyebrow">TASK STREAM</p><h1>{activeHost?.name ?? "尚未连接主机"}</h1></div>
@@ -436,8 +434,8 @@ export function App() {
         </div>
       </section>
 
-      <section className="conversation-column" ref={conversationColumnRef}>
-        {activeTask ? <TaskConversation task={activeTask} online={activeRuntime.online} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
+      <section className="conversation-column">
+        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} onBack={() => setMobilePane("tasks")} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
       </section>
     </main>
 
@@ -449,8 +447,14 @@ export function App() {
   </div>;
 }
 
-function TaskConversation({ task, online, onCommand }: { task: Task; online: boolean | null; onCommand(command: ClientCommand): void }) {
+function TaskConversation({ task, online, onBack, onCommand }: { task: Task; online: boolean | null; onBack(): void; onCommand(command: ClientCommand): void }) {
   const [prompt, setPrompt] = useState("");
+  const [pendingPrompt, setPendingPrompt] = useState("");
+  const [pendingMessageCount, setPendingMessageCount] = useState(0);
+  const [commandQueue, setCommandQueue] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem(`command-queue:${task.threadId}`) ?? "[]") as string[]; }
+    catch { return []; }
+  });
   const [tab, setTab] = useState<"chat" | "diff">("chat");
   const messageStreamRef = useRef<HTMLDivElement | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
@@ -461,9 +465,35 @@ function TaskConversation({ task, online, onCommand }: { task: Task; online: boo
 
   function submitPrompt() {
     if (!prompt.trim() || online !== true) return;
-    onCommand(running && task.activeTurnId ? { type: "turn.steer", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId, prompt: prompt.trim() } : { type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: prompt.trim() });
+    const submittedPrompt = prompt.trim();
+    stickToBottomRef.current = true;
+    if (running || pendingPrompt) setCommandQueue((current) => [...current, submittedPrompt]);
+    else {
+      setPendingPrompt(submittedPrompt);
+      setPendingMessageCount(task.messages.length);
+      onCommand({ type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: submittedPrompt });
+    }
     setPrompt("");
   }
+
+  useEffect(() => {
+    localStorage.setItem(`command-queue:${task.threadId}`, JSON.stringify(commandQueue));
+  }, [commandQueue, task.threadId]);
+
+  useEffect(() => {
+    if (running || pendingPrompt || online !== true || commandQueue.length === 0) return;
+    const nextPrompt = commandQueue[0]!;
+    setCommandQueue(commandQueue.slice(1));
+    setPendingPrompt(nextPrompt);
+    setPendingMessageCount(task.messages.length);
+    stickToBottomRef.current = true;
+    onCommand({ type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: nextPrompt });
+  }, [commandQueue, online, onCommand, pendingPrompt, running, task.threadId]);
+
+  useEffect(() => {
+    const latestMessage = task.messages.at(-1);
+    if (pendingPrompt && task.messages.length > pendingMessageCount && latestMessage?.role === "user" && latestMessage.text === pendingPrompt) setPendingPrompt("");
+  }, [pendingMessageCount, pendingPrompt, task.messages]);
 
   useLayoutEffect(() => {
     const stream = messageStreamRef.current;
@@ -477,10 +507,11 @@ function TaskConversation({ task, online, onCommand }: { task: Task; online: boo
       });
       return () => window.cancelAnimationFrame(frame);
     }
-  }, [task.threadId, task.messages.length, lastMessageLength, task.approvals.length, tab]);
+  }, [task.threadId, task.messages.length, lastMessageLength, task.approvals.length, pendingPrompt, tab]);
 
   return <>
     <div className="conversation-head">
+      <button className="mobile-back" type="button" onClick={onBack} aria-label="返回任务列表">‹</button>
       <div><p className="eyebrow">THREAD</p><h2>{task.title}</h2><code>{task.cwd}</code></div>
       <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>对话</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>Diff</button></div>
     </div>
@@ -489,7 +520,9 @@ function TaskConversation({ task, online, onCommand }: { task: Task; online: boo
       stickToBottomRef.current = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 90;
     }}>
       {task.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><span>{message.role === "user" ? "YOU" : message.role === "assistant" ? "CODEX" : "SYSTEM"}</span><pre>{message.text}</pre></article>)}
+      {pendingPrompt && <article className="message user pending"><span>YOU · 发送中</span><pre>{pendingPrompt}</pre></article>}
       {running && <article className="processing-card"><span className="processing-spinner" /><div><strong>远程主机正在处理</strong><p>Codex 正在电脑端执行任务。为保持页面稳定，处理过程不会实时同步；任务完成后会更新状态并发送通知。</p></div></article>}
+      {commandQueue.length > 0 && <section className="command-queue"><div><strong>等待队列</strong><span>{commandQueue.length} 条</span></div>{commandQueue.map((queuedPrompt, index) => <article key={`${index}:${queuedPrompt}`}><b>{index + 1}</b><p>{queuedPrompt}</p></article>)}</section>}
       {task.approvals.map((approval) => <article className="approval-card" key={String(approval.requestId)}>
         <div className="approval-label">ACTION REQUIRED</div><h3>{approval.title}</h3><pre>{approval.detail}</pre>
         <div className="approval-actions"><button onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "decline" })}>拒绝</button><button className="approve" onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "accept" })}>允许一次</button></div>
