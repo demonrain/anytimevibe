@@ -1,6 +1,6 @@
 {
   "name": "@anytimevibe/agent",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "随码桌面代理：在 Windows / macOS 上安全接力远程 Codex 任务",
   "author": "随码",
   "private": true,
@@ -8,26 +8,26 @@
   "scripts": {
     "dev": "pnpm build && electron .",
     "build:protocol": "pnpm -C ../../packages/protocol run build",
-    "build": "pnpm run build:protocol && tsup",
+    "build": "pnpm run build:protocol && tsup && node ../../scripts/check-agent-requires.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "package:dir": "pnpm build && electron-builder --win --dir",
     "package:win": "pnpm build && electron-builder --win nsis",
     "package:mac": "pnpm build && electron-builder --mac dmg zip --universal"
   },
-  "dependencies": {
+  "dependencies": {},
+  "devDependencies": {
     "@anytimevibe/protocol": "workspace:*",
+    "@types/ws": "^8.18.1",
+    "electron": "^36.5.0",
+    "electron-builder": "^26.0.12",
     "electron-updater": "6.6.2",
     "ws": "^8.18.3",
     "zod": "^3.25.76"
   },
-  "devDependencies": {
-    "@types/ws": "^8.18.1",
-    "electron": "^36.5.0",
-    "electron-builder": "^26.0.12"
-  },
   "build": {
     "appId": "com.anytimevibe.agent",
     "productName": "随码",
+    "executableName": "AnytimeVibe-Agent",
     "directories": {
       "output": "release"
     },
@@ -36,6 +36,7 @@
       "assets/**/*",
       "package.json"
     ],
+    "asar": true,
     "win": {
       "target": "nsis",
       "icon": "assets/icon.ico",

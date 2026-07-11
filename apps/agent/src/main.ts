@@ -156,6 +156,11 @@ let pairingTimer: NodeJS.Timeout | null = null;
 let codex: CodexAdapter | null = null;
 let syncKey: CryptoKey | null = null;
 let quitting = false;
+/** Bumped on every intentional connect(); stale socket handlers ignore events. */
+let connectGeneration = 0;
+let reconnectAttempt = 0;
+/** Permanent auth failures must not flap reconnect forever. */
+let reconnectBlockedReason: string | null = null;
 const pendingPrompts = new Map<string, string>();
 const pendingRequestTypes = new Map<string, "command" | "file" | "permission" | "input">();
 let activityOutputBuffer = "";
@@ -299,6 +304,7 @@ function createWindow(): void {
   windowRef.setMenuBarVisibility(false);
   windowRef.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(rendererHtml())}`);
   windowRef.on("close", (event) => {
+    // When quitting for update/install, allow the window to close so quitAndInstall can proceed.
     if (!quitting) {
       event.preventDefault();
       windowRef?.hide();
@@ -738,10 +744,19 @@ function wsUrl(relayUrl: string): string {
 
 let connecting = false;
 
+const FATAL_WS_CODES = new Set([
+  4001, // missing_credentials
+  4003 // unauthorized / revoked
+]);
+
 async function connect(force = false): Promise<void> {
   if (!config.hostId || !config.encryptedAgentToken || !config.encryptedSyncKey) {
     if (config.pairing) schedulePairingPoll();
     else updateState({ status: "waiting_pairing", detail: "等待配对连接，请生成配对码并在 Web 端完成授权。" });
+    return;
+  }
+  if (reconnectBlockedReason && !force) {
+    updateState({ status: "offline", detail: reconnectBlockedReason });
     return;
   }
   // Refresh toolchain paths before deciding compatibility (important on macOS GUI launches).
@@ -766,11 +781,20 @@ async function connect(force = false): Promise<void> {
     reconnectTimer = null;
   }
   connecting = true;
+  if (force) {
+    reconnectBlockedReason = null;
+    reconnectAttempt = 0;
+  }
+  const generation = ++connectGeneration;
   const previousSocket = socket;
   socket = null;
   if (previousSocket) {
     previousSocket.removeAllListeners();
-    previousSocket.close();
+    try {
+      previousSocket.close();
+    } catch {
+      // ignore
+    }
   }
   try {
     syncKey ??= await importAesKey(base64ToBytes(decryptSecret(config.encryptedSyncKey)));
@@ -780,23 +804,41 @@ async function connect(force = false): Promise<void> {
     return;
   }
   updateState({ status: "connecting", detail: "正在连接加密中继…", hostId: config.hostId });
-  const token = decryptSecret(config.encryptedAgentToken);
+  let token: string;
+  try {
+    token = decryptSecret(config.encryptedAgentToken);
+  } catch (error) {
+    connecting = false;
+    handleError(error);
+    return;
+  }
   const connection = new WebSocket(`${wsUrl(config.relayUrl)}/ws/agent?hostId=${encodeURIComponent(config.hostId)}`, {
     headers: { authorization: `Bearer ${token}` }
   });
   socket = connection;
   connection.on("open", () => {
+    if (generation !== connectGeneration || socket !== connection) {
+      try {
+        connection.close();
+      } catch {
+        // ignore
+      }
+      return;
+    }
     connecting = false;
-    if (socket !== connection) return connection.close();
+    reconnectAttempt = 0;
+    reconnectBlockedReason = null;
     // Keep the relay socket online even if Codex bootstrap fails, otherwise macOS
     // (missing GUI PATH / codex shebang) will flap between offline and reconnect.
     void (async () => {
       updateState({ status: "online", detail: "代理在线。Codex 凭据和项目文件均保留在本机。" });
       try {
         await ensureCodex();
+        if (generation !== connectGeneration || socket !== connection) return;
         await publishHostStatus();
         await syncAllThreads();
       } catch (error) {
+        if (generation !== connectGeneration || socket !== connection) return;
         const message = error instanceof Error ? error.message : String(error);
         updateState({
           status: "online",
@@ -805,35 +847,63 @@ async function connect(force = false): Promise<void> {
       }
     })();
   });
-  connection.on("message", (data) => handleRelayMessage(String(data)).catch(handleError));
+  connection.on("message", (data) => {
+    if (generation !== connectGeneration || socket !== connection) return;
+    handleRelayMessage(String(data)).catch(handleError);
+  });
   connection.on("close", (code, reason) => {
+    if (generation !== connectGeneration) return;
     connecting = false;
-    if (socket !== connection) return;
-    socket = null;
+    if (socket === connection) socket = null;
     const why = reason?.toString?.() || `code ${code}`;
+    // 4002 = replaced by a newer agent socket for the same host — do not fight it.
+    if (code === 4002) {
+      updateState({ status: "offline", detail: "连接已被新的代理实例替换。" });
+      return;
+    }
+    if (FATAL_WS_CODES.has(code) || /unauthorized|revoked|missing_credentials|user_deleted/i.test(why)) {
+      reconnectBlockedReason = `中继拒绝连接（${why}）。请重新配对。`;
+      updateState({ status: "offline", detail: reconnectBlockedReason });
+      return;
+    }
     scheduleReconnect(`中继连接已断开（${why}），正在重试。`);
   });
   connection.on("error", (error) => {
+    if (generation !== connectGeneration) return;
     connecting = false;
     if (socket === connection) {
       updateState({ status: "offline", detail: `无法连接中继：${error.message || "网络错误"}，正在重试。` });
     }
-    connection.close();
+    // Let the close handler own reconnect scheduling to avoid double timers.
+    try {
+      connection.close();
+    } catch {
+      // ignore
+    }
   });
 }
 
 function scheduleReconnect(detail: string): void {
+  if (quitting) return;
   if (publicState.status === "incompatible") return;
+  if (reconnectBlockedReason) {
+    updateState({ status: "offline", detail: reconnectBlockedReason });
+    return;
+  }
   if (!config.hostId || !config.encryptedAgentToken || !config.encryptedSyncKey) {
     updateState({ status: "waiting_pairing", detail: "等待配对连接，请生成配对码并在 Web 端完成授权。" });
     return;
   }
   updateState({ status: "offline", detail });
   if (reconnectTimer) return;
+  reconnectAttempt += 1;
+  // Exponential backoff with jitter: ~2s, 3s, 5s … capped at 30s.
+  const base = Math.min(30_000, 1500 * 2 ** Math.min(reconnectAttempt - 1, 4));
+  const delay = base + Math.floor(Math.random() * 800);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connect().catch(handleError);
-  }, 1800 + Math.floor(Math.random() * 1200));
+  }, delay);
 }
 
 async function ensureCodex(): Promise<void> {
@@ -1137,7 +1207,10 @@ function registerUpdateListeners(): void {
     updateState({ update: { status: "ready", version: info.version, message: "更新已在后台下载完成" } });
     showWindow();
   });
-  autoUpdater.on("error", (error) => updateState({ update: { status: "error", message: error.message } }));
+  autoUpdater.on("error", (error) => {
+    if (quitting) quitting = false;
+    updateState({ update: { status: "error", message: error.message } });
+  });
   // Required so window close handlers do not cancel quitAndInstall by hide-to-tray.
   // electron-updater emits this event; typings may lag behind runtime.
   (autoUpdater as NodeJS.EventEmitter).on("before-quit-for-update", () => {
@@ -1146,10 +1219,40 @@ function registerUpdateListeners(): void {
 }
 
 function installDownloadedUpdate(): void {
-  // Prevent tray-hide close handler from blocking electron-updater quit.
+  if (publicState.update.status !== "ready") {
+    updateState({ update: { status: "error", message: "更新包尚未下载完成，请先等待下载或点击检查更新。" } });
+    return;
+  }
+  // Prevent tray-hide close handler from blocking electron-updater quit on macOS/Windows.
   quitting = true;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   try {
+    socket?.removeAllListeners();
+    socket?.close();
+  } catch {
+    // ignore
+  }
+  socket = null;
+  try {
+    // isSilent=false so the installer UI can run; isForceRunAfter=true restarts the app.
+    // On macOS this also emits before-quit-for-update which must see quitting=true.
     autoUpdater.quitAndInstall(false, true);
+    // Fallback: if quitAndInstall is a no-op (e.g. app still running from DMG), force quit
+    // so autoInstallOnAppQuit can apply the already-downloaded update on next launch.
+    setTimeout(() => {
+      if (!quitting) return;
+      try {
+        app.quit();
+      } catch {
+        // ignore
+      }
+      setTimeout(() => {
+        if (quitting) app.exit(0);
+      }, 1500);
+    }, 2500);
   } catch (error) {
     quitting = false;
     const message = error instanceof Error ? error.message : String(error);
@@ -1223,7 +1326,12 @@ function registerIpc(): void {
   });
   ipcMain.handle("agent:check-update", async () => { await checkForAgentUpdate(); return publicState; });
   ipcMain.handle("agent:install-update", () => {
-    installDownloadedUpdate();
+    try {
+      installDownloadedUpdate();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      updateState({ update: { status: "error", message: `安装更新失败：${message}` } });
+    }
     return publicState;
   });
   ipcMain.handle("agent:relay-task", async (_event, threadId: string) => {

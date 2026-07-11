@@ -1,6 +1,10 @@
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const source = fs.readFileSync("apps/agent/dist/main.js", "utf8");
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const mainJs = path.join(root, "apps/agent/dist/main.js");
+const source = fs.readFileSync(mainJs, "utf8");
 const re = /require\(["']([^"']+)["']\)/g;
 const found = new Set();
 let match;
@@ -15,6 +19,18 @@ const nodeBuiltins = new Set([
 
 // Optional native accelerators for `ws` (loaded inside try/catch at runtime).
 const optionalNatives = new Set(["bufferutil", "utf-8-validate"]);
+
+// Electron runtime must remain an external require — never bundle the npm path stub.
+if (!found.has("electron")) {
+  console.error("FATAL: dist/main.js does not require('electron').");
+  console.error("The Electron npm package was likely bundled (path stub). Packaging will break.");
+  process.exitCode = 1;
+}
+
+if (/@anytimevibe\//.test(source)) {
+  console.error("FATAL: dist/main.js still references @anytimevibe/* — workspace packages must be bundled.");
+  process.exitCode = 1;
+}
 
 const external = [...found]
   .filter((name) => !name.startsWith("node:") && !nodeBuiltins.has(name))
