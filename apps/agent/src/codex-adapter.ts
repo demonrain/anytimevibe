@@ -100,7 +100,8 @@ export class CodexAdapter {
 
 export function threadToSnapshot(thread: JsonObject) {
   const messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string; createdAt?: number }> = [];
-  for (const turn of thread.turns ?? []) {
+  const turns = thread.turns ?? [];
+  for (const turn of turns) {
     for (const item of turn.items ?? []) {
       if (item.type === "userMessage") {
         const text = (item.content ?? []).filter((content: JsonObject) => content.type === "text").map((content: JsonObject) => content.text).join("\n");
@@ -112,11 +113,17 @@ export function threadToSnapshot(thread: JsonObject) {
       if (item.type === "plan" && item.text) messages.push({ id: item.id, role: "system", text: item.text });
     }
   }
+  const terminalStatuses = new Set(["completed", "failed", "cancelled", "canceled", "interrupted"]);
+  const activeTurn = [...turns].reverse().find((turn: JsonObject) => {
+    const status = String(turn.status ?? "").toLowerCase();
+    return turn.id && !turn.completedAt && !terminalStatuses.has(status);
+  });
   return {
     threadId: String(thread.id),
     title: String(thread.name || thread.preview || "未命名任务"),
     cwd: String(thread.cwd || ""),
     status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
+    ...(activeTurn ? { activeTurnId: String(activeTurn.id) } : {}),
     createdAt: Number(thread.createdAt ?? Date.now() / 1000),
     updatedAt: Number(thread.updatedAt ?? Date.now() / 1000),
     messages

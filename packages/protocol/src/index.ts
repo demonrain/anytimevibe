@@ -89,6 +89,7 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     title: z.string(),
     cwd: z.string(),
     status: z.string(),
+    activeTurnId: z.string().optional(),
     createdAt: z.number(),
     updatedAt: z.number(),
     messages: z.array(z.object({

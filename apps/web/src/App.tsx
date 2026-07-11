@@ -70,7 +70,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       diff: existing?.diff ?? "",
       messages: event.messages,
       approvals: existing?.approvals ?? [],
-      ...(existing?.activeTurnId ? { activeTurnId: existing.activeTurnId } : {})
+      ...(event.activeTurnId ? { activeTurnId: event.activeTurnId } : {})
     };
     return next;
   }

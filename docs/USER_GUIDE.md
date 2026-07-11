@@ -50,6 +50,12 @@ UPDATE_FEED_URL=https://github.com/demonrain/anytimevibe/releases/latest/downloa
 
 发布 Tag 后，GitHub Actions 会构建客户端并上传安装包、blockmap、`latest.yml` 和 `latest-mac.yml`。生产分发应配置 Windows 代码签名以及 Apple Developer ID 签名、公证，否则系统安全提示和 macOS 自动更新可能受限。
 
+## Web 与本机任务状态同步
+
+Web 下发任务后，Agent 会持续运行 Codex，并在本机控制面板的“当前远程任务”区域显示实时过程输出。过程输出仅保留在本机，不会作为流式内容上传到中继。
+
+线程同步快照包含活动回合 ID，因此任务执行期间刷新页面、退出登录或换浏览器重新登录后，任务仍显示“处理中”。任务完成后状态更新为完成，完整对话在自动同步或手动点击“同步任务”后显示。
+
 ## macOS 客户端
 
 macOS Agent 功能与 Windows 版一致，支持菜单栏常驻、登录启动、环境检测、配对和工作区白名单。构建命令：
@@ -483,7 +489,7 @@ AnytimeVibe-Agent-Setup.exe
 SHA256：
 
 ```text
-5CB5C099ACA0443BEDDBE743E6E83697212689AD6AEFFFA1D9ECB502D5320346
+F8CF1EE604A60EFEB4C9CCC7B7FE2503EAAD2E9D1B24CD6CE4E634BCD700BEB8
 ```
 
 后续重新构建安装包后，文件哈希会发生变化，应以实际发布渠道提供的新哈希为准。

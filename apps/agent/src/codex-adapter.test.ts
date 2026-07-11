@@ -25,4 +25,13 @@ describe("threadToSnapshot", () => {
       { id: "a1", role: "assistant", text: "done", createdAt: 2 }
     ]);
   });
+
+  it("includes the active turn in synchronization snapshots", () => {
+    const snapshot = threadToSnapshot({
+      id: "thread-active",
+      status: "active",
+      turns: [{ id: "turn-active", status: "inProgress", startedAt: 3, items: [] }]
+    });
+    expect(snapshot.activeTurnId).toBe("turn-active");
+  });
 });
