@@ -56,6 +56,7 @@ const claimBody = z.object({
 const authorizePairingBody = z.object({
   wrappedSyncKey: z.object({ nonce: z.string().min(1), ciphertext: z.string().min(1) })
 });
+const browserKeyAuthorizationBody = z.object({ clientPublicKey: z.record(z.unknown()) });
 
 const pushBody = z.object({
   endpoint: z.string().url(),
@@ -312,6 +313,35 @@ async function main(): Promise<void> {
     return { host: result[0] };
   });
 
+  app.post("/api/hosts/:hostId/key-authorizations", async (request, reply) => {
+    const user = await requireUser(sql, request, reply);
+    if (!user) return;
+    const { hostId } = request.params as { hostId: string };
+    const body = browserKeyAuthorizationBody.parse(request.body);
+    const hosts = await sql<Array<{ id: string; agentId: string; name: string; platform: string; codexVersion: string; agentPublicKey: JsonWebKey }>>`
+      SELECT id, agent_id, name, platform, codex_version, agent_public_key
+      FROM hosts WHERE id = ${hostId} AND user_id = ${user.id} AND revoked_at IS NULL LIMIT 1
+    `;
+    const host = hosts[0];
+    if (!host) return reply.code(404).send({ error: "host_not_found" });
+    const agent = agentSockets.get(hostId);
+    if (!agent || agent.readyState !== 1) return reply.code(409).send({ error: "host_offline" });
+    const pairingId = randomUUID();
+    await sql`
+      INSERT INTO pairings (
+        id, code, secret_hash, agent_id, agent_name, platform, codex_version,
+        agent_public_key, user_id, host_id, client_public_key, status, expires_at
+      ) VALUES (
+        ${pairingId}, ${`AUTO-${pairingId}`}, ${hashToken(randomToken())}, ${host.agentId},
+        ${String(host.name)}, ${String(host.platform)}, ${String(host.codexVersion)},
+        ${sql.json(host.agentPublicKey as never)}, ${user.id}, ${hostId},
+        ${sql.json(body.clientPublicKey as never)}, 'claimed', now() + interval '10 minutes'
+      )
+    `;
+    agent.send(jsonControl("relay.key_authorization", { pairingId, clientPublicKey: body.clientPublicKey }));
+    return reply.code(201).send({ pairingId, agentPublicKey: host.agentPublicKey, expiresInSeconds: 600 });
+  });
+
   app.post("/api/agent/pairings", async (request, reply) => {
     const body = agentPairBody.parse(request.body);
     let code = pairingCode();
@@ -565,7 +595,18 @@ async function main(): Promise<void> {
 
     agentSocket.on("message", async (data) => {
       try {
-        const envelope = encryptedEnvelopeSchema.parse(JSON.parse(data.toString()));
+        const parsed = JSON.parse(data.toString()) as Record<string, unknown>;
+        if (parsed.type === "agent.key_authorization") {
+          const pairingId = z.string().uuid().parse(parsed.pairingId);
+          const wrappedSyncKey = authorizePairingBody.shape.wrappedSyncKey.parse(parsed.wrappedSyncKey);
+          await sql`
+            UPDATE pairings SET wrapped_sync_key = ${sql.json(wrappedSyncKey as never)}, status = 'authorized'
+            WHERE id = ${pairingId} AND host_id = ${host.id} AND status = 'claimed' AND expires_at > now()
+          `;
+          broadcastToUser(host.userId, jsonControl("relay.key_authorized", { hostId: host.id, pairingId }));
+          return;
+        }
+        const envelope = encryptedEnvelopeSchema.parse(parsed);
         if (envelope.hostId !== host.id) throw new Error("host mismatch");
         if (envelope.persist) {
           await sql`

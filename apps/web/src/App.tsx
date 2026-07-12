@@ -221,6 +221,8 @@ export function App() {
   const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => (localStorage.getItem("permission-mode") as PermissionMode | null) ?? "inherit");
   const autoSyncedHostsRef = useRef(new Set<string>());
+  const [keyAuthorizationStatus, setKeyAuthorizationStatus] = useState<Record<string, "missing" | "authorizing">>({});
+  const keyAuthorizationsRef = useRef(new Set<string>());
   function selectTask(threadId: string) {
     setSelectedTaskId(threadId);
     setMobilePane("conversation");
@@ -294,6 +296,45 @@ export function App() {
     hostOfflineTimersRef.current.set(hostId, timer);
   });
 
+  async function authorizeExistingHost(hostId: string): Promise<void> {
+    if (keyAuthorizationsRef.current.has(hostId)) return;
+    keyAuthorizationsRef.current.add(hostId);
+    setKeyAuthorizationStatus((current) => ({ ...current, [hostId]: "authorizing" }));
+    try {
+      const keyPair = await generatePairingKeyPair();
+      const clientPublicKey = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
+      const authorization = await api<{ pairingId: string; agentPublicKey: JsonWebKey }>(`/api/hosts/${hostId}/key-authorizations`, {
+        method: "POST",
+        body: JSON.stringify({ clientPublicKey })
+      });
+      const pairingKey = await derivePairingKey(keyPair.privateKey, authorization.agentPublicKey, authorization.pairingId);
+      let wrappedSyncKey: { nonce: string; ciphertext: string } | null = null;
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        const status = await api<{ status: string; wrappedSyncKey?: { nonce: string; ciphertext: string } }>(`/api/pairings/${authorization.pairingId}/status`);
+        if (status.status === "authorized" && status.wrappedSyncKey) {
+          wrappedSyncKey = status.wrappedSyncKey;
+          break;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      }
+      if (!wrappedSyncKey) throw new Error("客户端密钥授权超时，请确认电脑端保持在线。");
+      const unwrapped = await decryptPayload<{ syncKey: string }>(pairingKey, wrappedSyncKey, authorization.pairingId);
+      await saveHostKey(hostId, await importAesKey(base64ToBytes(unwrapped.syncKey)));
+      setKeyAuthorizationStatus((current) => {
+        const next = { ...current };
+        delete next[hostId];
+        return next;
+      });
+      localStorage.removeItem(`sync:${hostId}`);
+      await loadHosts();
+    } catch (authorizationError) {
+      setKeyAuthorizationStatus((current) => ({ ...current, [hostId]: "missing" }));
+      throw authorizationError;
+    } finally {
+      keyAuthorizationsRef.current.delete(hostId);
+    }
+  }
+
   const loadHosts = useEffectEvent(async () => {
     const response = await api<{ hosts: Host[] }>("/api/hosts");
     setHosts(response.hosts);
@@ -311,7 +352,17 @@ export function App() {
     setSelectedHostId((current) => current ?? response.hosts[0]?.id ?? null);
     for (const host of response.hosts) {
       const key = await getHostKey(host.id);
-      if (!key) continue;
+      if (!key) {
+        setKeyAuthorizationStatus((current) => ({ ...current, [host.id]: current[host.id] ?? "missing" }));
+        if (host.online) void authorizeExistingHost(host.id).catch((authorizationError) => setError(authorizationError.message));
+        continue;
+      }
+      setKeyAuthorizationStatus((current) => {
+        if (!current[host.id]) return current;
+        const next = { ...current };
+        delete next[host.id];
+        return next;
+      });
       const after = Number(localStorage.getItem(`sync:${host.id}`) ?? 0);
       const sync = await api<{ events: EncryptedEnvelope[]; nextSequence: number }>(`/api/sync/${host.id}?after=${after}`);
       for (const envelope of sync.events) await handleEnvelope(envelope);
@@ -333,6 +384,9 @@ export function App() {
             const hostId = String(parsed.hostId);
             const online = Boolean(parsed.online);
             updateHostStatus(hostId, online);
+            if (online) void getHostKey(hostId).then((key) => {
+              if (!key) return authorizeExistingHost(hostId);
+            }).catch((authorizationError) => setError(authorizationError.message));
             if (online && !autoSyncedHostsRef.current.has(hostId)) {
               autoSyncedHostsRef.current.add(hostId);
               syncHostTasks(hostId).catch((syncError) => {
@@ -480,6 +534,7 @@ export function App() {
           </div>
         </div>
         <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? "主机在线，命令将立即执行" : activeRuntime.online === false ? "主机离线，仅可查看已同步记录" : "正在确认主机状态…"}</div>
+        {activeHost && keyAuthorizationStatus[activeHost.id] && <div className="key-authorization-note"><div><strong>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "正在授权此浏览器" : "此浏览器尚未取得主机密钥"}</strong><span>{activeRuntime.online === true ? "电脑端会自动完成端到端密钥授权。" : "请先让电脑端客户端上线，再重新授权。"}</span></div><button disabled={keyAuthorizationStatus[activeHost.id] === "authorizing" || activeRuntime.online !== true} onClick={() => authorizeExistingHost(activeHost.id).catch((authorizationError) => setError(authorizationError.message))}>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "授权中…" : "授权此浏览器"}</button></div>}
         <label className="permission-select">Codex 权限<select value={permissionMode} onChange={(event) => { const mode = event.target.value as PermissionMode; setPermissionMode(mode); localStorage.setItem("permission-mode", mode); }}><option value="inherit">跟随客户端配置</option><option value="full-access">Full Access</option><option value="workspace-write">Workspace Write</option><option value="read-only">Read Only</option></select></label>
         <div className="task-list">
           {tasks.map((task) => { const status = taskStatusMeta(task.status); return <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>

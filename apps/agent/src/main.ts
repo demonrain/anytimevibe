@@ -930,7 +930,19 @@ async function ensureCodex(): Promise<void> {
 }
 
 async function handleRelayMessage(raw: string): Promise<void> {
-  const envelope = JSON.parse(raw) as EncryptedEnvelope;
+  const parsed = JSON.parse(raw) as Record<string, any>;
+  if (parsed.type === "relay.key_authorization") {
+    if (!config.encryptedSyncKey) throw new Error("Missing encrypted sync key");
+    await ensurePairingKeys();
+    const pairingId = String(parsed.pairingId);
+    const privateJwk = JSON.parse(decryptSecret(config.encryptedPrivateKey!)) as JsonWebKey;
+    const privateKey = await crypto.subtle.importKey("jwk", privateJwk, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+    const pairingKey = await derivePairingKey(privateKey, parsed.clientPublicKey as JsonWebKey, pairingId);
+    const wrappedSyncKey = await encryptPayload(pairingKey, { syncKey: decryptSecret(config.encryptedSyncKey) }, pairingId);
+    socket?.send(JSON.stringify({ type: "agent.key_authorization", pairingId, wrappedSyncKey }));
+    return;
+  }
+  const envelope = parsed as EncryptedEnvelope;
   if (!syncKey) throw new Error("Missing sync key");
   const command = clientCommandSchema.parse(await openEnvelope<ClientCommand>(syncKey, envelope));
   await handleCommand(command);
