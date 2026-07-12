@@ -10,3 +10,11 @@ coverage/
 apps/agent/release/
 apps/agent/release-*/
 apps/relay/data/
+
+# HyperFrames generated media and render diagnostics
+artifacts/anytimevibe-promo/
+artifacts/**/anytimevibe-promo-*.mp4
+artifacts/**/frame-*.png
+artifacts/**/contact-sheet.png
+artifacts/**/AGENTS.md
+artifacts/**/CLAUDE.md
