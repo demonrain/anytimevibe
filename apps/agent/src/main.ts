@@ -156,6 +156,8 @@ let pairingTimer: NodeJS.Timeout | null = null;
 let codex: CodexAdapter | null = null;
 let syncKey: CryptoKey | null = null;
 let quitting = false;
+/** True while quitAndInstall is in progress — suppress all UI/side-effect callbacks. */
+let installingUpdate = false;
 /** Bumped on every intentional connect(); stale socket handlers ignore events. */
 let connectGeneration = 0;
 let reconnectAttempt = 0;
@@ -248,21 +250,41 @@ async function saveConfig(): Promise<void> {
   await fs.writeFile(configPath, JSON.stringify(config, null, 2), "utf8");
 }
 
+function isWindowAlive(): boolean {
+  return Boolean(windowRef && !windowRef.isDestroyed() && !windowRef.webContents.isDestroyed());
+}
+
 function updateState(patch: Partial<PublicState>): void {
   publicState = {
     ...publicState,
     ...patch,
-    relayUrl: config.relayUrl,
-    displayName: resolvedDisplayName(),
+    relayUrl: config?.relayUrl ?? publicState.relayUrl,
+    displayName: config ? resolvedDisplayName() : publicState.displayName,
     codexVersion,
-    workspaces: config.workspaces
+    workspaces: config?.workspaces ?? publicState.workspaces
   };
-  windowRef?.webContents.send("agent:state", publicState);
-  rebuildTray();
+  // During quit/update the BrowserWindow/Tray may already be destroyed; never touch them.
+  if (quitting || installingUpdate) return;
+  try {
+    if (isWindowAlive()) {
+      windowRef!.webContents.send("agent:state", publicState);
+    }
+  } catch {
+    // Window can race-destroy between isDestroyed checks and send.
+  }
+  try {
+    rebuildTray();
+  } catch {
+    // Tray may already be destroyed during shutdown.
+  }
 }
 
 function rebuildTray(): void {
-  if (!tray) return;
+  if (!tray || quitting || installingUpdate) return;
+  if (typeof (tray as Tray & { isDestroyed?: () => boolean }).isDestroyed === "function"
+    && (tray as Tray & { isDestroyed: () => boolean }).isDestroyed()) {
+    return;
+  }
   tray.setToolTip(`${resolvedDisplayName()} · ${publicState.status}`);
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: `状态：${publicState.status}`, enabled: false },
@@ -918,8 +940,13 @@ async function ensureCodex(): Promise<void> {
         : "未检测到 Codex CLI");
     }
   }
-  codex = new CodexAdapter(codexCommand, (message) => handleCodexMessage(message).catch(handleError), (detail) => {
+  codex = new CodexAdapter(codexCommand, (message) => {
+    if (quitting || installingUpdate) return;
+    handleCodexMessage(message).catch(handleError);
+  }, (detail) => {
     codex = null;
+    // Ignore exit noise while shutting down for update/quit — UI may already be destroyed.
+    if (quitting || installingUpdate) return;
     // Do not tear down the relay socket when Codex exits; keep online for reconnect of Codex only.
     updateState({
       status: socket?.readyState === WebSocket.OPEN ? "online" : publicState.status,
@@ -1197,6 +1224,7 @@ async function addWorkspace(): Promise<PublicState> {
 function handleError(error: unknown): void {
   const detail = error instanceof Error ? error.message : String(error);
   console.error(error);
+  if (quitting || installingUpdate) return;
   const connected = socket?.readyState === WebSocket.OPEN;
   updateState({
     status: publicState.status === "incompatible" ? "incompatible" : connected ? "online" : "offline",
@@ -1220,6 +1248,11 @@ function registerUpdateListeners(): void {
     showWindow();
   });
   autoUpdater.on("error", (error) => {
+    // Do not clear flags mid-install; that re-enables tray-hide and races with quit.
+    if (installingUpdate) {
+      console.error("update install error:", error);
+      return;
+    }
     if (quitting) quitting = false;
     updateState({ update: { status: "error", message: error.message } });
   });
@@ -1227,19 +1260,28 @@ function registerUpdateListeners(): void {
   // electron-updater emits this event; typings may lag behind runtime.
   (autoUpdater as NodeJS.EventEmitter).on("before-quit-for-update", () => {
     quitting = true;
+    installingUpdate = true;
+    prepareForUpdateQuit();
   });
 }
 
-function installDownloadedUpdate(): void {
-  if (publicState.update.status !== "ready") {
-    updateState({ update: { status: "error", message: "更新包尚未下载完成，请先等待下载或点击检查更新。" } });
-    return;
-  }
-  // Prevent tray-hide close handler from blocking electron-updater quit on macOS/Windows.
+/** Tear down sockets/codex/UI before the updater replaces the app bundle. */
+function prepareForUpdateQuit(): void {
   quitting = true;
+  installingUpdate = true;
+  reconnectBlockedReason = "updating";
+  connectGeneration += 1;
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
+  }
+  if (pairingTimer) {
+    clearTimeout(pairingTimer);
+    pairingTimer = null;
+  }
+  if (activityFlushTimer) {
+    clearTimeout(activityFlushTimer);
+    activityFlushTimer = null;
   }
   try {
     socket?.removeAllListeners();
@@ -1249,27 +1291,64 @@ function installDownloadedUpdate(): void {
   }
   socket = null;
   try {
-    // isSilent=false so the installer UI can run; isForceRunAfter=true restarts the app.
-    // On macOS this also emits before-quit-for-update which must see quitting=true.
-    autoUpdater.quitAndInstall(false, true);
-    // Fallback: if quitAndInstall is a no-op (e.g. app still running from DMG), force quit
-    // so autoInstallOnAppQuit can apply the already-downloaded update on next launch.
-    setTimeout(() => {
-      if (!quitting) return;
-      try {
-        app.quit();
-      } catch {
-        // ignore
-      }
-      setTimeout(() => {
-        if (quitting) app.exit(0);
-      }, 1500);
-    }, 2500);
-  } catch (error) {
-    quitting = false;
-    const message = error instanceof Error ? error.message : String(error);
-    updateState({ update: { status: "error", message: `无法启动安装：${message}` } });
+    codex?.stop();
+  } catch {
+    // ignore
   }
+  codex = null;
+  try {
+    if (tray) {
+      tray.destroy();
+      tray = null;
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    if (windowRef && !windowRef.isDestroyed()) {
+      windowRef.removeAllListeners("close");
+      windowRef.destroy();
+    }
+  } catch {
+    // ignore
+  }
+  windowRef = null;
+}
+
+function installDownloadedUpdate(): void {
+  if (installingUpdate) return;
+  if (publicState.update.status !== "ready") {
+    updateState({ update: { status: "error", message: "更新包尚未下载完成，请先等待下载或点击检查更新。" } });
+    return;
+  }
+  // 1) Mark quit + tear down runtime so no callback touches destroyed UI.
+  // 2) Only then ask electron-updater to install (after the process is idle).
+  prepareForUpdateQuit();
+  // Drain pending child-process exit / IPC events before replacing the app.
+  setTimeout(() => {
+    try {
+      // isSilent=false so the installer UI can run; isForceRunAfter=true restarts the app.
+      autoUpdater.quitAndInstall(false, true);
+      // Fallback: if quitAndInstall is a no-op (e.g. app still running from DMG), force quit
+      // so autoInstallOnAppQuit can apply the already-downloaded update on next launch.
+      setTimeout(() => {
+        if (!installingUpdate) return;
+        try {
+          app.quit();
+        } catch {
+          // ignore
+        }
+        setTimeout(() => {
+          if (installingUpdate) app.exit(0);
+        }, 1500);
+      }, 2000);
+    } catch (error) {
+      installingUpdate = false;
+      quitting = false;
+      const message = error instanceof Error ? error.message : String(error);
+      updateState({ update: { status: "error", message: `无法启动安装：${message}` } });
+    }
+  }, 150);
 }
 
 async function checkForAgentUpdate(): Promise<void> {
@@ -1341,6 +1420,8 @@ function registerIpc(): void {
     try {
       installDownloadedUpdate();
     } catch (error) {
+      installingUpdate = false;
+      quitting = false;
       const message = error instanceof Error ? error.message : String(error);
       updateState({ update: { status: "error", message: `安装更新失败：${message}` } });
     }
@@ -1396,8 +1477,23 @@ app.whenReady().then(async () => {
 app.on("window-all-closed", () => undefined);
 app.on("before-quit", () => {
   quitting = true;
+  if (installingUpdate) {
+    // prepareForUpdateQuit already cleaned resources; avoid double-kill races.
+    return;
+  }
   reconnectTimer && clearTimeout(reconnectTimer);
   pairingTimer && clearTimeout(pairingTimer);
-  socket?.close();
-  codex?.stop();
+  try {
+    socket?.removeAllListeners();
+    socket?.close();
+  } catch {
+    // ignore
+  }
+  socket = null;
+  try {
+    codex?.stop();
+  } catch {
+    // ignore
+  }
+  codex = null;
 });

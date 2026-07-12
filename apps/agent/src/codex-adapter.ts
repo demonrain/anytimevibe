@@ -64,8 +64,22 @@ export class CodexAdapter {
   }
 
   stop(): void {
-    this.process?.kill();
+    const child = this.process;
     this.process = null;
+    if (!child) return;
+    // Detach listeners first so kill-driven "exit" does not fire onExit UI updates
+    // during app quit / quitAndInstall (destroyed BrowserWindow).
+    child.removeAllListeners("exit");
+    child.removeAllListeners("error");
+    for (const pending of this.pending.values()) {
+      pending.reject(new Error("Codex app-server stopped"));
+    }
+    this.pending.clear();
+    try {
+      child.kill();
+    } catch {
+      // ignore
+    }
   }
 
   request<T = any>(method: string, params?: unknown): Promise<T> {
