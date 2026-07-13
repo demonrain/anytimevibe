@@ -504,7 +504,13 @@ async function loadConfig(): Promise<void> {
   };
 }
 
-let cachedLoginPath: string | null = null;
+// ---------------------------------------------------------------------------
+// Toolchain discovery / install — platform implementations are deliberately
+// separate so Windows fixes never change macOS behavior (and vice versa).
+// ---------------------------------------------------------------------------
+
+let cachedMacLoginPath: string | null = null;
+let cachedWindowsPath: string | null = null;
 
 async function pathExists(filePath: string): Promise<boolean> {
   try {
@@ -514,6 +520,101 @@ async function pathExists(filePath: string): Promise<boolean> {
     return false;
   }
 }
+
+// ---- macOS PATH (login shell + Homebrew/nvm) ----
+
+/** GUI apps on macOS often miss Homebrew/nvm PATH; rebuild from login shell + common locations. */
+async function resolveMacLoginPath(): Promise<string> {
+  if (cachedMacLoginPath) return cachedMacLoginPath;
+  const parts = new Set((process.env.PATH ?? "").split(":").filter(Boolean));
+  const home = os.homedir();
+  for (const dir of [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    path.join(home, ".local", "bin"),
+    path.join(home, ".nvm", "current", "bin"),
+    path.join(home, ".fnm", "current", "bin"),
+    path.join(home, ".volta", "bin"),
+    path.join(home, ".asdf", "shims"),
+    path.join(home, "Library", "Application Support", "fnm", "aliases", "default")
+  ]) {
+    parts.add(dir);
+  }
+  for (const shell of ["/bin/zsh", "/bin/bash"]) {
+    try {
+      const result = await execFileAsync(shell, ["-ilc", "printf %s \"$PATH\""], {
+        env: process.env,
+        timeout: 8_000,
+        maxBuffer: 1024 * 1024
+      });
+      for (const segment of String(result.stdout).trim().split(":")) {
+        if (segment) parts.add(segment);
+      }
+      break;
+    } catch {
+      // try next shell
+    }
+  }
+  cachedMacLoginPath = [...parts].join(":");
+  return cachedMacLoginPath;
+}
+
+async function applyMacLoginPathToProcess(): Promise<void> {
+  if (process.platform !== "darwin") return;
+  cachedMacLoginPath = null;
+  process.env.PATH = await resolveMacLoginPath();
+}
+
+async function findOnMacPath(command: string): Promise<string | null> {
+  const loginPath = await resolveMacLoginPath();
+  const candidates: string[] = [];
+  for (const dir of loginPath.split(":")) {
+    if (dir) candidates.push(path.join(dir, command));
+  }
+  candidates.unshift(
+    path.join("/opt/homebrew/bin", command),
+    path.join("/usr/local/bin", command),
+    path.join("/usr/bin", command)
+  );
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (await pathExists(candidate)) return candidate;
+  }
+  for (const shell of ["/bin/zsh", "/bin/bash"]) {
+    try {
+      const result = await execFileAsync(shell, ["-ilc", `command -v ${command}`], {
+        env: { ...process.env, PATH: loginPath },
+        timeout: 8_000
+      });
+      const found = String(result.stdout).trim().split(/\r?\n/).find(Boolean);
+      if (found && !found.includes("not found") && await pathExists(found)) return found;
+    } catch {
+      // try next shell
+    }
+  }
+  return null;
+}
+
+async function macCommandVersion(command: string, args: string[]): Promise<string | null> {
+  try {
+    const loginPath = await resolveMacLoginPath();
+    const result = await execFileAsync(command, args, {
+      env: { ...process.env, PATH: loginPath },
+      timeout: 8_000
+    });
+    const text = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
+// ---- Windows PATH (registry + common Node/npm dirs) ----
 
 function expandWindowsEnvVars(value: string): string {
   return value.replace(/%([^%]+)%/g, (_match, name: string) => process.env[name] ?? process.env[name.toUpperCase()] ?? "");
@@ -537,80 +638,71 @@ async function readWindowsRegistryPath(rootKey: string): Promise<string[]> {
   }
 }
 
-/** Rebuild PATH for GUI apps: macOS login shell / Windows registry + common tool dirs. */
-async function resolveLoginPath(): Promise<string> {
-  if (cachedLoginPath) return cachedLoginPath;
-  const parts = new Set((process.env.PATH ?? "").split(path.delimiter).filter(Boolean));
+/** GUI apps on Windows often inherit a stripped PATH; rebuild from registry + Node install dirs. */
+async function resolveWindowsPath(): Promise<string> {
+  if (cachedWindowsPath) return cachedWindowsPath;
+  const parts = new Set((process.env.PATH ?? "").split(";").filter(Boolean));
   const home = os.homedir();
-
-  if (process.platform === "win32") {
-    for (const dir of await readWindowsRegistryPath("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment")) parts.add(dir);
-    for (const dir of await readWindowsRegistryPath("HKCU\\Environment")) parts.add(dir);
-    for (const dir of [
-      path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs"),
-      path.join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "nodejs"),
-      path.join(process.env.LOCALAPPDATA || "", "Programs", "nodejs"),
-      path.join(process.env.APPDATA || "", "npm"),
-      path.join(home, "AppData", "Roaming", "npm"),
-      path.join(home, "AppData", "Local", "fnm"),
-      path.join(home, ".fnm"),
-      path.join(home, "scoop", "shims"),
-      path.join(home, "AppData", "Local", "Programs", "fnm")
-    ]) {
-      if (dir) parts.add(dir);
-    }
-    cachedLoginPath = [...parts].join(";");
-    return cachedLoginPath;
-  }
-
+  for (const dir of await readWindowsRegistryPath("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment")) parts.add(dir);
+  for (const dir of await readWindowsRegistryPath("HKCU\\Environment")) parts.add(dir);
   for (const dir of [
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    path.join(home, ".local", "bin"),
-    path.join(home, ".nvm", "current", "bin"),
-    path.join(home, ".fnm", "current", "bin"),
-    path.join(home, ".volta", "bin"),
-    path.join(home, ".asdf", "shims"),
-    path.join(home, "Library", "Application Support", "fnm", "aliases", "default")
+    path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs"),
+    path.join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "nodejs"),
+    path.join(process.env.LOCALAPPDATA || "", "Programs", "nodejs"),
+    path.join(process.env.APPDATA || "", "npm"),
+    path.join(home, "AppData", "Roaming", "npm"),
+    path.join(home, "AppData", "Local", "fnm"),
+    path.join(home, ".fnm"),
+    path.join(home, "scoop", "shims"),
+    path.join(home, "AppData", "Local", "Programs", "fnm")
   ]) {
-    parts.add(dir);
+    if (dir) parts.add(dir);
   }
-  for (const shell of ["/bin/zsh", "/bin/bash"]) {
-    try {
-      const result = await execFileAsync(shell, ["-ilc", "printf %s \"$PATH\""], {
-        env: process.env,
-        timeout: 8_000,
-        maxBuffer: 1024 * 1024
-      });
-      for (const segment of String(result.stdout).trim().split(path.delimiter)) {
-        if (segment) parts.add(segment);
-      }
-      break;
-    } catch {
-      // try next shell
-    }
-  }
-  cachedLoginPath = [...parts].join(path.delimiter);
-  return cachedLoginPath;
+  cachedWindowsPath = [...parts].join(";");
+  return cachedWindowsPath;
 }
 
-async function commandVersion(command: string, args: string[]): Promise<string | null> {
+async function applyWindowsPathToProcess(): Promise<void> {
+  if (process.platform !== "win32") return;
+  cachedWindowsPath = null;
+  process.env.PATH = await resolveWindowsPath();
+}
+
+async function findOnWindowsPath(command: string): Promise<string | null> {
+  const winPath = await resolveWindowsPath();
   try {
-    const loginPath = await resolveLoginPath();
-    const result = process.platform === "win32"
-      ? await execFileAsync(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(command, args), {
-        windowsHide: true,
-        windowsVerbatimArguments: true,
-        env: { ...process.env, PATH: loginPath },
-        timeout: 15_000
-      })
-      : await execFileAsync(command, args, {
-        env: { ...process.env, PATH: loginPath },
-        timeout: 8_000
-      });
+    const result = await execFileAsync("where.exe", [command], {
+      env: { ...process.env, PATH: winPath },
+      windowsHide: true,
+      timeout: 8_000
+    });
+    const found = result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    if (found) return found;
+  } catch {
+    // fall through
+  }
+  const names = /\.(cmd|exe|bat)$/i.test(command)
+    ? [command]
+    : [command, `${command}.cmd`, `${command}.exe`, `${command}.bat`];
+  for (const dir of winPath.split(";")) {
+    if (!dir) continue;
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (await pathExists(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+async function windowsCommandVersion(command: string, args: string[]): Promise<string | null> {
+  try {
+    const winPath = await resolveWindowsPath();
+    const result = await execFileAsync(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(command, args), {
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+      env: { ...process.env, PATH: winPath },
+      timeout: 15_000
+    });
     const text = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
     return text || null;
   } catch {
@@ -618,78 +710,45 @@ async function commandVersion(command: string, args: string[]): Promise<string |
   }
 }
 
-async function findOnPath(command: string): Promise<string | null> {
-  const loginPath = await resolveLoginPath();
+// ---- Shared thin dispatchers (no platform-specific logic inside) ----
+
+/** Apply platform tool PATH for child processes. Windows and macOS implementations are independent. */
+async function applyLoginPathToProcess(): Promise<void> {
   if (process.platform === "win32") {
-    try {
-      const result = await execFileAsync("where.exe", [command], {
-        env: { ...process.env, PATH: loginPath },
-        windowsHide: true,
-        timeout: 8_000
-      });
-      const found = result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
-      if (found) return found;
-    } catch {
-      // fall through to direct probes
-    }
-    const names = /\.(cmd|exe|bat)$/i.test(command)
-      ? [command]
-      : [command, `${command}.cmd`, `${command}.exe`, `${command}.bat`];
-    for (const dir of loginPath.split(";")) {
-      if (!dir) continue;
-      for (const name of names) {
-        const candidate = path.join(dir, name);
-        if (await pathExists(candidate)) return candidate;
-      }
-    }
-    return null;
+    await applyWindowsPathToProcess();
+    return;
   }
+  if (process.platform === "darwin") {
+    await applyMacLoginPathToProcess();
+  }
+}
 
-  const candidates: string[] = [];
-  for (const dir of loginPath.split(path.delimiter)) {
-    if (dir) candidates.push(path.join(dir, command));
-  }
-  candidates.unshift(
-    path.join("/opt/homebrew/bin", command),
-    path.join("/usr/local/bin", command),
-    path.join("/usr/bin", command)
-  );
-  const seen = new Set<string>();
-  for (const candidate of candidates) {
-    if (seen.has(candidate)) continue;
-    seen.add(candidate);
-    if (await pathExists(candidate)) return candidate;
-  }
-
-  for (const shell of ["/bin/zsh", "/bin/bash"]) {
-    try {
-      const result = await execFileAsync(shell, ["-ilc", `command -v ${command}`], {
-        env: { ...process.env, PATH: loginPath },
-        timeout: 8_000
-      });
-      const found = String(result.stdout).trim().split(/\r?\n/).find(Boolean);
-      if (found && !found.includes("not found") && await pathExists(found)) return found;
-    } catch {
-      // try next shell
-    }
-  }
+async function findOnPath(command: string): Promise<string | null> {
+  if (process.platform === "win32") return findOnWindowsPath(command);
+  if (process.platform === "darwin") return findOnMacPath(command);
   return null;
 }
 
-/** Apply rebuilt PATH so child processes (npm/codex/node) work from packaged GUI apps. */
-async function applyLoginPathToProcess(): Promise<void> {
-  cachedLoginPath = null;
-  process.env.PATH = await resolveLoginPath();
+async function commandVersion(command: string, args: string[]): Promise<string | null> {
+  if (process.platform === "win32") return windowsCommandVersion(command, args);
+  if (process.platform === "darwin") return macCommandVersion(command, args);
+  return null;
 }
 
 async function detectEnvironment(): Promise<EnvironmentState> {
-  // Reset PATH cache so "重新检测" picks up newly installed tools.
   await applyLoginPathToProcess();
-  const nodeCommand = await findOnPath(process.platform === "win32" ? "node.exe" : "node");
+  const nodeCommand = process.platform === "win32"
+    ? await findOnWindowsPath("node.exe")
+    : await findOnMacPath("node");
   const nodeOutput = nodeCommand ? await commandVersion(nodeCommand, ["--version"]) : null;
-  const configuredCodex = process.env.CODEX_COMMAND ? normalizeWindowsCommandPath(process.env.CODEX_COMMAND) : null;
-  const discoveredCodex = configuredCodex ?? await findOnPath(process.platform === "win32" ? "codex.cmd" : "codex");
-  if (discoveredCodex) codexCommand = normalizeWindowsCommandPath(discoveredCodex);
+  const configuredCodex = process.env.CODEX_COMMAND
+    ? (process.platform === "win32" ? normalizeWindowsCommandPath(process.env.CODEX_COMMAND) : process.env.CODEX_COMMAND)
+    : null;
+  const discoveredCodex = configuredCodex
+    ?? (process.platform === "win32" ? await findOnWindowsPath("codex.cmd") : await findOnMacPath("codex"));
+  if (discoveredCodex) {
+    codexCommand = process.platform === "win32" ? normalizeWindowsCommandPath(discoveredCodex) : discoveredCodex;
+  }
   const codexOutput = discoveredCodex ? await commandVersion(codexCommand, ["--version"]) : null;
   const detectedVersion = codexOutput?.replace(/^codex-cli\s+/i, "").trim();
   if (detectedVersion) codexVersion = detectedVersion;
@@ -714,13 +773,15 @@ async function findCodex(): Promise<void> {
   }
 }
 
-/** Run a Windows command via cmd.exe and stream output into the UI detail line. */
+// ---- Windows-only Codex install (in-process npm; console only for login) ----
+
 async function runWindowsCommand(
   command: string,
   args: string[],
   onChunk?: (text: string) => void
 ): Promise<void> {
-  await applyLoginPathToProcess();
+  if (process.platform !== "win32") throw new Error("runWindowsCommand is Windows-only");
+  await applyWindowsPathToProcess();
   await new Promise<void>((resolve, reject) => {
     const child = spawn(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(command, args), {
       windowsHide: true,
@@ -744,11 +805,9 @@ async function runWindowsCommand(
   });
 }
 
-/**
- * Open a visible console from a packaged Electron GUI app.
- * Direct spawn/start often only flashes a black window; WScript.Shell.Run is reliable.
- */
+/** Visible console from Electron GUI on Windows (WScript is more reliable than cmd start). */
 async function openWindowsVisibleConsole(lines: string[]): Promise<void> {
+  if (process.platform !== "win32") throw new Error("openWindowsVisibleConsole is Windows-only");
   const stamp = Date.now();
   const scriptPath = path.join(app.getPath("temp"), `anytimevibe-console-${stamp}.cmd`);
   const vbsPath = path.join(app.getPath("temp"), `anytimevibe-console-${stamp}.vbs`);
@@ -757,7 +816,6 @@ async function openWindowsVisibleConsole(lines: string[]): Promise<void> {
     "setlocal EnableExtensions",
     "chcp 65001 >nul",
     "title AnytimeVibe",
-    // Rebuild PATH inside the console too.
     "for /f \"tokens=2*\" %%A in ('reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\" /v Path 2^>nul') do set \"SYSPATH=%%B\"",
     "for /f \"tokens=2*\" %%A in ('reg query \"HKCU\\Environment\" /v Path 2^>nul') do set \"USERPATH=%%B\"",
     "set \"PATH=%SYSPATH%;%USERPATH%;%ProgramFiles%\\nodejs;%APPDATA%\\npm;%PATH%\"",
@@ -768,7 +826,6 @@ async function openWindowsVisibleConsole(lines: string[]): Promise<void> {
     ""
   ].join("\r\n");
   await fs.writeFile(scriptPath, script, "utf8");
-  // VBScript doubles quotes as "".
   const quoted = scriptPath.replace(/"/g, '""');
   const vbs = `CreateObject("WScript.Shell").Run "cmd /k ""${quoted}""", 1, False`;
   await fs.writeFile(vbsPath, vbs, "utf8");
@@ -788,9 +845,10 @@ async function openWindowsVisibleConsole(lines: string[]): Promise<void> {
 }
 
 async function installCodexOnWindows(): Promise<void> {
-  await applyLoginPathToProcess();
+  if (process.platform !== "win32") throw new Error("installCodexOnWindows is Windows-only");
+  await applyWindowsPathToProcess();
   updateState({ detail: "正在查找 npm…" });
-  const npm = (await findOnPath("npm.cmd")) ?? (await findOnPath("npm"));
+  const npm = (await findOnWindowsPath("npm.cmd")) ?? (await findOnWindowsPath("npm"));
   if (!npm) {
     throw new Error("未找到 npm。请确认 Node.js 安装时包含 npm，然后重启随码客户端再试。");
   }
@@ -801,9 +859,8 @@ async function installCodexOnWindows(): Promise<void> {
     updateState({ detail: `正在安装 Codex CLI… ${tail}` });
   });
 
-  // New global bins may appear under %APPDATA%\\npm — refresh PATH and redetect.
-  cachedLoginPath = null;
-  await applyLoginPathToProcess();
+  cachedWindowsPath = null;
+  await applyWindowsPathToProcess();
   const environment = await detectEnvironment();
   updateState({ environment });
 
@@ -815,10 +872,7 @@ async function installCodexOnWindows(): Promise<void> {
     );
   }
 
-  updateState({
-    environment,
-    detail: "Codex 安装成功，正在打开登录窗口…"
-  });
+  updateState({ environment, detail: "Codex 安装成功，正在打开登录窗口…" });
   try {
     await openWindowsVisibleConsole([
       "echo ============================================",
@@ -844,22 +898,30 @@ async function installCodexOnWindows(): Promise<void> {
   }
 }
 
+// ---- macOS-only Codex install (Terminal.app; unchanged from prior mac behavior) ----
+
+async function installCodexOnMac(): Promise<void> {
+  if (process.platform !== "darwin") throw new Error("installCodexOnMac is macOS-only");
+  await applyMacLoginPathToProcess();
+  const installCommand = "npm install -g @openai/codex@0.144.0 && codex login; echo ''; echo '完成。可关闭此窗口，回到随码客户端点击重新检测。'";
+  await execFileAsync("osascript", ["-e", `tell application \"Terminal\" to do script \"${installCommand}\"`]);
+  await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+  updateState({ detail: "已打开 Terminal 安装窗口。完成后请点击「重新检测」。" });
+}
+
 async function installEnvironment(target: "node" | "codex"): Promise<void> {
   if (target === "node") {
     await shell.openExternal("https://nodejs.org/en/download");
     updateState({ detail: "已打开 Node.js 下载页。安装完成后请重启随码并点击「重新检测」。" });
     return;
   }
+  // Strict platform split: do not share install implementation across OS.
   if (process.platform === "win32") {
-    // Install inside the app (reliable). Only open a console for interactive login.
     await installCodexOnWindows();
     return;
   }
   if (process.platform === "darwin") {
-    const installCommand = "npm install -g @openai/codex@0.144.0 && codex login; echo ''; echo '完成。可关闭此窗口，回到随码客户端点击重新检测。'";
-    await execFileAsync("osascript", ["-e", `tell application \"Terminal\" to do script \"${installCommand}\"`]);
-    await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
-    updateState({ detail: "已打开 Terminal 安装窗口。完成后请点击「重新检测」。" });
+    await installCodexOnMac();
     return;
   }
   throw new Error("当前系统暂不支持一键打开安装终端。");
