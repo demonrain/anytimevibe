@@ -425,7 +425,11 @@ function rendererHtml(): string {
     const nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">安装 Node.js</button>':'';
     const codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">安装兼容版 Codex</button>':'';
     environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+escapeHtml(env.nodeVersion||'未安装')+'</span>'+nodeAction+'</div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+escapeHtml(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span>'+codexAction+'</div>';
-    environment.querySelectorAll('button[data-install]').forEach(button=>button.addEventListener('click',()=>api.installEnvironment(button.dataset.install)));
+    environment.querySelectorAll('button[data-install]').forEach(button=>button.addEventListener('click',()=>{
+      const target=button.dataset.install;
+      button.disabled=true;
+      api.installEnvironment(target).catch((error)=>alert(error&&error.message?error.message:String(error))).finally(()=>{try{button.disabled=false}catch{}});
+    }));
     startPair.disabled=!env.codexCompatible||!state.relayUrl;
     pairBox.innerHTML=state.pairingCode?'<div class="pair">'+escapeHtml(state.pairingCode)+'</div><p class="detail">在 Web 端输入配对码，约 10 分钟后失效。</p>':'';
     workspaces.innerHTML=state.workspaces.length?state.workspaces.map(w=>'<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button class="ghost" data-id="'+escapeHtml(w.id)+'">移除</button></div>').join(''):'<div class="empty">尚未允许任何目录</div>';
@@ -650,20 +654,66 @@ async function findCodex(): Promise<void> {
   }
 }
 
+function windowsPowerShellPath(): string {
+  return path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+/** Open an interactive console for package installs. Electron GUI spawns often hide windows. */
+function openWindowsInstallConsole(title: string, powerShellCommand: string): void {
+  const ps = windowsPowerShellPath();
+  // cmd /c start "title" ... creates a visible new console detached from the Electron GUI process.
+  const child = spawn(
+    process.env.ComSpec ?? "cmd.exe",
+    ["/c", "start", title, ps, "-NoExit", "-ExecutionPolicy", "Bypass", "-NoProfile", "-Command", powerShellCommand],
+    {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env: process.env,
+      cwd: os.homedir()
+    }
+  );
+  child.on("error", (error) => {
+    handleError(new Error(`无法打开安装终端：${error.message}`));
+  });
+  child.unref();
+}
+
 async function installEnvironment(target: "node" | "codex"): Promise<void> {
   if (target === "node") {
     await shell.openExternal("https://nodejs.org/en/download");
+    updateState({ detail: "已打开 Node.js 下载页。安装完成后请点击「重新检测」。" });
     return;
   }
   if (process.platform === "win32") {
-    const installCommand = "npm install -g @openai/codex@0.144; if ($LASTEXITCODE -eq 0) { codex login }";
-    spawn("powershell.exe", ["-NoExit", "-Command", installCommand], { detached: true, windowsHide: false, stdio: "ignore" }).unref();
+    // Use cmd+start so a real console window appears (direct spawn from Electron often shows nothing).
+    const installCommand = [
+      "Write-Host '=== 随码：安装兼容版 Codex CLI 0.144.x ===' -ForegroundColor Cyan",
+      "Write-Host '若提示找不到 npm，请先安装 Node.js 并重新打开本窗口。'",
+      "$ErrorActionPreference = 'Stop'",
+      "try {",
+      "  npm install -g @openai/codex@0.144.0",
+      "  Write-Host '安装成功，正在启动 codex login ...' -ForegroundColor Green",
+      "  codex login",
+      "  Write-Host '完成。可关闭此窗口，回到随码客户端点击「重新检测」。' -ForegroundColor Green",
+      "} catch {",
+      "  Write-Host ($_ | Out-String) -ForegroundColor Red",
+      "  Write-Host '安装失败。请确认 Node.js / npm 已加入 PATH。' -ForegroundColor Red",
+      "}",
+      "Write-Host ''",
+      "pause"
+    ].join("; ");
+    openWindowsInstallConsole("随码-安装Codex", installCommand);
+    updateState({
+      detail: "已打开 PowerShell 安装窗口。请在该窗口完成安装与登录后，回到本客户端点击「重新检测」。"
+    });
     return;
   }
   if (process.platform === "darwin") {
-    const installCommand = "npm install -g @openai/codex@0.144 && codex login";
+    const installCommand = "npm install -g @openai/codex@0.144.0 && codex login; echo ''; echo '完成。可关闭此窗口，回到随码客户端点击重新检测。'";
     await execFileAsync("osascript", ["-e", `tell application \"Terminal\" to do script \"${installCommand}\"`]);
     await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+    updateState({ detail: "已打开 Terminal 安装窗口。完成后请点击「重新检测」。" });
     return;
   }
   throw new Error("当前系统暂不支持一键打开安装终端。");
@@ -1412,7 +1462,12 @@ function registerIpc(): void {
   });
   ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex") => {
     if (target !== "node" && target !== "codex") throw new Error("未知的安装目标");
-    await installEnvironment(target);
+    try {
+      await installEnvironment(target);
+    } catch (error) {
+      handleError(error);
+      throw error;
+    }
     return publicState;
   });
   ipcMain.handle("agent:check-update", async () => { await checkForAgentUpdate(); return publicState; });
