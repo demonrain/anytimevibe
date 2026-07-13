@@ -515,11 +515,54 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
-/** GUI apps on macOS often miss Homebrew/nvm PATH; rebuild from login shell + common locations. */
+function expandWindowsEnvVars(value: string): string {
+  return value.replace(/%([^%]+)%/g, (_match, name: string) => process.env[name] ?? process.env[name.toUpperCase()] ?? "");
+}
+
+async function readWindowsRegistryPath(rootKey: string): Promise<string[]> {
+  try {
+    const result = await execFileAsync("reg.exe", ["query", rootKey, "/v", "Path"], {
+      windowsHide: true,
+      timeout: 5_000
+    });
+    const line = String(result.stdout)
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .find((item) => /^Path\s+REG_/i.test(item));
+    if (!line) return [];
+    const value = line.replace(/^Path\s+REG_\w+\s+/i, "").trim();
+    return expandWindowsEnvVars(value).split(";").map((part) => part.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/** Rebuild PATH for GUI apps: macOS login shell / Windows registry + common tool dirs. */
 async function resolveLoginPath(): Promise<string> {
   if (cachedLoginPath) return cachedLoginPath;
   const parts = new Set((process.env.PATH ?? "").split(path.delimiter).filter(Boolean));
   const home = os.homedir();
+
+  if (process.platform === "win32") {
+    for (const dir of await readWindowsRegistryPath("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment")) parts.add(dir);
+    for (const dir of await readWindowsRegistryPath("HKCU\\Environment")) parts.add(dir);
+    for (const dir of [
+      path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs"),
+      path.join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "nodejs"),
+      path.join(process.env.LOCALAPPDATA || "", "Programs", "nodejs"),
+      path.join(process.env.APPDATA || "", "npm"),
+      path.join(home, "AppData", "Roaming", "npm"),
+      path.join(home, "AppData", "Local", "fnm"),
+      path.join(home, ".fnm"),
+      path.join(home, "scoop", "shims"),
+      path.join(home, "AppData", "Local", "Programs", "fnm")
+    ]) {
+      if (dir) parts.add(dir);
+    }
+    cachedLoginPath = [...parts].join(";");
+    return cachedLoginPath;
+  }
+
   for (const dir of [
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",
@@ -535,21 +578,19 @@ async function resolveLoginPath(): Promise<string> {
   ]) {
     parts.add(dir);
   }
-  if (process.platform !== "win32") {
-    for (const shell of ["/bin/zsh", "/bin/bash"]) {
-      try {
-        const result = await execFileAsync(shell, ["-ilc", "printf %s \"$PATH\""], {
-          env: process.env,
-          timeout: 8_000,
-          maxBuffer: 1024 * 1024
-        });
-        for (const segment of String(result.stdout).trim().split(path.delimiter)) {
-          if (segment) parts.add(segment);
-        }
-        break;
-      } catch {
-        // try next shell
+  for (const shell of ["/bin/zsh", "/bin/bash"]) {
+    try {
+      const result = await execFileAsync(shell, ["-ilc", "printf %s \"$PATH\""], {
+        env: process.env,
+        timeout: 8_000,
+        maxBuffer: 1024 * 1024
+      });
+      for (const segment of String(result.stdout).trim().split(path.delimiter)) {
+        if (segment) parts.add(segment);
       }
+      break;
+    } catch {
+      // try next shell
     }
   }
   cachedLoginPath = [...parts].join(path.delimiter);
@@ -558,11 +599,16 @@ async function resolveLoginPath(): Promise<string> {
 
 async function commandVersion(command: string, args: string[]): Promise<string | null> {
   try {
-    const loginPath = process.platform === "win32" ? process.env.PATH : await resolveLoginPath();
+    const loginPath = await resolveLoginPath();
     const result = process.platform === "win32"
-      ? await execFileAsync(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(command, args), { windowsHide: true, windowsVerbatimArguments: true })
+      ? await execFileAsync(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(command, args), {
+        windowsHide: true,
+        windowsVerbatimArguments: true,
+        env: { ...process.env, PATH: loginPath },
+        timeout: 15_000
+      })
       : await execFileAsync(command, args, {
-        env: { ...process.env, PATH: loginPath ?? process.env.PATH },
+        env: { ...process.env, PATH: loginPath },
         timeout: 8_000
       });
     const text = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
@@ -573,21 +619,36 @@ async function commandVersion(command: string, args: string[]): Promise<string |
 }
 
 async function findOnPath(command: string): Promise<string | null> {
+  const loginPath = await resolveLoginPath();
   if (process.platform === "win32") {
     try {
-      const result = await execFileAsync("where.exe", [command]);
-      return result.stdout.split(/\r?\n/).find(Boolean)?.trim() ?? null;
+      const result = await execFileAsync("where.exe", [command], {
+        env: { ...process.env, PATH: loginPath },
+        windowsHide: true,
+        timeout: 8_000
+      });
+      const found = result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+      if (found) return found;
     } catch {
-      return null;
+      // fall through to direct probes
     }
+    const names = /\.(cmd|exe|bat)$/i.test(command)
+      ? [command]
+      : [command, `${command}.cmd`, `${command}.exe`, `${command}.bat`];
+    for (const dir of loginPath.split(";")) {
+      if (!dir) continue;
+      for (const name of names) {
+        const candidate = path.join(dir, name);
+        if (await pathExists(candidate)) return candidate;
+      }
+    }
+    return null;
   }
 
-  const loginPath = await resolveLoginPath();
   const candidates: string[] = [];
   for (const dir of loginPath.split(path.delimiter)) {
     if (dir) candidates.push(path.join(dir, command));
   }
-  // Prefer well-known install locations even if PATH is incomplete.
   candidates.unshift(
     path.join("/opt/homebrew/bin", command),
     path.join("/usr/local/bin", command),
@@ -615,9 +676,8 @@ async function findOnPath(command: string): Promise<string | null> {
   return null;
 }
 
-/** Apply login-shell PATH to the process so child apps (codex shebang -> node) work on macOS GUI launches. */
+/** Apply rebuilt PATH so child processes (npm/codex/node) work from packaged GUI apps. */
 async function applyLoginPathToProcess(): Promise<void> {
-  if (process.platform === "win32") return;
   cachedLoginPath = null;
   process.env.PATH = await resolveLoginPath();
 }
@@ -654,106 +714,145 @@ async function findCodex(): Promise<void> {
   }
 }
 
+/** Run a Windows command via cmd.exe and stream output into the UI detail line. */
+async function runWindowsCommand(
+  command: string,
+  args: string[],
+  onChunk?: (text: string) => void
+): Promise<void> {
+  await applyLoginPathToProcess();
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(command, args), {
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+      env: process.env,
+      cwd: os.homedir()
+    });
+    let combined = "";
+    const handleChunk = (buf: Buffer) => {
+      const text = buf.toString("utf8");
+      combined = `${combined}${text}`.slice(-4_000);
+      onChunk?.(combined);
+    };
+    child.stdout?.on("data", handleChunk);
+    child.stderr?.on("data", handleChunk);
+    child.once("error", (error) => reject(error));
+    child.once("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(combined.trim() || `命令失败，退出码 ${code ?? "unknown"}`));
+    });
+  });
+}
+
 /**
- * Write a .cmd installer and open it in a real, persistent console.
- * Passing multi-line PowerShell via `cmd /c start ... -Command` is fragile (window flashes closed).
- * Electron GUI apps also often inherit a stripped PATH — the script reloads user/machine PATH.
+ * Open a visible console from a packaged Electron GUI app.
+ * Direct spawn/start often only flashes a black window; WScript.Shell.Run is reliable.
  */
-async function openWindowsCodexInstallConsole(): Promise<void> {
-  const scriptDir = app.getPath("temp");
-  const scriptPath = path.join(scriptDir, "anytimevibe-install-codex.cmd");
-  // Keep the script mostly ASCII + Chinese via chcp 65001 so the window stays readable.
+async function openWindowsVisibleConsole(lines: string[]): Promise<void> {
+  const stamp = Date.now();
+  const scriptPath = path.join(app.getPath("temp"), `anytimevibe-console-${stamp}.cmd`);
+  const vbsPath = path.join(app.getPath("temp"), `anytimevibe-console-${stamp}.vbs`);
   const script = [
     "@echo off",
     "setlocal EnableExtensions",
     "chcp 65001 >nul",
-    "title AnytimeVibe Codex Install",
-    "cd /d \"%USERPROFILE%\"",
-    "echo ============================================",
-    "echo   AnytimeVibe - Install Codex CLI 0.144.0",
-    "echo ============================================",
-    "echo.",
-    "rem Rebuild PATH from Machine + User registry (Electron GUI PATH is often incomplete)",
-    "set \"SYSPATH=\"",
-    "set \"USERPATH=\"",
+    "title AnytimeVibe",
+    // Rebuild PATH inside the console too.
     "for /f \"tokens=2*\" %%A in ('reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\" /v Path 2^>nul') do set \"SYSPATH=%%B\"",
     "for /f \"tokens=2*\" %%A in ('reg query \"HKCU\\Environment\" /v Path 2^>nul') do set \"USERPATH=%%B\"",
-    "set \"PATH=%SYSPATH%;%USERPATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs;%APPDATA%\\npm;%PATH%\"",
-    "echo PATH refreshed. Looking for npm...",
-    "where npm >nul 2>&1",
-    "if errorlevel 1 (",
-    "  echo.",
-    "  echo [ERROR] npm not found. Please install Node.js LTS first:",
-    "  echo   https://nodejs.org/en/download",
-    "  echo Then close this window and click the button again.",
-    "  echo.",
-    "  pause",
-    "  exit /b 1",
-    ")",
-    "where npm",
-    "echo.",
-    "echo Installing @openai/codex@0.144.0 globally...",
-    "call npm install -g @openai/codex@0.144.0",
-    "if errorlevel 1 (",
-    "  echo.",
-    "  echo [ERROR] npm install failed. See messages above.",
-    "  echo.",
-    "  pause",
-    "  exit /b 1",
-    ")",
-    "echo.",
-    "echo Install OK. Starting codex login...",
-    "echo (Complete the login in this window, then return to AnytimeVibe)",
-    "echo.",
-    "call codex login",
-    "echo.",
-    "echo ============================================",
-    "echo Done. You can close this window,",
-    "echo then click \"重新检测\" in AnytimeVibe.",
-    "echo ============================================",
+    "set \"PATH=%SYSPATH%;%USERPATH%;%ProgramFiles%\\nodejs;%APPDATA%\\npm;%PATH%\"",
+    ...lines,
     "echo.",
     "pause",
     "endlocal",
     ""
   ].join("\r\n");
   await fs.writeFile(scriptPath, script, "utf8");
-
-  // `start "title" cmd /k script` keeps a visible console; empty title is NOT used because
-  // start treats the first quoted arg as the window title.
-  const comspec = process.env.ComSpec || path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe");
-  // Quote the script path for paths that contain spaces (common under user profiles).
-  const child = spawn(
-    comspec,
-    ["/c", "start", "AnytimeVibe-Codex", comspec, "/k", `"${scriptPath}"`],
-    {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-      cwd: os.homedir(),
-      windowsVerbatimArguments: true
-    }
-  );
+  // VBScript doubles quotes as "".
+  const quoted = scriptPath.replace(/"/g, '""');
+  const vbs = `CreateObject("WScript.Shell").Run "cmd /k ""${quoted}""", 1, False`;
+  await fs.writeFile(vbsPath, vbs, "utf8");
+  const wscript = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
+  const child = spawn(wscript, [vbsPath], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    cwd: os.homedir()
+  });
   await new Promise<void>((resolve, reject) => {
-    child.once("error", (error) => reject(new Error(`无法打开安装终端：${error.message}`)));
-    // start returns immediately after launching the new console
+    child.once("error", (error) => reject(new Error(`无法打开控制台：${error.message}`)));
     child.once("spawn", () => resolve());
-    // Fallback if spawn event is delayed
-    setTimeout(() => resolve(), 500);
+    setTimeout(() => resolve(), 800);
   });
   child.unref();
+}
+
+async function installCodexOnWindows(): Promise<void> {
+  await applyLoginPathToProcess();
+  updateState({ detail: "正在查找 npm…" });
+  const npm = (await findOnPath("npm.cmd")) ?? (await findOnPath("npm"));
+  if (!npm) {
+    throw new Error("未找到 npm。请确认 Node.js 安装时包含 npm，然后重启随码客户端再试。");
+  }
+
+  updateState({ detail: `正在安装 @openai/codex@0.144.0…\nnpm: ${npm}` });
+  await runWindowsCommand(npm, ["install", "-g", "@openai/codex@0.144.0"], (log) => {
+    const tail = log.replace(/\r/g, "").split("\n").filter(Boolean).slice(-4).join(" | ");
+    updateState({ detail: `正在安装 Codex CLI… ${tail}` });
+  });
+
+  // New global bins may appear under %APPDATA%\\npm — refresh PATH and redetect.
+  cachedLoginPath = null;
+  await applyLoginPathToProcess();
+  const environment = await detectEnvironment();
+  updateState({ environment });
+
+  if (!environment.codexCompatible) {
+    throw new Error(
+      environment.codexInstalled
+        ? `已安装但版本不兼容（当前 ${environment.codexVersion}，需要 0.144.x）。`
+        : "npm 安装已结束，但仍未检测到 codex 命令。请重启客户端后再点「重新检测」。"
+    );
+  }
+
+  updateState({
+    environment,
+    detail: "Codex 安装成功，正在打开登录窗口…"
+  });
+  try {
+    await openWindowsVisibleConsole([
+      "echo ============================================",
+      "echo   AnytimeVibe - codex login",
+      "echo ============================================",
+      "echo.",
+      "where codex",
+      "echo.",
+      "call codex login",
+      "echo.",
+      "echo Login finished. Close this window and return to AnytimeVibe."
+    ]);
+    updateState({
+      environment,
+      detail: "Codex 已安装。请在弹出的登录窗口完成 codex login，然后点击「重新检测」。"
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    updateState({
+      environment,
+      detail: `Codex 已安装，但无法自动打开登录窗口（${message}）。请手动打开终端运行：codex login`
+    });
+  }
 }
 
 async function installEnvironment(target: "node" | "codex"): Promise<void> {
   if (target === "node") {
     await shell.openExternal("https://nodejs.org/en/download");
-    updateState({ detail: "已打开 Node.js 下载页。安装完成后请点击「重新检测」。" });
+    updateState({ detail: "已打开 Node.js 下载页。安装完成后请重启随码并点击「重新检测」。" });
     return;
   }
   if (process.platform === "win32") {
-    await openWindowsCodexInstallConsole();
-    updateState({
-      detail: "已打开安装窗口（AnytimeVibe-Codex）。请在该窗口完成 npm 安装与 codex login，然后点击「重新检测」。"
-    });
+    // Install inside the app (reliable). Only open a console for interactive login.
+    await installCodexOnWindows();
     return;
   }
   if (process.platform === "darwin") {
