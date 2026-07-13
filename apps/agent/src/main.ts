@@ -654,27 +654,91 @@ async function findCodex(): Promise<void> {
   }
 }
 
-function windowsPowerShellPath(): string {
-  return path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-}
+/**
+ * Write a .cmd installer and open it in a real, persistent console.
+ * Passing multi-line PowerShell via `cmd /c start ... -Command` is fragile (window flashes closed).
+ * Electron GUI apps also often inherit a stripped PATH — the script reloads user/machine PATH.
+ */
+async function openWindowsCodexInstallConsole(): Promise<void> {
+  const scriptDir = app.getPath("temp");
+  const scriptPath = path.join(scriptDir, "anytimevibe-install-codex.cmd");
+  // Keep the script mostly ASCII + Chinese via chcp 65001 so the window stays readable.
+  const script = [
+    "@echo off",
+    "setlocal EnableExtensions",
+    "chcp 65001 >nul",
+    "title AnytimeVibe Codex Install",
+    "cd /d \"%USERPROFILE%\"",
+    "echo ============================================",
+    "echo   AnytimeVibe - Install Codex CLI 0.144.0",
+    "echo ============================================",
+    "echo.",
+    "rem Rebuild PATH from Machine + User registry (Electron GUI PATH is often incomplete)",
+    "set \"SYSPATH=\"",
+    "set \"USERPATH=\"",
+    "for /f \"tokens=2*\" %%A in ('reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\" /v Path 2^>nul') do set \"SYSPATH=%%B\"",
+    "for /f \"tokens=2*\" %%A in ('reg query \"HKCU\\Environment\" /v Path 2^>nul') do set \"USERPATH=%%B\"",
+    "set \"PATH=%SYSPATH%;%USERPATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs;%APPDATA%\\npm;%PATH%\"",
+    "echo PATH refreshed. Looking for npm...",
+    "where npm >nul 2>&1",
+    "if errorlevel 1 (",
+    "  echo.",
+    "  echo [ERROR] npm not found. Please install Node.js LTS first:",
+    "  echo   https://nodejs.org/en/download",
+    "  echo Then close this window and click the button again.",
+    "  echo.",
+    "  pause",
+    "  exit /b 1",
+    ")",
+    "where npm",
+    "echo.",
+    "echo Installing @openai/codex@0.144.0 globally...",
+    "call npm install -g @openai/codex@0.144.0",
+    "if errorlevel 1 (",
+    "  echo.",
+    "  echo [ERROR] npm install failed. See messages above.",
+    "  echo.",
+    "  pause",
+    "  exit /b 1",
+    ")",
+    "echo.",
+    "echo Install OK. Starting codex login...",
+    "echo (Complete the login in this window, then return to AnytimeVibe)",
+    "echo.",
+    "call codex login",
+    "echo.",
+    "echo ============================================",
+    "echo Done. You can close this window,",
+    "echo then click \"重新检测\" in AnytimeVibe.",
+    "echo ============================================",
+    "echo.",
+    "pause",
+    "endlocal",
+    ""
+  ].join("\r\n");
+  await fs.writeFile(scriptPath, script, "utf8");
 
-/** Open an interactive console for package installs. Electron GUI spawns often hide windows. */
-function openWindowsInstallConsole(title: string, powerShellCommand: string): void {
-  const ps = windowsPowerShellPath();
-  // cmd /c start "title" ... creates a visible new console detached from the Electron GUI process.
+  // `start "title" cmd /k script` keeps a visible console; empty title is NOT used because
+  // start treats the first quoted arg as the window title.
+  const comspec = process.env.ComSpec || path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe");
+  // Quote the script path for paths that contain spaces (common under user profiles).
   const child = spawn(
-    process.env.ComSpec ?? "cmd.exe",
-    ["/c", "start", title, ps, "-NoExit", "-ExecutionPolicy", "Bypass", "-NoProfile", "-Command", powerShellCommand],
+    comspec,
+    ["/c", "start", "AnytimeVibe-Codex", comspec, "/k", `"${scriptPath}"`],
     {
       detached: true,
       stdio: "ignore",
       windowsHide: true,
-      env: process.env,
-      cwd: os.homedir()
+      cwd: os.homedir(),
+      windowsVerbatimArguments: true
     }
   );
-  child.on("error", (error) => {
-    handleError(new Error(`无法打开安装终端：${error.message}`));
+  await new Promise<void>((resolve, reject) => {
+    child.once("error", (error) => reject(new Error(`无法打开安装终端：${error.message}`)));
+    // start returns immediately after launching the new console
+    child.once("spawn", () => resolve());
+    // Fallback if spawn event is delayed
+    setTimeout(() => resolve(), 500);
   });
   child.unref();
 }
@@ -686,26 +750,9 @@ async function installEnvironment(target: "node" | "codex"): Promise<void> {
     return;
   }
   if (process.platform === "win32") {
-    // Use cmd+start so a real console window appears (direct spawn from Electron often shows nothing).
-    const installCommand = [
-      "Write-Host '=== 随码：安装兼容版 Codex CLI 0.144.x ===' -ForegroundColor Cyan",
-      "Write-Host '若提示找不到 npm，请先安装 Node.js 并重新打开本窗口。'",
-      "$ErrorActionPreference = 'Stop'",
-      "try {",
-      "  npm install -g @openai/codex@0.144.0",
-      "  Write-Host '安装成功，正在启动 codex login ...' -ForegroundColor Green",
-      "  codex login",
-      "  Write-Host '完成。可关闭此窗口，回到随码客户端点击「重新检测」。' -ForegroundColor Green",
-      "} catch {",
-      "  Write-Host ($_ | Out-String) -ForegroundColor Red",
-      "  Write-Host '安装失败。请确认 Node.js / npm 已加入 PATH。' -ForegroundColor Red",
-      "}",
-      "Write-Host ''",
-      "pause"
-    ].join("; ");
-    openWindowsInstallConsole("随码-安装Codex", installCommand);
+    await openWindowsCodexInstallConsole();
     updateState({
-      detail: "已打开 PowerShell 安装窗口。请在该窗口完成安装与登录后，回到本客户端点击「重新检测」。"
+      detail: "已打开安装窗口（AnytimeVibe-Codex）。请在该窗口完成 npm 安装与 codex login，然后点击「重新检测」。"
     });
     return;
   }
