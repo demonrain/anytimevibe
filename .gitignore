@@ -1,5 +1,6 @@
 node_modules/
 .pnpm-store/
+.npm-cache/
 .playwright-cli/
 dist/
 .vite/
@@ -16,5 +17,7 @@ artifacts/anytimevibe-promo/
 artifacts/**/anytimevibe-promo-*.mp4
 artifacts/**/frame-*.png
 artifacts/**/contact-sheet.png
+artifacts/**/updated-*.png
+artifacts/**/product-*.png
 artifacts/**/AGENTS.md
 artifacts/**/CLAUDE.md
