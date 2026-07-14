@@ -6,15 +6,28 @@ import type { PermissionMode } from "@anytimevibe/protocol";
 type RpcId = string | number;
 type JsonObject = Record<string, any>;
 
+/**
+ * Map web permission mode to Codex app-server thread/turn params.
+ * "inherit" must omit approvalPolicy/sandbox so local Codex config.toml is used.
+ */
 export function codexPermissionParams(permissionMode: PermissionMode = "inherit"): Record<string, string> {
   if (permissionMode === "full-access") return { approvalPolicy: "never", sandbox: "danger-full-access" };
   if (permissionMode === "workspace-write") return { approvalPolicy: "on-request", sandbox: "workspace-write" };
   if (permissionMode === "read-only") return { approvalPolicy: "on-request", sandbox: "read-only" };
+  // inherit / unknown: do not override the machine-local Codex configuration
   return {};
 }
 
 export function threadStartParams(cwd: string, permissionMode: PermissionMode = "inherit"): { cwd: string; approvalPolicy?: string; sandbox?: string } {
-  return { cwd, ...codexPermissionParams(permissionMode) };
+  const policy = codexPermissionParams(permissionMode);
+  // Only attach policy keys when explicitly set (inherit stays { cwd } only).
+  return Object.keys(policy).length ? { cwd, ...policy } : { cwd };
+}
+
+/** Params for thread/resume — empty object when inheriting local client config. */
+export function threadResumeParams(threadId: string, permissionMode: PermissionMode = "inherit"): Record<string, string> {
+  const policy = codexPermissionParams(permissionMode);
+  return Object.keys(policy).length ? { threadId, ...policy } : { threadId };
 }
 
 export class CodexAdapter {

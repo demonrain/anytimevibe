@@ -33,7 +33,7 @@ import {
   type EncryptedEnvelope,
   type Workspace
 } from "@anytimevibe/protocol";
-import { CodexAdapter, codexPermissionParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
+import { CodexAdapter, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
 const execFileAsync = promisify(execFile);
@@ -165,9 +165,14 @@ let reconnectAttempt = 0;
 let reconnectBlockedReason: string | null = null;
 const pendingPrompts = new Map<string, string>();
 const pendingRequestTypes = new Map<string, "command" | "file" | "permission" | "input">();
+/** threadId -> active turnId for streaming turn.delta to web */
+const activeTurnByThread = new Map<string, string>();
 let activityOutputBuffer = "";
 let activityFlushTimer: NodeJS.Timeout | null = null;
 const activityItems = new Map<string, string>();
+/** Pending remote stream chunks: key = threadId\\0itemId */
+const remoteDeltaBuffers = new Map<string, string>();
+let remoteDeltaFlushTimer: NodeJS.Timeout | null = null;
 
 function startLocalActivity(threadId: string, prompt: string, title = "远程任务"): void {
   activityOutputBuffer = "";
@@ -195,13 +200,14 @@ function activityItemLabel(item: Record<string, any>): string | null {
   }
   if (item.type === "mcpToolCall") return `调用工具\n${String(item.tool ?? item.name ?? "")}`;
   if (item.type === "webSearch") return `搜索资料\n${String(item.query ?? "")}`;
+  if (item.type === "reasoning") return "思考中";
   return null;
 }
 
 function activityItemResult(item: Record<string, any>): string {
   if (item.type === "agentMessage") return "";
   if (item.type === "commandExecution") {
-    const output = String(item.aggregatedOutput ?? item.output ?? "").trim();
+    const output = String(item.aggregatedOutput ?? item.output ?? item.stdout ?? "").trim();
     return output ? `命令输出\n${output}` : `命令${item.status ? ` ${item.status}` : "已完成"}`;
   }
   if (item.type === "fileChange") return `文件修改${item.status ? ` ${item.status}` : "已完成"}`;
@@ -221,7 +227,7 @@ function appendLocalActivity(threadId: string, delta: string): void {
     const output = (activity.output + activityOutputBuffer).slice(-100_000);
     activityOutputBuffer = "";
     updateState({ activity: { ...activity, output } });
-  }, 80);
+  }, 50);
 }
 
 function finishLocalActivity(threadId: string, status: string): void {
@@ -234,6 +240,46 @@ function finishLocalActivity(threadId: string, status: string): void {
   const normalized = status.toLowerCase();
   const finalStatus: ActivityState["status"] = normalized.includes("interrupt") ? "interrupted" : normalized.includes("fail") ? "failed" : "completed";
   updateState({ activity: { ...activity, output, status: finalStatus } });
+}
+
+function queueRemoteDelta(threadId: string, itemId: string, delta: string): void {
+  if (!delta || !threadId || !itemId) return;
+  if (!activeTurnByThread.has(threadId)) return;
+  const key = `${threadId}\0${itemId}`;
+  remoteDeltaBuffers.set(key, (remoteDeltaBuffers.get(key) ?? "") + delta);
+  if (remoteDeltaFlushTimer) return;
+  remoteDeltaFlushTimer = setTimeout(() => {
+    remoteDeltaFlushTimer = null;
+    void flushRemoteDeltas();
+  }, 60);
+}
+
+async function flushRemoteDeltas(): Promise<void> {
+  if (!remoteDeltaBuffers.size) return;
+  const pending = [...remoteDeltaBuffers.entries()];
+  remoteDeltaBuffers.clear();
+  for (const [key, delta] of pending) {
+    if (!delta) continue;
+    const sep = key.indexOf("\0");
+    const threadId = key.slice(0, sep);
+    const itemId = key.slice(sep + 1);
+    const turnId = activeTurnByThread.get(threadId);
+    if (!turnId) continue;
+    try {
+      // Live stream — do not persist every chunk to the relay DB.
+      await publish({
+        type: "turn.delta",
+        eventId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(),
+        threadId,
+        turnId,
+        itemId,
+        delta
+      }, false);
+    } catch (error) {
+      handleError(error);
+    }
+  }
 }
 
 function encryptSecret(value: string): string {
@@ -307,12 +353,16 @@ function createWindow(): void {
   const icon = loadProductIcon();
   windowRef = new BrowserWindow({
     width: 460,
-    height: 640,
+    height: 680,
     minWidth: 400,
-    minHeight: 480,
+    minHeight: 520,
     resizable: true,
     maximizable: false,
-    backgroundColor: "#f2eadb",
+    // Transparent frameless shell — chrome is drawn by the renderer.
+    frame: false,
+    transparent: true,
+    hasShadow: true,
+    backgroundColor: "#00000000",
     title: "随码",
     autoHideMenuBar: true,
     icon,
@@ -344,22 +394,28 @@ function rendererHtml(): string {
     }
   })();
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>随码</title><style>
-  :root{font-family:"Bahnschrift","Aptos","Segoe UI",sans-serif;color:#17211b;background:#f2eadb}
-  *{box-sizing:border-box}html,body{margin:0;min-height:100%}
-  body{overflow-x:hidden;overflow-y:auto;background:radial-gradient(circle at 92% 0,rgba(226,88,50,.16),transparent 34%),#f2eadb}
-  .shell{padding:14px 14px 16px;display:flex;flex-direction:column;gap:8px}
-  .head{display:flex;align-items:center;gap:10px}
+  :root{font-family:"Bahnschrift","Aptos","Segoe UI",sans-serif;color:#17211b}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:transparent}
+  body{overflow:hidden}
+  .frame{height:100%;padding:10px;display:flex}
+  .shell{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px;padding:12px 12px 10px;border-radius:18px;background:rgba(242,234,219,.92);border:1px solid rgba(23,33,27,.14);box-shadow:0 18px 40px rgba(23,33,27,.18);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);overflow:hidden}
+  .titlebar{display:flex;align-items:center;gap:10px;-webkit-app-region:drag;app-region:drag;padding:2px 2px 4px;cursor:default}
+  .titlebar .win-actions{-webkit-app-region:no-drag;app-region:no-drag;margin-left:auto;display:flex;gap:4px}
+  .titlebar .win-actions button{width:28px;height:24px;padding:0;border-radius:7px;background:#e7ddcd;color:#17211b;font-size:12px;line-height:1}
+  .titlebar .win-actions button.close{background:#e25832;color:#fff}
+  .scroll{flex:1;min-height:0;overflow-x:hidden;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding-right:2px}
   .mark{width:34px;height:34px;border-radius:10px;overflow:hidden;background:#17211b;flex:0 0 auto;box-shadow:0 6px 14px rgba(23,33,27,.16)}
   .mark img{width:100%;height:100%;display:block;object-fit:cover}
-  .head h1{font:700 16px Rockwell,serif;margin:0;line-height:1.1}
-  .head p{margin:2px 0 0;color:#6b726b;font-size:9px;letter-spacing:.12em}
-  .card{background:#fffaf0;border:1px solid rgba(23,33,27,.12);border-radius:12px;padding:10px 11px;box-shadow:0 8px 18px rgba(34,39,31,.05)}
+  .titlebar h1{font:700 16px Rockwell,serif;margin:0;line-height:1.1}
+  .titlebar p{margin:2px 0 0;color:#6b726b;font-size:9px;letter-spacing:.12em}
+  .card{background:rgba(255,250,240,.96);border:1px solid rgba(23,33,27,.12);border-radius:12px;padding:10px 11px;box-shadow:0 8px 18px rgba(34,39,31,.05)}
   .card.grow{display:flex;flex-direction:column}
   .status{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
   .status b{text-transform:uppercase;font-size:10px;letter-spacing:.1em}
   .dot{width:8px;height:8px;border-radius:50%;background:#999;flex:0 0 auto}
   .dot.online{background:#3bab70;box-shadow:0 0 0 4px rgba(59,171,112,.14)}
-  .detail{color:#6b726b;font-size:11px;line-height:1.4;margin:6px 0 0}
+  .detail{color:#6b726b;font-size:11px;line-height:1.4;margin:6px 0 0;white-space:pre-wrap}
   .meta{font:10px/1.4 "Cascadia Code",monospace;color:#687068;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   h2{font:700 12px Rockwell,serif;margin:0}
   .row{display:flex;gap:6px;align-items:center;min-width:0}
@@ -388,15 +444,22 @@ function rendererHtml(): string {
   .stack{display:grid;gap:6px;margin-top:6px}
   .label{font-size:10px;font-weight:800;color:#6b726b;letter-spacing:.04em}
   pre.activity{margin:6px 0 0;max-height:160px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#17211b;color:#e8eee8;border-radius:8px;padding:8px;font:10px/1.45 Cascadia Code,monospace}
-  </style></head><body><main class="shell">
-  <div class="head">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1>随码</h1><p>随时续上你的代码 · ${platformLabel}</p></div></div>
+  .footer{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 4px 0;border-top:1px solid rgba(23,33,27,.08);margin-top:2px;-webkit-app-region:no-drag;app-region:no-drag}
+  .footer .author{font-size:10px;color:#6b726b;line-height:1.35}
+  .footer .author strong{color:#17211b}
+  .footer button.feedback{background:transparent;color:#e25832;border:1px solid rgba(226,88,50,.35);padding:5px 9px}
+  </style></head><body><div class="frame"><main class="shell">
+  <div class="titlebar">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1>随码</h1><p>随时续上你的代码 · ${platformLabel}</p></div><div class="win-actions"><button type="button" id="winMin" title="最小化">–</button><button type="button" id="winClose" class="close" title="关闭">×</button></div></div>
+  <div class="scroll">
   <section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
   <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="updateBox" class="update-row"></div></section>
   <section class="card"><h2>中继与配对</h2><div class="stack"><div class="label">中继服务器</div><div class="row"><input id="relay" placeholder="https://vibe.demonrain.top"><button id="startPair" class="secondary">生成配对码</button><button id="saveRelay">保存</button></div><div id="pairBox"></div><div class="label">客户端名称</div><div class="row"><input id="displayName" placeholder="例如：公司电脑" maxlength="64"><button id="saveName" class="secondary">保存名称</button></div></div></section>
   <section class="card grow"><div class="status"><h2>允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><div id="workspaces" class="workspaces"></div></section>
   <section class="card" id="activityBox" style="display:none"></section>
   <section class="card" id="taskBox"></section>
-  </main><script>
+  </div>
+  <footer class="footer"><div class="author"><strong>随码 AnytimeVibe</strong><br>作者 · demonrain · 开源项目</div><button type="button" id="feedback" class="feedback">反馈问题</button></footer>
+  </main></div><script>
   const api=window.anytimeVibe;
   const status=document.querySelector('#status');
   const dot=document.querySelector('#dot');
@@ -461,6 +524,9 @@ function rendererHtml(): string {
   startPair.addEventListener('click',()=>api.startPairing());
   document.querySelector('#addWorkspace').addEventListener('click',()=>api.addWorkspace());
   document.querySelector('#recheck').addEventListener('click',()=>api.checkEnvironment());
+  document.querySelector('#winMin')?.addEventListener('click',()=>api.windowMinimize());
+  document.querySelector('#winClose')?.addEventListener('click',()=>api.windowClose());
+  document.querySelector('#feedback')?.addEventListener('click',()=>api.openFeedback());
   api.onState(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});
   api.getState().then(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});
   </script></body></html>`;
@@ -1227,6 +1293,16 @@ async function handleRelayMessage(raw: string): Promise<void> {
     socket?.send(JSON.stringify({ type: "agent.key_authorization", pairingId, wrappedSyncKey }));
     return;
   }
+  if (parsed.type === "relay.host_rename") {
+    const name = String(parsed.name ?? "").trim().slice(0, 64);
+    if (!name) return;
+    config.displayName = name;
+    await saveConfig();
+    updateState({ displayName: name, detail: `Web 端已将客户端名称更新为“${name}”。` });
+    // Confirm back so other browser sessions see the same name.
+    await publishHostStatus();
+    return;
+  }
   const envelope = parsed as EncryptedEnvelope;
   if (!syncKey) throw new Error("Missing sync key");
   const command = clientCommandSchema.parse(await openEnvelope<ClientCommand>(syncKey, envelope));
@@ -1248,7 +1324,8 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     await ensureCodex();
     if (command.type === "task.create") {
       if (!isAllowedWorkspace(command.cwd)) throw new Error("工作目录不在代理白名单中");
-      const started = await codex!.request("thread/start", threadStartParams(command.cwd, command.permissionMode));
+      const mode = command.permissionMode ?? "inherit";
+      const started = await codex!.request("thread/start", threadStartParams(command.cwd, mode));
       const thread = started.thread;
       localThreadId = thread.id;
       if (command.title) await codex!.request("thread/name/set", { threadId: thread.id, name: command.title });
@@ -1259,6 +1336,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         clientUserMessageId: command.commandId,
         input: [{ type: "text", text: command.prompt, text_elements: [] }]
       });
+      activeTurnByThread.set(thread.id, String(turn.turn.id));
       await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: thread.id, turnId: turn.turn.id, prompt: command.prompt }, true);
       return;
     }
@@ -1268,13 +1346,16 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "turn.start") {
-      await codex!.request("thread/resume", { threadId: command.threadId, ...codexPermissionParams(command.permissionMode) });
+      const mode = command.permissionMode ?? "inherit";
+      // inherit omits approval/sandbox so machine-local Codex config is honored.
+      await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
       startLocalActivity(command.threadId, command.prompt, "继续远程任务");
       const result = await codex!.request("turn/start", {
         threadId: command.threadId,
         clientUserMessageId: command.commandId,
         input: [{ type: "text", text: command.prompt, text_elements: [] }]
       });
+      activeTurnByThread.set(command.threadId, String(result.turn.id));
       await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: result.turn.id, prompt: command.prompt }, true);
       return;
     }
@@ -1288,6 +1369,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         clientUserMessageId: command.commandId,
         input: [{ type: "text", text: command.prompt, text_elements: [] }]
       });
+      activeTurnByThread.set(command.threadId, String(command.turnId));
       await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: command.turnId, prompt: command.prompt }, true);
       return;
     }
@@ -1297,6 +1379,8 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         new Promise((resolve) => setTimeout(resolve, 5000))
       ]);
       finishLocalActivity(command.threadId, "interrupted");
+      activeTurnByThread.delete(command.threadId);
+      await flushRemoteDeltas();
       await publish({ type: "turn.completed", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: command.turnId, status: "interrupted" }, true, "completed");
       return;
     }
@@ -1336,28 +1420,73 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const item = params.item ?? {};
     const label = activityItemLabel(item);
     const key = activityItemKey(params);
+    const threadId = String(params.threadId ?? "");
     if (label && key && !activityItems.has(key)) {
       activityItems.set(key, item.type);
-      appendLocalActivityStage(String(params.threadId), `▶ ${label}`);
+      appendLocalActivityStage(threadId, `▶ ${label}`);
+      // Stage markers stream to web progressively (CLI-like phases).
+      queueRemoteDelta(threadId, `stage:${key}`, `\n▶ ${label}\n`);
     }
   }
   if (message.method === "item/completed") {
     const params = message.params ?? {};
     const item = params.item ?? {};
     const key = activityItemKey(params);
+    const threadId = String(params.threadId ?? "");
     if (key && activityItems.has(key)) {
       activityItems.delete(key);
       const result = activityItemResult(item);
-      if (result) appendLocalActivityStage(String(params.threadId), `✓ ${result}`);
+      if (result) {
+        appendLocalActivityStage(threadId, `✓ ${result}`);
+        queueRemoteDelta(threadId, `stage:${key}:done`, `\n✓ ${result}\n`);
+      }
     }
   }
   if (message.method === "item/agentMessage/delta") {
-    appendLocalActivity(String(message.params.threadId), String(message.params.delta ?? ""));
+    const threadId = String(message.params?.threadId ?? "");
+    const itemId = String(message.params?.itemId ?? message.params?.item?.id ?? "assistant");
+    const delta = String(message.params?.delta ?? "");
+    appendLocalActivity(threadId, delta);
+    queueRemoteDelta(threadId, itemId, delta);
+  }
+  // Command / tool output chunks when the app-server streams them.
+  if (
+    message.method === "item/commandExecution/outputDelta"
+    || message.method === "item/commandExecution/delta"
+    || message.method === "item/mcpToolCall/outputDelta"
+  ) {
+    const params = message.params ?? {};
+    const threadId = String(params.threadId ?? "");
+    const itemId = String(params.itemId ?? params.item?.id ?? "command");
+    const delta = String(params.delta ?? params.chunk ?? params.output ?? "");
+    if (delta) {
+      appendLocalActivity(threadId, delta);
+      queueRemoteDelta(threadId, itemId, delta);
+    }
+  }
+  if (message.method === "agent/log") {
+    const line = String(message.params?.line ?? "").trim();
+    const threadId = publicState.activity?.threadId;
+    if (line && threadId && activeTurnByThread.has(threadId)) {
+      appendLocalActivity(threadId, `\n${line}`);
+      queueRemoteDelta(threadId, "cli-log", `\n${line}\n`);
+    }
+  }
+  if (message.method === "turn/started") {
+    const params = message.params ?? {};
+    const threadId = String(params.threadId ?? params.turn?.threadId ?? "");
+    const turnId = String(params.turnId ?? params.turn?.id ?? "");
+    if (threadId && turnId) activeTurnByThread.set(threadId, turnId);
   }
   if (message.method === "turn/completed") {
     const params = message.params;
-    finishLocalActivity(String(params.threadId), String(params.turn.status));
+    const threadId = String(params.threadId);
+    finishLocalActivity(threadId, String(params.turn.status));
+    await flushRemoteDeltas();
+    activeTurnByThread.delete(threadId);
     await publish({ type: "turn.completed", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: params.threadId, turnId: params.turn.id, status: String(params.turn.status) }, true, "completed");
+    // Refresh snapshot so final assistant text is complete even if some deltas were dropped.
+    try { await publishThread(threadId); } catch { /* ignore */ }
   }
   if (message.method === "serverRequest/resolved") {
     pendingRequestTypes.delete(String(message.params.requestId));
@@ -1693,6 +1822,20 @@ function registerIpc(): void {
   ipcMain.handle("agent:relay-task", async (_event, threadId: string) => {
     await relayTaskToCli(threadId);
     return publicState;
+  });
+  ipcMain.handle("agent:window-minimize", () => {
+    windowRef?.minimize();
+  });
+  ipcMain.handle("agent:window-close", () => {
+    // Match tray behavior: hide instead of quitting unless already exiting.
+    if (quitting || installingUpdate) {
+      windowRef?.close();
+      return;
+    }
+    windowRef?.hide();
+  });
+  ipcMain.handle("agent:open-feedback", async () => {
+    await shell.openExternal("https://github.com/demonrain/anytimevibe/issues");
   });
 }
 

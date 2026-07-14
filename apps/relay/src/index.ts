@@ -310,6 +310,11 @@ async function main(): Promise<void> {
       RETURNING id, name
     `;
     if (!result.length) return reply.code(404).send({ error: "host_not_found" });
+    // Push rename to the live agent so the desktop client display name stays in sync.
+    const agent = agentSockets.get(hostId);
+    if (agent && agent.readyState === 1) {
+      agent.send(jsonControl("relay.host_rename", { name: body.name }));
+    }
     return { host: result[0] };
   });
 

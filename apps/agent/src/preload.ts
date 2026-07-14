@@ -13,6 +13,9 @@ contextBridge.exposeInMainWorld("anytimeVibe", {
   checkUpdate: () => ipcRenderer.invoke("agent:check-update"),
   installUpdate: () => ipcRenderer.invoke("agent:install-update"),
   relayTask: (threadId: string) => ipcRenderer.invoke("agent:relay-task", threadId),
+  windowMinimize: () => ipcRenderer.invoke("agent:window-minimize"),
+  windowClose: () => ipcRenderer.invoke("agent:window-close"),
+  openFeedback: () => ipcRenderer.invoke("agent:open-feedback"),
   onState: (listener: (state: unknown) => void) => {
     const wrapped = (_event: unknown, state: unknown) => listener(state);
     ipcRenderer.on("agent:state", wrapped);
