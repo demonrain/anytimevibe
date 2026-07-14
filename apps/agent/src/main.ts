@@ -375,6 +375,19 @@ function createWindow(): void {
   if (process.platform === "win32") windowRef.setIcon(icon);
   windowRef.setMenuBarVisibility(false);
   windowRef.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(rendererHtml())}`);
+  windowRef.webContents.on("did-finish-load", () => {
+    // Push latest state after the page boots (covers races with first getState).
+    try {
+      if (windowRef && !windowRef.isDestroyed() && !windowRef.webContents.isDestroyed()) {
+        windowRef.webContents.send("agent:state", publicState);
+      }
+    } catch {
+      // ignore
+    }
+  });
+  windowRef.webContents.on("console-message", (_event, level, message) => {
+    if (level >= 2) console.error("[renderer]", message);
+  });
   windowRef.on("close", (event) => {
     // When quitting for update/install, allow the window to close so quitAndInstall can proceed.
     if (!quitting) {
@@ -393,6 +406,8 @@ function rendererHtml(): string {
       return "";
     }
   })();
+  // Snapshot state into the page so UI never depends solely on first IPC round-trip.
+  const initialStateJson = JSON.stringify(publicState).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>随码</title><style>
   :root{font-family:"Bahnschrift","Aptos","Segoe UI",sans-serif;color:#17211b}
   *{box-sizing:border-box}
@@ -467,107 +482,153 @@ function rendererHtml(): string {
   </div>
   <footer class="footer"><div class="author"><strong id="authorStrong">随码 AnytimeVibe</strong><br><span id="authorLine">作者 · demonrain · 开源项目</span></div><div class="footer-actions"><div class="lang-switch"><button type="button" id="langZh" class="active">中文</button><button type="button" id="langEn">EN</button></div><button type="button" id="feedback" class="feedback">反馈问题</button></div></footer>
   </main></div><script>
-  const api=window.anytimeVibe;
-  const I18N={
-    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · ${platformLabel}',authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败'},
-    en:{brand:'AnytimeVibe',tag:'Pick up your code · ${platformLabel}',authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed'}
+  (function(){
+  var platformLabel=${JSON.stringify(platformLabel)};
+  var initialState=${initialStateJson};
+  var api=window.anytimeVibe;
+  var I18N={
+    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',expand:'展开',collapse:'收起',open:'接力'},
+    en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',expand:'Expand',collapse:'Collapse',open:'Open'}
   };
-  let locale=(localStorage.getItem('anytimevibe-locale')==='en'?'en':'zh-CN');
+  var locale=(function(){try{return localStorage.getItem('anytimevibe-locale')==='en'?'en':'zh-CN';}catch(e){return 'zh-CN';}})();
   function t(key){return (I18N[locale]&&I18N[locale][key])||I18N.en[key]||key}
   function applyLocale(){
-    document.querySelector('#brandTitle').textContent=t('brand');
-    document.querySelector('#brandTag').textContent=t('tag');
-    document.querySelector('#authorStrong').textContent=t('authorStrong');
-    document.querySelector('#authorLine').textContent=t('authorLine');
-    document.querySelector('#feedback').textContent=t('feedback');
-    document.querySelector('#langZh').classList.toggle('active',locale==='zh-CN');
-    document.querySelector('#langEn').classList.toggle('active',locale==='en');
+    var el;
+    if(el=document.querySelector('#brandTitle')) el.textContent=t('brand');
+    if(el=document.querySelector('#brandTag')) el.textContent=t('tag');
+    if(el=document.querySelector('#authorStrong')) el.textContent=t('authorStrong');
+    if(el=document.querySelector('#authorLine')) el.textContent=t('authorLine');
+    if(el=document.querySelector('#feedback')) el.textContent=t('feedback');
+    if(el=document.querySelector('#langZh')) el.classList.toggle('active',locale==='zh-CN');
+    if(el=document.querySelector('#langEn')) el.classList.toggle('active',locale==='en');
   }
-  applyLocale();
-  const status=document.querySelector('#status');
-  const dot=document.querySelector('#dot');
-  const detail=document.querySelector('#detail');
-  const relay=document.querySelector('#relay');
-  const displayName=document.querySelector('#displayName');
-  const pairBox=document.querySelector('#pairBox');
-  const startPair=document.querySelector('#startPair');
-  const workspaces=document.querySelector('#workspaces');
-  const meta=document.querySelector('#meta');
-  const environment=document.querySelector('#environment');
-  const updateBox=document.querySelector('#updateBox');
-  const activityBox=document.querySelector('#activityBox');
-  const taskBox=document.querySelector('#taskBox');
-  let tasksOpen=false;
-  let lastTasks=[];
-  function escapeHtml(value){return String(value||'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));}
-  function render(state){
-    status.textContent=state.status;
-    dot.className='dot '+(state.status==='online'?'online':'');
-    detail.textContent=state.detail;
-    if(document.activeElement!==relay) relay.value=state.relayUrl||'';
-    if(document.activeElement!==displayName) displayName.value=state.displayName||'';
-    meta.textContent='Codex '+state.codexVersion+(state.hostId?' · '+String(state.hostId).slice(0,8):'');
-    const env=state.environment;
-    const nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">安装 Node.js</button>':'';
-    const codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">安装兼容版 Codex</button>':'';
-    environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+escapeHtml(env.nodeVersion||'未安装')+'</span>'+nodeAction+'</div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+escapeHtml(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span>'+codexAction+'</div>';
-    environment.querySelectorAll('button[data-install]').forEach(button=>button.addEventListener('click',()=>{
-      const target=button.dataset.install;
-      button.disabled=true;
-      api.installEnvironment(target).catch((error)=>alert(error&&error.message?error.message:String(error))).finally(()=>{try{button.disabled=false}catch{}});
-    }));
-    startPair.disabled=!env.codexCompatible||!state.relayUrl;
-    pairBox.innerHTML=state.pairingCode?'<div class="pair">'+escapeHtml(state.pairingCode)+'</div><p class="detail">在 Web 端输入配对码，约 10 分钟后失效。</p>':'';
-    workspaces.innerHTML=state.workspaces.length?state.workspaces.map(w=>'<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button class="ghost" data-id="'+escapeHtml(w.id)+'">移除</button></div>').join(''):'<div class="empty">尚未允许任何目录</div>';
-    workspaces.querySelectorAll('button[data-id]').forEach(button=>button.addEventListener('click',()=>api.removeWorkspace(button.dataset.id)));
+  var status=document.querySelector('#status');
+  var dot=document.querySelector('#dot');
+  var detail=document.querySelector('#detail');
+  var relay=document.querySelector('#relay');
+  var displayName=document.querySelector('#displayName');
+  var pairBox=document.querySelector('#pairBox');
+  var startPair=document.querySelector('#startPair');
+  var workspaces=document.querySelector('#workspaces');
+  var meta=document.querySelector('#meta');
+  var environment=document.querySelector('#environment');
+  var updateBox=document.querySelector('#updateBox');
+  var activityBox=document.querySelector('#activityBox');
+  var taskBox=document.querySelector('#taskBox');
+  var tasksOpen=false;
+  var lastTasks=[];
+  var taskQuery='';
+  function escapeHtml(value){return String(value||'').replace(/[&<>"']/g,function(char){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[char];});}
+  function paint(state){
+    try{
+      if(!state) return;
+      if(status) status.textContent=state.status||'';
+      if(dot) dot.className='dot '+(state.status==='online'?'online':'');
+      if(detail) detail.textContent=state.detail||'';
+      if(relay && document.activeElement!==relay) relay.value=state.relayUrl||'';
+      if(displayName && document.activeElement!==displayName) displayName.value=state.displayName||'';
+      if(meta) meta.textContent='Codex '+(state.codexVersion||'')+(state.hostId?' · '+String(state.hostId).slice(0,8):'');
+      var env=state.environment||{nodeInstalled:false,codexCompatible:false,codexInstalled:false};
+      var nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">安装 Node.js</button>':'';
+      var codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">安装兼容版 Codex</button>':'';
+      if(environment){
+        environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+escapeHtml(env.nodeVersion||'未安装')+'</span>'+nodeAction+'</div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+escapeHtml(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span>'+codexAction+'</div>';
+        environment.querySelectorAll('button[data-install]').forEach(function(button){
+          button.addEventListener('click',function(){
+            if(!api) return;
+            var target=button.getAttribute('data-install');
+            button.disabled=true;
+            api.installEnvironment(target).catch(function(error){alert(error&&error.message?error.message:String(error));}).finally(function(){try{button.disabled=false;}catch(e){}});
+          });
+        });
+      }
+      if(startPair) startPair.disabled=!env.codexCompatible||!state.relayUrl;
+      if(pairBox) pairBox.innerHTML=state.pairingCode?'<div class="pair">'+escapeHtml(state.pairingCode)+'</div><p class="detail">在 Web 端输入配对码，约 10 分钟后失效。</p>':'';
+      if(workspaces){
+        workspaces.innerHTML=(state.workspaces&&state.workspaces.length)?state.workspaces.map(function(w){return '<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button class="ghost" data-id="'+escapeHtml(w.id)+'">移除</button></div>';}).join(''):'<div class="empty">尚未允许任何目录</div>';
+        workspaces.querySelectorAll('button[data-id]').forEach(function(button){
+          button.addEventListener('click',function(){ if(api) api.removeWorkspace(button.getAttribute('data-id')); });
+        });
+      }
+      renderUpdate(state.update||{status:'idle'});
+      renderActivity(state.activity);
+      renderTasks(state.tasks||[]);
+    }catch(err){
+      if(detail) detail.textContent='界面渲染异常：'+(err&&err.message?err.message:String(err));
+      console.error(err);
+    }
   }
   function renderUpdate(update){
-    const labels={idle:t('latest'),checking:t('checking'),available:t('available'),downloading:t('downloading'),ready:t('ready'),error:t('error')};
-    // Green when current is latest; orange when an update exists/is downloading/ready.
-    const tone=update.status==='idle'?'ok':update.status==='error'?'err':(update.status==='available'||update.status==='downloading'||update.status==='ready')?'warn':'';
-    const text=update.version||update.message||(update.progress!==undefined?update.progress+'%':'');
-    updateBox.innerHTML='<div class="check '+tone+'"><b>'+labels[update.status]+'</b><span>'+escapeHtml(text)+'</span></div><button id="checkUpdate" class="secondary">'+escapeHtml(locale==='en'?'Check update':'检查更新')+'</button>'+(update.status==='ready'?'<button id="installUpdate">'+escapeHtml(locale==='en'?'Restart & install':'重启并更新')+'</button>':'');
-    document.querySelector('#checkUpdate')?.addEventListener('click',()=>api.checkUpdate());
-    document.querySelector('#installUpdate')?.addEventListener('click',()=>api.installUpdate());
+    if(!updateBox) return;
+    update=update||{status:'idle'};
+    var labels={idle:t('latest'),checking:t('checking'),available:t('available'),downloading:t('downloading'),ready:t('ready'),error:t('error')};
+    var tone=update.status==='idle'?'ok':update.status==='error'?'err':(update.status==='available'||update.status==='downloading'||update.status==='ready')?'warn':'';
+    var text=update.version||update.message||(update.progress!==undefined?update.progress+'%':'');
+    updateBox.innerHTML='<div class="check '+tone+'"><b>'+(labels[update.status]||update.status)+'</b><span>'+escapeHtml(text)+'</span></div><button id="checkUpdate" class="secondary">'+escapeHtml(t('checkUpdate'))+'</button>'+(update.status==='ready'?'<button id="installUpdate">'+escapeHtml(t('installUpdate'))+'</button>':'');
+    var checkBtn=document.querySelector('#checkUpdate');
+    var installBtn=document.querySelector('#installUpdate');
+    if(checkBtn&&api) checkBtn.addEventListener('click',function(){api.checkUpdate();});
+    if(installBtn&&api) installBtn.addEventListener('click',function(){api.installUpdate();});
   }
   function renderActivity(activity){
-    if(!activity){activityBox.style.display='none';activityBox.innerHTML='';return}
+    if(!activityBox) return;
+    if(!activity){activityBox.style.display='none';activityBox.innerHTML='';return;}
     activityBox.style.display='block';
-    const labels={processing:'处理中',completed:'已完成',failed:'失败',interrupted:'已停止'};
-    activityBox.innerHTML='<div class="status"><h2>当前远程任务</h2><b>'+labels[activity.status]+'</b></div><p class="detail"><strong>'+escapeHtml(activity.title)+'</strong> · '+escapeHtml(activity.prompt)+'</p><pre class="activity">'+escapeHtml(activity.output||'等待 Codex 输出…')+'</pre>';
-    const output=activityBox.querySelector('pre');
-    output.scrollTop=output.scrollHeight;
+    var labels={processing:'处理中',completed:'已完成',failed:'失败',interrupted:'已停止'};
+    activityBox.innerHTML='<div class="status"><h2>当前远程任务</h2><b>'+(labels[activity.status]||activity.status)+'</b></div><p class="detail"><strong>'+escapeHtml(activity.title)+'</strong> · '+escapeHtml(activity.prompt)+'</p><pre class="activity">'+escapeHtml(activity.output||'等待 Codex 输出…')+'</pre>';
+    var output=activityBox.querySelector('pre');
+    if(output) output.scrollTop=output.scrollHeight;
   }
-  let taskQuery='';
   function renderTasks(tasks){
+    if(!taskBox) return;
     lastTasks=tasks||[];
-    const q=taskQuery.trim().toLowerCase();
-    const filtered=!q?lastTasks:lastTasks.filter(task=>{
-      const hay=((task.title||'')+' '+(task.cwd||'')+' '+(task.status||'')).toLowerCase();
-      return hay.includes(q);
+    var q=taskQuery.trim().toLowerCase();
+    var filtered=!q?lastTasks:lastTasks.filter(function(task){
+      var hay=((task.title||'')+' '+(task.cwd||'')+' '+(task.status||'')).toLowerCase();
+      return hay.indexOf(q)>=0;
     });
-    taskBox.innerHTML='<div class="status"><h2>'+escapeHtml(t('relay'))+'</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?(locale==='en'?'Collapse':'收起'):(locale==='en'?'Expand':'展开'))+' · '+filtered.length+(q?'/'+lastTasks.length:'')+'</button></div>'
+    taskBox.innerHTML='<div class="status"><h2>'+escapeHtml(t('relay'))+'</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?t('collapse'):t('expand'))+' · '+filtered.length+(q?'/'+lastTasks.length:'')+'</button></div>'
       +(tasksOpen?'<div class="stack" style="margin-top:7px"><input id="taskSearch" placeholder="'+escapeHtml(t('search'))+'" value="'+escapeHtml(taskQuery)+'"></div>':'')
-      +(tasksOpen?(filtered.length?'<div class="workspaces" style="margin-top:7px">'+filtered.map(task=>'<div class="workspace"><div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div><button data-relay="'+escapeHtml(task.threadId)+'">'+(locale==='en'?'Open':'接力')+'</button></div>').join('')+'</div>':'<div class="empty">'+(q?t('noMatch'):t('noTask'))+'</div>'):'');
-    document.querySelector('#toggleTasks')?.addEventListener('click',()=>{tasksOpen=!tasksOpen;renderTasks(lastTasks)});
-    const search=document.querySelector('#taskSearch');
+      +(tasksOpen?(filtered.length?'<div class="workspaces" style="margin-top:7px">'+filtered.map(function(task){return '<div class="workspace"><div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div><button data-relay="'+escapeHtml(task.threadId)+'">'+escapeHtml(t('open'))+'</button></div>';}).join('')+'</div>':'<div class="empty">'+(q?t('noMatch'):t('noTask'))+'</div>'):'');
+    var toggle=document.querySelector('#toggleTasks');
+    if(toggle) toggle.addEventListener('click',function(){tasksOpen=!tasksOpen;renderTasks(lastTasks);});
+    var search=document.querySelector('#taskSearch');
     if(search){
-      search.addEventListener('input',()=>{taskQuery=search.value;renderTasks(lastTasks);const el=document.querySelector('#taskSearch');if(el){el.focus();const n=el.value.length;el.setSelectionRange(n,n)}});
+      search.addEventListener('input',function(){taskQuery=search.value;renderTasks(lastTasks);var el=document.querySelector('#taskSearch');if(el){el.focus();var n=el.value.length;try{el.setSelectionRange(n,n);}catch(e){}}});
     }
-    taskBox.querySelectorAll('[data-relay]').forEach(button=>button.addEventListener('click',()=>api.relayTask(button.dataset.relay)));
+    taskBox.querySelectorAll('[data-relay]').forEach(function(button){
+      button.addEventListener('click',function(){ if(api) api.relayTask(button.getAttribute('data-relay')); });
+    });
   }
-  document.querySelector('#saveRelay').addEventListener('click',()=>api.setRelayUrl(relay.value));
-  document.querySelector('#saveName').addEventListener('click',()=>api.setDisplayName(displayName.value));
-  startPair.addEventListener('click',()=>api.startPairing());
-  document.querySelector('#addWorkspace').addEventListener('click',()=>api.addWorkspace());
-  document.querySelector('#recheck').addEventListener('click',()=>api.checkEnvironment());
-  document.querySelector('#winMin')?.addEventListener('click',()=>api.windowMinimize());
-  document.querySelector('#winClose')?.addEventListener('click',()=>api.windowClose());
-  document.querySelector('#feedback')?.addEventListener('click',()=>api.openFeedback());
-  document.querySelector('#langZh')?.addEventListener('click',()=>{locale='zh-CN';localStorage.setItem('anytimevibe-locale',locale);applyLocale();api.getState().then(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])})});
-  document.querySelector('#langEn')?.addEventListener('click',()=>{locale='en';localStorage.setItem('anytimevibe-locale',locale);applyLocale();api.getState().then(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])})});
-  api.onState(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});
-  api.getState().then(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});
+  function bindUi(){
+    var el;
+    if((el=document.querySelector('#saveRelay'))&&api) el.addEventListener('click',function(){api.setRelayUrl(relay.value);});
+    if((el=document.querySelector('#saveName'))&&api) el.addEventListener('click',function(){api.setDisplayName(displayName.value);});
+    if(startPair&&api) startPair.addEventListener('click',function(){api.startPairing();});
+    if((el=document.querySelector('#addWorkspace'))&&api) el.addEventListener('click',function(){api.addWorkspace();});
+    if((el=document.querySelector('#recheck'))&&api) el.addEventListener('click',function(){api.checkEnvironment();});
+    if((el=document.querySelector('#winMin'))&&api) el.addEventListener('click',function(){api.windowMinimize();});
+    if((el=document.querySelector('#winClose'))&&api) el.addEventListener('click',function(){api.windowClose();});
+    if((el=document.querySelector('#feedback'))&&api) el.addEventListener('click',function(){api.openFeedback();});
+    if(el=document.querySelector('#langZh')) el.addEventListener('click',function(){locale='zh-CN';try{localStorage.setItem('anytimevibe-locale',locale);}catch(e){} applyLocale(); paint(initialState); refresh();});
+    if(el=document.querySelector('#langEn')) el.addEventListener('click',function(){locale='en';try{localStorage.setItem('anytimevibe-locale',locale);}catch(e){} applyLocale(); paint(initialState); refresh();});
+  }
+  function refresh(){
+    if(!api||!api.getState) return;
+    api.getState().then(function(state){ paint(state); }).catch(function(err){
+      if(detail) detail.textContent='读取状态失败：'+(err&&err.message?err.message:String(err));
+    });
+  }
+  applyLocale();
+  paint(initialState);
+  bindUi();
+  if(!api){
+    if(detail) detail.textContent='预加载桥接失败：window.anytimeVibe 不可用。请重装客户端。';
+  } else {
+    try{ api.onState(function(state){ paint(state); }); }catch(e){ console.error(e); }
+    refresh();
+  }
+  })();
   </script></body></html>`;
 }
 
@@ -1903,14 +1964,8 @@ async function checkForAgentUpdate(): Promise<void> {
   // Re-assert after setFeedURL — macOS generic provider occasionally resets download flags.
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
-  const result = await autoUpdater.checkForUpdates();
-  // If update-available already fired with explicit downloadUpdate, this is a no-op.
-  if (result?.downloadPromise) {
-    updateState({ update: { status: "downloading", version: result.updateInfo.version } });
-    await result.downloadPromise.catch((error: Error) => {
-      throw error;
-    });
-  }
+  // Do not await downloadPromise here — it can hang for minutes and must never block UI/IPC.
+  await autoUpdater.checkForUpdates();
 }
 
 function registerIpc(): void {
@@ -2022,7 +2077,10 @@ app.whenReady().then(async () => {
     if (process.platform === "win32") showWindow();
   });
   createWindow();
-  void checkForAgentUpdate().catch((error) => updateState({ update: { status: "error", message: error.message } }));
+  // Defer update check so first paint / IPC is never delayed by network download.
+  setTimeout(() => {
+    void checkForAgentUpdate().catch((error) => updateState({ update: { status: "error", message: error.message } }));
+  }, 1500);
   setInterval(() => void checkForAgentUpdate().catch(() => undefined), 6 * 60 * 60 * 1000).unref();
   try {
     await findCodex();
@@ -2033,7 +2091,8 @@ app.whenReady().then(async () => {
       detail: !config.relayUrl ? "请先配置中继地址。" : config.pairing ? "等待 Web 端确认配对。" : paired ? "Codex 已就绪，正在连接中继。" : "Codex 已就绪，等待配对连接。"
     });
     if (config.pairing) schedulePairingPoll();
-    if (config.hostId) await connect();
+    // Connect without blocking startup forever.
+    if (config.hostId) void connect().catch(handleError);
   } catch (error) {
     handleError(error);
   }
