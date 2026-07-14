@@ -447,12 +447,16 @@ function rendererHtml(): string {
   .stack{display:grid;gap:6px;margin-top:6px}
   .label{font-size:10px;font-weight:800;color:#6b726b;letter-spacing:.04em}
   pre.activity{margin:6px 0 0;max-height:160px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#17211b;color:#e8eee8;border-radius:8px;padding:8px;font:10px/1.45 Cascadia Code,monospace}
-  .footer{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 4px 0;border-top:1px solid rgba(23,33,27,.08);margin-top:2px;-webkit-app-region:no-drag;app-region:no-drag}
+  .footer{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 4px 0;border-top:1px solid rgba(23,33,27,.08);margin-top:2px;-webkit-app-region:no-drag;app-region:no-drag;flex-wrap:wrap}
   .footer .author{font-size:10px;color:#6b726b;line-height:1.35}
   .footer .author strong{color:#17211b}
+  .footer .footer-actions{display:flex;gap:6px;align-items:center}
   .footer button.feedback{background:transparent;color:#e25832;border:1px solid rgba(226,88,50,.35);padding:5px 9px}
+  .footer .lang-switch{display:inline-flex;border:1px solid rgba(23,33,27,.12);border-radius:8px;overflow:hidden}
+  .footer .lang-switch button{border:0;border-radius:0;background:#eee6d8;color:#6b726b;padding:5px 8px;font-size:10px}
+  .footer .lang-switch button.active{background:#17211b;color:#fff}
   </style></head><body><div class="frame"><main class="shell">
-  <div class="titlebar">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1>随码</h1><p>随时续上你的代码 · ${platformLabel}</p></div><div class="win-actions"><button type="button" id="winMin" title="最小化">–</button><button type="button" id="winClose" class="close" title="关闭">×</button></div></div>
+  <div class="titlebar">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1 id="brandTitle">随码</h1><p id="brandTag">随时续上你的代码 · ${platformLabel}</p></div><div class="win-actions"><button type="button" id="winMin" title="最小化">–</button><button type="button" id="winClose" class="close" title="关闭">×</button></div></div>
   <div class="scroll">
   <section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
   <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="updateBox" class="update-row"></div></section>
@@ -461,9 +465,25 @@ function rendererHtml(): string {
   <section class="card" id="activityBox" style="display:none"></section>
   <section class="card" id="taskBox"></section>
   </div>
-  <footer class="footer"><div class="author"><strong>随码 AnytimeVibe</strong><br>作者 · demonrain · 开源项目</div><button type="button" id="feedback" class="feedback">反馈问题</button></footer>
+  <footer class="footer"><div class="author"><strong id="authorStrong">随码 AnytimeVibe</strong><br><span id="authorLine">作者 · demonrain · 开源项目</span></div><div class="footer-actions"><div class="lang-switch"><button type="button" id="langZh" class="active">中文</button><button type="button" id="langEn">EN</button></div><button type="button" id="feedback" class="feedback">反馈问题</button></div></footer>
   </main></div><script>
   const api=window.anytimeVibe;
+  const I18N={
+    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · ${platformLabel}',authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败'},
+    en:{brand:'AnytimeVibe',tag:'Pick up your code · ${platformLabel}',authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed'}
+  };
+  let locale=(localStorage.getItem('anytimevibe-locale')==='en'?'en':'zh-CN');
+  function t(key){return (I18N[locale]&&I18N[locale][key])||I18N.en[key]||key}
+  function applyLocale(){
+    document.querySelector('#brandTitle').textContent=t('brand');
+    document.querySelector('#brandTag').textContent=t('tag');
+    document.querySelector('#authorStrong').textContent=t('authorStrong');
+    document.querySelector('#authorLine').textContent=t('authorLine');
+    document.querySelector('#feedback').textContent=t('feedback');
+    document.querySelector('#langZh').classList.toggle('active',locale==='zh-CN');
+    document.querySelector('#langEn').classList.toggle('active',locale==='en');
+  }
+  applyLocale();
   const status=document.querySelector('#status');
   const dot=document.querySelector('#dot');
   const detail=document.querySelector('#detail');
@@ -502,11 +522,11 @@ function rendererHtml(): string {
     workspaces.querySelectorAll('button[data-id]').forEach(button=>button.addEventListener('click',()=>api.removeWorkspace(button.dataset.id)));
   }
   function renderUpdate(update){
-    const labels={idle:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败'};
+    const labels={idle:t('latest'),checking:t('checking'),available:t('available'),downloading:t('downloading'),ready:t('ready'),error:t('error')};
     // Green when current is latest; orange when an update exists/is downloading/ready.
     const tone=update.status==='idle'?'ok':update.status==='error'?'err':(update.status==='available'||update.status==='downloading'||update.status==='ready')?'warn':'';
-    const text=update.version||update.message||(update.progress!==undefined?update.progress+'%':'后台自动检查');
-    updateBox.innerHTML='<div class="check '+tone+'"><b>'+labels[update.status]+'</b><span>'+escapeHtml(text)+'</span></div><button id="checkUpdate" class="secondary">检查更新</button>'+(update.status==='ready'?'<button id="installUpdate">重启并更新</button>':'');
+    const text=update.version||update.message||(update.progress!==undefined?update.progress+'%':'');
+    updateBox.innerHTML='<div class="check '+tone+'"><b>'+labels[update.status]+'</b><span>'+escapeHtml(text)+'</span></div><button id="checkUpdate" class="secondary">'+escapeHtml(locale==='en'?'Check update':'检查更新')+'</button>'+(update.status==='ready'?'<button id="installUpdate">'+escapeHtml(locale==='en'?'Restart & install':'重启并更新')+'</button>':'');
     document.querySelector('#checkUpdate')?.addEventListener('click',()=>api.checkUpdate());
     document.querySelector('#installUpdate')?.addEventListener('click',()=>api.installUpdate());
   }
@@ -526,9 +546,9 @@ function rendererHtml(): string {
       const hay=((task.title||'')+' '+(task.cwd||'')+' '+(task.status||'')).toLowerCase();
       return hay.includes(q);
     });
-    taskBox.innerHTML='<div class="status"><h2>任务接力</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?'收起':'展开')+' · '+filtered.length+(q?'/'+lastTasks.length:'')+'</button></div>'
-      +(tasksOpen?'<div class="stack" style="margin-top:7px"><input id="taskSearch" placeholder="搜索任务标题 / 路径 / 状态" value="'+escapeHtml(taskQuery)+'"></div>':'')
-      +(tasksOpen?(filtered.length?'<div class="workspaces" style="margin-top:7px">'+filtered.map(task=>'<div class="workspace"><div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div><button data-relay="'+escapeHtml(task.threadId)+'">接力</button></div>').join('')+'</div>':'<div class="empty">'+(q?'没有匹配的任务':'暂无可接力任务')+'</div>'):'');
+    taskBox.innerHTML='<div class="status"><h2>'+escapeHtml(t('relay'))+'</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?(locale==='en'?'Collapse':'收起'):(locale==='en'?'Expand':'展开'))+' · '+filtered.length+(q?'/'+lastTasks.length:'')+'</button></div>'
+      +(tasksOpen?'<div class="stack" style="margin-top:7px"><input id="taskSearch" placeholder="'+escapeHtml(t('search'))+'" value="'+escapeHtml(taskQuery)+'"></div>':'')
+      +(tasksOpen?(filtered.length?'<div class="workspaces" style="margin-top:7px">'+filtered.map(task=>'<div class="workspace"><div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div><button data-relay="'+escapeHtml(task.threadId)+'">'+(locale==='en'?'Open':'接力')+'</button></div>').join('')+'</div>':'<div class="empty">'+(q?t('noMatch'):t('noTask'))+'</div>'):'');
     document.querySelector('#toggleTasks')?.addEventListener('click',()=>{tasksOpen=!tasksOpen;renderTasks(lastTasks)});
     const search=document.querySelector('#taskSearch');
     if(search){
@@ -544,6 +564,8 @@ function rendererHtml(): string {
   document.querySelector('#winMin')?.addEventListener('click',()=>api.windowMinimize());
   document.querySelector('#winClose')?.addEventListener('click',()=>api.windowClose());
   document.querySelector('#feedback')?.addEventListener('click',()=>api.openFeedback());
+  document.querySelector('#langZh')?.addEventListener('click',()=>{locale='zh-CN';localStorage.setItem('anytimevibe-locale',locale);applyLocale();api.getState().then(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])})});
+  document.querySelector('#langEn')?.addEventListener('click',()=>{locale='en';localStorage.setItem('anytimevibe-locale',locale);applyLocale();api.getState().then(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])})});
   api.onState(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});
   api.getState().then(state=>{render(state);renderUpdate(state.update);renderActivity(state.activity);renderTasks(state.tasks||[])});
   </script></body></html>`;
@@ -1369,7 +1391,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     await ensureCodex();
     if (command.type === "task.create") {
       if (!isAllowedWorkspace(command.cwd)) throw new Error("工作目录不在代理白名单中");
-      const mode = command.permissionMode ?? "inherit";
+      const mode = command.permissionMode ?? "ask-for-approval";
       const started = await codex!.request("thread/start", threadStartParams(command.cwd, mode));
       const thread = started.thread;
       localThreadId = thread.id;
@@ -1391,8 +1413,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "turn.start") {
-      const mode = command.permissionMode ?? "inherit";
-      // inherit omits approval/sandbox so machine-local Codex config is honored.
+      const mode = command.permissionMode ?? "ask-for-approval";
       await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
       startLocalActivity(command.threadId, command.prompt, "继续远程任务");
       const result = await codex!.request("turn/start", {
@@ -1438,12 +1459,17 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "sync.request") {
-      const threadCount = await syncAllThreads();
+      const result = await syncAllThreads({
+        limit: command.limit,
+        query: command.query
+      });
       await publish({
         type: "sync.completed",
         eventId: crypto.randomUUID(),
         occurredAt: new Date().toISOString(),
-        threadCount
+        threadCount: result.threadCount,
+        partial: result.partial,
+        ...(command.query ? { query: command.query } : {})
       }, false);
     }
   } catch (error) {
@@ -1605,18 +1631,69 @@ async function publishThread(threadId: string): Promise<void> {
   const result = await codex!.request("thread/read", { threadId, includeTurns: true });
   const snapshot = threadToSnapshot(result.thread);
   const task: AgentTask = { threadId: snapshot.threadId, title: snapshot.title, cwd: snapshot.cwd, status: snapshot.status, updatedAt: snapshot.updatedAt };
-  updateState({ tasks: [task, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)].sort((left, right) => right.updatedAt - left.updatedAt).slice(0, 100) });
+  updateState({
+    tasks: [task, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)]
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, 200)
+  });
   await publish({ type: "thread.snapshot", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), ...snapshot }, true);
 }
 
-async function syncAllThreads(): Promise<number> {
+const DEFAULT_SYNC_LIMIT = 20;
+const SEARCH_LIST_LIMIT = 100;
+
+function threadMatchesQuery(thread: Record<string, any>, query: string): boolean {
+  const hay = [
+    thread.name,
+    thread.preview,
+    thread.cwd,
+    thread.id,
+    thread.status
+  ].map((value) => String(value ?? "").toLowerCase()).join("\n");
+  return hay.includes(query);
+}
+
+/**
+ * Lazy sync: by default only the most recently updated N threads (desc).
+ * With query: scan a larger list window and publish matches so search can find older tasks.
+ */
+async function syncAllThreads(options: { limit?: number; query?: string } = {}): Promise<{ threadCount: number; partial: boolean }> {
   await ensureCodex();
-  const response = await codex!.request("thread/list", { limit: 100, sortDirection: "desc" });
-  const threads = response.data ?? [];
-  for (const thread of threads) {
-    try { await publishThread(thread.id); } catch (error) { handleError(error); }
+  const query = options.query?.trim().toLowerCase() ?? "";
+  const limit = Math.min(100, Math.max(1, options.limit ?? DEFAULT_SYNC_LIMIT));
+  const listLimit = query ? SEARCH_LIST_LIMIT : limit;
+  const response = await codex!.request("thread/list", { limit: listLimit, sortDirection: "desc" });
+  let threads: Array<Record<string, any>> = response.data ?? [];
+  // Ensure newest-first by updatedAt when available.
+  threads = [...threads].sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0));
+  if (query) {
+    threads = threads.filter((thread) => threadMatchesQuery(thread, query));
+  } else {
+    threads = threads.slice(0, limit);
   }
-  return threads.length;
+  const total = threads.length;
+  let published = 0;
+  for (const thread of threads) {
+    try {
+      await publish({
+        type: "sync.progress",
+        eventId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(),
+        current: published,
+        total,
+        title: String(thread.name || thread.preview || thread.id || "")
+      }, false);
+      await publishThread(String(thread.id));
+      published += 1;
+    } catch (error) {
+      handleError(error);
+    }
+  }
+  return {
+    threadCount: published,
+    // Without a search query we only load the recent window — mark partial for the UI.
+    partial: !query
+  };
 }
 
 function shellQuote(value: string): string {
@@ -1685,10 +1762,19 @@ let updateListenersRegistered = false;
 function registerUpdateListeners(): void {
   if (updateListenersRegistered) return;
   updateListenersRegistered = true;
+  // Ensure both Windows NSIS and macOS zip feeds auto-download after check.
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.allowDowngrade = false;
   autoUpdater.on("checking-for-update", () => updateState({ update: { status: "checking" } }));
-  autoUpdater.on("update-available", (info) => updateState({ update: { status: "available", version: info.version } }));
+  autoUpdater.on("update-available", (info) => {
+    updateState({ update: { status: "available", version: info.version, message: "正在下载更新…" } });
+    // Explicit download: on some macOS builds autoDownload alone does not start.
+    void autoUpdater.downloadUpdate().catch((error: Error) => {
+      if (installingUpdate) return;
+      updateState({ update: { status: "error", message: error.message || "下载更新失败" } });
+    });
+  });
   autoUpdater.on("update-not-available", () => updateState({ update: { status: "idle", message: "当前已是最新版本" } }));
   autoUpdater.on("download-progress", (progress) => updateState({ update: { status: "downloading", progress: Math.round(progress.percent) } }));
   autoUpdater.on("update-downloaded", (info) => {
@@ -1814,7 +1900,17 @@ async function checkForAgentUpdate(): Promise<void> {
     return;
   }
   autoUpdater.setFeedURL({ provider: "generic", url: remoteConfig.updateFeedUrl });
-  await autoUpdater.checkForUpdates();
+  // Re-assert after setFeedURL — macOS generic provider occasionally resets download flags.
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  const result = await autoUpdater.checkForUpdates();
+  // If update-available already fired with explicit downloadUpdate, this is a no-op.
+  if (result?.downloadPromise) {
+    updateState({ update: { status: "downloading", version: result.updateInfo.version } });
+    await result.downloadPromise.catch((error: Error) => {
+      throw error;
+    });
+  }
 }
 
 function registerIpc(): void {

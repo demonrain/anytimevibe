@@ -8,24 +8,28 @@ type JsonObject = Record<string, any>;
 
 /**
  * Map web permission mode to Codex app-server thread/turn params.
- * "inherit" must omit approvalPolicy/sandbox so local Codex config.toml is used.
+ * Labels match Codex CLI: Read Only / Ask for approval / Approve for me / Full Access.
  */
-export function codexPermissionParams(permissionMode: PermissionMode = "inherit"): Record<string, string> {
+export function codexPermissionParams(permissionMode: PermissionMode = "ask-for-approval"): Record<string, string> {
+  // Legacy aliases
+  if (permissionMode === "inherit") return {};
+  if (permissionMode === "workspace-write") {
+    return { approvalPolicy: "on-request", sandbox: "workspace-write" };
+  }
   if (permissionMode === "full-access") return { approvalPolicy: "never", sandbox: "danger-full-access" };
-  if (permissionMode === "workspace-write") return { approvalPolicy: "on-request", sandbox: "workspace-write" };
+  if (permissionMode === "approve-for-me") return { approvalPolicy: "never", sandbox: "workspace-write" };
+  if (permissionMode === "ask-for-approval") return { approvalPolicy: "on-request", sandbox: "workspace-write" };
   if (permissionMode === "read-only") return { approvalPolicy: "on-request", sandbox: "read-only" };
-  // inherit / unknown: do not override the machine-local Codex configuration
   return {};
 }
 
-export function threadStartParams(cwd: string, permissionMode: PermissionMode = "inherit"): { cwd: string; approvalPolicy?: string; sandbox?: string } {
+export function threadStartParams(cwd: string, permissionMode: PermissionMode = "ask-for-approval"): { cwd: string; approvalPolicy?: string; sandbox?: string } {
   const policy = codexPermissionParams(permissionMode);
-  // Only attach policy keys when explicitly set (inherit stays { cwd } only).
   return Object.keys(policy).length ? { cwd, ...policy } : { cwd };
 }
 
 /** Params for thread/resume — empty object when inheriting local client config. */
-export function threadResumeParams(threadId: string, permissionMode: PermissionMode = "inherit"): Record<string, string> {
+export function threadResumeParams(threadId: string, permissionMode: PermissionMode = "ask-for-approval"): Record<string, string> {
   const policy = codexPermissionParams(permissionMode);
   return Object.keys(policy).length ? { threadId, ...policy } : { threadId };
 }
@@ -52,7 +56,6 @@ export class CodexAdapter {
       windowsHide: true,
       windowsVerbatimArguments: isWindows,
       stdio: ["pipe", "pipe", "pipe"],
-      // Inherit process PATH (agent refreshes login-shell PATH on macOS GUI launches).
       env: process.env
     });
     this.process = child;
@@ -70,7 +73,7 @@ export class CodexAdapter {
     child.on("error", (error) => this.onExit(error.message));
 
     await this.request("initialize", {
-      clientInfo: { name: "anytimevibe-agent", title: "随码", version: "0.4.9" },
+      clientInfo: { name: "anytimevibe-agent", title: "随码", version: "0.4.19" },
       capabilities: { experimentalApi: false, requestAttestation: false }
     });
     this.notify("initialized");
@@ -80,8 +83,6 @@ export class CodexAdapter {
     const child = this.process;
     this.process = null;
     if (!child) return;
-    // Detach listeners first so kill-driven "exit" does not fire onExit UI updates
-    // during app quit / quitAndInstall (destroyed BrowserWindow).
     child.removeAllListeners("exit");
     child.removeAllListeners("error");
     for (const pending of this.pending.values()) {

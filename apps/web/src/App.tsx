@@ -18,6 +18,8 @@ import {
   type Workspace
 } from "@anytimevibe/protocol";
 import { api, websocketUrl } from "./api";
+import { useI18n } from "./i18n/I18nProvider";
+import { normalizePermissionMode } from "./i18n/locales";
 import { getHostKey, removeHostKey, saveHostKey } from "./key-store";
 
 type Health = { ok: boolean; needsSetup: boolean; registrationEnabled: boolean; vapidPublicKey: string | null; clientDownloads: { windows: string | null; mac: string | null } };
@@ -78,7 +80,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     next.workspaces = event.workspaces;
     return next;
   }
-  if (event.type === "sync.completed") return next;
+  if (event.type === "sync.completed" || event.type === "sync.progress") return next;
   if (event.type === "thread.snapshot") {
     const existing = next.tasks[event.threadId];
     next.tasks[event.threadId] = {
@@ -219,8 +221,10 @@ export function App() {
   const [composerOpen, setComposerOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
-  const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => (localStorage.getItem("permission-mode") as PermissionMode | null) ?? "inherit");
+  const { locale, setLocale, t } = useI18n();
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => normalizePermissionMode(localStorage.getItem("permission-mode")));
   const [taskQuery, setTaskQuery] = useState("");
+  const taskSearchTimerRef = useRef<number | null>(null);
   const autoSyncedHostsRef = useRef(new Set<string>());
   const [keyAuthorizationStatus, setKeyAuthorizationStatus] = useState<Record<string, "missing" | "authorizing">>({});
   const keyAuthorizationsRef = useRef(new Set<string>());
@@ -244,11 +248,22 @@ export function App() {
     const key = await getHostKey(envelope.hostId);
     if (!key) return;
     const event = agentEventSchema.parse(await openEnvelope<AgentEvent>(key, envelope));
+    if (event.type === "sync.progress") {
+      setSyncStatus((current) => ({
+        ...current,
+        [envelope.hostId]: `${t("syncing")} ${event.current}/${event.total}`
+      }));
+      return;
+    }
     if (event.type === "sync.completed") {
-      setSyncStatus((current) => ({ ...current, [envelope.hostId]: `已同步 ${event.threadCount} 个任务` }));
+      const label = event.partial
+        ? (locale === "en" ? `Synced recent ${event.threadCount}` : `已同步最近 ${event.threadCount} 个`)
+        : (locale === "en" ? `Synced ${event.threadCount}` : `已同步 ${event.threadCount} 个任务`);
+      setSyncStatus((current) => ({ ...current, [envelope.hostId]: label }));
       window.setTimeout(() => {
         setSyncStatus((current) => {
-          if (!current[envelope.hostId]?.startsWith("已同步")) return current;
+          const value = current[envelope.hostId];
+          if (!value || value.startsWith(t("syncing"))) return current;
           const next = { ...current };
           delete next[envelope.hostId];
           return next;
@@ -478,10 +493,23 @@ export function App() {
     setHosts((current) => current.map((item) => item.id === host.id ? { ...item, name: response.host.name } : item));
   }
 
-  async function syncHostTasks(hostId: string) {
-    setSyncStatus((current) => ({ ...current, [hostId]: "同步中…" }));
+  async function syncHostTasks(hostId: string, options: { limit?: number; query?: string } = {}) {
+    setSyncStatus((current) => ({ ...current, [hostId]: t("syncing") }));
+    const timeout = window.setTimeout(() => {
+      setSyncStatus((current) => {
+        if (current[hostId] !== t("syncing") && !String(current[hostId] ?? "").startsWith(t("syncing"))) return current;
+        const next = { ...current };
+        delete next[hostId];
+        return next;
+      });
+    }, 90_000);
     try {
-      await sendCommand(hostId, { type: "sync.request", commandId: crypto.randomUUID() });
+      await sendCommand(hostId, {
+        type: "sync.request",
+        commandId: crypto.randomUUID(),
+        limit: options.limit ?? 20,
+        ...(options.query ? { query: options.query } : {})
+      });
     } catch (syncError) {
       setSyncStatus((current) => {
         const next = { ...current };
@@ -489,8 +517,24 @@ export function App() {
         return next;
       });
       throw syncError;
+    } finally {
+      window.clearTimeout(timeout);
     }
   }
+
+  useEffect(() => {
+    if (!selectedHostId || !taskQuery.trim()) return;
+    if (taskSearchTimerRef.current) window.clearTimeout(taskSearchTimerRef.current);
+    taskSearchTimerRef.current = window.setTimeout(() => {
+      const hostId = selectedHostId;
+      const online = runtime[hostId]?.online;
+      if (online !== true) return;
+      void syncHostTasks(hostId, { query: taskQuery.trim() }).catch((error) => setError(error.message));
+    }, 450);
+    return () => {
+      if (taskSearchTimerRef.current) window.clearTimeout(taskSearchTimerRef.current);
+    };
+  }, [taskQuery, selectedHostId]);
 
   if (!health) return <main className="loading-screen"><div className="pulse" /><p>正在进入随码安全工作区…</p>{error && <ErrorBanner message={error} clear={() => setError("")} />}</main>;
   if (!user) return <AuthScreen health={health} onAuthenticated={setUser} />;
@@ -512,56 +556,60 @@ export function App() {
   return <div className="app-shell">
     {error && <ErrorBanner message={error} clear={() => setError("")} />}
     <header className="topbar">
-      <div className="brand"><span className="brand-mark" aria-hidden="true"><img src="/icon.svg" alt="" /></span><div><strong>随码</strong><small>随时续上你的代码</small></div></div>
+      <div className="brand"><span className="brand-mark" aria-hidden="true"><img src="/icon.svg" alt="" /></span><div><strong>{t("brand")}</strong><small>{t("brandTag")}</small></div></div>
       <div className="top-actions">
         <ClientDownloads downloads={health.clientDownloads} />
-        <button className="quiet" onClick={() => subscribePush(health.vapidPublicKey).catch((pushError) => setError(pushError.message))}>开启通知</button>
+        <div className="lang-switch" role="group" aria-label={t("lang")}>
+          <button type="button" className={locale === "zh-CN" ? "active" : ""} onClick={() => setLocale("zh-CN")}>中文</button>
+          <button type="button" className={locale === "en" ? "active" : ""} onClick={() => setLocale("en")}>EN</button>
+        </div>
+        <button className="quiet" onClick={() => subscribePush(health.vapidPublicKey).catch((pushError) => setError(pushError.message))}>{t("notify")}</button>
         <div className="account-menu">
           <button className="avatar" title={user.username} aria-expanded={accountOpen} onClick={() => setAccountOpen((open) => !open)}>{user.username.slice(0, 1).toUpperCase()}</button>
           {accountOpen && <div className="account-popover">
-            <div><strong>{user.username}</strong><small>{user.isAdmin ? "管理员" : "个人空间"}</small></div>
-            {user.isAdmin && <a className="account-link" href="/admin">管理后台</a>}
-            <button onClick={() => logout().catch((logoutError) => setError(logoutError.message))}>退出登录</button>
+            <div><strong>{user.username}</strong><small>{user.isAdmin ? t("administrator") : t("personalSpace")}</small></div>
+            {user.isAdmin && <a className="account-link" href="/admin">{t("admin")}</a>}
+            <button onClick={() => logout().catch((logoutError) => setError(logoutError.message))}>{t("logout")}</button>
           </div>}
         </div>
       </div>
     </header>
 
     <aside className="rail">
-      <div className="rail-heading"><span>远程主机</span><button onClick={() => setPairingOpen(true)}>＋</button></div>
+      <div className="rail-heading"><span>{t("remoteHosts")}</span><button onClick={() => setPairingOpen(true)}>＋</button></div>
       <div className="host-list">
-        <button className="host-add-mobile" onClick={() => setPairingOpen(true)}>＋ 添加电脑</button>
+        <button className="host-add-mobile" onClick={() => setPairingOpen(true)}>{t("addComputer")}</button>
         {hosts.map((host) => <div key={host.id} className={`host-row ${host.id === selectedHostId ? "active" : ""}`}>
           <button className="host-pill" onClick={() => { setSelectedHostId(host.id); setSelectedTaskId(null); setMobilePane("tasks"); }}>
             <span className={`status-dot ${(runtime[host.id]?.online ?? host.online) ? "online" : ""}`} />
             <span><strong>{host.name}</strong><small>{host.codexVersion}</small></span>
           </button>
-          <button className="host-rename" title={`重命名 ${host.name}`} aria-label={`重命名设备 ${host.name}`} onClick={() => renameHost(host).catch((renameError) => setError(renameError.message))}>✎</button>
-          <button className="host-delete" title={`删除 ${host.name}`} aria-label={`删除设备 ${host.name}`} onClick={() => deleteHost(host).catch((deleteError) => setError(deleteError.message))}>×</button>
+          <button className="host-rename" title={`${t("renameHost")} ${host.name}`} aria-label={`${t("renameHost")} ${host.name}`} onClick={() => renameHost(host).catch((renameError) => setError(renameError.message))}>✎</button>
+          <button className="host-delete" title={`${t("deleteHost")} ${host.name}`} aria-label={`${t("deleteHost")} ${host.name}`} onClick={() => deleteHost(host).catch((deleteError) => setError(deleteError.message))}>×</button>
         </div>)}
-        {!hosts.length && <button className="empty-host" onClick={() => setPairingOpen(true)}>连接第一台电脑</button>}
+        {!hosts.length && <button className="empty-host" onClick={() => setPairingOpen(true)}>{t("connectFirst")}</button>}
       </div>
     </aside>
 
     <main className={`workspace mobile-${mobilePane}`}>
       <section className="task-column">
-        <button className="mobile-level-back" type="button" onClick={() => setMobilePane("hosts")}>‹ 客户端</button>
+        <button className="mobile-level-back" type="button" onClick={() => setMobilePane("hosts")}>{t("clients")}</button>
         <div className="section-title">
-          <div><p className="eyebrow">TASK STREAM</p><h1>{activeHost?.name ?? "尚未连接主机"}</h1></div>
+          <div><p className="eyebrow">{t("taskStream")}</p><h1 className="host-title">{activeHost?.name ?? t("noHost")}</h1></div>
           <div className="section-actions">
-            <button className="sync-tasks" disabled={!activeHost || activeRuntime.online !== true || syncStatus[activeHost.id] === "同步中…"} onClick={() => activeHost && syncHostTasks(activeHost.id).catch((syncError) => setError(syncError.message))}>{activeHost ? syncStatus[activeHost.id] ?? "同步任务" : "同步任务"}</button>
-            <button className="new-task" disabled={!activeHost || activeRuntime.online !== true} onClick={() => setComposerOpen(true)}>新任务</button>
+            <button className="sync-tasks" disabled={!activeHost || activeRuntime.online !== true || String(syncStatus[activeHost.id] ?? "").startsWith(t("syncing"))} onClick={() => activeHost && syncHostTasks(activeHost.id).catch((syncError) => setError(syncError.message))}>{activeHost ? syncStatus[activeHost.id] ?? t("syncTasks") : t("syncTasks")}</button>
+            <button className="new-task" disabled={!activeHost || activeRuntime.online !== true} onClick={() => setComposerOpen(true)}>{t("newTask")}</button>
           </div>
         </div>
-        <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? "主机在线，命令将立即执行" : activeRuntime.online === false ? "主机离线，仅可查看已同步记录" : "正在确认主机状态…"}</div>
+        <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? t("hostOnline") : activeRuntime.online === false ? t("hostOffline") : t("hostChecking")}</div>
         {activeHost && keyAuthorizationStatus[activeHost.id] && <div className="key-authorization-note"><div><strong>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "正在授权此浏览器" : "此浏览器尚未取得主机密钥"}</strong><span>{activeRuntime.online === true ? "电脑端会自动完成端到端密钥授权。" : "请先让电脑端客户端上线，再重新授权。"}</span></div><button disabled={keyAuthorizationStatus[activeHost.id] === "authorizing" || activeRuntime.online !== true} onClick={() => authorizeExistingHost(activeHost.id).catch((authorizationError) => setError(authorizationError.message))}>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "授权中…" : "授权此浏览器"}</button></div>}
-        <label className="permission-select">Codex 权限<select value={permissionMode} onChange={(event) => { const mode = event.target.value as PermissionMode; setPermissionMode(mode); localStorage.setItem("permission-mode", mode); }}><option value="inherit">跟随客户端配置（本机 Codex 设置）</option><option value="full-access">Full Access</option><option value="workspace-write">Workspace Write</option><option value="read-only">Read Only</option></select></label>
+        <label className="permission-select">{t("codexPermission")}<select value={permissionMode} onChange={(event) => { const mode = normalizePermissionMode(event.target.value); setPermissionMode(mode); localStorage.setItem("permission-mode", mode); }}><option value="read-only">{t("permReadOnly")}</option><option value="ask-for-approval">{t("permAsk")}</option><option value="approve-for-me">{t("permApprove")}</option><option value="full-access">{t("permFull")}</option></select></label>
         <div className="task-search">
           <input
             value={taskQuery}
             onChange={(event) => setTaskQuery(event.target.value)}
-            placeholder="搜索任务标题 / 内容 / 路径"
-            aria-label="搜索任务"
+            placeholder={t("searchTasks")}
+            aria-label={t("searchTasks")}
           />
           {normalizedTaskQuery && <small>{filteredTasks.length}/{tasks.length}</small>}
         </div>
@@ -570,15 +618,15 @@ export function App() {
             <div className="task-meta"><span className={`task-status ${status.tone}`}>{status.label}</span><time>{new Date(task.updatedAt * 1000).toLocaleString()}</time></div>
             <h3>{task.title}</h3>
             <p>{task.messages.at(-1)?.text || task.cwd}</p>
-            <div className="task-foot"><code>{shortPath(task.cwd)}</code>{task.approvals.length > 0 && <b>{task.approvals.length} 个审批</b>}</div>
+            <div className="task-foot"><code>{shortPath(task.cwd)}</code>{task.approvals.length > 0 && <b>{task.approvals.length}</b>}</div>
           </button>; })}
-          {!tasks.length && <div className="empty-state"><span>&gt;_</span><h3>等待第一条远程任务</h3><p>选择白名单工作区，向本机 Codex 下发任务。</p></div>}
-          {Boolean(tasks.length && !filteredTasks.length) && <div className="empty-state"><span>?</span><h3>没有匹配任务</h3><p>换个关键词试试标题、路径或对话内容。</p></div>}
+          {!tasks.length && <div className="empty-state"><span>&gt;_</span><h3>{t("noTasks")}</h3><p>{t("noTasksHint")}</p></div>}
+          {Boolean(tasks.length && !filteredTasks.length) && <div className="empty-state"><span>?</span><h3>{t("noMatch")}</h3><p>{t("noMatchHint")}</p></div>}
         </div>
       </section>
 
       <section className="conversation-column">
-        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} onPermissionModeChange={(mode) => { setPermissionMode(mode); localStorage.setItem("permission-mode", mode); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>选择一个任务</h2><p>这里会显示对话、执行状态、审批和最新 Diff。</p></div>}
+        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} onPermissionModeChange={(mode) => { const next = normalizePermissionMode(mode); setPermissionMode(next); localStorage.setItem("permission-mode", next); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>{t("pickTask")}</h2><p>{t("pickTaskHint")}</p></div>}
       </section>
     </main>
 
@@ -591,6 +639,7 @@ export function App() {
 }
 
 function TaskConversation({ task, online, visible, permissionMode, onPermissionModeChange, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; permissionMode: PermissionMode; onPermissionModeChange(mode: PermissionMode): void; onBack(): void; onCommand(command: ClientCommand): void }) {
+  const { t } = useI18n();
   const [prompt, setPrompt] = useState("");
   const [pendingPrompt, setPendingPrompt] = useState("");
   const [pendingMessageCount, setPendingMessageCount] = useState(0);
@@ -666,7 +715,7 @@ function TaskConversation({ task, online, visible, permissionMode, onPermissionM
     <div className="conversation-head">
       <button className="mobile-back" type="button" onClick={onBack} aria-label="返回任务列表">‹</button>
       <div><p className="eyebrow">THREAD</p><h2>{task.title}</h2><code>{task.cwd}</code></div>
-      <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>对话</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>Diff</button></div>
+      <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>{t("chat")}</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>{t("diff")}</button></div>
     </div>
     {tab === "chat" ? <div className="message-stream" ref={messageStreamRef} onScroll={(event) => {
       const stream = event.currentTarget;
@@ -674,11 +723,11 @@ function TaskConversation({ task, online, visible, permissionMode, onPermissionM
     }}>
       {task.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><span>{message.role === "user" ? "YOU" : message.role === "assistant" ? "CODEX" : "SYSTEM"}</span><pre>{message.text}</pre></article>)}
       {pendingPrompt && <article className="message user pending"><span>YOU · 发送中</span><pre>{pendingPrompt}</pre></article>}
-      {running && <article className="processing-card"><span className="processing-spinner" /><div><strong>远程主机正在处理</strong><p>Codex 正在电脑端执行；阶段日志与回复会实时流式同步到下方对话。</p></div></article>}
-      {commandQueue.length > 0 && <section className="command-queue"><div><strong>等待队列</strong><span>{commandQueue.length} 条</span></div>{commandQueue.map((queuedPrompt, index) => <article key={`${index}:${queuedPrompt}`}><b>{index + 1}</b><p>{queuedPrompt}</p></article>)}</section>}
+      {running && <article className="processing-card"><span className="processing-spinner" /><div><strong>{t("processing")}</strong><p>{t("processingHint")}</p></div></article>}
+      {commandQueue.length > 0 && <section className="command-queue"><div><strong>{t("queue")}</strong><span>{commandQueue.length}</span></div>{commandQueue.map((queuedPrompt, index) => <article key={`${index}:${queuedPrompt}`}><b>{index + 1}</b><p>{queuedPrompt}</p></article>)}</section>}
       {task.approvals.map((approval) => <article className="approval-card" key={String(approval.requestId)}>
-        <div className="approval-label">ACTION REQUIRED</div><h3>{approval.title}</h3><pre>{approval.detail}</pre>
-        <div className="approval-actions"><button onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "decline" })}>拒绝</button><button className="approve" onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "accept" })}>允许一次</button></div>
+        <div className="approval-label">{t("actionRequired")}</div><h3>{approval.title}</h3><pre>{approval.detail}</pre>
+        <div className="approval-actions"><button onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "decline" })}>{t("decline")}</button><button className="approve" onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "accept" })}>{t("allowOnce")}</button></div>
       </article>)}
       <div className="message-end" ref={messageEndRef} />
     </div> : <DiffView diff={task.diff} />}
@@ -692,7 +741,7 @@ function TaskConversation({ task, online, visible, permissionMode, onPermissionM
           submitPrompt();
         }
       }} placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"} />
-      <div><small><label className="composer-permission">当前权限<select value={permissionMode} onChange={(event) => onPermissionModeChange(event.target.value as PermissionMode)}><option value="inherit">跟随客户端配置</option><option value="full-access">Full Access</option><option value="workspace-write">Workspace Write</option><option value="read-only">Read Only</option></select></label><span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 发送</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>结束等待</button>}<button className="send" disabled={online !== true || !prompt.trim()}>发送</button></div>
+      <div><small><label className="composer-permission">{t("currentPermission")}<select value={permissionMode} onChange={(event) => onPermissionModeChange(normalizePermissionMode(event.target.value))}><option value="read-only">{t("permReadOnly")}</option><option value="ask-for-approval">{t("permAsk")}</option><option value="approve-for-me">{t("permApprove")}</option><option value="full-access">{t("permFull")}</option></select></label><span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> {t("sendShortcut")}</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>{t("stop")}</button>}<button className="send" disabled={online !== true || !prompt.trim()}>{t("send")}</button></div>
     </form>
   </>;
 }

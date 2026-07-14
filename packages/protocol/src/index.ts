@@ -26,7 +26,16 @@ export const workspaceSchema = z.object({
 export type Workspace = z.infer<typeof workspaceSchema>;
 
 const commandBase = z.object({ commandId: z.string().uuid() });
-export const permissionModeSchema = z.enum(["inherit", "full-access", "workspace-write", "read-only"]);
+/** Align with Codex CLI permission labels: Read Only / Ask for approval / Approve for me / Full Access */
+export const permissionModeSchema = z.enum([
+  "read-only",
+  "ask-for-approval",
+  "approve-for-me",
+  "full-access",
+  // legacy values still accepted from older web clients
+  "inherit",
+  "workspace-write"
+]);
 export type PermissionMode = z.infer<typeof permissionModeSchema>;
 
 export const clientCommandSchema = z.discriminatedUnion("type", [
@@ -63,7 +72,13 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     requestId: z.union([z.string(), z.number()]),
     decision: z.enum(["accept", "decline", "cancel"])
   }),
-  commandBase.extend({ type: z.literal("sync.request") })
+  commandBase.extend({
+    type: z.literal("sync.request"),
+    /** Recent threads to fully load (default 20). Ignored when query is set. */
+    limit: z.number().int().positive().max(100).optional(),
+    /** Fuzzy search across titles/previews; may load more than limit to find matches. */
+    query: z.string().trim().max(200).optional()
+  })
 ]);
 
 export type ClientCommand = z.infer<typeof clientCommandSchema>;
@@ -85,7 +100,16 @@ export const agentEventSchema = z.discriminatedUnion("type", [
   }),
   eventBase.extend({
     type: z.literal("sync.completed"),
-    threadCount: z.number().int().nonnegative()
+    threadCount: z.number().int().nonnegative(),
+    /** True when only a recent window was loaded (not a full history dump). */
+    partial: z.boolean().optional(),
+    query: z.string().optional()
+  }),
+  eventBase.extend({
+    type: z.literal("sync.progress"),
+    current: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+    title: z.string().optional()
   }),
   eventBase.extend({
     type: z.literal("thread.snapshot"),
