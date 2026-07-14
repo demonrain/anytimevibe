@@ -271,7 +271,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: AdminContext, ses
       isAdmin: z.boolean().optional(),
       disabled: z.boolean().optional(),
       note: z.string().trim().max(500).nullable().optional(),
-      password: z.string().min(10).max(256).optional()
+      password: z.string().min(6, "密码至少 6 位").max(256, "密码过长").optional()
     }).parse(request.body);
 
     const existing = await sql<Array<{ id: string; isAdmin: boolean }>>`

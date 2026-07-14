@@ -24,20 +24,32 @@ type SocketLike = {
   on(event: "close" | "error", listener: () => void): void;
 };
 
+const usernameField = z
+  .string()
+  .trim()
+  .min(3, "用户名至少 3 个字符")
+  .max(64, "用户名最多 64 个字符")
+  .regex(/^[a-zA-Z0-9_.-]+$/, "用户名仅支持字母、数字、下划线、点、短横线");
+
+const passwordField = z
+  .string()
+  .min(6, "密码至少 6 位")
+  .max(256, "密码过长");
+
 const setupBody = z.object({
-  setupToken: z.string(),
-  username: z.string().trim().min(3).max(64),
-  password: z.string().min(10).max(256)
+  setupToken: z.string().min(1, "请填写设置令牌"),
+  username: usernameField,
+  password: passwordField
 });
 
 const loginBody = z.object({
-  username: z.string().trim().min(1),
-  password: z.string().min(1)
+  username: z.string().trim().min(1, "请输入用户名"),
+  password: z.string().min(1, "请输入密码")
 });
 
 const registerBody = z.object({
-  username: z.string().trim().min(3).max(64).regex(/^[a-zA-Z0-9_.-]+$/),
-  password: z.string().min(10).max(256)
+  username: usernameField,
+  password: passwordField
 });
 
 const agentPairBody = z.object({
@@ -212,9 +224,11 @@ async function main(): Promise<void> {
     `;
     const user = rows[0];
     if (!user || !(await verifyPassword(user.passwordHash, body.password))) {
-      return reply.code(401).send({ error: "invalid_credentials" });
+      return reply.code(401).send({ error: "invalid_credentials", message: "用户名或密码错误" });
     }
-    if (user.disabledAt) return reply.code(403).send({ error: "account_disabled" });
+    if (user.disabledAt) {
+      return reply.code(403).send({ error: "account_disabled", message: "账号已被禁用" });
+    }
     const token = randomToken();
     await sql`
       INSERT INTO sessions (id, user_id, token_hash, expires_at)
@@ -226,16 +240,22 @@ async function main(): Promise<void> {
 
   app.post("/api/auth/register", { config: { rateLimit: { max: 5, timeWindow: "1 hour" } } }, async (request, reply) => {
     const policy = await resolveRegistrationPolicy(sql, config.REGISTRATION_ENABLED, config.MAX_USERS);
-    if (!policy.registrationEnabled) return reply.code(403).send({ error: "registration_disabled" });
+    if (!policy.registrationEnabled) {
+      return reply.code(403).send({ error: "registration_disabled", message: "当前未开放注册" });
+    }
     const body = registerBody.parse(request.body);
     const countRows = await sql<Array<{ count: number }>>`SELECT count(*)::int AS count FROM users`;
-    if ((countRows[0]?.count ?? 0) >= policy.maxUsers) return reply.code(403).send({ error: "user_limit_reached" });
+    if ((countRows[0]?.count ?? 0) >= policy.maxUsers) {
+      return reply.code(403).send({ error: "user_limit_reached", message: "注册人数已达上限" });
+    }
     const userId = randomUUID();
     const passwordHash = await hashPassword(body.password);
     try {
       await sql`INSERT INTO users (id, username, password_hash, is_admin) VALUES (${userId}, ${body.username}, ${passwordHash}, false)`;
     } catch (error) {
-      if ((error as { code?: string }).code === "23505") return reply.code(409).send({ error: "username_taken" });
+      if ((error as { code?: string }).code === "23505") {
+        return reply.code(409).send({ error: "username_taken", message: "用户名已被占用" });
+      }
       throw error;
     }
     const token = randomToken();
@@ -678,12 +698,20 @@ async function main(): Promise<void> {
   });
 
   app.setErrorHandler((error, _request, reply) => {
-    if (error instanceof z.ZodError) return reply.code(400).send({ error: "invalid_request", details: error.flatten() });
+    if (error instanceof z.ZodError) {
+      const first = error.issues[0];
+      const message = first?.message?.trim() || "请求参数无效";
+      return reply.code(400).send({
+        error: "invalid_request",
+        message,
+        details: error.flatten()
+      });
+    }
     if ((error as { code?: string }).code === "FST_ERR_CTP_EMPTY_JSON_BODY") {
-      return reply.code(400).send({ error: "empty_json_body" });
+      return reply.code(400).send({ error: "empty_json_body", message: "请求体不能为空" });
     }
     app.log.error(error);
-    return reply.code(500).send({ error: "internal_error" });
+    return reply.code(500).send({ error: "internal_error", message: "服务器内部错误" });
   });
 
   app.addHook("onClose", async () => {

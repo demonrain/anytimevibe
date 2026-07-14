@@ -329,7 +329,7 @@ export function AdminApp() {
                       await loadUsers();
                     })}>强制下线</button>
                     <button disabled={busyId === item.id} onClick={() => runAction(item.id, async () => {
-                      const password = window.prompt("输入新密码（至少 10 位）");
+                      const password = window.prompt("输入新密码（至少 6 位）");
                       if (!password) return;
                       await api(`/api/admin/users/${item.id}`, { method: "PATCH", body: JSON.stringify({ password }) });
                       window.alert("密码已重置，该用户所有会话已失效");
