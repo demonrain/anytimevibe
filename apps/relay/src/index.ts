@@ -585,18 +585,32 @@ async function main(): Promise<void> {
     const authorization = request.headers.authorization;
     const token = authorization?.startsWith("Bearer ") ? authorization.slice(7) : null;
     if (!query.hostId || !token) return socket.close(4001, "missing_credentials");
-    const rows = await sql<Array<{ id: string; userId: string }>>`
-      SELECT id, user_id FROM hosts
+    const rows = await sql<Array<{ id: string; userId: string; name: string; codexVersion: string; platform: string }>>`
+      SELECT id, user_id, name, codex_version, platform FROM hosts
       WHERE id = ${query.hostId} AND agent_token_hash = ${hashToken(token)} AND revoked_at IS NULL
       LIMIT 1
     `;
     const host = rows[0];
     if (!host) return socket.close(4001, "unauthorized");
     const agentSocket = socket as unknown as SocketLike;
-    agentSockets.get(host.id)?.close(4002, "replaced");
+    // Only replace an existing socket for this host (avoid flap from self-close races).
+    const previous = agentSockets.get(host.id);
+    if (previous && previous !== agentSocket) {
+      try {
+        previous.close(4002, "replaced");
+      } catch {
+        // ignore
+      }
+    }
     agentSockets.set(host.id, agentSocket);
     await sql`UPDATE hosts SET last_seen_at = now() WHERE id = ${host.id}`;
     broadcastToUser(host.userId, jsonControl("relay.host_status", { hostId: host.id, online: true }));
+    // Canonical name lives in DB (may have been renamed while agent was offline).
+    agentSocket.send(jsonControl("relay.host_hello", {
+      name: host.name,
+      codexVersion: host.codexVersion,
+      platform: host.platform
+    }));
 
     agentSocket.on("message", async (data) => {
       try {
@@ -609,6 +623,32 @@ async function main(): Promise<void> {
             WHERE id = ${pairingId} AND host_id = ${host.id} AND status = 'claimed' AND expires_at > now()
           `;
           broadcastToUser(host.userId, jsonControl("relay.key_authorized", { hostId: host.id, pairingId }));
+          return;
+        }
+        // Unencrypted agent metadata: keep admin/web host rows in sync with live client.
+        if (parsed.type === "agent.meta") {
+          const meta = z.object({
+            name: z.string().trim().min(1).max(64).optional(),
+            codexVersion: z.string().trim().min(1).max(80).optional(),
+            platform: z.string().trim().min(1).max(120).optional()
+          }).parse(parsed);
+          const nextName = meta.name?.trim();
+          const nextCodex = meta.codexVersion?.trim();
+          const nextPlatform = meta.platform?.trim();
+          await sql`
+            UPDATE hosts SET
+              name = COALESCE(${nextName ?? null}, name),
+              codex_version = COALESCE(${nextCodex ?? null}, codex_version),
+              platform = COALESCE(${nextPlatform ?? null}, platform),
+              last_seen_at = now()
+            WHERE id = ${host.id}
+          `;
+          broadcastToUser(host.userId, jsonControl("relay.host_meta", {
+            hostId: host.id,
+            ...(nextName ? { name: nextName } : {}),
+            ...(nextCodex ? { codexVersion: nextCodex } : {}),
+            ...(nextPlatform ? { platform: nextPlatform } : {})
+          }));
           return;
         }
         const envelope = encryptedEnvelopeSchema.parse(parsed);

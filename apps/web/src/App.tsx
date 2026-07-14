@@ -220,6 +220,7 @@ export function App() {
   const [accountOpen, setAccountOpen] = useState(false);
   const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => (localStorage.getItem("permission-mode") as PermissionMode | null) ?? "inherit");
+  const [taskQuery, setTaskQuery] = useState("");
   const autoSyncedHostsRef = useRef(new Set<string>());
   const [keyAuthorizationStatus, setKeyAuthorizationStatus] = useState<Record<string, "missing" | "authorizing">>({});
   const keyAuthorizationsRef = useRef(new Set<string>());
@@ -254,18 +255,18 @@ export function App() {
         });
       }, 3000);
     } else {
-      if (event.type === "host.status" && event.name) {
-        setHosts((current) => {
-          const host = current.find((item) => item.id === envelope.hostId);
-          if (host && host.name !== event.name) {
-            void api(`/api/hosts/${envelope.hostId}`, {
-              method: "PATCH",
-              body: JSON.stringify({ name: event.name })
-            }).catch(() => undefined);
-            return current.map((item) => item.id === envelope.hostId ? { ...item, name: event.name } : item);
-          }
-          return current;
-        });
+      // host.status is encrypted live state — update local UI only.
+      // Never PATCH name from here: agent may still hold a stale name and would overwrite web renames.
+      if (event.type === "host.status") {
+        setHosts((current) => current.map((item) => {
+          if (item.id !== envelope.hostId) return item;
+          return {
+            ...item,
+            ...(event.name ? { name: event.name } : {}),
+            ...(event.codexVersion ? { codexVersion: event.codexVersion } : {}),
+            ...(event.platform ? { platform: event.platform } : {})
+          };
+        }));
       }
       setRuntime((current) => ({
         ...current,
@@ -396,6 +397,16 @@ export function App() {
             }
             return;
           }
+          if (parsed.type === "relay.host_meta") {
+            const hostId = String(parsed.hostId);
+            setHosts((current) => current.map((host) => host.id !== hostId ? host : {
+              ...host,
+              ...(typeof parsed.name === "string" && parsed.name.trim() ? { name: parsed.name.trim() } : {}),
+              ...(typeof parsed.codexVersion === "string" && parsed.codexVersion.trim() ? { codexVersion: parsed.codexVersion.trim() } : {}),
+              ...(typeof parsed.platform === "string" && parsed.platform.trim() ? { platform: parsed.platform.trim() } : {})
+            }));
+            return;
+          }
           if (parsed.type === "relay.error") {
             setError(parsed.error === "host_offline" ? "远程主机当前离线。" : "中继拒绝了这条消息。");
             return;
@@ -487,7 +498,16 @@ export function App() {
   const activeHost = hosts.find((host) => host.id === selectedHostId) ?? null;
   const activeRuntime = selectedHostId ? runtime[selectedHostId] ?? emptyRuntime() : emptyRuntime();
   const tasks = Object.values(activeRuntime.tasks).sort((left, right) => right.updatedAt - left.updatedAt);
-  const activeTask = tasks.find((task) => task.threadId === selectedTaskId) ?? tasks[0] ?? null;
+  const normalizedTaskQuery = taskQuery.trim().toLowerCase();
+  const filteredTasks = !normalizedTaskQuery ? tasks : tasks.filter((task) => {
+    const messageText = task.messages.map((message) => message.text).join("\n");
+    const haystack = `${task.title}\n${task.cwd}\n${task.status}\n${messageText}`.toLowerCase();
+    return haystack.includes(normalizedTaskQuery);
+  });
+  const activeTask = filteredTasks.find((task) => task.threadId === selectedTaskId)
+    ?? tasks.find((task) => task.threadId === selectedTaskId)
+    ?? filteredTasks[0]
+    ?? null;
 
   return <div className="app-shell">
     {error && <ErrorBanner message={error} clear={() => setError("")} />}
@@ -536,14 +556,24 @@ export function App() {
         <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? "主机在线，命令将立即执行" : activeRuntime.online === false ? "主机离线，仅可查看已同步记录" : "正在确认主机状态…"}</div>
         {activeHost && keyAuthorizationStatus[activeHost.id] && <div className="key-authorization-note"><div><strong>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "正在授权此浏览器" : "此浏览器尚未取得主机密钥"}</strong><span>{activeRuntime.online === true ? "电脑端会自动完成端到端密钥授权。" : "请先让电脑端客户端上线，再重新授权。"}</span></div><button disabled={keyAuthorizationStatus[activeHost.id] === "authorizing" || activeRuntime.online !== true} onClick={() => authorizeExistingHost(activeHost.id).catch((authorizationError) => setError(authorizationError.message))}>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "授权中…" : "授权此浏览器"}</button></div>}
         <label className="permission-select">Codex 权限<select value={permissionMode} onChange={(event) => { const mode = event.target.value as PermissionMode; setPermissionMode(mode); localStorage.setItem("permission-mode", mode); }}><option value="inherit">跟随客户端配置（本机 Codex 设置）</option><option value="full-access">Full Access</option><option value="workspace-write">Workspace Write</option><option value="read-only">Read Only</option></select></label>
+        <div className="task-search">
+          <input
+            value={taskQuery}
+            onChange={(event) => setTaskQuery(event.target.value)}
+            placeholder="搜索任务标题 / 内容 / 路径"
+            aria-label="搜索任务"
+          />
+          {normalizedTaskQuery && <small>{filteredTasks.length}/{tasks.length}</small>}
+        </div>
         <div className="task-list">
-          {tasks.map((task) => { const status = taskStatusMeta(task.status); return <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>
+          {filteredTasks.map((task) => { const status = taskStatusMeta(task.status); return <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>
             <div className="task-meta"><span className={`task-status ${status.tone}`}>{status.label}</span><time>{new Date(task.updatedAt * 1000).toLocaleString()}</time></div>
             <h3>{task.title}</h3>
             <p>{task.messages.at(-1)?.text || task.cwd}</p>
             <div className="task-foot"><code>{shortPath(task.cwd)}</code>{task.approvals.length > 0 && <b>{task.approvals.length} 个审批</b>}</div>
           </button>; })}
           {!tasks.length && <div className="empty-state"><span>&gt;_</span><h3>等待第一条远程任务</h3><p>选择白名单工作区，向本机 Codex 下发任务。</p></div>}
+          {Boolean(tasks.length && !filteredTasks.length) && <div className="empty-state"><span>?</span><h3>没有匹配任务</h3><p>换个关键词试试标题、路径或对话内容。</p></div>}
         </div>
       </section>
 

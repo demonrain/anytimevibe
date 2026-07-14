@@ -400,7 +400,8 @@ function rendererHtml(): string {
   body{overflow:hidden}
   .frame{height:100%;padding:10px;display:flex}
   .shell{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px;padding:12px 12px 10px;border-radius:18px;background:rgba(242,234,219,.92);border:1px solid rgba(23,33,27,.14);box-shadow:0 18px 40px rgba(23,33,27,.18);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);overflow:hidden}
-  .titlebar{display:flex;align-items:center;gap:10px;-webkit-app-region:drag;app-region:drag;padding:2px 2px 4px;cursor:default}
+  .titlebar{display:flex;align-items:center;gap:10px;-webkit-app-region:drag;app-region:drag;padding:2px 2px 4px;cursor:default;user-select:none;-webkit-user-select:none}
+  .titlebar,.titlebar *{user-select:none;-webkit-user-select:none}
   .titlebar .win-actions{-webkit-app-region:no-drag;app-region:no-drag;margin-left:auto;display:flex;gap:4px}
   .titlebar .win-actions button{width:28px;height:24px;padding:0;border-radius:7px;background:#e7ddcd;color:#17211b;font-size:12px;line-height:1}
   .titlebar .win-actions button.close{background:#e25832;color:#fff}
@@ -429,6 +430,8 @@ function rendererHtml(): string {
   .check{display:flex;align-items:center;gap:7px;padding:6px 8px;background:#eee6d8;border-radius:8px;font-size:11px;min-width:0}
   .check:before{content:"";width:7px;height:7px;border-radius:50%;background:#d35a3b;flex:0 0 auto}
   .check.ok:before{background:#3bab70}
+  .check.warn:before{background:#e25832}
+  .check.err:before{background:#a63b28}
   .check b{font-weight:800;flex:0 0 auto}
   .check span{margin-left:auto;color:#687068;font:10px "Cascadia Code",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:48%}
   .check button{flex:0 0 auto;padding:5px 8px;font-size:10px}
@@ -499,9 +502,11 @@ function rendererHtml(): string {
     workspaces.querySelectorAll('button[data-id]').forEach(button=>button.addEventListener('click',()=>api.removeWorkspace(button.dataset.id)));
   }
   function renderUpdate(update){
-    const labels={idle:'自动更新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败'};
+    const labels={idle:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败'};
+    // Green when current is latest; orange when an update exists/is downloading/ready.
+    const tone=update.status==='idle'?'ok':update.status==='error'?'err':(update.status==='available'||update.status==='downloading'||update.status==='ready')?'warn':'';
     const text=update.version||update.message||(update.progress!==undefined?update.progress+'%':'后台自动检查');
-    updateBox.innerHTML='<div class="check '+(update.status==='ready'?'ok':'')+'"><b>'+labels[update.status]+'</b><span>'+escapeHtml(text)+'</span></div><button id="checkUpdate" class="secondary">检查更新</button>'+(update.status==='ready'?'<button id="installUpdate">重启并更新</button>':'');
+    updateBox.innerHTML='<div class="check '+tone+'"><b>'+labels[update.status]+'</b><span>'+escapeHtml(text)+'</span></div><button id="checkUpdate" class="secondary">检查更新</button>'+(update.status==='ready'?'<button id="installUpdate">重启并更新</button>':'');
     document.querySelector('#checkUpdate')?.addEventListener('click',()=>api.checkUpdate());
     document.querySelector('#installUpdate')?.addEventListener('click',()=>api.installUpdate());
   }
@@ -513,10 +518,22 @@ function rendererHtml(): string {
     const output=activityBox.querySelector('pre');
     output.scrollTop=output.scrollHeight;
   }
+  let taskQuery='';
   function renderTasks(tasks){
     lastTasks=tasks||[];
-    taskBox.innerHTML='<div class="status"><h2>任务接力</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?'收起':'展开')+' · '+lastTasks.length+'</button></div>'+(tasksOpen?(lastTasks.length?'<div class="workspaces" style="margin-top:7px">'+lastTasks.map(task=>'<div class="workspace"><div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div><button data-relay="'+escapeHtml(task.threadId)+'">接力</button></div>').join('')+'</div>':'<div class="empty">暂无可接力任务</div>'):'');
+    const q=taskQuery.trim().toLowerCase();
+    const filtered=!q?lastTasks:lastTasks.filter(task=>{
+      const hay=((task.title||'')+' '+(task.cwd||'')+' '+(task.status||'')).toLowerCase();
+      return hay.includes(q);
+    });
+    taskBox.innerHTML='<div class="status"><h2>任务接力</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?'收起':'展开')+' · '+filtered.length+(q?'/'+lastTasks.length:'')+'</button></div>'
+      +(tasksOpen?'<div class="stack" style="margin-top:7px"><input id="taskSearch" placeholder="搜索任务标题 / 路径 / 状态" value="'+escapeHtml(taskQuery)+'"></div>':'')
+      +(tasksOpen?(filtered.length?'<div class="workspaces" style="margin-top:7px">'+filtered.map(task=>'<div class="workspace"><div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div><button data-relay="'+escapeHtml(task.threadId)+'">接力</button></div>').join('')+'</div>':'<div class="empty">'+(q?'没有匹配的任务':'暂无可接力任务')+'</div>'):'');
     document.querySelector('#toggleTasks')?.addEventListener('click',()=>{tasksOpen=!tasksOpen;renderTasks(lastTasks)});
+    const search=document.querySelector('#taskSearch');
+    if(search){
+      search.addEventListener('input',()=>{taskQuery=search.value;renderTasks(lastTasks);const el=document.querySelector('#taskSearch');if(el){el.focus();const n=el.value.length;el.setSelectionRange(n,n)}});
+    }
     taskBox.querySelectorAll('[data-relay]').forEach(button=>button.addEventListener('click',()=>api.relayTask(button.dataset.relay)));
   }
   document.querySelector('#saveRelay').addEventListener('click',()=>api.setRelayUrl(relay.value));
@@ -1162,6 +1179,13 @@ async function connect(force = false): Promise<void> {
     headers: { authorization: `Bearer ${token}` }
   });
   socket = connection;
+  let pingTimer: NodeJS.Timeout | null = null;
+  const clearPing = () => {
+    if (pingTimer) {
+      clearInterval(pingTimer);
+      pingTimer = null;
+    }
+  };
   connection.on("open", () => {
     if (generation !== connectGeneration || socket !== connection) {
       try {
@@ -1174,6 +1198,22 @@ async function connect(force = false): Promise<void> {
     connecting = false;
     reconnectAttempt = 0;
     reconnectBlockedReason = null;
+    // Keepalive: reverse proxies often idle-drop sockets without ping frames.
+    clearPing();
+    pingTimer = setInterval(() => {
+      if (generation !== connectGeneration || socket !== connection) {
+        clearPing();
+        return;
+      }
+      if (connection.readyState === WebSocket.OPEN) {
+        try {
+          connection.ping();
+        } catch {
+          // ignore
+        }
+      }
+    }, 25_000);
+    pingTimer.unref?.();
     // Keep the relay socket online even if Codex bootstrap fails, otherwise macOS
     // (missing GUI PATH / codex shebang) will flap between offline and reconnect.
     void (async () => {
@@ -1182,7 +1222,8 @@ async function connect(force = false): Promise<void> {
         await ensureCodex();
         if (generation !== connectGeneration || socket !== connection) return;
         await publishHostStatus();
-        await syncAllThreads();
+        // Do not auto syncAllThreads on every reconnect — it floods the link and can
+        // look like flapping; user can sync from web when needed.
       } catch (error) {
         if (generation !== connectGeneration || socket !== connection) return;
         const message = error instanceof Error ? error.message : String(error);
@@ -1190,6 +1231,8 @@ async function connect(force = false): Promise<void> {
           status: "online",
           detail: `中继已连接，但 Codex 尚未就绪：${message}`
         });
+        // Still report meta so admin sees live codex version even if ensureCodex failed mid-way.
+        publishAgentMeta();
       }
     })();
   });
@@ -1199,6 +1242,7 @@ async function connect(force = false): Promise<void> {
   });
   connection.on("close", (code, reason) => {
     if (generation !== connectGeneration) return;
+    clearPing();
     connecting = false;
     if (socket === connection) socket = null;
     const why = reason?.toString?.() || `code ${code}`;
@@ -1207,6 +1251,8 @@ async function connect(force = false): Promise<void> {
       updateState({ status: "offline", detail: "连接已被新的代理实例替换。" });
       return;
     }
+    // Normal close during intentional reconnect/shutdown.
+    if (code === 1000 && (quitting || installingUpdate)) return;
     if (FATAL_WS_CODES.has(code) || /unauthorized|revoked|missing_credentials|user_deleted/i.test(why)) {
       reconnectBlockedReason = `中继拒绝连接（${why}）。请重新配对。`;
       updateState({ status: "offline", detail: reconnectBlockedReason });
@@ -1216,15 +1262,9 @@ async function connect(force = false): Promise<void> {
   });
   connection.on("error", (error) => {
     if (generation !== connectGeneration) return;
-    connecting = false;
+    // Do not close here — the 'close' event will follow and owns reconnect.
     if (socket === connection) {
       updateState({ status: "offline", detail: `无法连接中继：${error.message || "网络错误"}，正在重试。` });
-    }
-    // Let the close handler own reconnect scheduling to avoid double timers.
-    try {
-      connection.close();
-    } catch {
-      // ignore
     }
   });
 }
@@ -1293,14 +1333,19 @@ async function handleRelayMessage(raw: string): Promise<void> {
     socket?.send(JSON.stringify({ type: "agent.key_authorization", pairingId, wrappedSyncKey }));
     return;
   }
-  if (parsed.type === "relay.host_rename") {
+  if (parsed.type === "relay.host_hello" || parsed.type === "relay.host_rename") {
+    // Server DB is the source of truth for web-driven renames (and offline renames on reconnect).
     const name = String(parsed.name ?? "").trim().slice(0, 64);
-    if (!name) return;
-    config.displayName = name;
-    await saveConfig();
-    updateState({ displayName: name, detail: `Web 端已将客户端名称更新为“${name}”。` });
-    // Confirm back so other browser sessions see the same name.
-    await publishHostStatus();
+    if (name && name !== resolvedDisplayName()) {
+      config.displayName = name;
+      await saveConfig();
+      updateState({
+        displayName: name,
+        detail: parsed.type === "relay.host_rename"
+          ? `Web 端已将客户端名称更新为“${name}”。`
+          : `已同步服务器主机名称“${name}”。`
+      });
+    }
     return;
   }
   const envelope = parsed as EncryptedEnvelope;
@@ -1532,7 +1577,23 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   }
 }
 
+function publishAgentMeta(fields: { name?: string; codexVersion?: string; platform?: string } = {}): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  try {
+    socket.send(JSON.stringify({
+      type: "agent.meta",
+      name: fields.name ?? resolvedDisplayName(),
+      codexVersion: fields.codexVersion ?? codexVersion,
+      platform: fields.platform ?? `${process.platform} ${os.release()}`
+    }));
+  } catch {
+    // ignore
+  }
+}
+
 async function publishHostStatus(): Promise<void> {
+  // Keep encrypted host.status for workspaces/online UX; version/name also go via agent.meta for DB.
+  publishAgentMeta();
   await publish({
     type: "host.status", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), online: true,
     name: resolvedDisplayName(), platform: `${process.platform} ${os.release()}`, codexVersion,
@@ -1774,6 +1835,8 @@ function registerIpc(): void {
     config.displayName = normalized;
     await saveConfig();
     updateState({ displayName: normalized, detail: `客户端名称已更新为“${normalized}”。` });
+    // Update DB + other browsers via unencrypted meta (avoids host.status rename loops).
+    publishAgentMeta({ name: normalized });
     if (socket?.readyState === WebSocket.OPEN) await publishHostStatus();
     return publicState;
   });
