@@ -2,7 +2,7 @@
 /**
  * One-shot local test environment bootstrap:
  * - ensure .env.local exists
- * - start Postgres (docker compose dev)
+ * - start local Postgres (Docker if healthy, else embedded / native guidance)
  * - build protocol package
  */
 import { spawnSync } from "node:child_process";
@@ -42,55 +42,44 @@ if (!existsSync(envLocal)) {
 
 mkdirSync(path.join(root, ".local"), { recursive: true });
 
-console.log("\n[1/3] Starting local Postgres (docker compose)...");
-try {
-  run("docker", ["compose", "-f", "docker-compose.dev.yml", "up", "-d"]);
-} catch (error) {
-  console.error("\nFailed to start Postgres. Is Docker Desktop running?");
-  console.error(error instanceof Error ? error.message : error);
-  process.exit(1);
+console.log("\n[1/2] Preparing local Postgres (Docker if available, otherwise embedded)...");
+console.log("      Prefer: open Docker Desktop only if it starts cleanly.");
+console.log("      If Docker is stuck on \"Starting the Docker Engine\", ignore it and use this path.\n");
+
+// Start/ensure DB. For embedded mode this would block — so only run the non-blocking path here.
+// Prefer docker-or-already-up; if only embedded works, ask user to run `pnpm dev:pg` separately.
+const ensure = spawnSync(process.execPath, ["scripts/dev-pg.mjs", "ensure"], {
+  cwd: root,
+  encoding: "utf8",
+  shell: false
+});
+if (ensure.stdout) process.stdout.write(ensure.stdout);
+if (ensure.stderr) process.stderr.write(ensure.stderr);
+if (ensure.status === 0) {
+  console.log("[setup] Postgres is reachable.");
+} else {
+  console.warn("\n[setup] Postgres is not ready yet (Docker unavailable is OK).");
+  console.warn("  Next: in a NON-admin terminal run  pnpm dev:pg  and leave it open.");
+  console.warn("  Or: winget install -e --id PostgreSQL.PostgreSQL.16\n");
 }
 
-console.log("\n[2/3] Waiting for Postgres health...");
-let healthy = false;
-for (let attempt = 1; attempt <= 30; attempt += 1) {
-  const check = spawnSync(
-    "docker",
-    ["compose", "-f", "docker-compose.dev.yml", "exec", "-T", "postgres", "pg_isready", "-U", "anytimevibe", "-d", "anytimevibe"],
-    { cwd: root, shell: process.platform === "win32", encoding: "utf8" }
-  );
-  if (check.status === 0) {
-    healthy = true;
-    break;
-  }
-  if (process.platform === "win32") {
-    spawnSync("timeout", ["/t", "1", "/nobreak"], { shell: true, stdio: "ignore" });
-  } else {
-    spawnSync("sleep", ["1"], { stdio: "ignore" });
-  }
-}
-if (!healthy) {
-  console.error("Postgres did not become ready in time.");
-  process.exit(1);
-}
-console.log("Postgres is ready.");
-
-console.log("\n[3/3] Building protocol package...");
+console.log("\n[2/2] Building protocol package...");
 run("pnpm", ["--filter", "@anytimevibe/protocol", "build"]);
 
 console.log(`
-=== Setup complete ===
+=== Setup files ready ===
 
-Next (three terminals, or use pnpm dev:stack):
+Daily local test (recommended when Docker Desktop is broken):
 
-  1) Relay   pnpm dev:relay
-  2) Web     pnpm dev:web
-  3) Agent   pnpm dev:agent:local
+  Terminal 1:  pnpm dev:pg          # keep running (embedded Postgres) — use NON-admin shell
+  Terminal 2:  pnpm dev:stack       # Relay + Web
+  Terminal 3:  pnpm dev:agent:local # Electron → http://127.0.0.1:8787
 
 Open:  http://127.0.0.1:4173
-Setup token (from .env.local): SETUP_TOKEN
-Agent relay URL: http://127.0.0.1:8787
+SETUP_TOKEN: see .env.local
 
-Agent local data dir: .local/agent-data (isolated from production installs)
-Docs: docs/LOCAL_DEV.md
+If this shell is Administrator, PostgreSQL embedded mode will refuse to start.
+Use a normal PowerShell/Windows Terminal window, or install native PostgreSQL.
+
+Docker stuck help: docs/LOCAL_DEV.md#docker-desktop-卡住
 `);

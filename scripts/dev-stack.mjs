@@ -51,8 +51,8 @@ if (!existsSync(envLocal)) {
   process.exit(1);
 }
 
-// Ensure DB is up
-spawnLogged("db", "docker", ["compose", "-f", "docker-compose.dev.yml", "up", "-d"]);
+// Best-effort DB ensure (docker only; embedded must be started via pnpm dev:pg)
+spawnLogged("db-ensure", process.execPath, ["scripts/dev-pg.mjs", "ensure"]);
 
 // Small delay then start app processes with env file loader
 setTimeout(() => {
@@ -62,6 +62,7 @@ setTimeout(() => {
 Local stack starting...
   Web:   http://127.0.0.1:4173
   Relay: http://127.0.0.1:8787
+  DB:    if ECONNREFUSED, run in another NON-admin terminal: pnpm dev:pg
   Agent: pnpm dev:agent:local   (separate window)
 `);
 }, 1500);

@@ -8,7 +8,9 @@
     "typecheck": "pnpm -r --sort typecheck",
     "test": "vitest run",
     "dev:setup": "node scripts/dev-setup.mjs",
-    "dev:db": "docker compose -f docker-compose.dev.yml up -d",
+    "dev:pg": "node scripts/dev-pg.mjs auto",
+    "dev:db": "node scripts/dev-pg.mjs auto",
+    "dev:db:docker": "node scripts/dev-pg.mjs docker",
     "dev:db:down": "docker compose -f docker-compose.dev.yml down",
     "dev:db:reset": "docker compose -f docker-compose.dev.yml down -v",
     "dev:stack": "node scripts/dev-stack.mjs",
@@ -19,6 +21,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
+    "embedded-postgres": "18.1.0-beta.15",
     "tsup": "^8.5.0",
     "typescript": "^5.8.3",
     "vitest": "^3.2.4"
