@@ -50,12 +50,12 @@ type Task = {
   diff: string;
   messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string }>;
   approvals: Approval[];
+  cliEngine?: CliEngine;
 };
 type HostRuntime = {
   online: boolean | null;
   workspaces: Workspace[];
   tasks: Record<string, Task>;
-  cliEngine?: CliEngine;
   availableEngines?: CliEngineInfo[];
 };
 
@@ -79,7 +79,7 @@ function taskStatusMeta(status: string): { label: string; tone: string } {
 }
 
 function emptyRuntime(online: boolean | null = null): HostRuntime {
-  return { online, workspaces: [], tasks: {}, cliEngine: "codex", availableEngines: [] };
+  return { online, workspaces: [], tasks: {}, availableEngines: [] };
 }
 
 function normalizeCliEngine(value: string | null | undefined): CliEngine {
@@ -91,6 +91,24 @@ function cliEngineLabel(engine: CliEngine): string {
   if (engine === "claude") return "Claude Code";
   if (engine === "grok") return "Grok Build";
   return "Codex";
+}
+
+function EngineLogo({ engine, size = 14, className = "" }: { engine: CliEngine; size?: number; className?: string }) {
+  return (
+    <img
+      className={`engine-logo ${className}`.trim()}
+      src={`/vendors/${engine}.svg`}
+      alt={cliEngineLabel(engine)}
+      title={cliEngineLabel(engine)}
+      width={size}
+      height={size}
+      draggable={false}
+    />
+  );
+}
+
+function readyEngines(engines: CliEngineInfo[] | undefined): CliEngineInfo[] {
+  return (engines ?? []).filter((item) => item.ready);
 }
 
 function workspacesCacheKey(hostId: string): string {
@@ -154,13 +172,13 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   if (event.type === "host.status") {
     next.online = event.online;
     next.workspaces = event.workspaces;
-    if (event.cliEngine) next.cliEngine = event.cliEngine;
     if (event.availableEngines) next.availableEngines = event.availableEngines;
     return next;
   }
   if (event.type === "sync.completed" || event.type === "sync.progress") return next;
   if (event.type === "thread.snapshot") {
     const existing = next.tasks[event.threadId];
+    const engine = event.cliEngine ?? existing?.cliEngine;
     next.tasks[event.threadId] = {
       threadId: event.threadId,
       title: event.title || "未命名任务",
@@ -170,6 +188,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       diff: existing?.diff ?? "",
       messages: event.messages,
       approvals: existing?.approvals ?? [],
+      ...(engine ? { cliEngine: engine } : {}),
       ...(event.activeTurnId ? { activeTurnId: event.activeTurnId } : {})
     };
     return next;
@@ -669,14 +688,35 @@ export function App() {
       <div className="rail-heading"><span>{t("remoteHosts")}</span><button onClick={() => setPairingOpen(true)}>＋</button></div>
       <div className="host-list">
         <button className="host-add-mobile" onClick={() => setPairingOpen(true)}>{t("addComputer")}</button>
-        {hosts.map((host) => <div key={host.id} className={`host-row ${host.id === selectedHostId ? "active" : ""}`}>
-          <button className="host-pill" onClick={() => { setSelectedHostId(host.id); setSelectedTaskId(null); setMobilePane("tasks"); }}>
-            <span className={`status-dot ${(runtime[host.id]?.online ?? host.online) ? "online" : ""}`} />
-            <span><strong>{host.name}</strong><small>{host.codexVersion}</small></span>
-          </button>
-          <button className="host-rename" title={`${t("renameHost")} ${host.name}`} aria-label={`${t("renameHost")} ${host.name}`} onClick={() => renameHost(host).catch((renameError) => setError(renameError.message))}>✎</button>
-          <button className="host-delete" title={`${t("deleteHost")} ${host.name}`} aria-label={`${t("deleteHost")} ${host.name}`} onClick={() => deleteHost(host).catch((deleteError) => setError(deleteError.message))}>×</button>
-        </div>)}
+        {hosts.map((host) => {
+          const hostEngines = readyEngines(runtime[host.id]?.availableEngines);
+          // Fallback: older agents only report codexVersion
+          const engineChips = hostEngines.length
+            ? hostEngines
+            : (host.codexVersion && host.codexVersion !== "unknown"
+              ? [{ engine: "codex" as const, ready: true, version: host.codexVersion }]
+              : []);
+          return <div key={host.id} className={`host-row ${host.id === selectedHostId ? "active" : ""}`}>
+            <button className="host-pill" onClick={() => { setSelectedHostId(host.id); setSelectedTaskId(null); setMobilePane("tasks"); }}>
+              <span className={`status-dot ${(runtime[host.id]?.online ?? host.online) ? "online" : ""}`} />
+              <span>
+                <strong>{host.name}</strong>
+                {engineChips.length > 0 && (
+                  <small className="host-engines">
+                    {engineChips.map((item) => (
+                      <span key={item.engine} className="host-engine-chip" title={`${cliEngineLabel(item.engine)}${item.version ? ` ${item.version}` : ""}`}>
+                        <EngineLogo engine={item.engine} size={12} />
+                        <em>{item.version || cliEngineLabel(item.engine)}</em>
+                      </span>
+                    ))}
+                  </small>
+                )}
+              </span>
+            </button>
+            <button className="host-rename" title={`${t("renameHost")} ${host.name}`} aria-label={`${t("renameHost")} ${host.name}`} onClick={() => renameHost(host).catch((renameError) => setError(renameError.message))}>✎</button>
+            <button className="host-delete" title={`${t("deleteHost")} ${host.name}`} aria-label={`${t("deleteHost")} ${host.name}`} onClick={() => deleteHost(host).catch((deleteError) => setError(deleteError.message))}>×</button>
+          </div>;
+        })}
         {!hosts.length && <button className="empty-host" onClick={() => setPairingOpen(true)}>{t("connectFirst")}</button>}
       </div>
     </aside>
@@ -707,12 +747,22 @@ export function App() {
           {normalizedTaskQuery && <small>{filteredTasks.length}/{tasks.length}</small>}
         </div>
         <div className="task-list">
-          {filteredTasks.map((task) => { const status = taskStatusMeta(task.status); return <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>
-            <div className="task-meta"><span className={`task-status ${status.tone}`}>{status.label}</span><time>{new Date(task.updatedAt * 1000).toLocaleString()}</time></div>
-            <h3>{task.title}</h3>
-            <p>{task.messages.at(-1)?.text || task.cwd}</p>
-            <div className="task-foot"><code>{shortPath(task.cwd)}</code>{task.approvals.length > 0 && <b>{task.approvals.length}</b>}</div>
-          </button>; })}
+          {filteredTasks.map((task) => {
+            const status = taskStatusMeta(task.status);
+            const engine = task.cliEngine ? normalizeCliEngine(task.cliEngine) : undefined;
+            return <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>
+              <div className="task-meta">
+                <span className="task-meta-left">
+                  {engine && <EngineLogo engine={engine} size={14} className="task-engine-logo" />}
+                  <span className={`task-status ${status.tone}`}>{status.label}</span>
+                </span>
+                <time>{new Date(task.updatedAt * 1000).toLocaleString()}</time>
+              </div>
+              <h3>{task.title}</h3>
+              <p>{task.messages.at(-1)?.text || task.cwd}</p>
+              <div className="task-foot"><code>{shortPath(task.cwd)}</code>{task.approvals.length > 0 && <b>{task.approvals.length}</b>}</div>
+            </button>;
+          })}
           {!tasks.length && <div className="empty-state"><span>&gt;_</span><h3>{t("noTasks")}</h3><p>{t("noTasksHint")}</p></div>}
           {Boolean(tasks.length && !filteredTasks.length) && <div className="empty-state"><span>?</span><h3>{t("noMatch")}</h3><p>{t("noMatchHint")}</p></div>}
         </div>
@@ -728,7 +778,6 @@ export function App() {
       host={activeHost}
       workspaces={activeRuntime.workspaces}
       online={activeRuntime.online}
-      cliEngine={activeRuntime.cliEngine ?? "codex"}
       availableEngines={activeRuntime.availableEngines ?? []}
       onClose={() => setComposerOpen(false)}
       onRefreshWorkspaces={() => sendCommand(activeHost.id, { type: "host.refresh", commandId: crypto.randomUUID() })}
@@ -916,20 +965,20 @@ function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): voi
   </section></div>;
 }
 
-function NewTaskDialog({ host, workspaces, online, cliEngine, availableEngines, onClose, onRefreshWorkspaces, onCreate }: {
+function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, onRefreshWorkspaces, onCreate }: {
   host: Host;
   workspaces: Workspace[];
   online: boolean | null;
-  cliEngine: CliEngine;
   availableEngines: CliEngineInfo[];
   onClose(): void;
   onRefreshWorkspaces(): Promise<void>;
   onCreate(cwd: string, prompt: string, title: string, engine: CliEngine): Promise<void>;
 }) {
+  const ready = readyEngines(availableEngines);
   const [cwd, setCwd] = useState(workspaces[0]?.path ?? "");
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
-  const [engine, setEngine] = useState<CliEngine>(cliEngine);
+  const [engine, setEngine] = useState<CliEngine | "">(ready[0]?.engine ?? "");
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
@@ -941,8 +990,12 @@ function NewTaskDialog({ host, workspaces, online, cliEngine, availableEngines, 
   }, [workspaces]);
 
   useEffect(() => {
-    setEngine(cliEngine);
-  }, [cliEngine]);
+    if (!ready.length) {
+      setEngine("");
+      return;
+    }
+    setEngine((current) => (current && ready.some((item) => item.engine === current) ? current : ready[0]!.engine));
+  }, [availableEngines]);
 
   // Pull latest whitelist from the agent once when the dialog opens (avoid dep on unstable callback identity).
   const refreshRef = useRef(onRefreshWorkspaces);
@@ -963,6 +1016,10 @@ function NewTaskDialog({ host, workspaces, online, cliEngine, availableEngines, 
 
   return <div className="modal-backdrop"><form className="modal wide" onSubmit={async (event) => {
     event.preventDefault();
+    if (!engine) {
+      setError("请选择编码引擎");
+      return;
+    }
     setLoading(true);
     setError("");
     try {
@@ -975,15 +1032,32 @@ function NewTaskDialog({ host, workspaces, online, cliEngine, availableEngines, 
     <button type="button" className="modal-close" onClick={onClose}>×</button>
     <p className="eyebrow">NEW REMOTE TASK</p>
     <h2>向 {host.name} 下发任务</h2>
-    <label>编码引擎
-      <select value={engine} onChange={(event) => setEngine(normalizeCliEngine(event.target.value))}>
+    <div className="engine-picker">
+      <span className="engine-picker-label">编码引擎</span>
+      <div className="engine-picker-grid" role="radiogroup" aria-label="编码引擎">
         {(["codex", "claude", "grok"] as CliEngine[]).map((item) => {
           const info = availableEngines.find((entry) => entry.engine === item);
-          const ready = info ? info.ready : item === "codex";
-          return <option key={item} value={item} disabled={!ready}>{cliEngineLabel(item)}{info?.version ? ` · ${info.version}` : ready ? "" : " · 未安装"}</option>;
+          const isReady = Boolean(info?.ready);
+          const selected = engine === item;
+          return (
+            <button
+              key={item}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              className={`engine-card ${selected ? "selected" : ""} ${isReady ? "" : "disabled"}`}
+              disabled={!isReady}
+              onClick={() => setEngine(item)}
+              title={isReady ? `${cliEngineLabel(item)}${info?.version ? ` ${info.version}` : ""}` : `${cliEngineLabel(item)} 未安装`}
+            >
+              <EngineLogo engine={item} size={28} />
+              <strong>{cliEngineLabel(item)}</strong>
+              <small>{isReady ? (info?.version || "已安装") : "未安装"}</small>
+            </button>
+          );
         })}
-      </select>
-    </label>
+      </div>
+    </div>
     <label>工作区
       <select value={cwd} onChange={(event) => setCwd(event.target.value)} required disabled={!workspaces.length}>
         {!workspaces.length && <option value="" disabled>{refreshing ? "正在从电脑端读取白名单…" : online === true ? "电脑端尚未添加白名单目录" : "主机离线，无法读取白名单"}</option>}
@@ -992,9 +1066,9 @@ function NewTaskDialog({ host, workspaces, online, cliEngine, availableEngines, 
     </label>
     {online === true && <p className="admin-hint" style={{ marginTop: -6 }}>{refreshing ? "正在同步工作区…" : workspaces.length ? `已加载 ${workspaces.length} 个白名单目录` : "若刚添加目录，请确认电脑端客户端在线后重试。"}</p>}
     <label>任务标题<input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="可选，默认使用第一条指令" /></label>
-    <label>给 Codex 的指令<textarea className="task-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="描述目标、约束和验收方式…" required /></label>
+    <label>任务指令<textarea className="task-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="描述目标、约束和验收方式…" required /></label>
     {error && <p className="form-error">{error}</p>}
-    <button className="primary" disabled={loading || !cwd || !prompt.trim()}>{loading ? "正在发送…" : "开始任务"}</button>
+    <button className="primary" disabled={loading || !cwd || !prompt.trim() || !engine}>{loading ? "正在发送…" : "开始任务"}</button>
   </form></div>;
 }
 

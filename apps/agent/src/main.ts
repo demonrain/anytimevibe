@@ -497,7 +497,7 @@ function rendererHtml(): string {
   <div class="titlebar">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1 id="brandTitle">随码</h1><p id="brandTag">随时续上你的代码 · ${platformLabel}</p></div><div class="win-actions"><button type="button" id="winMin" title="最小化">–</button><button type="button" id="winClose" class="close" title="关闭">×</button></div></div>
   <div class="scroll">
   <section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
-  <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div class="stack" style="margin-top:8px"><label class="muted">默认编码引擎</label><select id="cliEngine"></select></div><div id="updateBox" class="update-row"></div></section>
+  <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="updateBox" class="update-row"></div></section>
   <section class="card"><h2>中继与配对</h2><div class="stack"><div class="label">中继服务器</div><div class="row"><input id="relay" placeholder="https://vibe.demonrain.top"><button id="startPair" class="secondary">生成配对码</button><button id="saveRelay">保存</button></div><div id="pairBox"></div><div class="label">客户端名称</div><div class="row"><input id="displayName" placeholder="例如：公司电脑" maxlength="64"><button id="saveName" class="secondary">保存名称</button></div></div></section>
   <section class="card grow"><div class="status"><h2>允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><div id="workspaces" class="workspaces"></div></section>
   <section class="card" id="activityBox" style="display:none"></section>
@@ -535,7 +535,6 @@ function rendererHtml(): string {
   var workspaces=document.querySelector('#workspaces');
   var meta=document.querySelector('#meta');
   var environment=document.querySelector('#environment');
-  var cliEngineSelect=document.querySelector('#cliEngine');
   var updateBox=document.querySelector('#updateBox');
   var activityBox=document.querySelector('#activityBox');
   var taskBox=document.querySelector('#taskBox');
@@ -570,15 +569,6 @@ function rendererHtml(): string {
             api.installEnvironment(target).catch(function(error){alert(error&&error.message?error.message:String(error));}).finally(function(){try{button.disabled=false;}catch(e){}});
           });
         });
-      }
-      if(cliEngineSelect&&document.activeElement!==cliEngineSelect){
-        var current=state.cliEngine||'codex';
-        cliEngineSelect.innerHTML=['codex','claude','grok'].map(function(engine){
-          var label=engine==='claude'?'Claude Code':engine==='grok'?'Grok Build':'Codex';
-          var info=engines.find(function(item){return item.engine===engine;});
-          var disabled=info&&info.ready===false?' disabled':'';
-          return '<option value="'+engine+'"'+(engine===current?' selected':'')+disabled+'>'+label+(info&&info.version?(' · '+info.version):'')+'</option>';
-        }).join('');
       }
       var anyEngineReady=env.codexCompatible||engines.some(function(item){return item.ready;});
       if(startPair) startPair.disabled=!anyEngineReady||!state.relayUrl;
@@ -653,9 +643,6 @@ function rendererHtml(): string {
     if(startPair&&api) startPair.addEventListener('click',function(){api.startPairing();});
     if((el=document.querySelector('#addWorkspace'))&&api) el.addEventListener('click',function(){api.addWorkspace();});
     if((el=document.querySelector('#recheck'))&&api) el.addEventListener('click',function(){api.checkEnvironment(); if(api.refreshEngines) api.refreshEngines();});
-    if(cliEngineSelect&&api&&api.setCliEngine){
-      cliEngineSelect.addEventListener('change',function(){ api.setCliEngine(cliEngineSelect.value); });
-    }
     if((el=document.querySelector('#winMin'))&&api) el.addEventListener('click',function(){api.windowMinimize();});
     if((el=document.querySelector('#winClose'))&&api) el.addEventListener('click',function(){api.windowClose();});
     if((el=document.querySelector('#feedback'))&&api) el.addEventListener('click',function(){api.openFeedback();});
@@ -1651,10 +1638,8 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     await publishHostStatus();
     return;
   }
+  // host.set_cli_engine kept for protocol compatibility; engine is chosen per-task on web.
   if (command.type === "host.set_cli_engine") {
-    const engine = normalizeCliEngine(command.cliEngine);
-    await taskStore.setDefaultEngine(engine);
-    updateState({ cliEngine: engine, detail: `默认编码引擎已切换为 ${engine}` });
     await publishHostStatus();
     return;
   }
@@ -1663,7 +1648,8 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     if (command.type === "task.create") {
       if (!isAllowedWorkspace(command.cwd)) throw new Error("工作目录不在代理白名单中");
       const mode = command.permissionMode ?? "ask-for-approval";
-      const engine = normalizeCliEngine(command.cliEngine ?? taskStore.getDefaultEngine());
+      if (!command.cliEngine) throw new Error("请在网页端选择编码引擎后再下发任务");
+      const engine = normalizeCliEngine(command.cliEngine);
       if (engine === "claude" || engine === "grok") {
         const threadId = crypto.randomUUID();
         localThreadId = threadId;
@@ -2401,13 +2387,6 @@ function registerIpc(): void {
   });
   ipcMain.handle("agent:refresh-tasks", async () => {
     await refreshLocalTasks();
-    return publicState;
-  });
-  ipcMain.handle("agent:set-cli-engine", async (_event, engine: string) => {
-    const next = normalizeCliEngine(engine);
-    await taskStore.setDefaultEngine(next);
-    updateState({ cliEngine: next, detail: `默认编码引擎已切换为 ${next}` });
-    if (socket?.readyState === WebSocket.OPEN) await publishHostStatus();
     return publicState;
   });
   ipcMain.handle("agent:refresh-engines", async () => {
