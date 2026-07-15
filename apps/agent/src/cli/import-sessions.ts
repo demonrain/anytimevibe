@@ -30,6 +30,48 @@ function extractUserQuery(text: string): string {
   return text.trim();
 }
 
+/** Drop CLI meta / system scaffolding so web transcripts stay human-readable. */
+function isNoiseTranscriptText(text: string): boolean {
+  const t = text.trim();
+  if (!t) return true;
+  // Claude local slash-command wrappers and stdout
+  if (
+    /<local-command-caveat>|<command-name>|<command-message>|<command-args>|<local-command-stdout>|<local-command-stdin>|<local-command-stderr>/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+  // Pure environment / git / system blocks with no user ask
+  if (/^<user_info>[\s\S]*<\/user_info>\s*$/i.test(t)) return true;
+  if (/^<git_status>[\s\S]*<\/git_status>\s*$/i.test(t)) return true;
+  if (/^<system-reminder>[\s\S]*<\/system-reminder>\s*$/i.test(t)) return true;
+  if (/^<agent_skills>[\s\S]*<\/agent_skills>\s*$/i.test(t)) return true;
+  if (/DO NOT respond to these messages/i.test(t) && t.length < 800) return true;
+  // Grok/Claude session bootstrap dumps
+  if (/^You are Grok\b/i.test(t) && t.length > 400) return true;
+  if (/^You are Claude\b/i.test(t) && t.length > 400) return true;
+  return false;
+}
+
+function cleanImportedMessageText(role: "user" | "assistant" | "system", raw: string): string | null {
+  let text = raw.trim();
+  if (!text) return null;
+  if (role === "user") {
+    text = extractUserQuery(text);
+    // Strip leftover injected context blocks when user_query was absent
+    text = text
+      .replace(/<user_info>[\s\S]*?<\/user_info>/gi, "")
+      .replace(/<git_status>[\s\S]*?<\/git_status>/gi, "")
+      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
+      .replace(/<agent_skills>[\s\S]*?<\/agent_skills>/gi, "")
+      .replace(/<executing_actions_with_care>[\s\S]*?<\/executing_actions_with_care>/gi, "")
+      .trim();
+  }
+  if (!text || isNoiseTranscriptText(text)) return null;
+  return text.slice(0, 20_000);
+}
+
 function parseGrokSessionsTable(stdout: string): Array<{ id: string; summary: string; updatedAt: number }> {
   const rows: Array<{ id: string; summary: string; updatedAt: number }> = [];
   for (const line of stdout.split(/\r?\n/)) {
@@ -140,13 +182,9 @@ async function readGrokSessionDir(dir: string, sessionId: string): Promise<{
         if (row.synthetic_reason === "compaction_meta" || row.synthetic_reason === "system_reminder") continue;
         let text = textFromContent(row.content);
         if (!text && typeof row.text === "string") text = row.text;
-        text = text.trim();
-        if (!text) continue;
-        if (roleRaw === "user") text = extractUserQuery(text);
-        // Drop huge system dumps mis-tagged as user
-        if (text.length > 50_000) text = text.slice(0, 50_000);
-        if (!text) continue;
-        messages.push({ id: crypto.randomUUID(), role: roleRaw, text: text.slice(0, 20_000) });
+        const cleaned = cleanImportedMessageText(roleRaw, text);
+        if (!cleaned) continue;
+        messages.push({ id: crypto.randomUUID(), role: roleRaw, text: cleaned });
       } catch {
         // ignore bad lines
       }
@@ -291,6 +329,7 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
             role?: string;
             content?: unknown;
           };
+          // Skip tool/queue/system scaffolding lines entirely
           if (row.type && row.type !== "user" && row.type !== "assistant") continue;
           const role = row.message?.role || row.role || (row.type === "user" || row.type === "assistant" ? row.type : undefined);
           if (role !== "user" && role !== "assistant") continue;
@@ -298,7 +337,8 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
           const content = row.message?.content ?? row.content;
           if (typeof content === "string") text = content;
           else text = textFromContent(content);
-          if (text.trim()) messages.push({ id: crypto.randomUUID(), role, text: text.trim().slice(0, 20_000) });
+          const cleaned = cleanImportedMessageText(role, text);
+          if (cleaned) messages.push({ id: crypto.randomUUID(), role, text: cleaned });
         } catch {
           // ignore
         }

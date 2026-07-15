@@ -494,8 +494,8 @@ function rendererHtml(): string {
   .check.warn:before{background:#e25832}
   .check.err:before{background:#a63b28}
   .check b{font-weight:800;flex:0 0 auto}
-  .check span{margin-left:auto;color:#687068;font:10px "Cascadia Code",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:48%}
-  .check button{flex:0 0 auto;padding:5px 8px;font-size:10px}
+  .check span{flex:1 1 auto;margin-left:6px;color:#687068;font:10px "Cascadia Code",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;text-align:right}
+  .check button{flex:0 0 auto;margin-left:8px;padding:5px 8px;font-size:10px}
   .update-row{display:flex;align-items:center;gap:6px;margin-top:6px;min-width:0}
   .update-row .check{flex:1 1 auto;margin:0}
   .pair{font:900 28px/1 monospace;letter-spacing:.18em;text-align:center;color:#e25832;margin:8px 0 4px;padding-left:.18em}
@@ -591,12 +591,13 @@ function rendererHtml(): string {
       if(meta) meta.textContent='Codex '+(state.codexVersion||'')+(state.hostId?' · '+String(state.hostId).slice(0,8):'');
       var env=state.environment||{nodeInstalled:false,codexCompatible:false,codexInstalled:false};
       var engines=state.availableEngines||[];
-      var nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">安装 Node.js</button>':'';
-      var codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">安装兼容版 Codex</button>':'';
+      var nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">一键安装</button>':'';
+      var codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">'+(env.codexInstalled?'安装兼容版':'一键安装')+'</button>':'';
       if(environment){
         var engineExtra=engines.filter(function(item){return item.engine!=='codex';}).map(function(item){
           var label=item.engine==='claude'?'Claude Code':'Grok Build';
-          return '<div class="check '+(item.ready?'ok':'')+'"><b>'+escapeHtml(label)+'</b><span>'+escapeHtml(item.version||item.detail||(item.ready?'就绪':'未就绪'))+'</span></div>';
+          var action=!item.ready?'<button data-install="'+escapeHtml(item.engine)+'" class="secondary">一键安装</button>':'';
+          return '<div class="check '+(item.ready?'ok':'')+'"><b>'+escapeHtml(label)+'</b><span>'+escapeHtml(item.version||item.detail||(item.ready?'就绪':'未安装'))+'</span>'+action+'</div>';
         }).join('');
         environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+escapeHtml(env.nodeVersion||'未安装')+'</span>'+nodeAction+'</div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+escapeHtml(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span>'+codexAction+'</div>'+engineExtra;
         environment.querySelectorAll('button[data-install]').forEach(function(button){
@@ -1158,11 +1159,108 @@ async function installCodexOnMac(): Promise<void> {
   updateState({ detail: "已打开 Terminal 安装窗口。完成后请点击「重新检测」。" });
 }
 
-async function installEnvironment(target: "node" | "codex"): Promise<void> {
+async function installClaudeOnWindows(): Promise<void> {
+  await applyWindowsPathToProcess();
+  updateState({ detail: "正在打开 Claude Code 安装窗口…" });
+  await openWindowsVisibleConsole([
+    "echo ============================================",
+    "echo   AnytimeVibe - install Claude Code",
+    "echo ============================================",
+    "echo.",
+    "where winget >nul 2>&1 && (",
+    "  echo [1] winget install Anthropic.ClaudeCode ...",
+    "  winget install --id Anthropic.ClaudeCode -e --accept-package-agreements --accept-source-agreements",
+    ") || echo winget not found, trying npm ...",
+    "where claude >nul 2>&1 || (",
+    "  echo [2] npm install -g @anthropic-ai/claude-code ...",
+    "  call npm install -g @anthropic-ai/claude-code",
+    ")",
+    "echo.",
+    "where claude",
+    "claude --version 2>nul",
+    "echo.",
+    "echo Done. Close this window and click 重新检测 in AnytimeVibe."
+  ]);
+  updateState({ detail: "已打开 Claude Code 安装窗口。完成后请点击「重新检测」。" });
+}
+
+async function installClaudeOnMac(): Promise<void> {
+  await applyMacLoginPathToProcess();
+  const installCommand =
+    "set -e; echo 'Installing Claude Code…'; "
+    + "(command -v brew >/dev/null && brew install --cask claude-code) "
+    + "|| curl -fsSL https://claude.ai/install.sh | bash; "
+    + "echo ''; claude --version || true; "
+    + "echo ''; echo '完成。可关闭此窗口，回到随码客户端点击重新检测。'";
+  await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(installCommand)}`]);
+  await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+  updateState({ detail: "已打开 Terminal 安装 Claude Code。完成后请点击「重新检测」。" });
+}
+
+async function installGrokOnWindows(): Promise<void> {
+  await applyWindowsPathToProcess();
+  updateState({ detail: "正在打开 Grok Build 安装窗口…" });
+  // Official installer is a bash/curl script; prefer Git Bash / WSL-free PowerShell bootstrap when present.
+  await openWindowsVisibleConsole([
+    "echo ============================================",
+    "echo   AnytimeVibe - install Grok Build CLI",
+    "echo ============================================",
+    "echo.",
+    "where bash >nul 2>&1 && (",
+    "  echo Using bash installer from https://x.ai/cli/install.sh",
+    "  bash -lc \"curl -fsSL https://x.ai/cli/install.sh | bash\"",
+    ") || (",
+    "  echo bash not found. Trying PowerShell bootstrap ...",
+    "  powershell -NoProfile -ExecutionPolicy Bypass -Command \"try { irm https://x.ai/cli/install.ps1 | iex } catch { Write-Host $_; Write-Host 'Open https://x.ai and install Grok Build CLI manually.' }\"",
+    ")",
+    "echo.",
+    "if exist \"%USERPROFILE%\\.grok\\bin\\grok.exe\" (\"%USERPROFILE%\\.grok\\bin\\grok.exe\" --version) else (where grok 2>nul)",
+    "echo.",
+    "echo Done. Close this window and click 重新检测 in AnytimeVibe."
+  ]);
+  updateState({ detail: "已打开 Grok Build 安装窗口。完成后请点击「重新检测」。" });
+}
+
+async function installGrokOnMac(): Promise<void> {
+  await applyMacLoginPathToProcess();
+  const installCommand =
+    "set -e; echo 'Installing Grok Build CLI…'; "
+    + "curl -fsSL https://x.ai/cli/install.sh | bash; "
+    + "export PATH=\"$HOME/.grok/bin:$PATH\"; "
+    + "echo ''; grok --version || true; "
+    + "echo ''; echo '完成。可关闭此窗口，回到随码客户端点击重新检测。'";
+  await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(installCommand)}`]);
+  await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+  updateState({ detail: "已打开 Terminal 安装 Grok Build。完成后请点击「重新检测」。" });
+}
+
+async function installEnvironment(target: "node" | "codex" | "claude" | "grok"): Promise<void> {
   if (target === "node") {
     await shell.openExternal("https://nodejs.org/en/download");
     updateState({ detail: "已打开 Node.js 下载页。安装完成后请重启随码并点击「重新检测」。" });
     return;
+  }
+  if (target === "claude") {
+    if (process.platform === "win32") {
+      await installClaudeOnWindows();
+      return;
+    }
+    if (process.platform === "darwin") {
+      await installClaudeOnMac();
+      return;
+    }
+    throw new Error("当前系统暂不支持一键安装 Claude Code。");
+  }
+  if (target === "grok") {
+    if (process.platform === "win32") {
+      await installGrokOnWindows();
+      return;
+    }
+    if (process.platform === "darwin") {
+      await installGrokOnMac();
+      return;
+    }
+    throw new Error("当前系统暂不支持一键安装 Grok Build。");
   }
   // Strict platform split: do not share install implementation across OS.
   if (process.platform === "win32") {
@@ -2260,6 +2358,50 @@ function quoteWinArg(value: string): string {
   return `"${value.replace(/"/g, "\\\"")}"`;
 }
 
+/**
+ * Build a command line for `cmd.exe /k ...`.
+ * `.cmd`/`.bat` must be invoked with `call` when chained after `set ... &&`,
+ * otherwise Windows treats the batch as terminating the parent command and Codex resume never runs.
+ */
+function formatWinCliCommand(binary: string, args: string[]): string {
+  const body = [quoteWinArg(binary), ...args.map(quoteWinArg)].join(" ");
+  if (/\.(cmd|bat)$/i.test(binary)) return `call ${body}`;
+  return body;
+}
+
+async function resolveCodexBinaryForRelay(): Promise<string> {
+  // Prefer the already-discovered absolute path; fall back to PATH resolution.
+  const current = (codexCommand || "").trim();
+  if (current && (path.isAbsolute(current) || /[\\/]/.test(current))) return current;
+  try {
+    await applyLoginPathToProcess();
+  } catch {
+    // ignore
+  }
+  if (process.platform === "win32") {
+    const hit = (await findOnWindowsPath("codex.cmd"))
+      || (await findOnWindowsPath("codex.exe"))
+      || (await findOnWindowsPath("codex"));
+    if (hit) {
+      codexCommand = normalizeWindowsCommandPath(hit);
+      return codexCommand;
+    }
+  } else {
+    try {
+      const { stdout } = await execFileAsync("which", ["codex"], { timeout: 5_000, env: process.env });
+      const hit = stdout.trim().split(/\r?\n/).find(Boolean);
+      if (hit) {
+        codexCommand = hit;
+        return codexCommand;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  if (current) return current;
+  throw new Error("未找到 Codex CLI，请先在「本机环境」中安装兼容版 Codex。");
+}
+
 async function relayTaskToCli(threadId: string): Promise<void> {
   const task = await resolveRelayTask(threadId);
   const stored = taskStore.get(threadId);
@@ -2274,49 +2416,54 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     // Do not force --model (default "sonnet" often maps to offline proxy models and
     // drops the user into the interactive model picker). Only pass when explicitly set.
     const model = (process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "").trim();
-    const parts = process.platform === "win32"
-      ? [
-          quoteWinArg(binary),
-          ...(model ? ["--model", model] : []),
-          ...(providerSessionId ? ["--resume", providerSessionId] : [])
-        ]
-      : [
-          shellQuote(binary),
-          ...(model ? ["--model", shellQuote(model)] : []),
-          ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : [])
-        ];
-    await openExternalTerminal(cwd, parts.join(" "));
+    const args = [
+      ...(model ? ["--model", model] : []),
+      ...(providerSessionId ? ["--resume", providerSessionId] : [])
+    ];
+    if (process.platform === "win32") {
+      await openExternalTerminal(cwd, formatWinCliCommand(binary, args));
+    } else {
+      await openExternalTerminal(
+        cwd,
+        [shellQuote(binary), ...args.map((part) => (part.startsWith("-") ? part : shellQuote(part)))].join(" ")
+      );
+    }
     return;
   }
 
   if (engine === "grok") {
     const binary = await resolveEngineBinary("grok");
     if (!binary) throw new Error("未找到 Grok Build CLI，无法接力");
-    const model = process.env.GROK_MODEL || process.env.XAI_MODEL;
-    const parts = process.platform === "win32"
-      ? [
-          quoteWinArg(binary),
-          ...(providerSessionId ? ["--resume", providerSessionId] : []),
-          ...(model ? ["--model", model] : []),
-          "--cwd", quoteWinArg(cwd)
-        ]
-      : [
+    const model = (process.env.GROK_MODEL || process.env.XAI_MODEL || "").trim();
+    const args = [
+      ...(providerSessionId ? ["--resume", providerSessionId] : []),
+      ...(model ? ["--model", model] : []),
+      "--cwd", cwd
+    ];
+    if (process.platform === "win32") {
+      await openExternalTerminal(cwd, formatWinCliCommand(binary, args));
+    } else {
+      await openExternalTerminal(
+        cwd,
+        [
           shellQuote(binary),
           ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : []),
           ...(model ? ["--model", shellQuote(model)] : []),
           "--cwd", shellQuote(cwd)
-        ];
-    await openExternalTerminal(cwd, parts.join(" "));
+        ].join(" ")
+      );
+    }
     return;
   }
 
-  // codex always uses product/thread id as session id — still go through proxy-aware terminal open.
+  // Codex session id is the product/thread id.
+  const binary = await resolveCodexBinaryForRelay();
   if (process.platform === "win32") {
-    await openExternalTerminal(cwd, `${quoteWinArg(codexCommand)} resume ${quoteWinArg(threadId)}`);
+    await openExternalTerminal(cwd, formatWinCliCommand(binary, ["resume", threadId]));
     return;
   }
   if (process.platform === "darwin") {
-    await openExternalTerminal(cwd, `${shellQuote(codexCommand)} resume ${shellQuote(threadId)}`);
+    await openExternalTerminal(cwd, `${shellQuote(binary)} resume ${shellQuote(threadId)}`);
     return;
   }
   throw new Error("当前系统暂不支持启动接力终端。");
@@ -2735,10 +2882,24 @@ function registerIpc(): void {
     });
     return publicState;
   });
-  ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex") => {
-    if (target !== "node" && target !== "codex") throw new Error("未知的安装目标");
+  ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex" | "claude" | "grok") => {
+    if (target !== "node" && target !== "codex" && target !== "claude" && target !== "grok") {
+      throw new Error("未知的安装目标");
+    }
     try {
       await installEnvironment(target);
+      // Re-detect after install window is launched (user may finish later; still refresh now for partial hits).
+      try {
+        await applyLoginPathToProcess();
+        const environment = await detectEnvironment();
+        const availableEngines = await detectAvailableEngines({
+          codexReady: environment.codexCompatible,
+          codexVersion: environment.codexVersion || "unknown"
+        });
+        updateState({ environment, availableEngines, codexVersion: environment.codexVersion || publicState.codexVersion });
+      } catch {
+        // optional
+      }
     } catch (error) {
       handleError(error);
       throw error;

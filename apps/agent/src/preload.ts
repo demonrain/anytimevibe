@@ -9,7 +9,7 @@ contextBridge.exposeInMainWorld("anytimeVibe", {
   removeWorkspace: (id: string) => ipcRenderer.invoke("agent:remove-workspace", id),
   reconnect: () => ipcRenderer.invoke("agent:reconnect"),
   checkEnvironment: () => ipcRenderer.invoke("agent:check-environment"),
-  installEnvironment: (target: "node" | "codex") => ipcRenderer.invoke("agent:install-environment", target),
+  installEnvironment: (target: "node" | "codex" | "claude" | "grok") => ipcRenderer.invoke("agent:install-environment", target),
   checkUpdate: () => ipcRenderer.invoke("agent:check-update"),
   installUpdate: () => ipcRenderer.invoke("agent:install-update"),
   relayTask: (threadId: string) => ipcRenderer.invoke("agent:relay-task", threadId),
