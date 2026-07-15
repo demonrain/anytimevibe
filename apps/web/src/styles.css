@@ -108,7 +108,81 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .command-queue { display: grid; gap: 6px; border: 1px solid rgba(226,88,50,.3); background: rgba(226,88,50,.06); border-radius: 14px; padding: 10px; min-width: 0; }.command-queue > div { display: flex; justify-content: space-between; align-items: center; color: var(--rust); font-size: 11px; }.command-queue > div span { font-size: 10px; font-weight: 800; }.command-queue article { display: flex; gap: 8px; align-items: flex-start; background: rgba(255,250,240,.75); border-radius: 9px; padding: 8px 9px; min-width: 0; }.command-queue article b { display: grid; place-items: center; flex: 0 0 auto; width: 18px; height: 18px; border-radius: 50%; background: var(--rust); color: white; font-size: 10px; }.command-queue article p { margin: 1px 0 0; font-size: 11px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; min-width: 0; }
 .composer { border-top: 1px solid var(--line); padding: 10px 14px max(10px, env(safe-area-inset-bottom)); background: rgba(242,234,219,.85); backdrop-filter: blur(18px); min-width: 0; flex: 0 0 auto; }.composer textarea { min-height: 56px; resize: vertical; background: var(--cream); font-size: 13px; padding: 10px 11px; }.composer > div { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 8px; flex-wrap: wrap; }.composer small { margin-right: auto; color: #737a72; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }.send-shortcut { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }.composer kbd { border: 1px solid rgba(23,33,27,.2); border-bottom-width: 2px; border-radius: 5px; background: var(--cream); padding: 1px 5px; font: 10px/1.4 "Cascadia Code", monospace; color: var(--ink); }.composer button { border: 0; border-radius: 8px; padding: 7px 12px; font-size: 12px; font-weight: 800; cursor: pointer; }.composer .send { background: var(--rust); color: white; }.composer .stop { background: #efe0d8; color: #9b341e; }
 .diff-view { min-width: 0; min-height: 0; overflow: auto; padding: 12px 0; font: 11px/1.5 "Cascadia Code", Consolas, monospace; background: #18201b; color: #d5d9d1; }.diff-view div { padding: 0 14px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%; }.diff-view .add { background: rgba(60,160,99,.2); color: #b9efca; }.diff-view .remove { background: rgba(210,70,54,.18); color: #ffc1b7; }.diff-view .hunk { color: #e8c46a; background: rgba(232,196,106,.08); }.diff-empty, .conversation-empty { display: grid; place-content: center; text-align: center; color: #747a73; padding: 24px; min-width: 0; }.conversation-empty { grid-row: 1 / -1; }.orbit { width: 72px; height: 72px; border: 2px solid var(--rust); border-radius: 50%; margin: auto; position: relative; }.orbit::after { content: ""; position: absolute; width: 11px; height: 11px; background: var(--moss); border-radius: 50%; top: 6px; right: 2px; }
-.modal-backdrop { position: fixed; inset: 0; z-index: 50; background: rgba(23,33,27,.58); display: grid; place-items: center; padding: 18px; backdrop-filter: blur(9px); }.modal { width: min(430px, 100%); background: var(--cream); border-radius: 24px; padding: 28px; box-shadow: 0 40px 100px rgba(0,0,0,.28); position: relative; display: grid; gap: 15px; animation: rise .25s ease both; }.modal.wide { width: min(620px, 100%); }.modal h2 { margin: 0; font: 700 27px "Rockwell", serif; }.modal > p { color: #6d746c; line-height: 1.55; }.modal-close { position: absolute; right: 15px; top: 13px; border: 0; background: transparent; font-size: 27px; cursor: pointer; }.pair-code { font: 800 38px/1 monospace; letter-spacing: .24em; text-align: center; padding-left: .24em; }.pair-preview { text-align: center; display: grid; gap: 7px; }.computer-icon { font-size: 58px; color: var(--moss); }.pair-preview h3 { margin: 0; }.task-prompt { min-height: 150px; resize: vertical; }
+/*
+ * Mobile new-task forms are taller than the viewport. Using only place-items:center
+ * clips the sheet and prevents pan/scroll, so the submit button stays off-screen.
+ * Backdrop scrolls the full sheet; the modal itself also caps height and scrolls.
+ */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(23,33,27,.58);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  padding: max(12px, env(safe-area-inset-top, 0px)) 12px max(12px, env(safe-area-inset-bottom, 0px));
+  backdrop-filter: blur(9px);
+}
+.modal {
+  width: min(430px, 100%);
+  max-width: 100%;
+  max-height: calc(100dvh - 24px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  background: var(--cream);
+  border-radius: 24px;
+  padding: 28px;
+  box-shadow: 0 40px 100px rgba(0,0,0,.28);
+  position: relative;
+  display: grid;
+  gap: 15px;
+  animation: rise .25s ease both;
+  margin-top: auto;
+  margin-bottom: auto;
+  flex: 0 0 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+}
+.modal.wide { width: min(620px, 100%); }
+.modal h2 { margin: 0; padding-right: 28px; font: 700 27px "Rockwell", serif; overflow-wrap: anywhere; }
+.modal > p { color: #6d746c; line-height: 1.55; }
+.modal-close {
+  position: sticky;
+  top: 0;
+  justify-self: end;
+  z-index: 2;
+  margin: -10px -10px -20px auto;
+  border: 0;
+  background: rgba(242,234,219,.92);
+  border-radius: 999px;
+  font-size: 24px;
+  line-height: 1;
+  width: 36px;
+  height: 36px;
+  cursor: pointer;
+}
+.pair-code { font: 800 38px/1 monospace; letter-spacing: .24em; text-align: center; padding-left: .24em; }
+.pair-preview { text-align: center; display: grid; gap: 7px; }
+.computer-icon { font-size: 58px; color: var(--moss); }
+.pair-preview h3 { margin: 0; }
+.task-prompt { min-height: 150px; max-height: min(36vh, 260px); resize: vertical; }
+.modal .primary {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  width: 100%;
+  margin-top: 4px;
+  box-shadow: 0 -12px 20px rgba(242,234,219,.95);
+}
 .error-banner { position: fixed; left: 50%; top: 14px; transform: translateX(-50%); z-index: 100; width: min(620px, calc(100% - 28px)); border: 0; border-radius: 12px; background: #a63b28; color: white; padding: 12px 15px; display: flex; justify-content: space-between; text-align: left; box-shadow: 0 15px 45px rgba(94,24,13,.28); cursor: pointer; }.error-banner span { opacity: .7; }
 @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } } @keyframes pulse { 50% { transform: scale(.72); opacity: .45; } } @keyframes spin { to { transform: rotate(360deg); } }
 /* Large / high-DPI desktop (4K @ 150% ≈ 2560 CSS px): denser chrome, more content */
@@ -160,6 +234,30 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   .workspace.mobile-conversation .mobile-back { position: relative; z-index: 3; }
 }
 @media (max-width: 700px) { .composer textarea { max-height: 180px; }.composer-permission select, .composer-reply-detail select { min-width: 96px; max-width: 128px; }.settings-row { gap: 8px; }.permission-select, .reply-detail-select { grid-template-columns: auto minmax(0, 1fr); } }
+
+/* New-task / pairing sheets: keep full form reachable on short phone viewports */
+@media (max-width: 700px) {
+  .modal-backdrop {
+    padding: max(8px, env(safe-area-inset-top, 0px)) 8px max(8px, env(safe-area-inset-bottom, 0px));
+  }
+  .modal,
+  .modal.wide {
+    width: 100%;
+    max-height: calc(100dvh - 16px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    border-radius: 18px;
+    padding: 18px 14px max(14px, env(safe-area-inset-bottom, 0px));
+    gap: 12px;
+  }
+  .modal h2 { font-size: 22px; }
+  .engine-picker-grid { gap: 8px; }
+  .engine-card { padding: 10px 6px; gap: 4px; }
+  .task-prompt { min-height: 96px; max-height: min(28vh, 180px); }
+  .modal .primary {
+    padding: 12px 14px;
+    font-size: 14px;
+    border-radius: 12px;
+  }
+}
 
 /* Account menu admin link */
 .account-popover .account-link { display: block; border: 0; border-radius: 9px; padding: 9px 10px; background: #e7efe9; color: var(--moss); text-decoration: none; font-weight: 800; }
