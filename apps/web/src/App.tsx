@@ -201,15 +201,17 @@ function assistantStreamItemId(messageId: string): string | null {
   return rest.slice(sep + 1);
 }
 
-/** Stage / CLI / command streams — hidden in concise reply mode. */
+/** Verbose process streams — hidden in concise reply mode. */
 function isProcessStreamMessage(message: { id: string; role: string }): boolean {
   if (message.role !== "assistant") return false;
   const itemId = assistantStreamItemId(message.id);
   if (!itemId) return false;
+  // Progress stages (▶ / ⏳) stay visible so headless runs are not a blank "processing" screen.
+  if (itemId.startsWith("stage:") && !itemId.includes("thought")) return false;
   return itemId === "cli-log"
-    || itemId.startsWith("stage:")
     || itemId.startsWith("exec:")
-    || itemId.startsWith("process:");
+    || itemId.startsWith("process:")
+    || itemId.includes("thought");
 }
 
 /** Strip control characters that can break layout engines while keeping newlines/tabs. */
@@ -243,7 +245,20 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     };
     return next;
   }
-  if (event.type === "error") return next;
+  if (event.type === "error") {
+    if (event.threadId && next.tasks[event.threadId]) {
+      next.tasks[event.threadId]!.status = "failed";
+      delete next.tasks[event.threadId]!.activeTurnId;
+      if (event.message) {
+        next.tasks[event.threadId]!.messages.push({
+          id: event.eventId,
+          role: "system",
+          text: event.message
+        });
+      }
+    }
+    return next;
+  }
   if (event.type === "request.resolved") {
     if (event.threadId) {
       const task = next.tasks[event.threadId];

@@ -39,6 +39,7 @@ import {
 import { CodexAdapter, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
 import { detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { interruptHeadlessThread, runHeadlessTurn } from "./cli/headless-runner";
+import { importLocalCliSessions } from "./cli/import-sessions";
 import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix } from "./local-proxy";
@@ -1844,6 +1845,12 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     if (command.type === "sync.request") {
       // Refresh workspaces for the web new-task picker before streaming threads.
       await publishHostStatus();
+      // Import local Claude/Grok CLI sessions, then publish them to the web.
+      try {
+        await importLocalCliSessions(taskStore, command.limit ?? DEFAULT_SYNC_LIMIT);
+      } catch {
+        // ignore
+      }
       // Publish non-Codex tasks from local index first.
       for (const task of taskStore.list(command.limit ?? DEFAULT_SYNC_LIMIT)) {
         if (task.engine === "codex") continue;
@@ -2065,6 +2072,12 @@ async function publishThread(threadId: string): Promise<void> {
 /** Load 接力 task list from local Codex (thread/list) — independent of web sync. */
 async function refreshLocalTasks(limit = 50): Promise<void> {
   const listLimit = Math.min(100, Math.max(1, limit));
+  // Pull sessions created by local Claude/Grok CLIs into the index so web sync can see them.
+  try {
+    await importLocalCliSessions(taskStore, listLimit);
+  } catch {
+    // ignore import failures
+  }
   const storedTasks: AgentTask[] = taskStore.list(listLimit).map((task) => ({
     threadId: task.threadId,
     title: task.title,
@@ -2245,9 +2258,18 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   if (engine === "claude") {
     const binary = await resolveEngineBinary("claude");
     if (!binary) throw new Error("未找到 Claude Code CLI，无法接力");
+    const model = process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "sonnet";
     const parts = process.platform === "win32"
-      ? [quoteWinArg(binary), ...(providerSessionId ? ["--resume", providerSessionId] : [])]
-      : [shellQuote(binary), ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : [])];
+      ? [
+          quoteWinArg(binary),
+          "--model", model,
+          ...(providerSessionId ? ["--resume", providerSessionId] : [])
+        ]
+      : [
+          shellQuote(binary),
+          "--model", shellQuote(model),
+          ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : [])
+        ];
     await openExternalTerminal(cwd, parts.join(" "));
     return;
   }
@@ -2255,9 +2277,20 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   if (engine === "grok") {
     const binary = await resolveEngineBinary("grok");
     if (!binary) throw new Error("未找到 Grok Build CLI，无法接力");
+    const model = process.env.GROK_MODEL || process.env.XAI_MODEL;
     const parts = process.platform === "win32"
-      ? [quoteWinArg(binary), ...(providerSessionId ? ["--resume", providerSessionId] : []), "--cwd", quoteWinArg(cwd)]
-      : [shellQuote(binary), ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : []), "--cwd", shellQuote(cwd)];
+      ? [
+          quoteWinArg(binary),
+          ...(providerSessionId ? ["--resume", providerSessionId] : []),
+          ...(model ? ["--model", model] : []),
+          "--cwd", quoteWinArg(cwd)
+        ]
+      : [
+          shellQuote(binary),
+          ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : []),
+          ...(model ? ["--model", shellQuote(model)] : []),
+          "--cwd", shellQuote(cwd)
+        ];
     await openExternalTerminal(cwd, parts.join(" "));
     return;
   }
