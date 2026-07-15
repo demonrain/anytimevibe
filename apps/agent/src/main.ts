@@ -1674,7 +1674,10 @@ async function runHeadlessTaskTurn(options: {
     prompt: options.prompt,
     permissionMode: options.permissionMode,
     ...(resumeId ? { providerSessionId: resumeId } : {})
-  }, (event) => { void handleBackendStreamEvent(event); });
+  }, async (event) => {
+    // Must await so publish sequence numbers and delta flush stay ordered.
+    await handleBackendStreamEvent(event);
+  });
 
   const latest = taskStore.get(options.threadId) ?? stored;
   if (result.providerSessionId) latest.providerSessionId = result.providerSessionId;
@@ -1691,7 +1694,7 @@ async function runHeadlessTaskTurn(options: {
       id: crypto.randomUUID(),
       role: "system",
       text: options.engine === "claude"
-        ? "Claude 任务失败。请确认本机已安装 Claude Code 并完成登录（claude auth login）。"
+        ? "Claude 任务失败。请确认本机已安装 Claude Code 并登录；若提示模型已下线，请设置环境变量 CLAUDE_MODEL（例如 claude-opus-4-7）或在 Claude CLI 中切换模型。"
         : "Grok 任务失败。请确认本机已安装 Grok Build 并已登录。"
     });
   }
@@ -1700,9 +1703,18 @@ async function runHeadlessTaskTurn(options: {
 }
 
 async function handleCommand(command: ClientCommand): Promise<void> {
-  // host.refresh only needs the relay + local workspace config, not Codex.
+  // host.refresh: status + re-import local Claude/Grok sessions for web list.
   if (command.type === "host.refresh") {
     await publishHostStatus();
+    try {
+      await importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT);
+      for (const task of taskStore.list(DEFAULT_SYNC_LIMIT)) {
+        if (task.engine === "codex") continue;
+        await publishStoredTaskSnapshot(task.threadId);
+      }
+    } catch {
+      // optional
+    }
     return;
   }
   // host.set_cli_engine kept for protocol compatibility; engine is chosen per-task on web.
@@ -2258,16 +2270,18 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   if (engine === "claude") {
     const binary = await resolveEngineBinary("claude");
     if (!binary) throw new Error("未找到 Claude Code CLI，无法接力");
-    const model = process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "sonnet";
+    // Do not force --model (default "sonnet" often maps to offline proxy models and
+    // drops the user into the interactive model picker). Only pass when explicitly set.
+    const model = (process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "").trim();
     const parts = process.platform === "win32"
       ? [
           quoteWinArg(binary),
-          "--model", model,
+          ...(model ? ["--model", model] : []),
           ...(providerSessionId ? ["--resume", providerSessionId] : [])
         ]
       : [
           shellQuote(binary),
-          "--model", shellQuote(model),
+          ...(model ? ["--model", shellQuote(model)] : []),
           ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : [])
         ];
     await openExternalTerminal(cwd, parts.join(" "));
@@ -2558,10 +2572,30 @@ function registerIpc(): void {
   });
   ipcMain.handle("agent:relay-task", async (_event, threadId: string) => {
     await relayTaskToCli(threadId);
+    // After handoff, re-import CLI sessions a bit later so local work can appear on web sync.
+    setTimeout(() => {
+      void importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT)
+        .then(async () => {
+          for (const task of taskStore.list(DEFAULT_SYNC_LIMIT)) {
+            if (task.engine === "codex") continue;
+            await publishStoredTaskSnapshot(task.threadId);
+          }
+        })
+        .catch(() => undefined);
+    }, 15_000);
     return publicState;
   });
   ipcMain.handle("agent:refresh-tasks", async () => {
     await refreshLocalTasks();
+    // Also push multi-CLI tasks to the web when the agent window refreshes.
+    try {
+      for (const task of taskStore.list(DEFAULT_SYNC_LIMIT)) {
+        if (task.engine === "codex") continue;
+        await publishStoredTaskSnapshot(task.threadId);
+      }
+    } catch {
+      // ignore
+    }
     return publicState;
   });
   ipcMain.handle("agent:refresh-engines", async () => {

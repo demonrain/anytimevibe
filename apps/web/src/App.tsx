@@ -206,12 +206,15 @@ function isProcessStreamMessage(message: { id: string; role: string }): boolean 
   if (message.role !== "assistant") return false;
   const itemId = assistantStreamItemId(message.id);
   if (!itemId) return false;
-  // Progress stages (▶ / ⏳) stay visible so headless runs are not a blank "processing" screen.
-  if (itemId.startsWith("stage:") && !itemId.includes("thought")) return false;
+  // Hide raw token-level thought streams only (stage:thought:…), not stage:thinking progress.
+  if (itemId.startsWith("stage:thought:") || itemId === "thought" || itemId.startsWith("thought:")) {
+    return true;
+  }
+  // Progress stages (▶ / ⏳ / 思考中) stay visible so headless runs are not a blank "processing" screen.
+  if (itemId.startsWith("stage:")) return false;
   return itemId === "cli-log"
     || itemId.startsWith("exec:")
-    || itemId.startsWith("process:")
-    || itemId.includes("thought");
+    || itemId.startsWith("process:");
 }
 
 /** Strip control characters that can break layout engines while keeping newlines/tabs. */

@@ -36,21 +36,23 @@ function permissionArgs(engine: CliEngine, mode: PermissionMode): string[] {
 function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
   const args: string[] = [];
   if (engine === "claude") {
-    const model = process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "sonnet";
+    // Do NOT default to "sonnet" — many proxy setups map sonnet → offline models
+    // (e.g. claude-opus-4-6). Only pass --model when explicitly configured.
+    const model = (process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "").trim();
     args.push(
       "-p", options.prompt,
       "--output-format", "stream-json",
       "--verbose",
-      "--include-partial-messages",
-      "--model", model
+      "--include-partial-messages"
     );
+    if (model) args.push("--model", model);
     // Only use --bare when API key is present (bare skips keychain/OAuth).
     if (process.env.ANTHROPIC_API_KEY) args.push("--bare");
     if (options.providerSessionId) args.push("--resume", options.providerSessionId);
     args.push(...permissionArgs(engine, options.permissionMode));
     return args;
   }
-  const model = process.env.GROK_MODEL || process.env.XAI_MODEL;
+  const model = (process.env.GROK_MODEL || process.env.XAI_MODEL || "").trim();
   args.push(
     "-p", options.prompt,
     "--output-format", "streaming-json",
@@ -86,6 +88,8 @@ type ParseState = {
   failed: boolean;
   errorMessage: string;
   sawAssistant: boolean;
+  sawThoughtStage: boolean;
+  lastProgressAt: number;
 };
 
 function handleClaudeLine(
@@ -107,7 +111,8 @@ function handleClaudeLine(
   if (type === "system") {
     const subtype = String(parsed.subtype || "");
     if (subtype === "init") {
-      emitDelta(onEvent, options, "stage:init", "stage", "\n▶ Claude 会话初始化\n");
+      const model = parsed.model ? `（模型 ${parsed.model}）` : "";
+      emitDelta(onEvent, options, "stage:init", "stage", `\n▶ Claude 会话初始化${model}\n`);
     } else if (subtype === "api_retry") {
       const attempt = parsed.attempt ?? "?";
       const max = parsed.max_retries ?? "?";
@@ -143,9 +148,18 @@ function handleClaudeLine(
   if (type === "assistant" && parsed.message?.content) {
     for (const block of parsed.message.content) {
       if (block?.type === "text" && block.text && !state.sawAssistant) {
-        state.text += String(block.text);
-        state.sawAssistant = true;
-        emitDelta(onEvent, options, "assistant", "assistant", String(block.text));
+        const text = String(block.text);
+        // Synthetic assistant error payloads (auth / model offline)
+        if (parsed.message?.model === "<synthetic>" || /API Error:|not logged in|已下线/i.test(text)) {
+          state.failed = true;
+          state.errorMessage = text;
+          onEvent({ type: "error", threadId: options.threadId, message: text });
+          emitDelta(onEvent, options, "stage:error", "stage", `\n✗ ${text}\n`);
+        } else {
+          state.text += text;
+          state.sawAssistant = true;
+          emitDelta(onEvent, options, "assistant", "assistant", text);
+        }
       }
     }
     return;
@@ -153,15 +167,15 @@ function handleClaudeLine(
   if (type === "result") {
     if (parsed.session_id) state.sessionId = String(parsed.session_id);
     if (typeof parsed.result === "string" && parsed.result) {
-      if (!state.sawAssistant) {
-        state.text = parsed.result;
-        state.sawAssistant = true;
-        emitDelta(onEvent, options, "assistant", "assistant", parsed.result);
-      }
       if (parsed.is_error) {
         state.failed = true;
         state.errorMessage = parsed.result;
         onEvent({ type: "error", threadId: options.threadId, message: parsed.result });
+        emitDelta(onEvent, options, "stage:error", "stage", `\n✗ ${parsed.result}\n`);
+      } else if (!state.sawAssistant) {
+        state.text = parsed.result;
+        state.sawAssistant = true;
+        emitDelta(onEvent, options, "assistant", "assistant", parsed.result);
       }
     } else if (parsed.is_error) {
       state.failed = true;
@@ -192,8 +206,23 @@ function handleGrokLine(
     return;
   }
   if (type === "thought" && parsed.data != null) {
-    // Stream thinking as process log so users see progress even before final text.
-    emitDelta(onEvent, options, "thought", "thought", String(parsed.data));
+    // Concise web mode hides thought tokens; emit a single visible stage so UI is not blank.
+    if (!state.sawThoughtStage) {
+      state.sawThoughtStage = true;
+      emitDelta(onEvent, options, "stage:thinking", "stage", "\n… Grok 思考中\n");
+    } else {
+      const now = Date.now();
+      // Heartbeat every ~8s so long thinking still looks alive.
+      if (now - state.lastProgressAt > 8_000) {
+        state.lastProgressAt = now;
+        emitDelta(onEvent, options, "stage:thinking", "stage", "…");
+      }
+    }
+    return;
+  }
+  if (type === "tool_call" || type === "tool" || type === "function_call") {
+    const name = parsed.name || parsed.tool || parsed.function?.name || "tool";
+    emitDelta(onEvent, options, `stage:tool:${name}`, "stage", `\n▶ 调用 ${name}\n`);
     return;
   }
   if (type === "end") {
@@ -209,6 +238,7 @@ function handleGrokLine(
     state.failed = true;
     state.errorMessage = String(parsed.message || "Grok 运行失败");
     onEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+    emitDelta(onEvent, options, "stage:error", "stage", `\n✗ ${state.errorMessage}\n`);
     return;
   }
   if (parsed.sessionId && !state.sessionId) state.sessionId = String(parsed.sessionId);
@@ -259,7 +289,16 @@ export async function runHeadlessTurn(
   const finalArgs = useCmdShim ? windowsCmdArguments(command, args) : args;
 
   const proxy = await collectLocalProxyEnv();
-  const env = mergeProxyIntoEnv(process.env, proxy);
+  const env = mergeProxyIntoEnv(
+    {
+      ...process.env,
+      // Headless / non-TTY friendly
+      CI: process.env.CI || "1",
+      TERM: process.env.TERM || "dumb",
+      NO_COLOR: process.env.NO_COLOR || "1"
+    },
+    proxy
+  );
 
   safeOnEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
   emitDelta(
@@ -272,14 +311,21 @@ export async function runHeadlessTurn(
   if (Object.keys(proxy).length) {
     emitDelta(safeOnEvent, options, "stage:proxy", "stage", "\n… 已注入本机代理环境\n");
   }
+  console.log(`[headless] spawn ${executable} ${finalArgs.map((a) => (a.includes(" ") ? JSON.stringify(a) : a)).join(" ")}`);
 
+  // Use pipe+end for stdin (not "ignore") — some CLIs hang when stdin is a null device.
   const child = spawn(executable, finalArgs, {
     cwd: options.cwd,
     env,
     windowsHide: true,
     windowsVerbatimArguments: useCmdShim,
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"]
   });
+  try {
+    child.stdin?.end();
+  } catch {
+    // ignore
+  }
   activeByThread.set(options.threadId, { child, turnId: options.turnId });
 
   const state: ParseState = {
@@ -287,7 +333,9 @@ export async function runHeadlessTurn(
     text: "",
     failed: false,
     errorMessage: "",
-    sawAssistant: false
+    sawAssistant: false,
+    sawThoughtStage: false,
+    lastProgressAt: Date.now()
   };
 
   const result = await new Promise<HeadlessRunResult>((resolve) => {
@@ -296,6 +344,7 @@ export async function runHeadlessTurn(
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
+      if (heartbeat) clearInterval(heartbeat);
       activeByThread.delete(options.threadId);
       resolve({
         providerSessionId: state.sessionId || options.providerSessionId || options.threadId,
@@ -308,9 +357,22 @@ export async function runHeadlessTurn(
       state.failed = true;
       state.errorMessage = `${engine === "claude" ? "Claude" : "Grok"} 执行超时（${Math.round(HEADLESS_TIMEOUT_MS / 1000)}s），已终止`;
       safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+      emitDelta(safeOnEvent, options, "stage:timeout", "stage", `\n✗ ${state.errorMessage}\n`);
       try { child.kill(); } catch { /* ignore */ }
       finish("failed");
     }, HEADLESS_TIMEOUT_MS);
+
+    // Periodic "still working" stage so the web never looks frozen with zero events.
+    const heartbeat = setInterval(() => {
+      if (settled) return;
+      emitDelta(
+        safeOnEvent,
+        options,
+        "stage:heartbeat",
+        "stage",
+        `\n… ${engine === "claude" ? "Claude" : "Grok"} 仍在执行…\n`
+      );
+    }, 20_000);
 
     if (child.stdout) {
       createInterface({ input: child.stdout }).on("line", (line) => {
@@ -340,9 +402,10 @@ export async function runHeadlessTurn(
       if (state.failed || (code !== 0 && code !== null)) {
         if (!state.errorMessage) {
           state.errorMessage = engine === "claude"
-            ? `Claude 退出码 ${code ?? "unknown"}（未登录请执行 claude auth login；限流会自动重试）`
+            ? `Claude 退出码 ${code ?? "unknown"}（模型不可用时请设置 CLAUDE_MODEL，或在 Claude CLI 中切换模型；未登录请执行 claude auth login）`
             : `Grok 退出码 ${code ?? "unknown"}`;
           safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+          emitDelta(safeOnEvent, options, "stage:error", "stage", `\n✗ ${state.errorMessage}\n`);
         }
         finish("failed");
         return;

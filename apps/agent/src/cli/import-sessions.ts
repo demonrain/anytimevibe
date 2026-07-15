@@ -9,72 +9,144 @@ import type { StoredTask } from "./types";
 
 const execFileAsync = promisify(execFile);
 
+type HistoryMessage = StoredTask["messages"][number];
+
+function textFromContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const row = block as { type?: string; text?: string; content?: string };
+    if (typeof row.text === "string" && row.text) parts.push(row.text);
+    else if (typeof row.content === "string" && row.content) parts.push(row.content);
+  }
+  return parts.join("\n");
+}
+
+function extractUserQuery(text: string): string {
+  const match = text.match(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/i);
+  if (match?.[1]?.trim()) return match[1].trim();
+  return text.trim();
+}
+
 function parseGrokSessionsTable(stdout: string): Array<{ id: string; summary: string; updatedAt: number }> {
   const rows: Array<{ id: string; summary: string; updatedAt: number }> = [];
   for (const line of stdout.split(/\r?\n/)) {
-    // SESSION ID looks like UUID (v4 or custom 019f...)
-    const match = line.match(/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$/i);
+    // SESSION ID may be UUID v4 or ULID-style 019f...
+    const match = line.match(
+      /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$/i
+    );
     if (!match) continue;
     const id = match[1]!;
     const updated = match[3]!;
     const summary = (match[5] || "").trim() || id.slice(0, 8);
     const updatedAt = Date.parse(updated) ? Date.parse(updated) / 1000 : Date.now() / 1000;
-    rows.push({ id, summary: summary === "(no summary)" ? `Grok ${id.slice(0, 8)}` : summary, updatedAt });
+    rows.push({
+      id,
+      summary: summary === "(no summary)" ? `Grok ${id.slice(0, 8)}` : summary,
+      updatedAt
+    });
   }
   return rows;
 }
 
-async function readGrokSessionMeta(sessionId: string): Promise<{ cwd?: string; title?: string; messages?: StoredTask["messages"] }> {
-  const root = process.env.GROK_HOME || path.join(os.homedir(), ".grok", "sessions");
-  // Sessions are nested under path-encoded project dirs.
-  async function walk(dir: string, depth: number): Promise<string | null> {
-    if (depth > 4) return null;
-    let entries: string[] = [];
-    try {
-      entries = await fs.readdir(dir);
-    } catch {
-      return null;
-    }
-    for (const entry of entries) {
-      const full = path.join(dir, entry);
-      if (entry === sessionId) return full;
-      try {
-        const st = await fs.stat(full);
-        if (st.isDirectory()) {
-          const found = await walk(full, depth + 1);
-          if (found) return found;
-        }
-      } catch {
-        // ignore
-      }
-    }
-    return null;
+async function walkSessionDirs(root: string, depth: number, hits: Array<{ id: string; dir: string; mtime: number }>): Promise<void> {
+  if (depth > 5) return;
+  let entries: string[] = [];
+  try {
+    entries = await fs.readdir(root);
+  } catch {
+    return;
   }
-  const dir = await walk(root, 0);
-  if (!dir) return {};
+  for (const entry of entries) {
+    if (entry === "session_search.sqlite" || entry.endsWith(".lock") || entry.endsWith(".jsonl") && !entry.includes("-")) {
+      // skip top-level non-session files later via stat
+    }
+    const full = path.join(root, entry);
+    let st;
+    try {
+      st = await fs.stat(full);
+    } catch {
+      continue;
+    }
+    if (!st.isDirectory()) continue;
+    // Session dirs look like UUIDs
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(entry)) {
+      hits.push({ id: entry, dir: full, mtime: st.mtimeMs / 1000 });
+      continue;
+    }
+    await walkSessionDirs(full, depth + 1, hits);
+  }
+}
+
+function decodeGrokProjectDir(name: string): string {
+  try {
+    const decoded = decodeURIComponent(name);
+    if (/^[A-Za-z]:\\|^\//.test(decoded) || decoded.includes("\\") || decoded.includes("/")) return decoded;
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
+async function readGrokSessionDir(dir: string, sessionId: string): Promise<{
+  cwd?: string;
+  title?: string;
+  messages: HistoryMessage[];
+  updatedAt?: number;
+}> {
   let title: string | undefined;
   let cwd: string | undefined;
-  const messages: StoredTask["messages"] = [];
+  let updatedAt: number | undefined;
+  const messages: HistoryMessage[] = [];
+
   try {
     const summary = JSON.parse(await fs.readFile(path.join(dir, "summary.json"), "utf8")) as {
       title?: string;
       summary?: string;
+      session_summary?: string;
+      generated_title?: string;
       cwd?: string;
+      updated_at?: string;
+      last_active_at?: string;
+      info?: { id?: string; cwd?: string };
     };
-    title = summary.title || summary.summary;
-    cwd = summary.cwd;
+    title = summary.generated_title || summary.session_summary || summary.title || summary.summary;
+    cwd = summary.cwd || summary.info?.cwd;
+    const ts = summary.last_active_at || summary.updated_at;
+    if (ts && Date.parse(ts)) updatedAt = Date.parse(ts) / 1000;
   } catch {
     // ignore
   }
+
   try {
     const history = await fs.readFile(path.join(dir, "chat_history.jsonl"), "utf8");
     for (const line of history.split(/\r?\n/)) {
       if (!line.trim()) continue;
       try {
-        const row = JSON.parse(line) as { role?: string; text?: string; content?: string };
-        const role = row.role === "user" || row.role === "assistant" || row.role === "system" ? row.role : null;
-        const text = String(row.text ?? row.content ?? "").trim();
-        if (role && text) messages.push({ id: crypto.randomUUID(), role, text: text.slice(0, 20_000) });
+        const row = JSON.parse(line) as {
+          type?: string;
+          role?: string;
+          text?: string;
+          content?: unknown;
+          synthetic_reason?: string;
+        };
+        // Grok uses { type: "user"|"assistant", content: string | blocks }
+        // Older formats may use role/text.
+        const roleRaw = row.type || row.role;
+        if (roleRaw !== "user" && roleRaw !== "assistant") continue;
+        // Skip compaction meta noise
+        if (row.synthetic_reason === "compaction_meta" || row.synthetic_reason === "system_reminder") continue;
+        let text = textFromContent(row.content);
+        if (!text && typeof row.text === "string") text = row.text;
+        text = text.trim();
+        if (!text) continue;
+        if (roleRaw === "user") text = extractUserQuery(text);
+        // Drop huge system dumps mis-tagged as user
+        if (text.length > 50_000) text = text.slice(0, 50_000);
+        if (!text) continue;
+        messages.push({ id: crypto.randomUUID(), role: roleRaw, text: text.slice(0, 20_000) });
       } catch {
         // ignore bad lines
       }
@@ -82,56 +154,82 @@ async function readGrokSessionMeta(sessionId: string): Promise<{ cwd?: string; t
   } catch {
     // ignore
   }
-  // Infer cwd from parent folder name (URL-encoded path)
+
   if (!cwd) {
     const parent = path.basename(path.dirname(dir));
-    try {
-      const decoded = decodeURIComponent(parent.replace(/%5C/gi, "\\").replace(/%3A/gi, ":"));
-      if (/^[A-Za-z]:\\|^\//.test(decoded) || decoded.includes("\\") || decoded.includes("/")) cwd = decoded;
-    } catch {
-      // ignore
-    }
+    cwd = decodeGrokProjectDir(parent) || undefined;
   }
+
+  if (!title) {
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    title = lastUser?.text.slice(0, 80) || `Grok ${sessionId.slice(0, 8)}`;
+  }
+
   return {
     ...(cwd ? { cwd } : {}),
     ...(title ? { title } : {}),
-    ...(messages.length ? { messages: messages.slice(-80) } : {})
+    messages: messages.slice(-80),
+    ...(updatedAt ? { updatedAt } : {})
   };
 }
 
 async function importGrokSessions(store: TaskStore, limit: number): Promise<number> {
-  const binary = await resolveEngineBinary("grok");
-  if (!binary) return 0;
+  const root = process.env.GROK_HOME || path.join(os.homedir(), ".grok", "sessions");
+  const hits: Array<{ id: string; dir: string; mtime: number }> = [];
+  await walkSessionDirs(root, 0, hits);
+  hits.sort((a, b) => b.mtime - a.mtime);
+
+  // Merge IDs from `grok sessions list` (may include remote/cloud labels).
   try {
-    const { stdout } = await execFileAsync(binary, ["sessions", "list", "--limit", String(limit)], {
-      timeout: 20_000,
-      windowsHide: true,
-      env: process.env,
-      maxBuffer: 2_000_000
-    });
-    const rows = parseGrokSessionsTable(stdout).slice(0, limit);
-    let added = 0;
-    for (const row of rows) {
-      const existing = store.get(row.id);
-      const meta = await readGrokSessionMeta(row.id);
-      const task: StoredTask = {
-        threadId: row.id,
-        engine: "grok",
-        providerSessionId: row.id,
-        cwd: meta.cwd || existing?.cwd || "",
-        title: meta.title || existing?.title || row.summary,
-        status: existing?.status === "active" ? "active" : "completed",
-        createdAt: existing?.createdAt ?? row.updatedAt,
-        updatedAt: Math.max(existing?.updatedAt ?? 0, row.updatedAt),
-        messages: (meta.messages && meta.messages.length ? meta.messages : existing?.messages) || []
-      };
-      await store.upsert(task);
-      added += 1;
+    const binary = await resolveEngineBinary("grok");
+    if (binary) {
+      const { stdout } = await execFileAsync(binary, ["sessions", "list", "--limit", String(limit)], {
+        timeout: 20_000,
+        windowsHide: true,
+        env: process.env,
+        maxBuffer: 2_000_000
+      });
+      for (const row of parseGrokSessionsTable(stdout)) {
+        if (!hits.some((h) => h.id === row.id)) {
+          hits.push({ id: row.id, dir: "", mtime: row.updatedAt });
+        }
+      }
+      hits.sort((a, b) => b.mtime - a.mtime);
     }
-    return added;
   } catch {
-    return 0;
+    // filesystem-only is fine
   }
+
+  let added = 0;
+  for (const hit of hits.slice(0, limit)) {
+    const existing = store.get(hit.id);
+    let meta: Awaited<ReturnType<typeof readGrokSessionDir>> = { messages: [] };
+    if (hit.dir) {
+      meta = await readGrokSessionDir(hit.dir, hit.id);
+    } else {
+      // Locate dir by id if list-only entry
+      const found: Array<{ id: string; dir: string; mtime: number }> = [];
+      await walkSessionDirs(root, 0, found);
+      const match = found.find((item) => item.id === hit.id);
+      if (match) meta = await readGrokSessionDir(match.dir, hit.id);
+    }
+
+    const messages = meta.messages.length ? meta.messages : (existing?.messages || []);
+    const task: StoredTask = {
+      threadId: hit.id,
+      engine: "grok",
+      providerSessionId: hit.id,
+      cwd: meta.cwd || existing?.cwd || "",
+      title: meta.title || existing?.title || `Grok ${hit.id.slice(0, 8)}`,
+      status: existing?.status === "active" ? "active" : "completed",
+      createdAt: existing?.createdAt ?? hit.mtime,
+      updatedAt: Math.max(existing?.updatedAt ?? 0, meta.updatedAt ?? 0, hit.mtime),
+      messages
+    };
+    await store.upsert(task);
+    added += 1;
+  }
+  return added;
 }
 
 async function importClaudeSessions(store: TaskStore, limit: number): Promise<number> {
@@ -155,13 +253,12 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
     let cwd = "";
     try {
       const base = path.basename(project);
-      cwd = decodeURIComponent(base.replace(/^-/, "").replace(/-/g, (m, offset, str) => {
-        // Claude uses path with - separators; best-effort decode
-        return m;
-      }));
       // Common form: C--Users-... → C:\Users\...
       if (/^[A-Za-z]--/.test(base)) {
         cwd = base.replace(/^([A-Za-z])--/, "$1:\\").replace(/-/g, "\\");
+      } else if (base.startsWith("-")) {
+        // Unix: -Users-foo-bar → /Users/foo/bar
+        cwd = base.replace(/-/g, "/");
       }
     } catch {
       cwd = "";
@@ -182,7 +279,7 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
   let added = 0;
   for (const hit of hits.slice(0, limit)) {
     const existing = store.get(hit.id);
-    const messages: StoredTask["messages"] = [];
+    const messages: HistoryMessage[] = [];
     try {
       const raw = await fs.readFile(hit.file, "utf8");
       for (const line of raw.split(/\r?\n/)) {
@@ -192,15 +289,15 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
             type?: string;
             message?: { role?: string; content?: Array<{ type?: string; text?: string }> | string };
             role?: string;
+            content?: unknown;
           };
-          const role = row.message?.role || row.role;
+          if (row.type && row.type !== "user" && row.type !== "assistant") continue;
+          const role = row.message?.role || row.role || (row.type === "user" || row.type === "assistant" ? row.type : undefined);
           if (role !== "user" && role !== "assistant") continue;
           let text = "";
-          const content = row.message?.content;
+          const content = row.message?.content ?? row.content;
           if (typeof content === "string") text = content;
-          else if (Array.isArray(content)) {
-            text = content.filter((c) => c?.type === "text" && c.text).map((c) => c.text).join("\n");
-          }
+          else text = textFromContent(content);
           if (text.trim()) messages.push({ id: crypto.randomUUID(), role, text: text.trim().slice(0, 20_000) });
         } catch {
           // ignore
