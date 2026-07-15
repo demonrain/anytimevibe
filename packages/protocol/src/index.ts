@@ -78,6 +78,10 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     limit: z.number().int().positive().max(100).optional(),
     /** Fuzzy search across titles/previews; may load more than limit to find matches. */
     query: z.string().trim().max(200).optional()
+  }),
+  /** Ask the agent to re-publish host.status (workspaces, online, versions). Does not require Codex. */
+  commandBase.extend({
+    type: z.literal("host.refresh")
   })
 ]);
 

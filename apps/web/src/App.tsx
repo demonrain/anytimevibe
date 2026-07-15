@@ -78,6 +78,37 @@ function emptyRuntime(online: boolean | null = null): HostRuntime {
   return { online, workspaces: [], tasks: {} };
 }
 
+function workspacesCacheKey(hostId: string): string {
+  return `workspaces:${hostId}`;
+}
+
+function loadCachedWorkspaces(hostId: string): Workspace[] {
+  try {
+    const raw = localStorage.getItem(workspacesCacheKey(hostId));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is Workspace => (
+      Boolean(item)
+      && typeof item === "object"
+      && typeof (item as Workspace).id === "string"
+      && typeof (item as Workspace).name === "string"
+      && typeof (item as Workspace).path === "string"
+      && (item as Workspace).path.length > 0
+    ));
+  } catch {
+    return [];
+  }
+}
+
+function cacheWorkspaces(hostId: string, workspaces: Workspace[]): void {
+  try {
+    localStorage.setItem(workspacesCacheKey(hostId), JSON.stringify(workspaces));
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
 /** Message ids from turn.delta are `assistant:${turnId}:${itemId}`. */
 function assistantStreamItemId(messageId: string): string | null {
   if (!messageId.startsWith("assistant:")) return null;
@@ -304,6 +335,7 @@ export function App() {
       // host.status is encrypted live state — update local UI only.
       // Never PATCH name from here: agent may still hold a stale name and would overwrite web renames.
       if (event.type === "host.status") {
+        cacheWorkspaces(envelope.hostId, event.workspaces);
         setHosts((current) => current.map((item) => {
           if (item.id !== envelope.hostId) return item;
           return {
@@ -389,9 +421,12 @@ export function App() {
       const next = { ...current };
       for (const host of response.hosts) {
         const existing = next[host.id];
+        const cachedWorkspaces = loadCachedWorkspaces(host.id);
         next[host.id] = {
           ...(existing ?? emptyRuntime(host.online ? true : null)),
-          online: host.online ? true : existing?.online ?? null
+          online: host.online ? true : existing?.online ?? null,
+          // Prefer live state; fall back to last known allowlist so New Task works offline of host.status replay.
+          workspaces: existing?.workspaces?.length ? existing.workspaces : cachedWorkspaces
         };
       }
       return next;
@@ -434,6 +469,13 @@ export function App() {
             if (online) void getHostKey(hostId).then((key) => {
               if (!key) return authorizeExistingHost(hostId);
             }).catch((authorizationError) => setError(authorizationError.message));
+            if (online) {
+              // Always re-pull allowlisted workspaces when the host comes online.
+              void getHostKey(hostId).then((key) => {
+                if (!key) return;
+                return sendCommand(hostId, { type: "host.refresh", commandId: crypto.randomUUID() });
+              }).catch(() => undefined);
+            }
             if (online && !autoSyncedHostsRef.current.has(hostId)) {
               autoSyncedHostsRef.current.add(hostId);
               syncHostTasks(hostId).catch((syncError) => {
@@ -665,10 +707,17 @@ export function App() {
     </main>
 
     {pairingOpen && <PairingDialog onClose={() => setPairingOpen(false)} onPaired={async () => { setPairingOpen(false); await loadHosts(); }} />}
-    {composerOpen && activeHost && <NewTaskDialog host={activeHost} workspaces={activeRuntime.workspaces} onClose={() => setComposerOpen(false)} onCreate={async (cwd, prompt, title) => {
-      await sendCommand(activeHost.id, { type: "task.create", commandId: crypto.randomUUID(), cwd, prompt, permissionMode, ...(title ? { title } : {}) });
-      setComposerOpen(false);
-    }} />}
+    {composerOpen && activeHost && <NewTaskDialog
+      host={activeHost}
+      workspaces={activeRuntime.workspaces}
+      online={activeRuntime.online}
+      onClose={() => setComposerOpen(false)}
+      onRefreshWorkspaces={() => sendCommand(activeHost.id, { type: "host.refresh", commandId: crypto.randomUUID() })}
+      onCreate={async (cwd, prompt, title) => {
+        await sendCommand(activeHost.id, { type: "task.create", commandId: crypto.randomUUID(), cwd, prompt, permissionMode, ...(title ? { title } : {}) });
+        setComposerOpen(false);
+      }}
+    />}
   </div>;
 }
 
@@ -840,18 +889,69 @@ function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): voi
   </section></div>;
 }
 
-function NewTaskDialog({ host, workspaces, onClose, onCreate }: { host: Host; workspaces: Workspace[]; onClose(): void; onCreate(cwd: string, prompt: string, title: string): Promise<void> }) {
+function NewTaskDialog({ host, workspaces, online, onClose, onRefreshWorkspaces, onCreate }: {
+  host: Host;
+  workspaces: Workspace[];
+  online: boolean | null;
+  onClose(): void;
+  onRefreshWorkspaces(): Promise<void>;
+  onCreate(cwd: string, prompt: string, title: string): Promise<void>;
+}) {
   const [cwd, setCwd] = useState(workspaces[0]?.path ?? "");
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
-  return <div className="modal-backdrop"><form className="modal wide" onSubmit={async (event) => { event.preventDefault(); setLoading(true); setError(""); try { await onCreate(cwd, prompt, title); } catch (createError) { setError(createError instanceof Error ? createError.message : "任务创建失败"); setLoading(false); } }}>
-    <button type="button" className="modal-close" onClick={onClose}>×</button><p className="eyebrow">NEW REMOTE TASK</p><h2>向 {host.name} 下发任务</h2>
-    <label>工作区<select value={cwd} onChange={(event) => setCwd(event.target.value)} required><option value="" disabled>电脑端尚未添加白名单目录</option>{workspaces.map((workspace) => <option key={workspace.id} value={workspace.path}>{workspace.name} · {workspace.path}</option>)}</select></label>
+
+  // When host.status arrives after open, pick the first allowlisted path.
+  useEffect(() => {
+    if (!workspaces.length) return;
+    setCwd((current) => (current && workspaces.some((item) => item.path === current) ? current : workspaces[0]!.path));
+  }, [workspaces]);
+
+  // Pull latest whitelist from the agent once when the dialog opens (avoid dep on unstable callback identity).
+  const refreshRef = useRef(onRefreshWorkspaces);
+  refreshRef.current = onRefreshWorkspaces;
+  useEffect(() => {
+    if (online !== true) return;
+    let cancelled = false;
+    setRefreshing(true);
+    refreshRef.current()
+      .catch((refreshError) => {
+        if (!cancelled) setError(refreshError instanceof Error ? refreshError.message : "无法刷新工作区列表");
+      })
+      .finally(() => {
+        if (!cancelled) setRefreshing(false);
+      });
+    return () => { cancelled = true; };
+  }, [host.id, online]);
+
+  return <div className="modal-backdrop"><form className="modal wide" onSubmit={async (event) => {
+    event.preventDefault();
+    setLoading(true);
+    setError("");
+    try {
+      await onCreate(cwd, prompt, title);
+    } catch (createError) {
+      setError(createError instanceof Error ? createError.message : "任务创建失败");
+      setLoading(false);
+    }
+  }}>
+    <button type="button" className="modal-close" onClick={onClose}>×</button>
+    <p className="eyebrow">NEW REMOTE TASK</p>
+    <h2>向 {host.name} 下发任务</h2>
+    <label>工作区
+      <select value={cwd} onChange={(event) => setCwd(event.target.value)} required disabled={!workspaces.length}>
+        {!workspaces.length && <option value="" disabled>{refreshing ? "正在从电脑端读取白名单…" : online === true ? "电脑端尚未添加白名单目录" : "主机离线，无法读取白名单"}</option>}
+        {workspaces.map((workspace) => <option key={workspace.id} value={workspace.path}>{workspace.name} · {workspace.path}</option>)}
+      </select>
+    </label>
+    {online === true && <p className="admin-hint" style={{ marginTop: -6 }}>{refreshing ? "正在同步工作区…" : workspaces.length ? `已加载 ${workspaces.length} 个白名单目录` : "若刚添加目录，请确认电脑端客户端在线后重试。"}</p>}
     <label>任务标题<input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="可选，默认使用第一条指令" /></label>
     <label>给 Codex 的指令<textarea className="task-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="描述目标、约束和验收方式…" required /></label>
-    {error && <p className="form-error">{error}</p>}<button className="primary" disabled={loading || !cwd || !prompt.trim()}>{loading ? "正在发送…" : "开始任务"}</button>
+    {error && <p className="form-error">{error}</p>}
+    <button className="primary" disabled={loading || !cwd || !prompt.trim()}>{loading ? "正在发送…" : "开始任务"}</button>
   </form></div>;
 }
 

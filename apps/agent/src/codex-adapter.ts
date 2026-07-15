@@ -73,7 +73,7 @@ export class CodexAdapter {
     child.on("error", (error) => this.onExit(error.message));
 
     await this.request("initialize", {
-      clientInfo: { name: "anytimevibe-agent", title: "随码", version: "0.4.22" },
+      clientInfo: { name: "anytimevibe-agent", title: "随码", version: "0.4.23" },
       capabilities: { experimentalApi: false, requestAttestation: false }
     });
     this.notify("initialized");

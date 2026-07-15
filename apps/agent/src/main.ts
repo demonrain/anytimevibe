@@ -591,7 +591,14 @@ function rendererHtml(): string {
       +(tasksOpen?'<div class="stack" style="margin-top:7px"><input id="taskSearch" placeholder="'+escapeHtml(t('search'))+'" value="'+escapeHtml(taskQuery)+'"></div>':'')
       +(tasksOpen?(filtered.length?'<div class="workspaces" style="margin-top:7px">'+filtered.map(function(task){return '<div class="workspace"><div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div><button data-relay="'+escapeHtml(task.threadId)+'">'+escapeHtml(t('open'))+'</button></div>';}).join('')+'</div>':'<div class="empty">'+(q?t('noMatch'):t('noTask'))+'</div>'):'');
     var toggle=document.querySelector('#toggleTasks');
-    if(toggle) toggle.addEventListener('click',function(){tasksOpen=!tasksOpen;renderTasks(lastTasks);});
+    if(toggle) toggle.addEventListener('click',function(){
+      tasksOpen=!tasksOpen;
+      renderTasks(lastTasks);
+      // Expand: re-read local Codex threads (not web-driven).
+      if(tasksOpen&&api&&api.refreshTasks){
+        api.refreshTasks().then(function(state){ if(state&&state.tasks) paint(state); }).catch(function(){});
+      }
+    });
     var search=document.querySelector('#taskSearch');
     if(search){
       search.addEventListener('input',function(){taskQuery=search.value;renderTasks(lastTasks);var el=document.querySelector('#taskSearch');if(el){el.focus();var n=el.value.length;try{el.setSelectionRange(n,n);}catch(e){}}});
@@ -1301,10 +1308,17 @@ async function connect(force = false): Promise<void> {
     // (missing GUI PATH / codex shebang) will flap between offline and reconnect.
     void (async () => {
       updateState({ status: "online", detail: "代理在线。Codex 凭据和项目文件均保留在本机。" });
+      // Always push workspaces/online status — must not depend on Codex being ready.
+      try {
+        if (generation === connectGeneration && socket === connection) await publishHostStatus();
+      } catch {
+        // ignore; connect path continues
+      }
       try {
         await ensureCodex();
         if (generation !== connectGeneration || socket !== connection) return;
-        await publishHostStatus();
+        // Local 接力 list reads Codex threads directly (not gated on web sync).
+        await refreshLocalTasks();
         // Do not auto syncAllThreads on every reconnect — it floods the link and can
         // look like flapping; user can sync from web when needed.
       } catch (error) {
@@ -1447,6 +1461,11 @@ function isAllowedWorkspace(requestedPath: string): boolean {
 }
 
 async function handleCommand(command: ClientCommand): Promise<void> {
+  // host.refresh only needs the relay + local workspace config, not Codex.
+  if (command.type === "host.refresh") {
+    await publishHostStatus();
+    return;
+  }
   let localThreadId = "threadId" in command ? command.threadId : undefined;
   try {
     await ensureCodex();
@@ -1520,10 +1539,14 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "sync.request") {
+      // Refresh workspaces for the web new-task picker before streaming threads.
+      await publishHostStatus();
       const result = await syncAllThreads({
-        limit: command.limit,
-        query: command.query
+        ...(command.limit !== undefined ? { limit: command.limit } : {}),
+        ...(command.query !== undefined ? { query: command.query } : {})
       });
+      // Keep local 接力 list aligned with what was just read from Codex.
+      await refreshLocalTasks(command.limit ?? DEFAULT_SYNC_LIMIT).catch(() => undefined);
       await publish({
         type: "sync.completed",
         eventId: crypto.randomUUID(),
@@ -1702,6 +1725,23 @@ async function publishThread(threadId: string): Promise<void> {
   await publish({ type: "thread.snapshot", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), ...snapshot }, true);
 }
 
+/** Load 接力 task list from local Codex (thread/list) — independent of web sync. */
+async function refreshLocalTasks(limit = 50): Promise<void> {
+  if (!codex) await ensureCodex();
+  const listLimit = Math.min(100, Math.max(1, limit));
+  const response = await codex!.request("thread/list", { limit: listLimit, sortDirection: "desc" });
+  let threads: Array<Record<string, any>> = response.data ?? [];
+  threads = [...threads].sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0));
+  const tasks: AgentTask[] = threads.map((thread) => ({
+    threadId: String(thread.id),
+    title: String(thread.name || thread.preview || "未命名任务"),
+    cwd: String(thread.cwd || ""),
+    status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
+    updatedAt: Number(thread.updatedAt ?? Date.now() / 1000)
+  }));
+  updateState({ tasks });
+}
+
 const DEFAULT_SYNC_LIMIT = 20;
 const SEARCH_LIST_LIMIT = 100;
 
@@ -1763,9 +1803,29 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
+async function resolveRelayTask(threadId: string): Promise<AgentTask> {
+  const cached = publicState.tasks.find((item) => item.threadId === threadId);
+  if (cached) return cached;
+  await ensureCodex();
+  const result = await codex!.request("thread/read", { threadId, includeTurns: false });
+  const snapshot = threadToSnapshot(result.thread);
+  const task: AgentTask = {
+    threadId: snapshot.threadId,
+    title: snapshot.title,
+    cwd: snapshot.cwd,
+    status: snapshot.status,
+    updatedAt: snapshot.updatedAt
+  };
+  updateState({
+    tasks: [task, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)]
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, 200)
+  });
+  return task;
+}
+
 async function relayTaskToCli(threadId: string): Promise<void> {
-  const task = publicState.tasks.find((item) => item.threadId === threadId);
-  if (!task) throw new Error("任务不存在，请先同步任务列表。");
+  const task = await resolveRelayTask(threadId);
   if (process.platform === "win32") {
     const child = spawn(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(codexCommand, ["resume", threadId]), {
       cwd: task.cwd || undefined,
@@ -2039,6 +2099,10 @@ function registerIpc(): void {
     await relayTaskToCli(threadId);
     return publicState;
   });
+  ipcMain.handle("agent:refresh-tasks", async () => {
+    await refreshLocalTasks();
+    return publicState;
+  });
   ipcMain.handle("agent:window-minimize", () => {
     windowRef?.minimize();
   });
@@ -2092,6 +2156,8 @@ app.whenReady().then(async () => {
       status: !config.relayUrl ? "unconfigured" : config.pairing ? "pairing" : paired ? "offline" : "waiting_pairing",
       detail: !config.relayUrl ? "请先配置中继地址。" : config.pairing ? "等待 Web 端确认配对。" : paired ? "Codex 已就绪，正在连接中继。" : "Codex 已就绪，等待配对连接。"
     });
+    // Local 接力: list Codex threads as soon as the app can talk to Codex.
+    void refreshLocalTasks().catch(() => undefined);
     if (config.pairing) schedulePairingPoll();
     // Connect without blocking startup forever.
     if (config.hostId) void connect().catch(handleError);
