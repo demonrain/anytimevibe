@@ -9,45 +9,56 @@
 
 **离开电脑，任务不用停。随时续上你的代码。**
 
-随码是一个面向个人开发者和小团队的远程 Codex 工作台：通过手机或浏览器连接自己的 Windows / macOS 电脑，在远程主机上执行本机 Codex CLI 任务，并同步任务状态、会话记录、审批和完成通知。
+随码是一个面向个人开发者和小团队的远程 AI 编程工作台：通过手机或浏览器连接自己的 Windows / macOS 电脑，选择 Codex、Claude Code 或 Grok Build 在远程主机上执行任务，并同步任务状态、流式回复、会话记录、审批和完成通知。
 
-它不是远程桌面，也不会把项目源码或 Codex 凭据上传到中继服务。桌面 Agent 在本机调用 Codex，Relay 只负责身份认证、WebSocket 路由、Web Push 和加密事件存储。
+它不是远程桌面，也不会把项目源码或各引擎凭据上传到中继服务。桌面 Agent 在本机检测并调用已安装的编码 CLI，Relay 只负责身份认证、WebSocket 路由、Web Push 和加密事件存储。
 
 ## 产品预览
 
-[![观看 30 秒产品宣传视频](docs/media/remote-command.png)](docs/media/anytimevibe-promo.mp4)
+<video src="docs/media/anytimevibe-promo.mp4" controls width="100%"></video>
 
-视频文件：[anytimevibe-promo.mp4](docs/media/anytimevibe-promo.mp4)。宣传片展示了手机下发任务、电脑 CLI 接力、队列状态同步和权限控制。
-
-| 手机下发任务 | 电脑 CLI 接力 |
+| 多引擎任务选择 | 原生 CLI 接力 |
 | --- | --- |
-| ![手机发送命令，电脑立即执行](docs/media/remote-command.png) | ![手机任务接力到电脑 CLI](docs/media/cli-handoff.png) |
+| ![选择 Codex、Claude Code 或 Grok Build 下发任务](docs/media/remote-command.png) | ![任务按所属引擎接力到原生 CLI](docs/media/cli-handoff.png) |
 
-| 任务队列与状态 | Codex 权限控制 |
+| 多引擎任务流 | 引擎权限映射 |
 | --- | --- |
-| ![任务队列和处理状态](docs/media/task-stream.png) | ![Full Access 权限设置](docs/media/permissions.png) |
+| ![Codex、Claude 和 Grok 的统一任务流](docs/media/task-stream.png) | ![不同编码引擎的权限映射](docs/media/permissions.png) |
 
 ## 核心工作流
 
 1. 在手机或桌面浏览器登录 Web PWA，选择已配对的电脑和白名单工作区。
-2. 手机发送任务命令，Windows / macOS Agent 在本机启动或继续 Codex CLI 任务。
-3. 需要更完整的终端开发时，点击“电脑接力”，在桌面 CLI 中 `codex resume` 同一任务上下文。
-4. 任务进度、完成状态、审批请求和同步后的会话记录继续回到 Web 端，刷新或更换浏览器也能恢复任务状态。
+2. 新建任务时选择 Codex、Claude Code 或 Grok Build，并使用该引擎对应的权限模式。
+3. Windows / macOS Agent 在本机启动选定 CLI，实时同步阶段日志、回复和任务状态。
+4. 需要完整终端体验时，点击“电脑接力”，Agent 使用对应引擎的原生会话 ID 恢复任务；刷新或更换浏览器也能继续同步。
 
 ## 能做什么
 
 - 多用户注册、登录和用户级主机隔离。
 - 配对多台 Windows / macOS 主机，并为主机设置易记名称。
-- 在白名单工作区创建、继续、追加、停止 Codex 任务。
-- 手机下发命令，远程电脑执行；电脑端一键接力回到同一任务。
+- 在白名单工作区选择 Codex、Claude Code 或 Grok Build 创建任务。
+- 每个任务保留所属引擎、原生会话 ID、权限模式和流式输出。
+- 手机下发命令，远程电脑执行；电脑端按引擎一键接力到同一原生会话。
 - 任务队列、处理中、已完成、失败和离线状态同步。
 - Web Push 审批与任务完成通知。
-- Full Access、Workspace Write、Read Only 等 Codex 权限设置。
+- 根据不同 CLI 映射 Read Only、Full Access、Bypass permissions、Always approve 等权限。
 - 多浏览器设备授权，避免每个浏览器重复配对同一主机。
+- 客户端检测三种引擎的安装状态和版本，并展示每台主机可用的引擎。
+- 导入 Claude Code / Grok Build 本地会话，与 Web 创建的任务统一显示。
 - 客户端环境检测、Codex 安装指引、自动更新和 Windows / macOS 安装包。
 - 手动同步或登录后自动同步任务记录和会话历史。
 
-当前边界：Web 端在任务执行期间优先显示处理中状态，完整流式 CLI 输出由本机 Agent 处理；不提供任意终端、远程桌面、文件浏览器或 Codex 桌面 UI 自动化。Agent 必须在电脑用户已登录且 Codex 环境可用时在线工作。
+当前边界：不同 CLI 的审批与输出能力存在差异，随码会映射为统一任务体验；不提供任意终端、远程桌面、文件浏览器或桌面 UI 自动化。Agent 必须在电脑用户已登录且至少一个受支持引擎已安装并完成登录时在线工作。
+
+## 支持的编码引擎
+
+| 引擎 | 本机执行方式 | 权限映射 | 会话与接力 |
+| --- | --- | --- | --- |
+| Codex | `codex app-server --stdio` | Read Only、Ask for approval、Approve for me、Full Access | 读取 Codex thread，并通过 `codex resume` 接力 |
+| Claude Code | `claude -p --output-format stream-json` | 只读工具、接受文件编辑、跳过权限确认 | 导入 `~/.claude/projects` 会话，并通过 `claude --resume` 接力 |
+| Grok Build | `grok -p --output-format streaming-json` | 只读工具、接受文件编辑、全自动批准 | 导入 Grok sessions，并通过 `grok --resume` 接力 |
+
+任务创建页只允许选择当前主机已检测为可用的引擎。Claude / Grok 可以通过 `CLAUDE_MODEL`、`ANTHROPIC_MODEL`、`GROK_MODEL` 或 `XAI_MODEL` 指定模型；未设置时使用对应 CLI 的本机默认配置。
 
 ## 系统架构
 
@@ -55,8 +66,13 @@
 flowchart LR
     PWA[手机 / 桌面浏览器 PWA] <-->|HTTPS / WSS<br/>加密事件信封| Relay[VPS Relay]
     Relay <-->|出站 WSS<br/>加密事件信封| Agent[Windows / macOS Agent]
-    Agent <-->|JSONL stdio| Codex[Codex app-server]
+    Agent --> Router{本机 CLI 引擎路由}
+    Router <-->|JSONL stdio| Codex[Codex app-server]
+    Router <-->|stream-json| Claude[Claude Code]
+    Router <-->|streaming-json| Grok[Grok Build]
     Codex --> Workspace[白名单工作区]
+    Claude --> Workspace
+    Grok --> Workspace
     Relay --> DB[(PostgreSQL)]
     Relay --> Push[Web Push]
 ```
@@ -68,13 +84,13 @@ flowchart LR
 | Web PWA | React 19、TypeScript、Vite 6、Service Worker、IndexedDB | 登录、主机、任务、会话、审批、Diff 和移动端布局 |
 | Relay 服务 | Node.js、Fastify 5、WebSocket、Zod、Argon2id、Web Push | 认证、用户隔离、在线路由、加密事件存储和通知 |
 | 数据库 | PostgreSQL 16 | 账号、会话、主机、配对、Push 订阅和加密事件元数据 |
-| 桌面 Agent | Electron 36、WebSocket、electron-updater | 托盘常驻、配对、环境检测、自动更新和本机 Codex 进程管理 |
-| Codex 适配 | Codex app-server JSONL stdio | `thread/start`、`thread/resume`、`turn/start`、审批和状态事件 |
+| 桌面 Agent | Electron 36、WebSocket、electron-updater | 托盘常驻、配对、三引擎检测、本地会话导入、自动更新和进程管理 |
+| 多引擎适配 | Codex app-server、Claude stream-json、Grok streaming-json | 引擎选择、权限映射、流式事件、会话恢复、停止任务和原生 CLI 接力 |
 | 部署 | Docker Compose、Caddy 2.8 | Relay、Web、PostgreSQL、HTTPS 和证书自动续期 |
 
 ## 安全模型
 
-- Relay 不运行 Codex，不读取项目源码、命令正文、对话正文或 Diff 明文。
+- Relay 不运行任何编码引擎，不读取项目源码、命令正文、对话正文或 Diff 明文。
 - Web 与 Agent 之间传输加密事件信封；主机同步密钥由浏览器和 Agent 管理。
 - 浏览器密钥保存在 IndexedDB `CryptoKey` 中，新浏览器通过 Agent 授权现有主机密钥。
 - Agent 使用 Electron `safeStorage` 保护本机令牌、私钥和同步密钥。
@@ -83,7 +99,7 @@ flowchart LR
 
 ## 快速开始
 
-环境要求：Node.js 22+、pnpm 10+、Git；运行服务端还需要 Docker Engine 和 Docker Compose。
+环境要求：Node.js 22+、pnpm 10+、Git；运行服务端还需要 Docker Engine 和 Docker Compose。执行远程任务至少需要在 Agent 主机上安装并登录 Codex CLI `0.144.x`、Claude Code CLI 或 Grok Build CLI 中的一种。
 
 ```bash
 git clone https://github.com/demonrain/anytimevibe.git
@@ -92,28 +108,6 @@ pnpm install
 pnpm typecheck
 pnpm test
 pnpm build
-```
-
-### 本地测试环境（发版前推荐）
-
-完整联调说明见 [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md)。
-
-```bash
-pnpm install
-pnpm dev:setup          # 生成 .env.local + 启动本地 Postgres + 构建 protocol
-pnpm dev:stack          # Relay + Web
-# 另开终端：
-pnpm dev:agent:local    # Electron 连 http://127.0.0.1:8787，数据在 .local/agent-data
-```
-
-浏览器打开 http://127.0.0.1:4173 ，用 `.env.local` 中的 `SETUP_TOKEN` 初始化管理员。
-
-分开启动：
-
-```bash
-pnpm dev:web
-pnpm dev:relay
-pnpm dev:agent:local
 ```
 
 ## Docker 部署
@@ -168,11 +162,8 @@ macOS 包需要在 macOS 或 GitHub Actions `macos-latest` 环境构建。当前
 - [管理后台](docs/ADMIN.md)：多用户服务的管理能力和运维边界。
 - [容量评估](docs/CAPACITY.md)：不同注册用户数和并发连接规模的服务器建议。
 - [更新源配置](docs/UPDATE_FEED.md)：桌面客户端后台更新和重启安装流程。
-- [品牌规范](docs/BRANDING.md)：产品名称、图标、Slogan 和发布素材规范。
 
 ## Star 趋势
-
-下图通过 Star History 动态读取 GitHub 数据，不把某个时间点的 Star 数量写死在文档中：
 
 ![AnytimeVibe GitHub Star History](https://api.star-history.com/svg?repos=demonrain/anytimevibe&type=Date)
 

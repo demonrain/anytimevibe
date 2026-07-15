@@ -339,6 +339,30 @@ function ClientDownloads({ downloads }: { downloads: Health["clientDownloads"] }
   </div>;
 }
 
+const featuredEngines: Array<{ engine: CliEngine; vendor: string; product: string }> = [
+  { engine: "codex", vendor: "OpenAI", product: "Codex" },
+  { engine: "claude", vendor: "Anthropic", product: "Claude Code" },
+  { engine: "grok", vendor: "xAI", product: "Grok Build" }
+];
+
+function FeaturedEngines() {
+  return <section className="featured-engines" aria-label="支持的 AI 编程引擎">
+    <div className="featured-engines-head">
+      <span>三大主流模型厂商</span>
+      <strong>三款均已支持 · 一台主机自由选择</strong>
+    </div>
+    <div className="featured-engine-grid" role="list">
+      {featuredEngines.map((item) => <article className={`featured-engine featured-engine-${item.engine}`} role="listitem" key={item.engine}>
+        <span className="featured-engine-logo"><EngineLogo engine={item.engine} size={38} /></span>
+        <span className="featured-engine-copy">
+          <strong>{item.vendor}</strong>
+          <small>{item.product}</small>
+        </span>
+      </article>)}
+    </div>
+  </section>;
+}
+
 function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticated(user: User): void }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -368,15 +392,16 @@ function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticat
   return <main className="auth-shell">
     <section className="auth-story">
       <p className="eyebrow">随码 · 随时续码</p>
-      <h1>离开电脑，<br />任务不用停。</h1>
-      <p>连接自己的 Windows 或 macOS 主机，继续 Codex 对话、处理审批、查看代码 Diff。云端只负责转发密文，源码与密钥留在本机。</p>
+      <h1><span>离开电脑，</span><span>任务不用停。</span></h1>
+      <p>连接自己的 Windows 或 macOS 主机，远程使用 OpenAI Codex、Anthropic Claude Code 与 xAI Grok Build。云端只负责转发密文，源码与密钥留在本机。</p>
+      <FeaturedEngines />
       <div className="signal-line"><span />端到端加密 · 本机执行</div>
       <ClientDownloads downloads={health.clientDownloads} />
     </section>
     <form className="auth-card" onSubmit={submit}>
       <div className="mark" aria-hidden="true"><img src="/icon.svg" alt="" /></div>
       <h2>{health.needsSetup ? "初始化服务" : registering ? "创建个人空间" : "进入随码"}</h2>
-      <p>{health.needsSetup ? "创建首个管理员账号，开启你的随码服务。" : registering ? "注册后即可配对自己的电脑，数据与其他用户隔离。" : "登录后随时接住本机 Codex 任务。"}</p>
+      <p>{health.needsSetup ? "创建首个管理员账号，开启你的随码服务。" : registering ? "注册后即可配对自己的电脑，数据与其他用户隔离。" : "登录后随时接住本机 AI 编程任务。"}</p>
       {health.needsSetup && <label>设置令牌<input value={setupToken} onChange={(event) => setSetupToken(event.target.value)} required /></label>}
       <label>用户名<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
       <label>密码<input type="password" autoComplete={health.needsSetup || registering ? "new-password" : "current-password"} minLength={health.needsSetup || registering ? 6 : undefined} value={password} onChange={(event) => setPassword(event.target.value)} required placeholder={health.needsSetup || registering ? "至少 6 位" : undefined} /></label>
