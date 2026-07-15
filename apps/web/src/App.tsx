@@ -93,6 +93,13 @@ function cliEngineLabel(engine: CliEngine): string {
   return "Codex";
 }
 
+/** Short badge label for assistant bubbles (matches YOU / SYSTEM style). */
+function assistantEngineBadge(engine: CliEngine): string {
+  if (engine === "claude") return "CLAUDE";
+  if (engine === "grok") return "GROK";
+  return "CODEX";
+}
+
 function EngineLogo({ engine, size = 14, className = "" }: { engine: CliEngine; size?: number; className?: string }) {
   return (
     <img
@@ -201,20 +208,21 @@ function assistantStreamItemId(messageId: string): string | null {
   return rest.slice(sep + 1);
 }
 
-/** Verbose process streams — hidden in concise reply mode. */
+/**
+ * Verbose process streams — hidden in concise reply mode from the first paint
+ * (not only after the final snapshot). Final model text uses itemId "assistant"
+ * (Claude/Grok) or a plain Codex item id (not stage:/exec:/cli-log).
+ */
 function isProcessStreamMessage(message: { id: string; role: string }): boolean {
   if (message.role !== "assistant") return false;
   const itemId = assistantStreamItemId(message.id);
   if (!itemId) return false;
-  // Hide raw token-level thought streams only (stage:thought:…), not stage:thinking progress.
-  if (itemId.startsWith("stage:thought:") || itemId === "thought" || itemId.startsWith("thought:")) {
-    return true;
-  }
-  // Progress stages (▶ / ⏳ / 思考中) stay visible so headless runs are not a blank "processing" screen.
-  if (itemId.startsWith("stage:")) return false;
   return itemId === "cli-log"
+    || itemId === "thought"
+    || itemId.startsWith("thought:")
     || itemId.startsWith("exec:")
-    || itemId.startsWith("process:");
+    || itemId.startsWith("process:")
+    || itemId.startsWith("stage:");
 }
 
 /** Strip control characters that can break layout engines while keeping newlines/tabs. */
@@ -288,7 +296,16 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   if (event.type === "turn.started") {
     task.status = "active";
     task.activeTurnId = event.turnId;
-    if (event.prompt) task.messages.push({ id: event.eventId, role: "user", text: event.prompt });
+    // Snapshot may already include the user turn (headless path). Avoid duplicate YOU bubbles.
+    if (event.prompt) {
+      const prompt = event.prompt.trim();
+      const already = task.messages.some(
+        (item: Task["messages"][number]) => item.role === "user" && item.text.trim() === prompt
+      );
+      if (!already) {
+        task.messages.push({ id: event.eventId, role: "user", text: event.prompt });
+      }
+    }
   }
   if (event.type === "turn.delta") {
     const id = `assistant:${event.turnId}:${event.itemId}`;
@@ -974,7 +991,13 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     }}>
       {visibleMessages.map((message) => {
         const process = isProcessStreamMessage(message);
-        const label = message.role === "user" ? "YOU" : message.role === "system" ? "SYSTEM" : process ? t("replyProcess") : "CODEX";
+        const label = message.role === "user"
+          ? "YOU"
+          : message.role === "system"
+            ? "SYSTEM"
+            : process
+              ? t("replyProcess")
+              : assistantEngineBadge(taskEngine);
         return <article key={message.id} className={`message ${message.role}${process ? " process" : ""}`}><span>{label}</span><pre>{sanitizeDisplayText(message.text)}</pre></article>;
       })}
       {pendingPrompt && <article className="message user pending"><span>YOU · 发送中</span><pre>{sanitizeDisplayText(pendingPrompt)}</pre></article>}
