@@ -96,8 +96,8 @@ function cliEngineLabel(engine: CliEngine): string {
 function EngineLogo({ engine, size = 14, className = "" }: { engine: CliEngine; size?: number; className?: string }) {
   return (
     <img
-      className={`engine-logo ${className}`.trim()}
-      src={`/vendors/${engine}.svg`}
+      className={`engine-logo engine-logo-${engine} ${className}`.trim()}
+      src={`/vendors/${engine}.png`}
       alt={cliEngineLabel(engine)}
       title={cliEngineLabel(engine)}
       width={size}
@@ -109,6 +109,56 @@ function EngineLogo({ engine, size = 14, className = "" }: { engine: CliEngine; 
 
 function readyEngines(engines: CliEngineInfo[] | undefined): CliEngineInfo[] {
   return (engines ?? []).filter((item) => item.ready);
+}
+
+type PermissionOption = { value: PermissionMode; label: string };
+
+function permissionOptionsForEngine(engine: CliEngine, locale: "zh-CN" | "en"): PermissionOption[] {
+  if (engine === "claude") {
+    return locale === "en"
+      ? [
+          { value: "read-only", label: "Read-only tools" },
+          { value: "ask-for-approval", label: "Accept edits" },
+          { value: "full-access", label: "Bypass permissions" }
+        ]
+      : [
+          { value: "read-only", label: "只读工具" },
+          { value: "ask-for-approval", label: "接受文件编辑" },
+          { value: "full-access", label: "跳过权限确认" }
+        ];
+  }
+  if (engine === "grok") {
+    return locale === "en"
+      ? [
+          { value: "read-only", label: "Read-only tools" },
+          { value: "ask-for-approval", label: "Accept edits" },
+          { value: "full-access", label: "Always approve (YOLO)" }
+        ]
+      : [
+          { value: "read-only", label: "只读工具" },
+          { value: "ask-for-approval", label: "接受文件编辑" },
+          { value: "full-access", label: "全自动批准" }
+        ];
+  }
+  // codex
+  return locale === "en"
+    ? [
+        { value: "read-only", label: "Read Only" },
+        { value: "ask-for-approval", label: "Ask for approval" },
+        { value: "approve-for-me", label: "Approve for me" },
+        { value: "full-access", label: "Full Access" }
+      ]
+    : [
+        { value: "read-only", label: "Read Only" },
+        { value: "ask-for-approval", label: "Ask for approval" },
+        { value: "approve-for-me", label: "Approve for me" },
+        { value: "full-access", label: "Full Access" }
+      ];
+}
+
+function isMacPlatform(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || "") || /Mac OS/i.test(navigator.userAgent || "");
 }
 
 function workspacesCacheKey(hostId: string): string {
@@ -699,17 +749,21 @@ export function App() {
           return <div key={host.id} className={`host-row ${host.id === selectedHostId ? "active" : ""}`}>
             <button className="host-pill" onClick={() => { setSelectedHostId(host.id); setSelectedTaskId(null); setMobilePane("tasks"); }}>
               <span className={`status-dot ${(runtime[host.id]?.online ?? host.online) ? "online" : ""}`} />
-              <span>
-                <strong>{host.name}</strong>
+              <span className="host-pill-body">
+                <strong className="host-name">{host.name}</strong>
                 {engineChips.length > 0 && (
-                  <small className="host-engines">
+                  <span className="host-engine-rail" aria-label="installed engines">
                     {engineChips.map((item) => (
-                      <span key={item.engine} className="host-engine-chip" title={`${cliEngineLabel(item.engine)}${item.version ? ` ${item.version}` : ""}`}>
-                        <EngineLogo engine={item.engine} size={12} />
-                        <em>{item.version || cliEngineLabel(item.engine)}</em>
+                      <span
+                        key={item.engine}
+                        className="host-engine-item"
+                        title={`${cliEngineLabel(item.engine)}${item.version ? ` · ${item.version}` : ""}`}
+                      >
+                        <EngineLogo engine={item.engine} size={16} />
+                        <span className="host-engine-ver">{item.version || "—"}</span>
                       </span>
                     ))}
-                  </small>
+                  </span>
                 )}
               </span>
             </button>
@@ -734,7 +788,6 @@ export function App() {
         <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? t("hostOnline") : activeRuntime.online === false ? t("hostOffline") : t("hostChecking")}</div>
         {activeHost && keyAuthorizationStatus[activeHost.id] && <div className="key-authorization-note"><div><strong>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "正在授权此浏览器" : "此浏览器尚未取得主机密钥"}</strong><span>{activeRuntime.online === true ? "电脑端会自动完成端到端密钥授权。" : "请先让电脑端客户端上线，再重新授权。"}</span></div><button disabled={keyAuthorizationStatus[activeHost.id] === "authorizing" || activeRuntime.online !== true} onClick={() => authorizeExistingHost(activeHost.id).catch((authorizationError) => setError(authorizationError.message))}>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "授权中…" : "授权此浏览器"}</button></div>}
         <div className="settings-row">
-          <label className="permission-select">{t("codexPermission")}<select value={permissionMode} onChange={(event) => { const mode = normalizePermissionMode(event.target.value); setPermissionMode(mode); localStorage.setItem("permission-mode", mode); }}><option value="read-only">{t("permReadOnly")}</option><option value="ask-for-approval">{t("permAsk")}</option><option value="approve-for-me">{t("permApprove")}</option><option value="full-access">{t("permFull")}</option></select></label>
           <label className="reply-detail-select">{t("agentReplyDetail")}<select value={replyDetail} onChange={(event) => { const next = normalizeReplyDetail(event.target.value); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }}><option value="concise">{t("replyConcise")}</option><option value="detailed">{t("replyDetailed")}</option></select></label>
         </div>
         <div className="task-search">
@@ -781,13 +834,15 @@ export function App() {
       availableEngines={activeRuntime.availableEngines ?? []}
       onClose={() => setComposerOpen(false)}
       onRefreshWorkspaces={() => sendCommand(activeHost.id, { type: "host.refresh", commandId: crypto.randomUUID() })}
-      onCreate={async (cwd, prompt, title, engine) => {
+      onCreate={async (cwd, prompt, title, engine, mode) => {
+        setPermissionMode(mode);
+        localStorage.setItem("permission-mode", mode);
         await sendCommand(activeHost.id, {
           type: "task.create",
           commandId: crypto.randomUUID(),
           cwd,
           prompt,
-          permissionMode,
+          permissionMode: mode,
           cliEngine: engine,
           ...(title ? { title } : {})
         });
@@ -798,7 +853,7 @@ export function App() {
 }
 
 function TaskConversation({ task, online, visible, permissionMode, replyDetail, onPermissionModeChange, onReplyDetailChange, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; permissionMode: PermissionMode; replyDetail: ReplyDetail; onPermissionModeChange(mode: PermissionMode): void; onReplyDetailChange(detail: ReplyDetail): void; onBack(): void; onCommand(command: ClientCommand): void }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [prompt, setPrompt] = useState("");
   const [pendingPrompt, setPendingPrompt] = useState("");
   const [pendingMessageCount, setPendingMessageCount] = useState(0);
@@ -813,10 +868,19 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
   const stickToBottomRef = useRef(true);
   const previousThreadRef = useRef(task.threadId);
   const running = Boolean(task.activeTurnId);
+  const taskEngine = normalizeCliEngine(task.cliEngine);
+  const permissionOptions = permissionOptionsForEngine(taskEngine, locale);
+  const isMac = isMacPlatform();
   const visibleMessages = replyDetail === "detailed"
     ? task.messages
     : task.messages.filter((message) => !isProcessStreamMessage(message));
   const lastMessageLength = visibleMessages.at(-1)?.text.length ?? 0;
+
+  useEffect(() => {
+    if (!permissionOptions.some((item) => item.value === permissionMode)) {
+      onPermissionModeChange(permissionOptions[0]?.value ?? "ask-for-approval");
+    }
+  }, [task.threadId, taskEngine]);
 
   function submitPrompt() {
     if (!prompt.trim() || online !== true) return;
@@ -876,7 +940,14 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
   return <>
     <div className="conversation-head">
       <button className="mobile-back" type="button" onClick={onBack} aria-label="返回任务列表">‹</button>
-      <div><p className="eyebrow">THREAD</p><h2 title={task.title}>{task.title}</h2><code title={task.cwd}>{task.cwd}</code></div>
+      <div>
+        <p className="eyebrow">THREAD</p>
+        <h2 title={task.title} className="thread-title-row">
+          <EngineLogo engine={taskEngine} size={18} className="thread-engine-logo" />
+          <span>{task.title}</span>
+        </h2>
+        <code title={task.cwd}>{task.cwd}</code>
+      </div>
       <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>{t("chat")}</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>{t("diff")}</button></div>
     </div>
     {tab === "chat" ? <div className="message-stream" ref={messageStreamRef} onScroll={(event) => {
@@ -902,12 +973,35 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
       submitPrompt();
     }}>
       <textarea ref={composerTextareaRef} value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => {
-        if (event.ctrlKey && event.key === "Enter") {
+        const sendHotkey = isMac ? event.metaKey : event.ctrlKey;
+        if (sendHotkey && event.key === "Enter") {
           event.preventDefault();
           submitPrompt();
         }
       }} placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"} />
-      <div><small><label className="composer-permission">{t("currentPermission")}<select value={permissionMode} onChange={(event) => onPermissionModeChange(normalizePermissionMode(event.target.value))}><option value="read-only">{t("permReadOnly")}</option><option value="ask-for-approval">{t("permAsk")}</option><option value="approve-for-me">{t("permApprove")}</option><option value="full-access">{t("permFull")}</option></select></label><label className="composer-reply-detail">{t("agentReplyDetail")}<select value={replyDetail} onChange={(event) => onReplyDetailChange(normalizeReplyDetail(event.target.value))}><option value="concise">{t("replyConcise")}</option><option value="detailed">{t("replyDetailed")}</option></select></label><span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> {t("sendShortcut")}</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>{t("stop")}</button>}<button className="send" disabled={online !== true || !prompt.trim()}>{t("send")}</button></div>
+      <div>
+        <small>
+          <label className="composer-permission">
+            {t("currentPermission")}
+            <select value={permissionMode} onChange={(event) => onPermissionModeChange(normalizePermissionMode(event.target.value))}>
+              {permissionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          </label>
+          <label className="composer-reply-detail">
+            {t("agentReplyDetail")}
+            <select value={replyDetail} onChange={(event) => onReplyDetailChange(normalizeReplyDetail(event.target.value))}>
+              <option value="concise">{t("replyConcise")}</option>
+              <option value="detailed">{t("replyDetailed")}</option>
+            </select>
+          </label>
+          <span className="send-shortcut">
+            {isMac ? <><kbd>⌘</kbd> + <kbd>Enter</kbd></> : <><kbd>Ctrl</kbd> + <kbd>Enter</kbd></>}
+            {" "}{t("sendShortcut")}
+          </span>
+        </small>
+        {running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>{t("stop")}</button>}
+        <button className="send" disabled={online !== true || !prompt.trim()}>{t("send")}</button>
+      </div>
     </form>
   </>;
 }
@@ -972,13 +1066,16 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
   availableEngines: CliEngineInfo[];
   onClose(): void;
   onRefreshWorkspaces(): Promise<void>;
-  onCreate(cwd: string, prompt: string, title: string, engine: CliEngine): Promise<void>;
+  onCreate(cwd: string, prompt: string, title: string, engine: CliEngine, permissionMode: PermissionMode): Promise<void>;
 }) {
+  const { locale } = useI18n();
   const ready = readyEngines(availableEngines);
   const [cwd, setCwd] = useState(workspaces[0]?.path ?? "");
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [engine, setEngine] = useState<CliEngine | "">(ready[0]?.engine ?? "");
+  const permissionOptions = permissionOptionsForEngine(engine ? normalizeCliEngine(engine) : "codex", locale);
+  const [taskPermission, setTaskPermission] = useState<PermissionMode>(permissionOptions[0]?.value ?? "ask-for-approval");
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
@@ -996,6 +1093,11 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
     }
     setEngine((current) => (current && ready.some((item) => item.engine === current) ? current : ready[0]!.engine));
   }, [availableEngines]);
+
+  useEffect(() => {
+    const options = permissionOptionsForEngine(engine ? normalizeCliEngine(engine) : "codex", locale);
+    setTaskPermission((current) => (options.some((item) => item.value === current) ? current : options[0]!.value));
+  }, [engine, locale]);
 
   // Pull latest whitelist from the agent once when the dialog opens (avoid dep on unstable callback identity).
   const refreshRef = useRef(onRefreshWorkspaces);
@@ -1023,7 +1125,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
     setLoading(true);
     setError("");
     try {
-      await onCreate(cwd, prompt, title, engine);
+      await onCreate(cwd, prompt, title, engine, taskPermission);
     } catch (createError) {
       setError(createError instanceof Error ? createError.message : "任务创建失败");
       setLoading(false);
@@ -1050,7 +1152,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
               onClick={() => setEngine(item)}
               title={isReady ? `${cliEngineLabel(item)}${info?.version ? ` ${info.version}` : ""}` : `${cliEngineLabel(item)} 未安装`}
             >
-              <EngineLogo engine={item} size={28} />
+              <EngineLogo engine={item} size={32} />
               <strong>{cliEngineLabel(item)}</strong>
               <small>{isReady ? (info?.version || "已安装") : "未安装"}</small>
             </button>
@@ -1058,6 +1160,11 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
         })}
       </div>
     </div>
+    <label>权限模式
+      <select value={taskPermission} onChange={(event) => setTaskPermission(normalizePermissionMode(event.target.value))} disabled={!engine}>
+        {permissionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </select>
+    </label>
     <label>工作区
       <select value={cwd} onChange={(event) => setCwd(event.target.value)} required disabled={!workspaces.length}>
         {!workspaces.length && <option value="" disabled>{refreshing ? "正在从电脑端读取白名单…" : online === true ? "电脑端尚未添加白名单目录" : "主机离线，无法读取白名单"}</option>}

@@ -92,6 +92,7 @@ type AgentTask = {
   cwd: string;
   status: string;
   updatedAt: number;
+  engine?: CliEngine;
 };
 
 type ActivityState = {
@@ -431,6 +432,25 @@ function rendererHtml(): string {
   })();
   // Snapshot state into the page so UI never depends solely on first IPC round-trip.
   const initialStateJson = JSON.stringify(publicState).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
+  const vendorLogo = (name: string): string => {
+    const candidates = [
+      path.join(__dirname, "..", "assets", "vendors", `${name}.png`),
+      path.join(process.resourcesPath, "assets", "vendors", `${name}.png`)
+    ];
+    for (const file of candidates) {
+      try {
+        return `data:image/png;base64,${readFileSync(file).toString("base64")}`;
+      } catch {
+        // try next
+      }
+    }
+    return "";
+  };
+  const logoMapJson = JSON.stringify({
+    codex: vendorLogo("codex"),
+    claude: vendorLogo("claude"),
+    grok: vendorLogo("grok")
+  }).replace(/</g, "\\u003c");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>随码</title><style>
   :root{font-family:"Bahnschrift","Aptos","Segoe UI",sans-serif;color:#17211b}
   *{box-sizing:border-box}
@@ -481,6 +501,9 @@ function rendererHtml(): string {
   .workspace div{flex:1 1 auto;min-width:0;overflow:hidden}
   .workspace strong,.workspace small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .workspace small{color:#747a73;margin-top:1px;font-size:10px}
+  .task-main{display:flex;align-items:flex-start;gap:8px;min-width:0;flex:1 1 auto}
+  .engine-badge{width:18px;height:18px;border-radius:5px;object-fit:cover;flex:0 0 auto;background:#fff;box-shadow:0 0 0 1px rgba(23,33,27,.08)}
+  .engine-badge.codex{background:#000}
   .empty{text-align:center;color:#888;padding:8px;font-size:11px}
   .stack{display:grid;gap:6px;margin-top:6px}
   .label{font-size:10px;font-weight:800;color:#6b726b;letter-spacing:.04em}
@@ -508,7 +531,20 @@ function rendererHtml(): string {
   (function(){
   var platformLabel=${JSON.stringify(platformLabel)};
   var initialState=${initialStateJson};
+  var vendorLogos=${logoMapJson};
   var api=window.anytimeVibe;
+  function engineLogo(engine){
+    var src=vendorLogos&&vendorLogos[engine];
+    if(!src) return '';
+    return '<img class="engine-badge '+(engine||'')+'" src="'+src+'" alt="'+(engine||'')+'" width="18" height="18">';
+  }
+  function detectEngine(task){
+    if(task&&task.engine) return task.engine;
+    var title=String(task&&task.title||'');
+    if(/^\\[claude\\]/i.test(title)) return 'claude';
+    if(/^\\[grok\\]/i.test(title)) return 'grok';
+    return 'codex';
+  }
   var I18N={
     'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',expand:'展开',collapse:'收起',open:'接力'},
     en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',expand:'Expand',collapse:'Collapse',open:'Open'}
@@ -618,7 +654,10 @@ function rendererHtml(): string {
     });
     taskBox.innerHTML='<div class="status"><h2>'+escapeHtml(t('relay'))+'</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?t('collapse'):t('expand'))+' · '+filtered.length+(q?'/'+lastTasks.length:'')+'</button></div>'
       +(tasksOpen?'<div class="stack" style="margin-top:7px"><input id="taskSearch" placeholder="'+escapeHtml(t('search'))+'" value="'+escapeHtml(taskQuery)+'"></div>':'')
-      +(tasksOpen?(filtered.length?'<div class="workspaces" style="margin-top:7px">'+filtered.map(function(task){return '<div class="workspace"><div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div><button data-relay="'+escapeHtml(task.threadId)+'">'+escapeHtml(t('open'))+'</button></div>';}).join('')+'</div>':'<div class="empty">'+(q?t('noMatch'):t('noTask'))+'</div>'):'');
+      +(tasksOpen?(filtered.length?'<div class="workspaces" style="margin-top:7px">'+filtered.map(function(task){
+          var engine=detectEngine(task);
+          return '<div class="workspace"><div class="task-main">'+engineLogo(engine)+'<div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div></div><button data-relay="'+escapeHtml(task.threadId)+'">'+escapeHtml(t('open'))+'</button></div>';
+        }).join('')+'</div>':'<div class="empty">'+(q?t('noMatch'):t('noTask'))+'</div>'):'');
     var toggle=document.querySelector('#toggleTasks');
     if(toggle) toggle.addEventListener('click',function(){
       tasksOpen=!tasksOpen;
@@ -1554,7 +1593,8 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     title: task.title,
     cwd: task.cwd,
     status: task.status,
-    updatedAt: task.updatedAt
+    updatedAt: task.updatedAt,
+    engine: task.engine
   };
   updateState({
     tasks: [agentTask, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)]
@@ -1981,7 +2021,7 @@ async function publishHostStatus(): Promise<void> {
 async function publishThread(threadId: string): Promise<void> {
   const result = await codex!.request("thread/read", { threadId, includeTurns: true });
   const snapshot = threadToSnapshot(result.thread);
-  const task: AgentTask = { threadId: snapshot.threadId, title: snapshot.title, cwd: snapshot.cwd, status: snapshot.status, updatedAt: snapshot.updatedAt };
+  const task: AgentTask = { threadId: snapshot.threadId, title: snapshot.title, cwd: snapshot.cwd, status: snapshot.status, updatedAt: snapshot.updatedAt, engine: "codex" };
   updateState({
     tasks: [task, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)]
       .sort((left, right) => right.updatedAt - left.updatedAt)
@@ -2001,10 +2041,11 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   const listLimit = Math.min(100, Math.max(1, limit));
   const storedTasks: AgentTask[] = taskStore.list(listLimit).map((task) => ({
     threadId: task.threadId,
-    title: `[${task.engine}] ${task.title}`,
+    title: task.title,
     cwd: task.cwd,
     status: task.status,
-    updatedAt: task.updatedAt
+    updatedAt: task.updatedAt,
+    engine: task.engine
   }));
   let codexTasks: AgentTask[] = [];
   try {
@@ -2017,7 +2058,8 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
       title: String(thread.name || thread.preview || "未命名任务"),
       cwd: String(thread.cwd || ""),
       status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
-      updatedAt: Number(thread.updatedAt ?? Date.now() / 1000)
+      updatedAt: Number(thread.updatedAt ?? Date.now() / 1000),
+      engine: "codex" as const
     }));
   } catch {
     // Codex optional when listing Claude/Grok tasks.
