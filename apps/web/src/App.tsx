@@ -11,6 +11,8 @@ import {
   openEnvelope,
   pairingClaimResponseSchema,
   type AgentEvent,
+  type CliEngine,
+  type CliEngineInfo,
   type ClientCommand,
   type EncryptedEnvelope,
   type PairingPublicInfo,
@@ -53,6 +55,8 @@ type HostRuntime = {
   online: boolean | null;
   workspaces: Workspace[];
   tasks: Record<string, Task>;
+  cliEngine?: CliEngine;
+  availableEngines?: CliEngineInfo[];
 };
 
 function taskStatusMeta(status: string): { label: string; tone: string } {
@@ -75,7 +79,18 @@ function taskStatusMeta(status: string): { label: string; tone: string } {
 }
 
 function emptyRuntime(online: boolean | null = null): HostRuntime {
-  return { online, workspaces: [], tasks: {} };
+  return { online, workspaces: [], tasks: {}, cliEngine: "codex", availableEngines: [] };
+}
+
+function normalizeCliEngine(value: string | null | undefined): CliEngine {
+  if (value === "claude" || value === "grok" || value === "codex") return value;
+  return "codex";
+}
+
+function cliEngineLabel(engine: CliEngine): string {
+  if (engine === "claude") return "Claude Code";
+  if (engine === "grok") return "Grok Build";
+  return "Codex";
 }
 
 function workspacesCacheKey(hostId: string): string {
@@ -139,6 +154,8 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   if (event.type === "host.status") {
     next.online = event.online;
     next.workspaces = event.workspaces;
+    if (event.cliEngine) next.cliEngine = event.cliEngine;
+    if (event.availableEngines) next.availableEngines = event.availableEngines;
     return next;
   }
   if (event.type === "sync.completed" || event.type === "sync.progress") return next;
@@ -711,10 +728,20 @@ export function App() {
       host={activeHost}
       workspaces={activeRuntime.workspaces}
       online={activeRuntime.online}
+      cliEngine={activeRuntime.cliEngine ?? "codex"}
+      availableEngines={activeRuntime.availableEngines ?? []}
       onClose={() => setComposerOpen(false)}
       onRefreshWorkspaces={() => sendCommand(activeHost.id, { type: "host.refresh", commandId: crypto.randomUUID() })}
-      onCreate={async (cwd, prompt, title) => {
-        await sendCommand(activeHost.id, { type: "task.create", commandId: crypto.randomUUID(), cwd, prompt, permissionMode, ...(title ? { title } : {}) });
+      onCreate={async (cwd, prompt, title, engine) => {
+        await sendCommand(activeHost.id, {
+          type: "task.create",
+          commandId: crypto.randomUUID(),
+          cwd,
+          prompt,
+          permissionMode,
+          cliEngine: engine,
+          ...(title ? { title } : {})
+        });
         setComposerOpen(false);
       }}
     />}
@@ -889,17 +916,20 @@ function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): voi
   </section></div>;
 }
 
-function NewTaskDialog({ host, workspaces, online, onClose, onRefreshWorkspaces, onCreate }: {
+function NewTaskDialog({ host, workspaces, online, cliEngine, availableEngines, onClose, onRefreshWorkspaces, onCreate }: {
   host: Host;
   workspaces: Workspace[];
   online: boolean | null;
+  cliEngine: CliEngine;
+  availableEngines: CliEngineInfo[];
   onClose(): void;
   onRefreshWorkspaces(): Promise<void>;
-  onCreate(cwd: string, prompt: string, title: string): Promise<void>;
+  onCreate(cwd: string, prompt: string, title: string, engine: CliEngine): Promise<void>;
 }) {
   const [cwd, setCwd] = useState(workspaces[0]?.path ?? "");
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [engine, setEngine] = useState<CliEngine>(cliEngine);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
@@ -909,6 +939,10 @@ function NewTaskDialog({ host, workspaces, online, onClose, onRefreshWorkspaces,
     if (!workspaces.length) return;
     setCwd((current) => (current && workspaces.some((item) => item.path === current) ? current : workspaces[0]!.path));
   }, [workspaces]);
+
+  useEffect(() => {
+    setEngine(cliEngine);
+  }, [cliEngine]);
 
   // Pull latest whitelist from the agent once when the dialog opens (avoid dep on unstable callback identity).
   const refreshRef = useRef(onRefreshWorkspaces);
@@ -932,7 +966,7 @@ function NewTaskDialog({ host, workspaces, online, onClose, onRefreshWorkspaces,
     setLoading(true);
     setError("");
     try {
-      await onCreate(cwd, prompt, title);
+      await onCreate(cwd, prompt, title, engine);
     } catch (createError) {
       setError(createError instanceof Error ? createError.message : "任务创建失败");
       setLoading(false);
@@ -941,6 +975,15 @@ function NewTaskDialog({ host, workspaces, online, onClose, onRefreshWorkspaces,
     <button type="button" className="modal-close" onClick={onClose}>×</button>
     <p className="eyebrow">NEW REMOTE TASK</p>
     <h2>向 {host.name} 下发任务</h2>
+    <label>编码引擎
+      <select value={engine} onChange={(event) => setEngine(normalizeCliEngine(event.target.value))}>
+        {(["codex", "claude", "grok"] as CliEngine[]).map((item) => {
+          const info = availableEngines.find((entry) => entry.engine === item);
+          const ready = info ? info.ready : item === "codex";
+          return <option key={item} value={item} disabled={!ready}>{cliEngineLabel(item)}{info?.version ? ` · ${info.version}` : ready ? "" : " · 未安装"}</option>;
+        })}
+      </select>
+    </label>
     <label>工作区
       <select value={cwd} onChange={(event) => setCwd(event.target.value)} required disabled={!workspaces.length}>
         {!workspaces.length && <option value="" disabled>{refreshing ? "正在从电脑端读取白名单…" : online === true ? "电脑端尚未添加白名单目录" : "主机离线，无法读取白名单"}</option>}

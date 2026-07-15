@@ -38,13 +38,27 @@ export const permissionModeSchema = z.enum([
 ]);
 export type PermissionMode = z.infer<typeof permissionModeSchema>;
 
+/** Local coding CLI backend used by the desktop agent. */
+export const cliEngineSchema = z.enum(["codex", "claude", "grok"]);
+export type CliEngine = z.infer<typeof cliEngineSchema>;
+
+export const cliEngineInfoSchema = z.object({
+  engine: cliEngineSchema,
+  ready: z.boolean(),
+  version: z.string().optional(),
+  detail: z.string().optional()
+});
+export type CliEngineInfo = z.infer<typeof cliEngineInfoSchema>;
+
 export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
     type: z.literal("task.create"),
     cwd: z.string().min(1),
     prompt: z.string().min(1),
     title: z.string().min(1).max(160).optional(),
-    permissionMode: permissionModeSchema.optional()
+    permissionMode: permissionModeSchema.optional(),
+    /** Override host default CLI engine for this task. */
+    cliEngine: cliEngineSchema.optional()
   }),
   commandBase.extend({
     type: z.literal("thread.resume"),
@@ -82,6 +96,11 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
   /** Ask the agent to re-publish host.status (workspaces, online, versions). Does not require Codex. */
   commandBase.extend({
     type: z.literal("host.refresh")
+  }),
+  /** Set the host default coding CLI engine (persisted on the agent). */
+  commandBase.extend({
+    type: z.literal("host.set_cli_engine"),
+    cliEngine: cliEngineSchema
   })
 ]);
 
@@ -100,7 +119,11 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     platform: z.string(),
     codexVersion: z.string(),
     workspaces: z.array(workspaceSchema),
-    detail: z.string().optional()
+    detail: z.string().optional(),
+    /** Preferred coding CLI on this host. */
+    cliEngine: cliEngineSchema.optional(),
+    /** Detected engines and readiness. */
+    availableEngines: z.array(cliEngineInfoSchema).optional()
   }),
   eventBase.extend({
     type: z.literal("sync.completed"),
@@ -124,6 +147,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     activeTurnId: z.string().optional(),
     createdAt: z.number(),
     updatedAt: z.number(),
+    /** Which coding CLI owns this thread. */
+    cliEngine: cliEngineSchema.optional(),
     messages: z.array(z.object({
       id: z.string(),
       role: z.enum(["user", "assistant", "system"]),

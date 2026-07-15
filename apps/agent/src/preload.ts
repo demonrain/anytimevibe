@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld("anytimeVibe", {
   installUpdate: () => ipcRenderer.invoke("agent:install-update"),
   relayTask: (threadId: string) => ipcRenderer.invoke("agent:relay-task", threadId),
   refreshTasks: () => ipcRenderer.invoke("agent:refresh-tasks"),
+  setCliEngine: (engine: string) => ipcRenderer.invoke("agent:set-cli-engine", engine),
+  refreshEngines: () => ipcRenderer.invoke("agent:refresh-engines"),
   windowMinimize: () => ipcRenderer.invoke("agent:window-minimize"),
   windowClose: () => ipcRenderer.invoke("agent:window-close"),
   openFeedback: () => ipcRenderer.invoke("agent:open-feedback"),

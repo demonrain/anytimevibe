@@ -29,11 +29,18 @@ import {
   openEnvelope,
   randomKeyBytes,
   type AgentEvent,
+  type CliEngine,
+  type CliEngineInfo,
   type ClientCommand,
   type EncryptedEnvelope,
+  type PermissionMode,
   type Workspace
 } from "@anytimevibe/protocol";
 import { CodexAdapter, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
+import { detectAvailableEngines } from "./cli/detect";
+import { interruptHeadlessThread, runHeadlessTurn } from "./cli/headless-runner";
+import { TaskStore } from "./cli/task-store";
+import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
 const execFileAsync = promisify(execFile);
@@ -69,6 +76,9 @@ type PublicState = {
   pairingExpiresAt?: number | undefined;
   hostId?: string | undefined;
   codexVersion: string;
+  /** Default coding CLI for new tasks. */
+  cliEngine: CliEngine;
+  availableEngines: CliEngineInfo[];
   workspaces: Workspace[];
   environment: EnvironmentState;
   update: UpdateState;
@@ -115,7 +125,20 @@ let configPath = "";
 let codexCommand = "codex.cmd";
 let codexVersion = "unknown";
 const initialEnvironment: EnvironmentState = { platform: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "other", nodeInstalled: false, codexInstalled: false, codexCompatible: false };
-let publicState: PublicState = { relayUrl: DEFAULT_RELAY_URL, displayName: "", status: "unconfigured", detail: "请先配置中继地址。", codexVersion, workspaces: [], environment: initialEnvironment, update: { status: "idle" }, tasks: [] };
+let publicState: PublicState = {
+  relayUrl: DEFAULT_RELAY_URL,
+  displayName: "",
+  status: "unconfigured",
+  detail: "请先配置中继地址。",
+  codexVersion,
+  cliEngine: "codex",
+  availableEngines: [],
+  workspaces: [],
+  environment: initialEnvironment,
+  update: { status: "idle" },
+  tasks: []
+};
+const taskStore = new TaskStore();
 
 function productIconPath(): string {
   const candidates = [
@@ -474,7 +497,7 @@ function rendererHtml(): string {
   <div class="titlebar">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1 id="brandTitle">随码</h1><p id="brandTag">随时续上你的代码 · ${platformLabel}</p></div><div class="win-actions"><button type="button" id="winMin" title="最小化">–</button><button type="button" id="winClose" class="close" title="关闭">×</button></div></div>
   <div class="scroll">
   <section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
-  <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="updateBox" class="update-row"></div></section>
+  <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div class="stack" style="margin-top:8px"><label class="muted">默认编码引擎</label><select id="cliEngine"></select></div><div id="updateBox" class="update-row"></div></section>
   <section class="card"><h2>中继与配对</h2><div class="stack"><div class="label">中继服务器</div><div class="row"><input id="relay" placeholder="https://vibe.demonrain.top"><button id="startPair" class="secondary">生成配对码</button><button id="saveRelay">保存</button></div><div id="pairBox"></div><div class="label">客户端名称</div><div class="row"><input id="displayName" placeholder="例如：公司电脑" maxlength="64"><button id="saveName" class="secondary">保存名称</button></div></div></section>
   <section class="card grow"><div class="status"><h2>允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><div id="workspaces" class="workspaces"></div></section>
   <section class="card" id="activityBox" style="display:none"></section>
@@ -512,6 +535,7 @@ function rendererHtml(): string {
   var workspaces=document.querySelector('#workspaces');
   var meta=document.querySelector('#meta');
   var environment=document.querySelector('#environment');
+  var cliEngineSelect=document.querySelector('#cliEngine');
   var updateBox=document.querySelector('#updateBox');
   var activityBox=document.querySelector('#activityBox');
   var taskBox=document.querySelector('#taskBox');
@@ -529,10 +553,15 @@ function rendererHtml(): string {
       if(displayName && document.activeElement!==displayName) displayName.value=state.displayName||'';
       if(meta) meta.textContent='Codex '+(state.codexVersion||'')+(state.hostId?' · '+String(state.hostId).slice(0,8):'');
       var env=state.environment||{nodeInstalled:false,codexCompatible:false,codexInstalled:false};
+      var engines=state.availableEngines||[];
       var nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">安装 Node.js</button>':'';
       var codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">安装兼容版 Codex</button>':'';
       if(environment){
-        environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+escapeHtml(env.nodeVersion||'未安装')+'</span>'+nodeAction+'</div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+escapeHtml(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span>'+codexAction+'</div>';
+        var engineExtra=engines.filter(function(item){return item.engine!=='codex';}).map(function(item){
+          var label=item.engine==='claude'?'Claude Code':'Grok Build';
+          return '<div class="check '+(item.ready?'ok':'')+'"><b>'+escapeHtml(label)+'</b><span>'+escapeHtml(item.version||item.detail||(item.ready?'就绪':'未就绪'))+'</span></div>';
+        }).join('');
+        environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+escapeHtml(env.nodeVersion||'未安装')+'</span>'+nodeAction+'</div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+escapeHtml(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span>'+codexAction+'</div>'+engineExtra;
         environment.querySelectorAll('button[data-install]').forEach(function(button){
           button.addEventListener('click',function(){
             if(!api) return;
@@ -542,7 +571,17 @@ function rendererHtml(): string {
           });
         });
       }
-      if(startPair) startPair.disabled=!env.codexCompatible||!state.relayUrl;
+      if(cliEngineSelect&&document.activeElement!==cliEngineSelect){
+        var current=state.cliEngine||'codex';
+        cliEngineSelect.innerHTML=['codex','claude','grok'].map(function(engine){
+          var label=engine==='claude'?'Claude Code':engine==='grok'?'Grok Build':'Codex';
+          var info=engines.find(function(item){return item.engine===engine;});
+          var disabled=info&&info.ready===false?' disabled':'';
+          return '<option value="'+engine+'"'+(engine===current?' selected':'')+disabled+'>'+label+(info&&info.version?(' · '+info.version):'')+'</option>';
+        }).join('');
+      }
+      var anyEngineReady=env.codexCompatible||engines.some(function(item){return item.ready;});
+      if(startPair) startPair.disabled=!anyEngineReady||!state.relayUrl;
       if(pairBox) pairBox.innerHTML=state.pairingCode?'<div class="pair">'+escapeHtml(state.pairingCode)+'</div><p class="detail">在 Web 端输入配对码，约 10 分钟后失效。</p>':'';
       if(workspaces){
         workspaces.innerHTML=(state.workspaces&&state.workspaces.length)?state.workspaces.map(function(w){return '<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button class="ghost" data-id="'+escapeHtml(w.id)+'">移除</button></div>';}).join(''):'<div class="empty">尚未允许任何目录</div>';
@@ -613,7 +652,10 @@ function rendererHtml(): string {
     if((el=document.querySelector('#saveName'))&&api) el.addEventListener('click',function(){api.setDisplayName(displayName.value);});
     if(startPair&&api) startPair.addEventListener('click',function(){api.startPairing();});
     if((el=document.querySelector('#addWorkspace'))&&api) el.addEventListener('click',function(){api.addWorkspace();});
-    if((el=document.querySelector('#recheck'))&&api) el.addEventListener('click',function(){api.checkEnvironment();});
+    if((el=document.querySelector('#recheck'))&&api) el.addEventListener('click',function(){api.checkEnvironment(); if(api.refreshEngines) api.refreshEngines();});
+    if(cliEngineSelect&&api&&api.setCliEngine){
+      cliEngineSelect.addEventListener('change',function(){ api.setCliEngine(cliEngineSelect.value); });
+    }
     if((el=document.querySelector('#winMin'))&&api) el.addEventListener('click',function(){api.windowMinimize();});
     if((el=document.querySelector('#winClose'))&&api) el.addEventListener('click',function(){api.windowClose();});
     if((el=document.querySelector('#feedback'))&&api) el.addEventListener('click',function(){api.openFeedback();});
@@ -1466,22 +1508,192 @@ function isAllowedWorkspace(requestedPath: string): boolean {
   });
 }
 
+async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void> {
+  if (event.type === "delta") {
+    const itemId = event.kind === "assistant"
+      ? event.itemId
+      : event.kind === "exec"
+        ? (event.itemId.startsWith("exec:") ? event.itemId : `exec:${event.itemId}`)
+        : event.kind === "stage"
+          ? (event.itemId.startsWith("stage:") ? event.itemId : `stage:${event.itemId}`)
+          : event.kind === "thought"
+            ? `stage:thought:${event.itemId}`
+            : "cli-log";
+    queueRemoteDelta(event.threadId, itemId, event.delta);
+    appendLocalActivity(event.threadId, event.delta);
+    return;
+  }
+  if (event.type === "turn.started") {
+    activeTurnByThread.set(event.threadId, event.turnId);
+    await publish({
+      type: "turn.started",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadId: event.threadId,
+      turnId: event.turnId,
+      ...(event.prompt ? { prompt: event.prompt } : {})
+    }, true);
+    return;
+  }
+  if (event.type === "session") {
+    await taskStore.setProviderSession(event.threadId, event.providerSessionId);
+    return;
+  }
+  if (event.type === "error") {
+    handleError(new Error(event.message));
+    return;
+  }
+  if (event.type === "turn.completed") {
+    await flushRemoteDeltas();
+    activeTurnByThread.delete(event.threadId);
+    finishLocalActivity(event.threadId, event.status);
+    await taskStore.setStatus(event.threadId, event.status);
+    await publish({
+      type: "turn.completed",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadId: event.threadId,
+      turnId: event.turnId,
+      status: event.status
+    }, true, "completed");
+  }
+}
+
+async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
+  const task = taskStore.get(threadId);
+  if (!task) return;
+  const agentTask: AgentTask = {
+    threadId: task.threadId,
+    title: task.title,
+    cwd: task.cwd,
+    status: task.status,
+    updatedAt: task.updatedAt
+  };
+  updateState({
+    tasks: [agentTask, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)]
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, 200)
+  });
+  await publish({
+    type: "thread.snapshot",
+    eventId: crypto.randomUUID(),
+    occurredAt: new Date().toISOString(),
+    threadId: task.threadId,
+    title: task.title,
+    cwd: task.cwd,
+    status: task.status,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    cliEngine: task.engine,
+    messages: task.messages
+  }, true);
+}
+
+async function runHeadlessTaskTurn(options: {
+  engine: Exclude<CliEngine, "codex">;
+  threadId: string;
+  cwd: string;
+  prompt: string;
+  title?: string;
+  permissionMode: PermissionMode;
+  isNew: boolean;
+}): Promise<void> {
+  const turnId = crypto.randomUUID();
+  const now = Date.now() / 1000;
+  let stored = taskStore.get(options.threadId);
+  if (options.isNew || !stored) {
+    stored = {
+      threadId: options.threadId,
+      engine: options.engine,
+      providerSessionId: options.threadId,
+      cwd: options.cwd,
+      title: options.title || options.prompt.slice(0, 80),
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+      messages: []
+    };
+  }
+  stored.messages.push({ id: crypto.randomUUID(), role: "user", text: options.prompt });
+  stored.status = "active";
+  stored.updatedAt = now;
+  await taskStore.upsert(stored);
+  await publishStoredTaskSnapshot(options.threadId);
+  startLocalActivity(options.threadId, options.prompt, stored.title);
+  activeTurnByThread.set(options.threadId, turnId);
+
+  const result = await runHeadlessTurn(options.engine, {
+    threadId: options.threadId,
+    turnId,
+    cwd: options.cwd,
+    prompt: options.prompt,
+    permissionMode: options.permissionMode,
+    ...(stored.providerSessionId && stored.providerSessionId !== options.threadId
+      ? { providerSessionId: stored.providerSessionId }
+      : {}),
+    ...(options.isNew ? { preferredSessionId: options.threadId } : {})
+  }, (event) => { void handleBackendStreamEvent(event); });
+
+  const latest = taskStore.get(options.threadId) ?? stored;
+  latest.providerSessionId = result.providerSessionId || latest.providerSessionId;
+  latest.status = result.status;
+  latest.updatedAt = Date.now() / 1000;
+  if (result.text.trim()) {
+    latest.messages.push({ id: crypto.randomUUID(), role: "assistant", text: result.text });
+  }
+  await taskStore.upsert(latest);
+  await publishStoredTaskSnapshot(options.threadId);
+}
+
 async function handleCommand(command: ClientCommand): Promise<void> {
   // host.refresh only needs the relay + local workspace config, not Codex.
   if (command.type === "host.refresh") {
     await publishHostStatus();
     return;
   }
+  if (command.type === "host.set_cli_engine") {
+    const engine = normalizeCliEngine(command.cliEngine);
+    await taskStore.setDefaultEngine(engine);
+    updateState({ cliEngine: engine, detail: `默认编码引擎已切换为 ${engine}` });
+    await publishHostStatus();
+    return;
+  }
   let localThreadId = "threadId" in command ? command.threadId : undefined;
   try {
-    await ensureCodex();
     if (command.type === "task.create") {
       if (!isAllowedWorkspace(command.cwd)) throw new Error("工作目录不在代理白名单中");
       const mode = command.permissionMode ?? "ask-for-approval";
+      const engine = normalizeCliEngine(command.cliEngine ?? taskStore.getDefaultEngine());
+      if (engine === "claude" || engine === "grok") {
+        const threadId = crypto.randomUUID();
+        localThreadId = threadId;
+        await runHeadlessTaskTurn({
+          engine,
+          threadId,
+          cwd: command.cwd,
+          prompt: command.prompt,
+          ...(command.title ? { title: command.title } : {}),
+          permissionMode: mode,
+          isNew: true
+        });
+        return;
+      }
+      await ensureCodex();
       const started = await codex!.request("thread/start", threadStartParams(command.cwd, mode));
       const thread = started.thread;
       localThreadId = thread.id;
       if (command.title) await codex!.request("thread/name/set", { threadId: thread.id, name: command.title });
+      await taskStore.upsert({
+        threadId: thread.id,
+        engine: "codex",
+        providerSessionId: thread.id,
+        cwd: command.cwd,
+        title: command.title || command.prompt.slice(0, 80),
+        status: "active",
+        createdAt: Date.now() / 1000,
+        updatedAt: Date.now() / 1000,
+        messages: []
+      });
       await publishThread(thread.id);
       startLocalActivity(thread.id, command.prompt, command.title || command.prompt.slice(0, 80));
       const turn = await codex!.request("turn/start", {
@@ -1494,12 +1706,32 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "thread.resume") {
+      const stored = taskStore.get(command.threadId);
+      if (stored && stored.engine !== "codex") {
+        await publishStoredTaskSnapshot(command.threadId);
+        return;
+      }
+      await ensureCodex();
       await codex!.request("thread/resume", { threadId: command.threadId });
       await publishThread(command.threadId);
       return;
     }
     if (command.type === "turn.start") {
       const mode = command.permissionMode ?? "ask-for-approval";
+      const stored = taskStore.get(command.threadId);
+      if (stored && (stored.engine === "claude" || stored.engine === "grok")) {
+        await runHeadlessTaskTurn({
+          engine: stored.engine,
+          threadId: command.threadId,
+          cwd: stored.cwd,
+          prompt: command.prompt,
+          title: stored.title,
+          permissionMode: mode,
+          isNew: false
+        });
+        return;
+      }
+      await ensureCodex();
       await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
       startLocalActivity(command.threadId, command.prompt, "继续远程任务");
       const result = await codex!.request("turn/start", {
@@ -1512,6 +1744,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "turn.steer") {
+      await ensureCodex();
       await codex!.request("thread/resume", { threadId: command.threadId });
       if (publicState.activity?.threadId !== command.threadId) startLocalActivity(command.threadId, command.prompt, "追加远程指令");
       pendingPrompts.set(command.threadId, command.prompt);
@@ -1526,6 +1759,17 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "turn.interrupt") {
+      const stored = taskStore.get(command.threadId);
+      if (stored && stored.engine !== "codex") {
+        interruptHeadlessThread(command.threadId);
+        finishLocalActivity(command.threadId, "interrupted");
+        activeTurnByThread.delete(command.threadId);
+        await taskStore.setStatus(command.threadId, "interrupted");
+        await flushRemoteDeltas();
+        await publish({ type: "turn.completed", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: command.turnId, status: "interrupted" }, true, "completed");
+        return;
+      }
+      await ensureCodex();
       await Promise.race([
         codex!.request("turn/interrupt", { threadId: command.threadId, turnId: command.turnId }).catch(() => undefined),
         new Promise((resolve) => setTimeout(resolve, 5000))
@@ -1537,6 +1781,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "approval.resolve") {
+      await ensureCodex();
       const requestType = pendingRequestTypes.get(String(command.requestId));
       pendingRequestTypes.delete(String(command.requestId));
       if (requestType === "input") codex!.respond(command.requestId, { answers: {} });
@@ -1547,12 +1792,25 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     if (command.type === "sync.request") {
       // Refresh workspaces for the web new-task picker before streaming threads.
       await publishHostStatus();
-      const result = await syncAllThreads({
-        ...(command.limit !== undefined ? { limit: command.limit } : {}),
-        ...(command.query !== undefined ? { query: command.query } : {})
-      });
-      // Keep local 接力 list aligned with what was just read from Codex.
-      await refreshLocalTasks(command.limit ?? DEFAULT_SYNC_LIMIT).catch(() => undefined);
+      // Publish non-Codex tasks from local index first.
+      for (const task of taskStore.list(command.limit ?? DEFAULT_SYNC_LIMIT)) {
+        if (task.engine === "codex") continue;
+        if (command.query && !`${task.title}\n${task.cwd}\n${task.status}`.toLowerCase().includes(command.query.trim().toLowerCase())) continue;
+        await publishStoredTaskSnapshot(task.threadId);
+      }
+      let result = { threadCount: 0, partial: true };
+      try {
+        await ensureCodex();
+        result = await syncAllThreads({
+          ...(command.limit !== undefined ? { limit: command.limit } : {}),
+          ...(command.query !== undefined ? { query: command.query } : {})
+        });
+        // Keep local 接力 list aligned with what was just read from Codex.
+        await refreshLocalTasks(command.limit ?? DEFAULT_SYNC_LIMIT).catch(() => undefined);
+      } catch (error) {
+        // Codex optional when only Claude/Grok tasks exist.
+        handleError(error);
+      }
       await publish({
         type: "sync.completed",
         eventId: crypto.randomUUID(),
@@ -1709,13 +1967,28 @@ function publishAgentMeta(fields: { name?: string; codexVersion?: string; platfo
   }
 }
 
+async function refreshAvailableEngines(): Promise<void> {
+  const codexReady = Boolean(publicState.environment.codexCompatible || codex);
+  const availableEngines = await detectAvailableEngines({
+    codexReady,
+    codexVersion: codexVersion || publicState.environment.codexVersion || "unknown"
+  });
+  updateState({
+    availableEngines,
+    cliEngine: taskStore.getDefaultEngine()
+  });
+}
+
 async function publishHostStatus(): Promise<void> {
   // Keep encrypted host.status for workspaces/online UX; version/name also go via agent.meta for DB.
+  await refreshAvailableEngines().catch(() => undefined);
   publishAgentMeta();
   await publish({
     type: "host.status", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), online: true,
     name: resolvedDisplayName(), platform: `${process.platform} ${os.release()}`, codexVersion,
-    workspaces: config.workspaces
+    workspaces: config.workspaces,
+    cliEngine: taskStore.getDefaultEngine(),
+    availableEngines: publicState.availableEngines
   }, true);
 }
 
@@ -1728,23 +2001,44 @@ async function publishThread(threadId: string): Promise<void> {
       .sort((left, right) => right.updatedAt - left.updatedAt)
       .slice(0, 200)
   });
-  await publish({ type: "thread.snapshot", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), ...snapshot }, true);
+  await publish({
+    type: "thread.snapshot",
+    eventId: crypto.randomUUID(),
+    occurredAt: new Date().toISOString(),
+    ...snapshot,
+    cliEngine: "codex"
+  }, true);
 }
 
 /** Load 接力 task list from local Codex (thread/list) — independent of web sync. */
 async function refreshLocalTasks(limit = 50): Promise<void> {
-  if (!codex) await ensureCodex();
   const listLimit = Math.min(100, Math.max(1, limit));
-  const response = await codex!.request("thread/list", { limit: listLimit, sortDirection: "desc" });
-  let threads: Array<Record<string, any>> = response.data ?? [];
-  threads = [...threads].sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0));
-  const tasks: AgentTask[] = threads.map((thread) => ({
-    threadId: String(thread.id),
-    title: String(thread.name || thread.preview || "未命名任务"),
-    cwd: String(thread.cwd || ""),
-    status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
-    updatedAt: Number(thread.updatedAt ?? Date.now() / 1000)
+  const storedTasks: AgentTask[] = taskStore.list(listLimit).map((task) => ({
+    threadId: task.threadId,
+    title: `[${task.engine}] ${task.title}`,
+    cwd: task.cwd,
+    status: task.status,
+    updatedAt: task.updatedAt
   }));
+  let codexTasks: AgentTask[] = [];
+  try {
+    if (!codex) await ensureCodex();
+    const response = await codex!.request("thread/list", { limit: listLimit, sortDirection: "desc" });
+    let threads: Array<Record<string, any>> = response.data ?? [];
+    threads = [...threads].sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0));
+    codexTasks = threads.map((thread) => ({
+      threadId: String(thread.id),
+      title: String(thread.name || thread.preview || "未命名任务"),
+      cwd: String(thread.cwd || ""),
+      status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
+      updatedAt: Number(thread.updatedAt ?? Date.now() / 1000)
+    }));
+  } catch {
+    // Codex optional when listing Claude/Grok tasks.
+  }
+  const byId = new Map<string, AgentTask>();
+  for (const task of [...storedTasks, ...codexTasks]) byId.set(task.threadId, task);
+  const tasks = [...byId.values()].sort((left, right) => right.updatedAt - left.updatedAt).slice(0, listLimit);
   updateState({ tasks });
 }
 
@@ -2109,6 +2403,17 @@ function registerIpc(): void {
     await refreshLocalTasks();
     return publicState;
   });
+  ipcMain.handle("agent:set-cli-engine", async (_event, engine: string) => {
+    const next = normalizeCliEngine(engine);
+    await taskStore.setDefaultEngine(next);
+    updateState({ cliEngine: next, detail: `默认编码引擎已切换为 ${next}` });
+    if (socket?.readyState === WebSocket.OPEN) await publishHostStatus();
+    return publicState;
+  });
+  ipcMain.handle("agent:refresh-engines", async () => {
+    await refreshAvailableEngines();
+    return publicState;
+  });
   ipcMain.handle("agent:window-minimize", () => {
     windowRef?.minimize();
   });
@@ -2132,6 +2437,8 @@ if (process.platform === "win32") {
 
 app.whenReady().then(async () => {
   await loadConfig();
+  await taskStore.load(app.getPath("userData"));
+  updateState({ cliEngine: taskStore.getDefaultEngine() });
   registerIpc();
   if (process.platform === "darwin") {
     Menu.setApplicationMenu(Menu.buildFromTemplate([{ role: "appMenu" }]));
