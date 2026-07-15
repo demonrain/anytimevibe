@@ -37,7 +37,7 @@ import {
   type Workspace
 } from "@anytimevibe/protocol";
 import { CodexAdapter, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
-import { detectAvailableEngines } from "./cli/detect";
+import { detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { interruptHeadlessThread, runHeadlessTurn } from "./cli/headless-runner";
 import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
@@ -1566,6 +1566,14 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
   }
   if (event.type === "error") {
     handleError(new Error(event.message));
+    // Also surface to web clients as a persisted error event when possible.
+    void publish({
+      type: "error",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      message: event.message,
+      ...(event.threadId ? { threadId: event.threadId } : {})
+    }, true).catch(() => undefined);
     return;
   }
   if (event.type === "turn.completed") {
@@ -1631,7 +1639,7 @@ async function runHeadlessTaskTurn(options: {
     stored = {
       threadId: options.threadId,
       engine: options.engine,
-      providerSessionId: options.threadId,
+      providerSessionId: "",
       cwd: options.cwd,
       title: options.title || options.prompt.slice(0, 80),
       status: "active",
@@ -1648,24 +1656,42 @@ async function runHeadlessTaskTurn(options: {
   startLocalActivity(options.threadId, options.prompt, stored.title);
   activeTurnByThread.set(options.threadId, turnId);
 
+  // Ensure GUI-spawned agent can see user-installed CLIs on PATH.
+  try {
+    await applyLoginPathToProcess();
+  } catch {
+    // ignore PATH enrichment failures
+  }
+
+  // Resume only when we already have a provider-native session id from a prior turn.
+  const resumeId = stored.providerSessionId.trim() || undefined;
   const result = await runHeadlessTurn(options.engine, {
     threadId: options.threadId,
     turnId,
     cwd: options.cwd,
     prompt: options.prompt,
     permissionMode: options.permissionMode,
-    ...(stored.providerSessionId && stored.providerSessionId !== options.threadId
-      ? { providerSessionId: stored.providerSessionId }
-      : {}),
-    ...(options.isNew ? { preferredSessionId: options.threadId } : {})
+    ...(resumeId ? { providerSessionId: resumeId } : {})
   }, (event) => { void handleBackendStreamEvent(event); });
 
   const latest = taskStore.get(options.threadId) ?? stored;
-  latest.providerSessionId = result.providerSessionId || latest.providerSessionId;
+  if (result.providerSessionId) latest.providerSessionId = result.providerSessionId;
   latest.status = result.status;
   latest.updatedAt = Date.now() / 1000;
   if (result.text.trim()) {
-    latest.messages.push({ id: crypto.randomUUID(), role: "assistant", text: result.text });
+    latest.messages.push({
+      id: crypto.randomUUID(),
+      role: result.status === "failed" ? "system" : "assistant",
+      text: result.text
+    });
+  } else if (result.status === "failed") {
+    latest.messages.push({
+      id: crypto.randomUUID(),
+      role: "system",
+      text: options.engine === "claude"
+        ? "Claude 任务失败。请确认本机已安装 Claude Code 并完成登录（claude auth login）。"
+        : "Grok 任务失败。请确认本机已安装 Grok Build 并已登录。"
+    });
   }
   await taskStore.upsert(latest);
   await publishStoredTaskSnapshot(options.threadId);
@@ -2130,32 +2156,106 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-async function resolveRelayTask(threadId: string): Promise<AgentTask> {
+async function resolveRelayTask(threadId: string): Promise<AgentTask & { providerSessionId?: string }> {
+  const stored = taskStore.get(threadId);
+  if (stored) {
+    return {
+      threadId: stored.threadId,
+      title: stored.title,
+      cwd: stored.cwd,
+      status: stored.status,
+      updatedAt: stored.updatedAt,
+      engine: stored.engine,
+      providerSessionId: stored.providerSessionId
+    };
+  }
   const cached = publicState.tasks.find((item) => item.threadId === threadId);
-  if (cached) return cached;
-  await ensureCodex();
-  const result = await codex!.request("thread/read", { threadId, includeTurns: false });
-  const snapshot = threadToSnapshot(result.thread);
-  const task: AgentTask = {
-    threadId: snapshot.threadId,
-    title: snapshot.title,
-    cwd: snapshot.cwd,
-    status: snapshot.status,
-    updatedAt: snapshot.updatedAt
-  };
-  updateState({
-    tasks: [task, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)]
-      .sort((left, right) => right.updatedAt - left.updatedAt)
-      .slice(0, 200)
-  });
-  return task;
+  if (cached?.engine && cached.engine !== "codex") return cached;
+  if (cached?.engine === "codex" || !cached) {
+    try {
+      await ensureCodex();
+      const result = await codex!.request("thread/read", { threadId, includeTurns: false });
+      const snapshot = threadToSnapshot(result.thread);
+      const task: AgentTask = {
+        threadId: snapshot.threadId,
+        title: snapshot.title,
+        cwd: snapshot.cwd,
+        status: snapshot.status,
+        updatedAt: snapshot.updatedAt,
+        engine: "codex"
+      };
+      updateState({
+        tasks: [task, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)]
+          .sort((left, right) => right.updatedAt - left.updatedAt)
+          .slice(0, 200)
+      });
+      return task;
+    } catch {
+      if (cached) return cached;
+      throw new Error("任务不存在或会话已失效");
+    }
+  }
+  return cached;
+}
+
+async function openExternalTerminal(cwd: string, commandLine: string): Promise<void> {
+  if (process.platform === "win32") {
+    // Visible console that remains open (`/k`) so the user can continue the CLI session.
+    const child = spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/k", commandLine], {
+      cwd: cwd || undefined,
+      detached: true,
+      windowsHide: false,
+      stdio: "ignore"
+    });
+    child.unref();
+    return;
+  }
+  if (process.platform === "darwin") {
+    const command = `cd ${shellQuote(cwd || os.homedir())} && ${commandLine}`;
+    await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`]);
+    await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+    return;
+  }
+  throw new Error("当前系统暂不支持启动接力终端。");
+}
+
+function quoteWinArg(value: string): string {
+  if (!/[\s"]/g.test(value)) return value;
+  return `"${value.replace(/"/g, "\\\"")}"`;
 }
 
 async function relayTaskToCli(threadId: string): Promise<void> {
   const task = await resolveRelayTask(threadId);
+  const stored = taskStore.get(threadId);
+  const engine = task.engine ?? stored?.engine ?? "codex";
+  const cwd = task.cwd || os.homedir();
+  // Only resume with provider-native session ids (not our product thread UUID unless they match).
+  const providerSessionId = (stored?.providerSessionId || "").trim();
+
+  if (engine === "claude") {
+    const binary = await resolveEngineBinary("claude");
+    if (!binary) throw new Error("未找到 Claude Code CLI，无法接力");
+    const parts = process.platform === "win32"
+      ? [quoteWinArg(binary), ...(providerSessionId ? ["--resume", providerSessionId] : [])]
+      : [shellQuote(binary), ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : [])];
+    await openExternalTerminal(cwd, parts.join(" "));
+    return;
+  }
+
+  if (engine === "grok") {
+    const binary = await resolveEngineBinary("grok");
+    if (!binary) throw new Error("未找到 Grok Build CLI，无法接力");
+    const parts = process.platform === "win32"
+      ? [quoteWinArg(binary), ...(providerSessionId ? ["--resume", providerSessionId] : []), "--cwd", quoteWinArg(cwd)]
+      : [shellQuote(binary), ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : []), "--cwd", shellQuote(cwd)];
+    await openExternalTerminal(cwd, parts.join(" "));
+    return;
+  }
+
+  // codex always uses product/thread id as session id
   if (process.platform === "win32") {
     const child = spawn(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(codexCommand, ["resume", threadId]), {
-      cwd: task.cwd || undefined,
+      cwd: cwd || undefined,
       detached: true,
       windowsHide: false,
       windowsVerbatimArguments: true,
@@ -2165,7 +2265,7 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     return;
   }
   if (process.platform === "darwin") {
-    const command = `cd ${shellQuote(task.cwd || os.homedir())} && ${shellQuote(codexCommand)} resume ${shellQuote(threadId)}`;
+    const command = `cd ${shellQuote(cwd)} && ${shellQuote(codexCommand)} resume ${shellQuote(threadId)}`;
     await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`]);
     await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
     return;

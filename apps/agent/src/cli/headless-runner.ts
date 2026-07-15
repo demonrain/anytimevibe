@@ -1,9 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
-import { randomUUID } from "node:crypto";
 import type { CliEngine, PermissionMode } from "@anytimevibe/protocol";
 import { windowsCmdArguments } from "../windows-command";
-import { resolveEngineCommand } from "./detect";
+import { resolveEngineBinary } from "./detect";
 import type { BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
 
 type ActiveRun = {
@@ -14,45 +13,50 @@ type ActiveRun = {
 const activeByThread = new Map<string, ActiveRun>();
 
 function permissionArgs(engine: CliEngine, mode: PermissionMode): string[] {
-  // Headless CLIs cannot easily surface interactive approval cards like Codex app-server.
-  // Map product modes to closest non-interactive flags.
+  // Headless remote runs must not block on TTY permission prompts.
   if (engine === "claude") {
-    if (mode === "full-access") return ["--permission-mode", "bypassPermissions", "--dangerously-skip-permissions"];
-    if (mode === "approve-for-me") return ["--permission-mode", "acceptEdits"];
-    if (mode === "read-only") return ["--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep"];
-    // ask-for-approval / default → acceptEdits so remote turns do not hang waiting for TTY
+    if (mode === "full-access") {
+      return ["--permission-mode", "bypassPermissions", "--dangerously-skip-permissions"];
+    }
+    if (mode === "read-only") {
+      return ["--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep"];
+    }
+    // acceptEdits for remaining modes
     return ["--permission-mode", "acceptEdits"];
   }
-  // grok
-  if (mode === "full-access") return ["--always-approve", "--permission-mode", "bypassPermissions"];
-  if (mode === "approve-for-me") return ["--permission-mode", "acceptEdits"];
-  if (mode === "read-only") return ["--permission-mode", "dontAsk", "--tools", "read_file,grep,list_dir,web_search"];
-  return ["--permission-mode", "acceptEdits"];
+  // grok: always-approve for unattended agent use (acceptEdits alone can hang without TTY)
+  if (mode === "read-only") {
+    return ["--permission-mode", "dontAsk", "--tools", "read_file,grep,list_dir,web_search"];
+  }
+  if (mode === "full-access" || mode === "approve-for-me" || mode === "ask-for-approval") {
+    return ["--always-approve"];
+  }
+  return ["--always-approve"];
 }
 
 function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
   const args: string[] = [];
   if (engine === "claude") {
+    // Do not force --session-id on create: Claude assigns one and returns it.
     args.push(
       "-p", options.prompt,
       "--output-format", "stream-json",
       "--verbose",
-      "--include-partial-messages",
-      "--bare"
+      "--include-partial-messages"
     );
+    // --bare skips OAuth/keychain; only use when ANTHROPIC_API_KEY is set.
+    if (process.env.ANTHROPIC_API_KEY) args.push("--bare");
     if (options.providerSessionId) args.push("--resume", options.providerSessionId);
-    else if (options.preferredSessionId) args.push("--session-id", options.preferredSessionId);
     args.push(...permissionArgs(engine, options.permissionMode));
     return args;
   }
-  // grok
+  // grok — never force client-chosen session id on first turn; resume only when we have one.
   args.push(
     "-p", options.prompt,
     "--output-format", "streaming-json",
     "--cwd", options.cwd
   );
   if (options.providerSessionId) args.push("--resume", options.providerSessionId);
-  else if (options.preferredSessionId) args.push("--session-id", options.preferredSessionId);
   args.push(...permissionArgs(engine, options.permissionMode));
   return args;
 }
@@ -75,10 +79,17 @@ function emitDelta(
   });
 }
 
+type ParseState = {
+  sessionId: string;
+  text: string;
+  failed: boolean;
+  errorMessage: string;
+};
+
 function handleClaudeLine(
   line: string,
   options: HeadlessRunOptions,
-  state: { sessionId: string; text: string },
+  state: ParseState,
   onEvent: (event: BackendStreamEvent) => void
 ): void {
   let parsed: any;
@@ -98,13 +109,20 @@ function handleClaudeLine(
     }
     return;
   }
+  if (type === "content_block_delta" && parsed.delta?.text) {
+    state.text += String(parsed.delta.text);
+    emitDelta(onEvent, options, "assistant", "assistant", String(parsed.delta.text));
+    return;
+  }
   if (type === "assistant" && parsed.message?.content) {
     for (const block of parsed.message.content) {
       if (block?.type === "text" && block.text) {
-        // Prefer partial stream; still accept full blocks if no partials.
-        if (!state.text) {
-          state.text += String(block.text);
-          emitDelta(onEvent, options, "assistant", "assistant", String(block.text));
+        if (!state.text.includes(String(block.text))) {
+          // Prefer partials; still accept if only full blocks arrive.
+          if (!state.text) {
+            state.text += String(block.text);
+            emitDelta(onEvent, options, "assistant", "assistant", String(block.text));
+          }
         }
       }
     }
@@ -112,25 +130,32 @@ function handleClaudeLine(
   }
   if (type === "result") {
     if (parsed.session_id) state.sessionId = String(parsed.session_id);
-    if (typeof parsed.result === "string" && parsed.result && !state.text) {
-      state.text = parsed.result;
-      emitDelta(onEvent, options, "assistant", "assistant", parsed.result);
-    }
-    if (parsed.is_error) {
-      const msg = typeof parsed.result === "string" ? parsed.result : "Claude 运行失败";
-      onEvent({ type: "error", threadId: options.threadId, message: msg });
+    if (typeof parsed.result === "string" && parsed.result) {
+      if (!state.text) {
+        state.text = parsed.result;
+        emitDelta(onEvent, options, "assistant", "assistant", parsed.result);
+      }
+      if (parsed.is_error) {
+        state.failed = true;
+        state.errorMessage = parsed.result;
+        onEvent({ type: "error", threadId: options.threadId, message: parsed.result });
+      }
+    } else if (parsed.is_error) {
+      state.failed = true;
+      state.errorMessage = "Claude 运行失败";
+      onEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
     }
     return;
   }
   if (type === "system" && parsed.subtype === "init") {
-    emitDelta(onEvent, options, `stage:init`, "stage", "\n▶ Claude 会话初始化\n");
+    emitDelta(onEvent, options, "stage:init", "stage", "\n▶ Claude 会话初始化\n");
   }
 }
 
 function handleGrokLine(
   line: string,
   options: HeadlessRunOptions,
-  state: { sessionId: string; text: string },
+  state: ParseState,
   onEvent: (event: BackendStreamEvent) => void
 ): void {
   let parsed: any;
@@ -141,21 +166,34 @@ function handleGrokLine(
     return;
   }
   const type = String(parsed.type || "");
-  if (type === "text" && parsed.data) {
+  if (type === "text" && parsed.data != null) {
     state.text += String(parsed.data);
     emitDelta(onEvent, options, "assistant", "assistant", String(parsed.data));
     return;
   }
-  if (type === "thought" && parsed.data) {
+  if (type === "thought" && parsed.data != null) {
     emitDelta(onEvent, options, "thought", "thought", String(parsed.data));
     return;
   }
   if (type === "end") {
     if (parsed.sessionId) state.sessionId = String(parsed.sessionId);
+    // Some builds only put final text on end
+    if (!state.text && typeof parsed.text === "string" && parsed.text) {
+      state.text = parsed.text;
+      emitDelta(onEvent, options, "assistant", "assistant", parsed.text);
+    }
     return;
   }
   if (type === "error") {
-    onEvent({ type: "error", threadId: options.threadId, message: String(parsed.message || "Grok 运行失败") });
+    state.failed = true;
+    state.errorMessage = String(parsed.message || "Grok 运行失败");
+    onEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+  }
+  // json single-object mode fallback fields
+  if (parsed.sessionId && !state.sessionId) state.sessionId = String(parsed.sessionId);
+  if (typeof parsed.text === "string" && parsed.text && type !== "text" && !state.text) {
+    state.text = parsed.text;
+    emitDelta(onEvent, options, "assistant", "assistant", parsed.text);
   }
 }
 
@@ -170,27 +208,47 @@ export async function runHeadlessTurn(
     activeByThread.delete(options.threadId);
   }
 
-  const command = resolveEngineCommand(engine);
+  const command = await resolveEngineBinary(engine);
+  if (!command) {
+    const message = engine === "claude"
+      ? "未找到 Claude Code CLI，请安装并确保 claude 在 PATH 中"
+      : "未找到 Grok Build CLI，请安装并确保 grok 在 PATH 中";
+    onEvent({ type: "error", threadId: options.threadId, message });
+    onEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
+    onEvent({ type: "turn.completed", threadId: options.threadId, turnId: options.turnId, status: "failed" });
+    return { providerSessionId: options.providerSessionId || options.threadId, status: "failed", text: message };
+  }
+
   const args = buildArgs(engine, options);
   const isWindows = process.platform === "win32";
-  const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
-  const finalArgs = isWindows ? windowsCmdArguments(command, args) : args;
+  // Prefer direct spawn of the absolute binary; fall back to cmd only for .cmd shims.
+  const useCmdShim = isWindows && /\.cmd$/i.test(command);
+  const executable = useCmdShim ? (process.env.ComSpec ?? "cmd.exe") : command;
+  const finalArgs = useCmdShim ? windowsCmdArguments(command, args) : args;
 
   onEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
-  emitDelta(onEvent, options, `stage:${engine}`, "stage", `\n▶ 使用 ${engine === "claude" ? "Claude Code" : "Grok Build"} 执行\n`);
+  emitDelta(
+    onEvent,
+    options,
+    `stage:${engine}`,
+    "stage",
+    `\n▶ 使用 ${engine === "claude" ? "Claude Code" : "Grok Build"} 执行\n`
+  );
 
   const child = spawn(executable, finalArgs, {
     cwd: options.cwd,
-    env: process.env,
+    env: { ...process.env },
     windowsHide: true,
-    windowsVerbatimArguments: isWindows,
+    windowsVerbatimArguments: useCmdShim,
     stdio: ["ignore", "pipe", "pipe"]
   });
   activeByThread.set(options.threadId, { child, turnId: options.turnId });
 
-  const state = {
-    sessionId: options.providerSessionId || options.preferredSessionId || randomUUID(),
-    text: ""
+  const state: ParseState = {
+    sessionId: options.providerSessionId || "",
+    text: "",
+    failed: false,
+    errorMessage: ""
   };
 
   const result = await new Promise<HeadlessRunResult>((resolve) => {
@@ -199,20 +257,30 @@ export async function runHeadlessTurn(
       if (settled) return;
       settled = true;
       activeByThread.delete(options.threadId);
-      resolve({ providerSessionId: state.sessionId, status, text: state.text });
+      resolve({
+        providerSessionId: state.sessionId || options.providerSessionId || options.threadId,
+        status,
+        text: state.text || state.errorMessage
+      });
     };
 
-    createInterface({ input: child.stdout }).on("line", (line) => {
-      if (engine === "claude") handleClaudeLine(line, options, state, onEvent);
-      else handleGrokLine(line, options, state, onEvent);
-      if (state.sessionId && state.sessionId !== options.providerSessionId) {
-        onEvent({ type: "session", threadId: options.threadId, providerSessionId: state.sessionId });
-      }
-    });
-    createInterface({ input: child.stderr }).on("line", (line) => {
-      if (line.trim()) emitDelta(onEvent, options, "cli-log", "cli-log", `${line}\n`);
-    });
+    if (child.stdout) {
+      createInterface({ input: child.stdout }).on("line", (line) => {
+        if (engine === "claude") handleClaudeLine(line, options, state, onEvent);
+        else handleGrokLine(line, options, state, onEvent);
+        if (state.sessionId && state.sessionId !== options.providerSessionId) {
+          onEvent({ type: "session", threadId: options.threadId, providerSessionId: state.sessionId });
+        }
+      });
+    }
+    if (child.stderr) {
+      createInterface({ input: child.stderr }).on("line", (line) => {
+        if (line.trim()) emitDelta(onEvent, options, "cli-log", "cli-log", `${line}\n`);
+      });
+    }
     child.on("error", (error) => {
+      state.failed = true;
+      state.errorMessage = error.message;
       onEvent({ type: "error", threadId: options.threadId, message: error.message });
       finish("failed");
     });
@@ -221,7 +289,18 @@ export async function runHeadlessTurn(
         finish("interrupted");
         return;
       }
-      finish(code === 0 ? "completed" : "failed");
+      if (state.failed || (code !== 0 && code !== null)) {
+        if (!state.errorMessage && state.text) state.errorMessage = state.text;
+        if (!state.errorMessage) {
+          state.errorMessage = engine === "claude"
+            ? `Claude 退出码 ${code ?? "unknown"}（若未登录请在电脑端执行 claude auth login）`
+            : `Grok 退出码 ${code ?? "unknown"}`;
+          onEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+        }
+        finish("failed");
+        return;
+      }
+      finish("completed");
     });
   });
 
