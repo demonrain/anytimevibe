@@ -501,9 +501,8 @@ function rendererHtml(): string {
   .workspace div{flex:1 1 auto;min-width:0;overflow:hidden}
   .workspace strong,.workspace small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .workspace small{color:#747a73;margin-top:1px;font-size:10px}
-  .task-main{display:flex;align-items:flex-start;gap:8px;min-width:0;flex:1 1 auto}
+  .task-main{display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 auto}
   .engine-badge{width:18px;height:18px;border-radius:5px;object-fit:cover;flex:0 0 auto;background:#fff;box-shadow:0 0 0 1px rgba(23,33,27,.08)}
-  .engine-badge.codex{background:#000}
   .empty{text-align:center;color:#888;padding:8px;font-size:11px}
   .stack{display:grid;gap:6px;margin-top:6px}
   .label{font-size:10px;font-weight:800;color:#6b726b;letter-spacing:.04em}

@@ -12,7 +12,7 @@
   --line: rgba(23, 33, 27, 0.16);
   --shadow: 0 24px 70px rgba(32, 38, 30, 0.13);
   --topbar-h: 56px;
-  --rail-w: 220px;
+  --rail-w: 300px;
   --task-col-w: 300px;
   --msg-font: 12.5px;
   --msg-lh: 1.55;
@@ -51,9 +51,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .lang-switch { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: rgba(255,255,255,.5); }.lang-switch button { border: 0; background: transparent; padding: 8px 10px; font-size: 11px; font-weight: 800; cursor: pointer; color: #697068; }.lang-switch button.active { background: var(--ink); color: white; }
 .rail { border-right: 1px solid var(--line); padding: 14px 10px; background: rgba(255,250,240,.48); min-width: 0; overflow-x: hidden; overflow-y: auto; }
 .rail-heading { display: flex; justify-content: space-between; align-items: center; padding: 0 6px 10px; font-size: 10px; letter-spacing: .12em; font-weight: 900; text-transform: uppercase; }.rail-heading button { border: 0; background: var(--ink); color: white; border-radius: 8px; width: 26px; height: 26px; cursor: pointer; }
-.host-list { display: grid; gap: 8px; }.host-add-mobile { display: none; border: 1px dashed rgba(226,88,50,.55); background: rgba(226,88,50,.08); color: var(--rust); border-radius: 12px; padding: 10px 13px; font-weight: 850; cursor: pointer; white-space: nowrap; }.host-row { display: grid; grid-template-columns: minmax(0,1fr) 26px 26px; align-items: start; border-radius: 14px; transition: .18s ease; padding: 2px 0; }.host-row.active { background: var(--ink); color: white; box-shadow: 0 8px 18px rgba(23,33,27,.16); }.host-pill, .empty-host { border: 0; text-align: left; background: transparent; color: inherit; border-radius: 12px; padding: 10px; display: flex; gap: 10px; align-items: flex-start; cursor: pointer; min-width: 0; }.host-pill-body { display: grid; min-width: 0; gap: 8px; flex: 1; }.host-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 800; }.host-engine-rail { display: grid; grid-template-columns: repeat(auto-fit, minmax(72px, 1fr)); gap: 6px; width: 100%; }.host-engine-item { display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: 6px; min-width: 0; padding: 5px 6px; border-radius: 10px; background: rgba(23,33,27,.05); }.host-row.active .host-engine-item { background: rgba(255,255,255,.1); }.host-engine-ver { font-size: 10px; font-weight: 700; opacity: .78; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: .01em; }.host-rename, .host-delete { width: 24px; height: 24px; margin-top: 8px; border: 0; border-radius: 8px; background: transparent; color: currentColor; opacity: .42; cursor: pointer; font-size: 13px; }.host-delete { font-size: 17px; }.host-rename:hover { opacity: 1; background: rgba(45,118,83,.16); color: var(--moss); }.host-delete:hover { opacity: 1; background: rgba(226,88,50,.16); color: var(--rust); }.status-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #9a9f98; margin-top: 6px; }.status-dot.online { background: #4db77d; box-shadow: 0 0 0 5px rgba(77,183,125,.13); }
+.host-list { display: grid; gap: 8px; }.host-add-mobile { display: none; border: 1px dashed rgba(226,88,50,.55); background: rgba(226,88,50,.08); color: var(--rust); border-radius: 12px; padding: 10px 13px; font-weight: 850; cursor: pointer; white-space: nowrap; }.host-row { display: grid; grid-template-columns: minmax(0,1fr) 26px 26px; align-items: start; border-radius: 14px; transition: .18s ease; padding: 2px 0; }.host-row.active { background: var(--ink); color: white; box-shadow: 0 8px 18px rgba(23,33,27,.16); }.host-pill, .empty-host { border: 0; text-align: left; background: transparent; color: inherit; border-radius: 12px; padding: 10px; display: flex; gap: 10px; align-items: flex-start; cursor: pointer; min-width: 0; }.host-pill-body { display: grid; min-width: 0; gap: 8px; flex: 1; }.host-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 800; }.host-engine-rail { display: flex; flex-wrap: nowrap; gap: 6px; width: 100%; min-width: 0; overflow: hidden; }.host-engine-item { display: inline-flex; align-items: center; gap: 5px; min-width: 0; flex: 1 1 0; padding: 4px 6px; border-radius: 10px; background: rgba(23,33,27,.05); }.host-row.active .host-engine-item { background: rgba(255,255,255,.1); }.host-engine-ver { font-size: 10px; font-weight: 700; opacity: .8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: .01em; min-width: 0; }.host-rename, .host-delete { width: 24px; height: 24px; margin-top: 8px; border: 0; border-radius: 8px; background: transparent; color: currentColor; opacity: .42; cursor: pointer; font-size: 13px; }.host-delete { font-size: 17px; }.host-rename:hover { opacity: 1; background: rgba(45,118,83,.16); color: var(--moss); }.host-delete:hover { opacity: 1; background: rgba(226,88,50,.16); color: var(--rust); }.status-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #9a9f98; margin-top: 6px; }.status-dot.online { background: #4db77d; box-shadow: 0 0 0 5px rgba(77,183,125,.13); }
 .engine-logo { display: block; border-radius: 5px; flex: 0 0 auto; object-fit: cover; background: #fff; box-shadow: 0 0 0 1px rgba(23,33,27,.08); }
-.engine-logo-codex { background: #000; }
 .task-meta-left { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
 .task-engine-logo { box-shadow: 0 0 0 1px rgba(23,33,27,.08); }
 .thread-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -99,17 +98,17 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } } @keyframes pulse { 50% { transform: scale(.72); opacity: .45; } } @keyframes spin { to { transform: rotate(360deg); } }
 /* Large / high-DPI desktop (4K @ 150% ≈ 2560 CSS px): denser chrome, more content */
 @media (min-width: 1280px) {
-  :root { --topbar-h: 52px; --rail-w: 200px; --task-col-w: 280px; --msg-font: 12px; }
+  :root { --topbar-h: 52px; --rail-w: 300px; --task-col-w: 280px; --msg-font: 12px; }
   .quiet { padding: 7px 10px; font-size: 12px; }
   .top-actions { gap: 8px; }
 }
 @media (min-width: 1600px) {
-  :root { --rail-w: 220px; --task-col-w: 320px; }
+  :root { --rail-w: 320px; --task-col-w: 320px; }
   .message { max-width: min(78%, 920px); }
   .message-stream { padding: 16px 22px; }
 }
 @media (min-width: 2200px) {
-  :root { --rail-w: 240px; --task-col-w: 360px; --msg-font: 12.5px; }
+  :root { --rail-w: 340px; --task-col-w: 360px; --msg-font: 12.5px; }
   .message { max-width: min(70%, 980px); }
 }
 /* Scaled displays (125%–150%): keep UI compact without relying on device-pixel-ratio alone */
