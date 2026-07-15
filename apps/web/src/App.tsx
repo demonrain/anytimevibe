@@ -96,7 +96,7 @@ function cliEngineLabel(engine: CliEngine): string {
 function EngineLogo({ engine, size = 14, className = "" }: { engine: CliEngine; size?: number; className?: string }) {
   return (
     <img
-      className={`engine-logo engine-logo-${engine} ${className}`.trim()}
+      className={`engine-logo ${className}`.trim()}
       src={`/vendors/${engine}.png`}
       alt={cliEngineLabel(engine)}
       title={cliEngineLabel(engine)}
