@@ -1582,6 +1582,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     queueRemoteDelta(threadId, itemId, delta);
   }
   // Command / tool output chunks when the app-server streams them.
+  // Prefix exec: so web concise mode can hide process streams while keeping final replies.
   if (
     message.method === "item/commandExecution/outputDelta"
     || message.method === "item/commandExecution/delta"
@@ -1589,7 +1590,8 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   ) {
     const params = message.params ?? {};
     const threadId = String(params.threadId ?? "");
-    const itemId = String(params.itemId ?? params.item?.id ?? "command");
+    const rawItemId = String(params.itemId ?? params.item?.id ?? "command");
+    const itemId = rawItemId.startsWith("exec:") ? rawItemId : `exec:${rawItemId}`;
     const delta = String(params.delta ?? params.chunk ?? params.output ?? "");
     if (delta) {
       appendLocalActivity(threadId, delta);

@@ -33,6 +33,10 @@ export const messages = {
     permAsk: "Ask for approval",
     permApprove: "Approve for me",
     permFull: "Full Access",
+    agentReplyDetail: "Agent 回复",
+    replyConcise: "简洁",
+    replyDetailed: "详细",
+    replyProcess: "过程",
     chat: "对话",
     diff: "Diff",
     send: "发送",
@@ -82,6 +86,10 @@ export const messages = {
     permAsk: "Ask for approval",
     permApprove: "Approve for me",
     permFull: "Full Access",
+    agentReplyDetail: "Agent reply",
+    replyConcise: "Concise",
+    replyDetailed: "Detailed",
+    replyProcess: "Process",
     chat: "Chat",
     diff: "Diff",
     send: "Send",
@@ -121,4 +129,13 @@ export function normalizePermissionMode(value: string | null | undefined): "read
   if (value === "workspace-write") return "ask-for-approval";
   if (value === "inherit") return "ask-for-approval";
   return "ask-for-approval";
+}
+
+export const REPLY_DETAIL_STORAGE_KEY = "agent-reply-detail";
+
+/** concise = final replies only; detailed = include stage / exec / cli process streams */
+export type ReplyDetail = "concise" | "detailed";
+
+export function normalizeReplyDetail(value: string | null | undefined): ReplyDetail {
+  return value === "concise" ? "concise" : "detailed";
 }

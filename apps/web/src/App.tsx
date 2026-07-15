@@ -19,7 +19,12 @@ import {
 } from "@anytimevibe/protocol";
 import { api, websocketUrl } from "./api";
 import { useI18n } from "./i18n/I18nProvider";
-import { normalizePermissionMode } from "./i18n/locales";
+import {
+  normalizePermissionMode,
+  normalizeReplyDetail,
+  REPLY_DETAIL_STORAGE_KEY,
+  type ReplyDetail
+} from "./i18n/locales";
 import { getHostKey, removeHostKey, saveHostKey } from "./key-store";
 
 type Health = { ok: boolean; needsSetup: boolean; registrationEnabled: boolean; vapidPublicKey: string | null; clientDownloads: { windows: string | null; mac: string | null } };
@@ -71,6 +76,31 @@ function taskStatusMeta(status: string): { label: string; tone: string } {
 
 function emptyRuntime(online: boolean | null = null): HostRuntime {
   return { online, workspaces: [], tasks: {} };
+}
+
+/** Message ids from turn.delta are `assistant:${turnId}:${itemId}`. */
+function assistantStreamItemId(messageId: string): string | null {
+  if (!messageId.startsWith("assistant:")) return null;
+  const rest = messageId.slice("assistant:".length);
+  const sep = rest.indexOf(":");
+  if (sep < 0) return null;
+  return rest.slice(sep + 1);
+}
+
+/** Stage / CLI / command streams — hidden in concise reply mode. */
+function isProcessStreamMessage(message: { id: string; role: string }): boolean {
+  if (message.role !== "assistant") return false;
+  const itemId = assistantStreamItemId(message.id);
+  if (!itemId) return false;
+  return itemId === "cli-log"
+    || itemId.startsWith("stage:")
+    || itemId.startsWith("exec:")
+    || itemId.startsWith("process:");
+}
+
+/** Strip control characters that can break layout engines while keeping newlines/tabs. */
+function sanitizeDisplayText(text: string): string {
+  return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u2028\u2029]/g, "");
 }
 
 function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
@@ -223,6 +253,7 @@ export function App() {
   const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
   const { locale, setLocale, t } = useI18n();
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => normalizePermissionMode(localStorage.getItem("permission-mode")));
+  const [replyDetail, setReplyDetail] = useState<ReplyDetail>(() => normalizeReplyDetail(localStorage.getItem(REPLY_DETAIL_STORAGE_KEY)));
   const [taskQuery, setTaskQuery] = useState("");
   const taskSearchTimerRef = useRef<number | null>(null);
   const autoSyncedHostsRef = useRef(new Set<string>());
@@ -603,7 +634,10 @@ export function App() {
         </div>
         <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? t("hostOnline") : activeRuntime.online === false ? t("hostOffline") : t("hostChecking")}</div>
         {activeHost && keyAuthorizationStatus[activeHost.id] && <div className="key-authorization-note"><div><strong>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "正在授权此浏览器" : "此浏览器尚未取得主机密钥"}</strong><span>{activeRuntime.online === true ? "电脑端会自动完成端到端密钥授权。" : "请先让电脑端客户端上线，再重新授权。"}</span></div><button disabled={keyAuthorizationStatus[activeHost.id] === "authorizing" || activeRuntime.online !== true} onClick={() => authorizeExistingHost(activeHost.id).catch((authorizationError) => setError(authorizationError.message))}>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "授权中…" : "授权此浏览器"}</button></div>}
-        <label className="permission-select">{t("codexPermission")}<select value={permissionMode} onChange={(event) => { const mode = normalizePermissionMode(event.target.value); setPermissionMode(mode); localStorage.setItem("permission-mode", mode); }}><option value="read-only">{t("permReadOnly")}</option><option value="ask-for-approval">{t("permAsk")}</option><option value="approve-for-me">{t("permApprove")}</option><option value="full-access">{t("permFull")}</option></select></label>
+        <div className="settings-row">
+          <label className="permission-select">{t("codexPermission")}<select value={permissionMode} onChange={(event) => { const mode = normalizePermissionMode(event.target.value); setPermissionMode(mode); localStorage.setItem("permission-mode", mode); }}><option value="read-only">{t("permReadOnly")}</option><option value="ask-for-approval">{t("permAsk")}</option><option value="approve-for-me">{t("permApprove")}</option><option value="full-access">{t("permFull")}</option></select></label>
+          <label className="reply-detail-select">{t("agentReplyDetail")}<select value={replyDetail} onChange={(event) => { const next = normalizeReplyDetail(event.target.value); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }}><option value="concise">{t("replyConcise")}</option><option value="detailed">{t("replyDetailed")}</option></select></label>
+        </div>
         <div className="task-search">
           <input
             value={taskQuery}
@@ -626,7 +660,7 @@ export function App() {
       </section>
 
       <section className="conversation-column">
-        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} onPermissionModeChange={(mode) => { const next = normalizePermissionMode(mode); setPermissionMode(next); localStorage.setItem("permission-mode", next); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>{t("pickTask")}</h2><p>{t("pickTaskHint")}</p></div>}
+        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} replyDetail={replyDetail} onPermissionModeChange={(mode) => { const next = normalizePermissionMode(mode); setPermissionMode(next); localStorage.setItem("permission-mode", next); }} onReplyDetailChange={(detail) => { const next = normalizeReplyDetail(detail); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>{t("pickTask")}</h2><p>{t("pickTaskHint")}</p></div>}
       </section>
     </main>
 
@@ -638,7 +672,7 @@ export function App() {
   </div>;
 }
 
-function TaskConversation({ task, online, visible, permissionMode, onPermissionModeChange, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; permissionMode: PermissionMode; onPermissionModeChange(mode: PermissionMode): void; onBack(): void; onCommand(command: ClientCommand): void }) {
+function TaskConversation({ task, online, visible, permissionMode, replyDetail, onPermissionModeChange, onReplyDetailChange, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; permissionMode: PermissionMode; replyDetail: ReplyDetail; onPermissionModeChange(mode: PermissionMode): void; onReplyDetailChange(detail: ReplyDetail): void; onBack(): void; onCommand(command: ClientCommand): void }) {
   const { t } = useI18n();
   const [prompt, setPrompt] = useState("");
   const [pendingPrompt, setPendingPrompt] = useState("");
@@ -654,7 +688,10 @@ function TaskConversation({ task, online, visible, permissionMode, onPermissionM
   const stickToBottomRef = useRef(true);
   const previousThreadRef = useRef(task.threadId);
   const running = Boolean(task.activeTurnId);
-  const lastMessageLength = task.messages.at(-1)?.text.length ?? 0;
+  const visibleMessages = replyDetail === "detailed"
+    ? task.messages
+    : task.messages.filter((message) => !isProcessStreamMessage(message));
+  const lastMessageLength = visibleMessages.at(-1)?.text.length ?? 0;
 
   function submitPrompt() {
     if (!prompt.trim() || online !== true) return;
@@ -709,24 +746,28 @@ function TaskConversation({ task, online, visible, permissionMode, onPermissionM
       });
       return () => window.cancelAnimationFrame(frame);
     }
-  }, [task.threadId, task.messages.length, lastMessageLength, task.approvals.length, pendingPrompt, tab, visible]);
+  }, [task.threadId, visibleMessages.length, lastMessageLength, task.approvals.length, pendingPrompt, tab, visible, replyDetail]);
 
   return <>
     <div className="conversation-head">
       <button className="mobile-back" type="button" onClick={onBack} aria-label="返回任务列表">‹</button>
-      <div><p className="eyebrow">THREAD</p><h2>{task.title}</h2><code>{task.cwd}</code></div>
+      <div><p className="eyebrow">THREAD</p><h2 title={task.title}>{task.title}</h2><code title={task.cwd}>{task.cwd}</code></div>
       <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>{t("chat")}</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>{t("diff")}</button></div>
     </div>
     {tab === "chat" ? <div className="message-stream" ref={messageStreamRef} onScroll={(event) => {
       const stream = event.currentTarget;
       stickToBottomRef.current = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 90;
     }}>
-      {task.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><span>{message.role === "user" ? "YOU" : message.role === "assistant" ? "CODEX" : "SYSTEM"}</span><pre>{message.text}</pre></article>)}
-      {pendingPrompt && <article className="message user pending"><span>YOU · 发送中</span><pre>{pendingPrompt}</pre></article>}
+      {visibleMessages.map((message) => {
+        const process = isProcessStreamMessage(message);
+        const label = message.role === "user" ? "YOU" : message.role === "system" ? "SYSTEM" : process ? t("replyProcess") : "CODEX";
+        return <article key={message.id} className={`message ${message.role}${process ? " process" : ""}`}><span>{label}</span><pre>{sanitizeDisplayText(message.text)}</pre></article>;
+      })}
+      {pendingPrompt && <article className="message user pending"><span>YOU · 发送中</span><pre>{sanitizeDisplayText(pendingPrompt)}</pre></article>}
       {running && <article className="processing-card"><span className="processing-spinner" /><div><strong>{t("processing")}</strong><p>{t("processingHint")}</p></div></article>}
-      {commandQueue.length > 0 && <section className="command-queue"><div><strong>{t("queue")}</strong><span>{commandQueue.length}</span></div>{commandQueue.map((queuedPrompt, index) => <article key={`${index}:${queuedPrompt}`}><b>{index + 1}</b><p>{queuedPrompt}</p></article>)}</section>}
+      {commandQueue.length > 0 && <section className="command-queue"><div><strong>{t("queue")}</strong><span>{commandQueue.length}</span></div>{commandQueue.map((queuedPrompt, index) => <article key={`${index}:${queuedPrompt}`}><b>{index + 1}</b><p>{sanitizeDisplayText(queuedPrompt)}</p></article>)}</section>}
       {task.approvals.map((approval) => <article className="approval-card" key={String(approval.requestId)}>
-        <div className="approval-label">{t("actionRequired")}</div><h3>{approval.title}</h3><pre>{approval.detail}</pre>
+        <div className="approval-label">{t("actionRequired")}</div><h3>{approval.title}</h3><pre>{sanitizeDisplayText(approval.detail)}</pre>
         <div className="approval-actions"><button onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "decline" })}>{t("decline")}</button><button className="approve" onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "accept" })}>{t("allowOnce")}</button></div>
       </article>)}
       <div className="message-end" ref={messageEndRef} />
@@ -741,14 +782,14 @@ function TaskConversation({ task, online, visible, permissionMode, onPermissionM
           submitPrompt();
         }
       }} placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"} />
-      <div><small><label className="composer-permission">{t("currentPermission")}<select value={permissionMode} onChange={(event) => onPermissionModeChange(normalizePermissionMode(event.target.value))}><option value="read-only">{t("permReadOnly")}</option><option value="ask-for-approval">{t("permAsk")}</option><option value="approve-for-me">{t("permApprove")}</option><option value="full-access">{t("permFull")}</option></select></label><span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> {t("sendShortcut")}</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>{t("stop")}</button>}<button className="send" disabled={online !== true || !prompt.trim()}>{t("send")}</button></div>
+      <div><small><label className="composer-permission">{t("currentPermission")}<select value={permissionMode} onChange={(event) => onPermissionModeChange(normalizePermissionMode(event.target.value))}><option value="read-only">{t("permReadOnly")}</option><option value="ask-for-approval">{t("permAsk")}</option><option value="approve-for-me">{t("permApprove")}</option><option value="full-access">{t("permFull")}</option></select></label><label className="composer-reply-detail">{t("agentReplyDetail")}<select value={replyDetail} onChange={(event) => onReplyDetailChange(normalizeReplyDetail(event.target.value))}><option value="concise">{t("replyConcise")}</option><option value="detailed">{t("replyDetailed")}</option></select></label><span className="send-shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> {t("sendShortcut")}</span></small>{running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>{t("stop")}</button>}<button className="send" disabled={online !== true || !prompt.trim()}>{t("send")}</button></div>
     </form>
   </>;
 }
 
 function DiffView({ diff }: { diff: string }) {
   if (!diff) return <div className="diff-empty">当前任务还没有产生代码变更。</div>;
-  return <div className="diff-view">{diff.split("\n").map((line, index) => <div key={index} className={line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "remove" : line.startsWith("@@") ? "hunk" : ""}>{line || " "}</div>)}</div>;
+  return <div className="diff-view">{sanitizeDisplayText(diff).split("\n").map((line, index) => <div key={index} className={line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "remove" : line.startsWith("@@") ? "hunk" : ""}>{line || " "}</div>)}</div>;
 }
 
 function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): void }) {
