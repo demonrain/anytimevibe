@@ -1,6 +1,6 @@
 {
   "name": "@anytimevibe/agent",
-  "version": "0.4.24",
+  "version": "0.4.25",
   "description": "随码桌面代理：在 Windows / macOS 上安全接力远程 Codex 任务",
   "author": "随码",
   "private": true,
