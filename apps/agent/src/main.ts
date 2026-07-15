@@ -675,7 +675,15 @@ function rendererHtml(): string {
       search.addEventListener('input',function(){taskQuery=search.value;renderTasks(lastTasks);var el=document.querySelector('#taskSearch');if(el){el.focus();var n=el.value.length;try{el.setSelectionRange(n,n);}catch(e){}}});
     }
     taskBox.querySelectorAll('[data-relay]').forEach(function(button){
-      button.addEventListener('click',function(){ if(api) api.relayTask(button.getAttribute('data-relay')); });
+      button.addEventListener('click',function(){
+        if(!api) return;
+        button.disabled=true;
+        api.relayTask(button.getAttribute('data-relay')).then(function(){
+          if(detail) detail.textContent='已打开接力终端。';
+        }).catch(function(error){
+          alert(error&&error.message?error.message:String(error));
+        }).finally(function(){ try{ button.disabled=false; }catch(e){} });
+      });
     });
   }
   function bindUi(){
@@ -684,7 +692,15 @@ function rendererHtml(): string {
     if((el=document.querySelector('#saveName'))&&api) el.addEventListener('click',function(){api.setDisplayName(displayName.value);});
     if(startPair&&api) startPair.addEventListener('click',function(){api.startPairing();});
     if((el=document.querySelector('#addWorkspace'))&&api) el.addEventListener('click',function(){api.addWorkspace();});
-    if((el=document.querySelector('#recheck'))&&api) el.addEventListener('click',function(){api.checkEnvironment(); if(api.refreshEngines) api.refreshEngines();});
+    if((el=document.querySelector('#recheck'))&&api) el.addEventListener('click',function(){
+      el.disabled=true;
+      if(detail) detail.textContent='正在检测 Node / Codex / Claude / Grok…';
+      Promise.resolve(api.checkEnvironment()).then(function(state){
+        if(state) paint(state);
+      }).catch(function(error){
+        alert(error&&error.message?error.message:String(error));
+      }).finally(function(){ try{ el.disabled=false; }catch(e){} });
+    });
     if((el=document.querySelector('#winMin'))&&api) el.addEventListener('click',function(){api.windowMinimize();});
     if((el=document.querySelector('#winClose'))&&api) el.addEventListener('click',function(){api.windowClose();});
     if((el=document.querySelector('#feedback'))&&api) el.addEventListener('click',function(){api.openFeedback();});
@@ -1152,21 +1168,114 @@ async function installCodexOnWindows(): Promise<void> {
 
 async function installCodexOnMac(): Promise<void> {
   if (process.platform !== "darwin") throw new Error("installCodexOnMac is macOS-only");
+  updateState({ detail: "正在打开 Terminal 安装 Codex…" });
+  await openMacTerminalScript(`
+echo "Installing Codex CLI 0.144.0…"
+if ! command -v npm >/dev/null 2>&1; then
+  echo "未找到 npm，请先安装 Node.js。"
+else
+  npm install -g @openai/codex@0.144.0
+  if command -v codex >/dev/null 2>&1; then
+    codex --version
+    echo "安装成功，开始登录…"
+    codex login || true
+  else
+    echo "安装结束但未找到 codex 命令，请检查 npm 全局 bin 是否在 PATH。"
+  fi
+fi
+`);
+  updateState({ detail: "已打开 Terminal 安装 Codex。完成后请点击「重新检测」。" });
+}
+
+/** Build shell export/set lines for the current machine proxy (so curl/irm work offline-LAN). */
+async function proxyShellLines(platform: "win32" | "darwin" | "powershell"): Promise<string[]> {
+  const proxy = await collectLocalProxyEnv();
+  const entries = Object.entries(proxy).filter((entry): entry is [string, string] => Boolean(entry[1]));
+  if (!entries.length) return [];
+  if (platform === "powershell") {
+    return entries.map(([key, value]) => `$env:${key} = ${JSON.stringify(value)}`);
+  }
+  if (platform === "win32") {
+    return entries.map(([key, value]) => `set "${key}=${value.replace(/"/g, "")}"`);
+  }
+  return entries.map(([key, value]) => `export ${key}=${JSON.stringify(value)}`);
+}
+
+/** macOS Terminal: run a multi-line bash script (proxy + PATH already injected). */
+async function openMacTerminalScript(scriptBody: string): Promise<void> {
   await applyMacLoginPathToProcess();
-  const installCommand = "npm install -g @openai/codex@0.144.0 && codex login; echo ''; echo '完成。可关闭此窗口，回到随码客户端点击重新检测。'";
-  await execFileAsync("osascript", ["-e", `tell application \"Terminal\" to do script \"${installCommand}\"`]);
+  const proxyLines = await proxyShellLines("darwin");
+  const stamp = Date.now();
+  const scriptPath = path.join(os.tmpdir(), `anytimevibe-install-${stamp}.sh`);
+  const full = [
+    "#!/bin/bash",
+    "set +e",
+    ...proxyLines,
+    'export PATH="$HOME/.grok/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"',
+    "echo \"Proxy: HTTP_PROXY=${HTTP_PROXY:-none}\"",
+    scriptBody,
+    "echo \"\"",
+    "echo \"---\"",
+    "echo \"可关闭此窗口，回到随码客户端点击「重新检测」。\""
+  ].join("\n");
+  await fs.writeFile(scriptPath, full, "utf8");
+  try {
+    await fs.chmod(scriptPath, 0o755);
+  } catch {
+    // ignore
+  }
+  const launch = `bash ${JSON.stringify(scriptPath)}`;
+  await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(launch)}`]);
   await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
-  updateState({ detail: "已打开 Terminal 安装窗口。完成后请点击「重新检测」。" });
+}
+
+/** Windows: visible PowerShell window (never WSL/bash — those install Linux binaries). */
+async function openWindowsPowerShellScript(scriptBody: string): Promise<void> {
+  if (process.platform !== "win32") throw new Error("openWindowsPowerShellScript is Windows-only");
+  const stamp = Date.now();
+  const ps1Path = path.join(app.getPath("temp"), `anytimevibe-ps-${stamp}.ps1`);
+  const vbsPath = path.join(app.getPath("temp"), `anytimevibe-ps-${stamp}.vbs`);
+  const proxyLines = await proxyShellLines("powershell");
+  const full = [
+    "$ErrorActionPreference = 'Continue'",
+    "try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new() } catch {}",
+    "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12",
+    "$ProgressPreference = 'SilentlyContinue'",
+    ...proxyLines,
+    scriptBody,
+    "Write-Host ''",
+    "Write-Host 'Press Enter to close...'",
+    "[void](Read-Host)"
+  ].join("\r\n");
+  await fs.writeFile(ps1Path, full, "utf8");
+  const quoted = ps1Path.replace(/"/g, '""');
+  const vbs = `CreateObject("WScript.Shell").Run "powershell.exe -NoLogo -ExecutionPolicy Bypass -File ""${quoted}""", 1, False`;
+  await fs.writeFile(vbsPath, vbs, "utf8");
+  const wscript = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
+  const child = spawn(wscript, [vbsPath], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    cwd: os.homedir()
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once("error", (error) => reject(new Error(`无法打开 PowerShell：${error.message}`)));
+    child.once("spawn", () => resolve());
+    setTimeout(() => resolve(), 800);
+  });
+  child.unref();
 }
 
 async function installClaudeOnWindows(): Promise<void> {
   await applyWindowsPathToProcess();
   updateState({ detail: "正在打开 Claude Code 安装窗口…" });
+  const proxyLines = await proxyShellLines("win32");
   await openWindowsVisibleConsole([
     "echo ============================================",
     "echo   AnytimeVibe - install Claude Code",
     "echo ============================================",
     "echo.",
+    ...proxyLines,
     "where winget >nul 2>&1 && (",
     "  echo [1] winget install Anthropic.ClaudeCode ...",
     "  winget install --id Anthropic.ClaudeCode -e --accept-package-agreements --accept-source-agreements",
@@ -1185,52 +1294,119 @@ async function installClaudeOnWindows(): Promise<void> {
 }
 
 async function installClaudeOnMac(): Promise<void> {
-  await applyMacLoginPathToProcess();
-  const installCommand =
-    "set -e; echo 'Installing Claude Code…'; "
-    + "(command -v brew >/dev/null && brew install --cask claude-code) "
-    + "|| curl -fsSL https://claude.ai/install.sh | bash; "
-    + "echo ''; claude --version || true; "
-    + "echo ''; echo '完成。可关闭此窗口，回到随码客户端点击重新检测。'";
-  await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(installCommand)}`]);
-  await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+  updateState({ detail: "正在打开 Terminal 安装 Claude Code…" });
+  // Prefer official install.sh (no Homebrew auto-update hang). brew as last resort with NO_AUTO_UPDATE.
+  await openMacTerminalScript(`
+echo "Installing Claude Code…"
+export HOMEBREW_NO_AUTO_UPDATE=1
+export HOMEBREW_NO_ENV_HINTS=1
+OK=0
+if curl -fsSL --connect-timeout 25 --max-time 300 https://claude.ai/install.sh | bash; then
+  OK=1
+elif command -v npm >/dev/null 2>&1; then
+  echo "official installer failed, trying npm…"
+  npm install -g @anthropic-ai/claude-code && OK=1
+elif command -v brew >/dev/null 2>&1; then
+  echo "trying brew cask (no auto-update)…"
+  brew install --cask claude-code && OK=1
+fi
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+if command -v claude >/dev/null 2>&1; then
+  claude --version
+  echo "安装成功"
+else
+  echo "安装失败：请检查网络/代理后重试，或手动安装 Claude Code。"
+  echo "  curl -fsSL https://claude.ai/install.sh | bash"
+fi
+`);
   updateState({ detail: "已打开 Terminal 安装 Claude Code。完成后请点击「重新检测」。" });
 }
 
 async function installGrokOnWindows(): Promise<void> {
   await applyWindowsPathToProcess();
-  updateState({ detail: "正在打开 Grok Build 安装窗口…" });
-  // Official installer is a bash/curl script; prefer Git Bash / WSL-free PowerShell bootstrap when present.
-  await openWindowsVisibleConsole([
-    "echo ============================================",
-    "echo   AnytimeVibe - install Grok Build CLI",
-    "echo ============================================",
-    "echo.",
-    "where bash >nul 2>&1 && (",
-    "  echo Using bash installer from https://x.ai/cli/install.sh",
-    "  bash -lc \"curl -fsSL https://x.ai/cli/install.sh | bash\"",
-    ") || (",
-    "  echo bash not found. Trying PowerShell bootstrap ...",
-    "  powershell -NoProfile -ExecutionPolicy Bypass -Command \"try { irm https://x.ai/cli/install.ps1 | iex } catch { Write-Host $_; Write-Host 'Open https://x.ai and install Grok Build CLI manually.' }\"",
-    ")",
-    "echo.",
-    "if exist \"%USERPROFILE%\\.grok\\bin\\grok.exe\" (\"%USERPROFILE%\\.grok\\bin\\grok.exe\" --version) else (where grok 2>nul)",
-    "echo.",
-    "echo Done. Close this window and click 重新检测 in AnytimeVibe."
-  ]);
-  updateState({ detail: "已打开 Grok Build 安装窗口。完成后请点击「重新检测」。" });
+  updateState({ detail: "正在打开 PowerShell 安装 Grok Build（Windows 原生，不用 WSL）…" });
+  // NEVER use bash/WSL here — it installs linux-x86_64 into the WSL root filesystem.
+  await openWindowsPowerShellScript(`
+Write-Host '============================================'
+Write-Host '  AnytimeVibe - install Grok Build (Windows)'
+Write-Host '============================================'
+Write-Host ''
+Write-Host 'Using PowerShell installer (native Windows). WSL/bash is intentionally skipped.'
+Write-Host ("Proxy HTTPS_PROXY=" + $(if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } else { 'none' }))
+$bin = Join-Path $env:USERPROFILE '.grok\\bin'
+$grokExe = Join-Path $bin 'grok.exe'
+$installed = $false
+try {
+  Write-Host '[1] irm https://x.ai/cli/install.ps1 | iex'
+  Invoke-Expression (Invoke-RestMethod -Uri 'https://x.ai/cli/install.ps1' -TimeoutSec 90)
+  if (Test-Path $grokExe) { $installed = $true }
+} catch {
+  Write-Host ("install.ps1 failed: " + $_.Exception.Message)
+}
+if (-not $installed) {
+  try {
+    Write-Host '[2] fallback: download windows binary via install API…'
+    New-Item -ItemType Directory -Force -Path $bin | Out-Null
+    # Some releases expose a direct windows asset; best-effort.
+    $candidates = @(
+      'https://x.ai/cli/download/windows-x86_64/grok.exe',
+      'https://x.ai/cli/download/latest/windows-x86_64/grok.exe'
+    )
+    foreach ($url in $candidates) {
+      try {
+        Write-Host ("  trying " + $url)
+        Invoke-WebRequest -Uri $url -OutFile $grokExe -UseBasicParsing -TimeoutSec 120
+        if ((Test-Path $grokExe) -and ((Get-Item $grokExe).Length -gt 1000000)) { $installed = $true; break }
+      } catch {
+        Write-Host ("  " + $_.Exception.Message)
+      }
+    }
+  } catch {
+    Write-Host ("fallback failed: " + $_.Exception.Message)
+  }
+}
+if (Test-Path $grokExe) {
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if (-not $userPath) { $userPath = '' }
+  if ($userPath -notlike ('*' + $bin + '*')) {
+    [Environment]::SetEnvironmentVariable('Path', ($bin + ';' + $userPath), 'User')
+    Write-Host ("Added to user PATH: " + $bin)
+  }
+  $env:Path = $bin + ';' + $env:Path
+  Write-Host ''
+  & $grokExe --version
+  Write-Host ''
+  Write-Host 'Install OK. Close this window and click 重新检测 in AnytimeVibe.'
+} else {
+  Write-Host ''
+  Write-Host 'FAILED: grok.exe not found under' $bin
+  Write-Host 'Check network/proxy. Do not use WSL bash installer on Windows.'
+  Write-Host 'Manual: open PowerShell and run:  irm https://x.ai/cli/install.ps1 | iex'
+}
+`);
+  updateState({ detail: "已打开 PowerShell 安装 Grok Build。完成后请点击「重新检测」。" });
 }
 
 async function installGrokOnMac(): Promise<void> {
-  await applyMacLoginPathToProcess();
-  const installCommand =
-    "set -e; echo 'Installing Grok Build CLI…'; "
-    + "curl -fsSL https://x.ai/cli/install.sh | bash; "
-    + "export PATH=\"$HOME/.grok/bin:$PATH\"; "
-    + "echo ''; grok --version || true; "
-    + "echo ''; echo '完成。可关闭此窗口，回到随码客户端点击重新检测。'";
-  await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(installCommand)}`]);
-  await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+  updateState({ detail: "正在打开 Terminal 安装 Grok Build…" });
+  await openMacTerminalScript(`
+echo "Installing Grok Build CLI…"
+echo "If curl times out, ensure system proxy / VPN can reach x.ai"
+OK=0
+if curl -fsSL --connect-timeout 25 --max-time 300 https://x.ai/cli/install.sh | bash; then
+  OK=1
+fi
+export PATH="$HOME/.grok/bin:$HOME/.local/bin:$PATH"
+if command -v grok >/dev/null 2>&1 || [ -x "$HOME/.grok/bin/grok" ]; then
+  if command -v grok >/dev/null 2>&1; then grok --version; else "$HOME/.grok/bin/grok" --version; fi
+  echo "安装成功"
+else
+  echo "安装失败：无法从 x.ai 下载（常见原因：网络超时、未配置代理）。"
+  echo "可手动执行："
+  echo "  export https_proxy=http://127.0.0.1:端口"
+  echo "  curl -fsSL https://x.ai/cli/install.sh | bash"
+fi
+`);
   updateState({ detail: "已打开 Terminal 安装 Grok Build。完成后请点击「重新检测」。" });
 }
 
@@ -2326,23 +2502,25 @@ async function resolveRelayTask(threadId: string): Promise<AgentTask & { provide
 async function openExternalTerminal(cwd: string, commandLine: string): Promise<void> {
   const proxy = await collectLocalProxyEnv();
   const env = mergeProxyIntoEnv(process.env, proxy);
-  const prefix = proxyShellPrefix(proxy);
-  const fullCommand = `${prefix}${commandLine}`;
 
   if (process.platform === "win32") {
-    // Visible console that remains open (`/k`) so the user can continue the CLI session.
-    // Proxy env is both injected into process env and set via `set ... &&` so child shells keep it.
-    const child = spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/k", fullCommand], {
-      cwd: cwd || undefined,
-      env,
-      detached: true,
-      windowsHide: false,
-      stdio: "ignore"
-    });
-    child.unref();
+    // Electron GUI-spawned `cmd /k` with long `set A=… && set B=… && call …` lines is unreliable
+    // (window may never appear). Use the same WScript-visible console path as installers.
+    const proxyLines = await proxyShellLines("win32");
+    const workdir = cwd && cwd.trim() ? cwd : os.homedir();
+    await openWindowsVisibleConsole([
+      ...proxyLines,
+      `cd /d ${quoteWinArg(workdir)}`,
+      "echo.",
+      "echo [AnytimeVibe] CLI handoff",
+      "echo.",
+      commandLine
+    ]);
     return;
   }
   if (process.platform === "darwin") {
+    const prefix = proxyShellPrefix(proxy);
+    const fullCommand = `${prefix}${commandLine}`;
     const command = `cd ${shellQuote(cwd || os.homedir())} && ${fullCommand}`;
     await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`], {
       env
@@ -2370,9 +2548,7 @@ function formatWinCliCommand(binary: string, args: string[]): string {
 }
 
 async function resolveCodexBinaryForRelay(): Promise<string> {
-  // Prefer the already-discovered absolute path; fall back to PATH resolution.
-  const current = (codexCommand || "").trim();
-  if (current && (path.isAbsolute(current) || /[\\/]/.test(current))) return current;
+  // Always re-resolve from PATH/registry so GUI-launched shells get an absolute binary.
   try {
     await applyLoginPathToProcess();
   } catch {
@@ -2398,6 +2574,8 @@ async function resolveCodexBinaryForRelay(): Promise<string> {
       // ignore
     }
   }
+  const current = (codexCommand || "").trim();
+  if (current && (path.isAbsolute(current) || /[\\/]/.test(current))) return current;
   if (current) return current;
   throw new Error("未找到 Codex CLI，请先在「本机环境」中安装兼容版 Codex。");
 }
@@ -2458,8 +2636,22 @@ async function relayTaskToCli(threadId: string): Promise<void> {
 
   // Codex session id is the product/thread id.
   const binary = await resolveCodexBinaryForRelay();
+  console.log(`[relay] codex binary=${binary} thread=${threadId} cwd=${cwd}`);
   if (process.platform === "win32") {
-    await openExternalTerminal(cwd, formatWinCliCommand(binary, ["resume", threadId]));
+    // Prefer invoking via `node …/codex.js` when the discovery path is a .cmd shim —
+    // some environments break on nested batch files even with `call`.
+    const nodeBin = (await findOnWindowsPath("node.exe")) || (await findOnWindowsPath("node"));
+    const codexJs = path.join(path.dirname(binary), "node_modules", "@openai", "codex", "bin", "codex.js");
+    let commandLine = formatWinCliCommand(binary, ["resume", threadId]);
+    try {
+      await fs.access(codexJs);
+      if (nodeBin) {
+        commandLine = formatWinCliCommand(nodeBin, [codexJs, "resume", threadId]);
+      }
+    } catch {
+      // keep call codex.cmd
+    }
+    await openExternalTerminal(cwd, commandLine);
     return;
   }
   if (process.platform === "darwin") {
@@ -2873,13 +3065,45 @@ function registerIpc(): void {
   });
   ipcMain.handle("agent:reconnect", async () => { await connect(true); return publicState; });
   ipcMain.handle("agent:check-environment", async () => {
+    try {
+      await applyLoginPathToProcess();
+    } catch {
+      // ignore
+    }
     const environment = await detectEnvironment();
+    const availableEngines = await detectAvailableEngines({
+      codexReady: environment.codexCompatible,
+      codexVersion: environment.codexVersion || "unknown"
+    });
+    const anyEngineReady = environment.codexCompatible || availableEngines.some((item) => item.ready);
     const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
+    const readyLabels = availableEngines
+      .filter((item) => item.ready)
+      .map((item) => `${item.engine}${item.version ? ` ${item.version}` : ""}`)
+      .join(" · ");
     updateState({
       environment,
-      status: environment.codexCompatible ? (paired ? "offline" : config.relayUrl ? "waiting_pairing" : "unconfigured") : "incompatible",
-      detail: environment.codexCompatible ? (paired ? "Codex 环境检测通过。" : "Codex 环境已就绪，正在等待配对连接。") : "环境尚未就绪，请按提示完成安装。"
+      availableEngines,
+      codexVersion: environment.codexVersion || publicState.codexVersion,
+      status: !anyEngineReady
+        ? "incompatible"
+        : paired
+          ? (socket?.readyState === WebSocket.OPEN ? "online" : "offline")
+          : config.relayUrl
+            ? "waiting_pairing"
+            : "unconfigured",
+      detail: !anyEngineReady
+        ? "未检测到可用编码引擎。请安装 Codex / Claude Code / Grok Build 后重试。"
+        : `环境检测完成：${readyLabels || "就绪"}${paired ? "。主机引擎能力已同步到网页。" : "。"}`
     });
+    // Push engine icons/versions to the web host card when online.
+    if (socket?.readyState === WebSocket.OPEN) {
+      try {
+        await publishHostStatus();
+      } catch {
+        // ignore publish failures during local recheck
+      }
+    }
     return publicState;
   });
   ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex" | "claude" | "grok") => {
@@ -2919,7 +3143,13 @@ function registerIpc(): void {
     return publicState;
   });
   ipcMain.handle("agent:relay-task", async (_event, threadId: string) => {
-    await relayTaskToCli(threadId);
+    try {
+      await relayTaskToCli(threadId);
+      updateState({ detail: `已打开任务接力终端：${threadId.slice(0, 8)}…` });
+    } catch (error) {
+      handleError(error);
+      throw error;
+    }
     // After handoff, re-import CLI sessions a bit later so local work can appear on web sync.
     setTimeout(() => {
       void importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT)
