@@ -60,8 +60,8 @@ function parseWindowsProxyServer(proxyServer: string): LocalProxyEnv {
     out.HTTPS_PROXY = out.HTTP_PROXY;
     out.https_proxy = out.HTTP_PROXY;
   }
-  if (!out.ALL_PROXY && (out.HTTP_PROXY || out.HTTPS_PROXY)) {
-    const fallback = out.HTTPS_PROXY || out.HTTP_PROXY;
+  const fallback = out.HTTPS_PROXY || out.HTTP_PROXY;
+  if (!out.ALL_PROXY && fallback) {
     out.ALL_PROXY = fallback;
     out.all_proxy = fallback;
   }
