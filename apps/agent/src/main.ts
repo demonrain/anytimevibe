@@ -41,6 +41,7 @@ import { detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { interruptHeadlessThread, runHeadlessTurn } from "./cli/headless-runner";
 import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
+import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
 const execFileAsync = promisify(execFile);
@@ -2199,10 +2200,17 @@ async function resolveRelayTask(threadId: string): Promise<AgentTask & { provide
 }
 
 async function openExternalTerminal(cwd: string, commandLine: string): Promise<void> {
+  const proxy = await collectLocalProxyEnv();
+  const env = mergeProxyIntoEnv(process.env, proxy);
+  const prefix = proxyShellPrefix(proxy);
+  const fullCommand = `${prefix}${commandLine}`;
+
   if (process.platform === "win32") {
     // Visible console that remains open (`/k`) so the user can continue the CLI session.
-    const child = spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/k", commandLine], {
+    // Proxy env is both injected into process env and set via `set ... &&` so child shells keep it.
+    const child = spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/k", fullCommand], {
       cwd: cwd || undefined,
+      env,
       detached: true,
       windowsHide: false,
       stdio: "ignore"
@@ -2211,8 +2219,10 @@ async function openExternalTerminal(cwd: string, commandLine: string): Promise<v
     return;
   }
   if (process.platform === "darwin") {
-    const command = `cd ${shellQuote(cwd || os.homedir())} && ${commandLine}`;
-    await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`]);
+    const command = `cd ${shellQuote(cwd || os.homedir())} && ${fullCommand}`;
+    await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`], {
+      env
+    });
     await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
     return;
   }
@@ -2252,22 +2262,13 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     return;
   }
 
-  // codex always uses product/thread id as session id
+  // codex always uses product/thread id as session id — still go through proxy-aware terminal open.
   if (process.platform === "win32") {
-    const child = spawn(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(codexCommand, ["resume", threadId]), {
-      cwd: cwd || undefined,
-      detached: true,
-      windowsHide: false,
-      windowsVerbatimArguments: true,
-      stdio: "ignore"
-    });
-    child.unref();
+    await openExternalTerminal(cwd, `${quoteWinArg(codexCommand)} resume ${quoteWinArg(threadId)}`);
     return;
   }
   if (process.platform === "darwin") {
-    const command = `cd ${shellQuote(cwd)} && ${shellQuote(codexCommand)} resume ${shellQuote(threadId)}`;
-    await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`]);
-    await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+    await openExternalTerminal(cwd, `${shellQuote(codexCommand)} resume ${shellQuote(threadId)}`);
     return;
   }
   throw new Error("当前系统暂不支持启动接力终端。");
