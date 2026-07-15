@@ -7,6 +7,7 @@
   "main": "dist/main.js",
   "scripts": {
     "dev": "pnpm build && electron .",
+    "dev:local": "pnpm build && electron . --user-data-dir=../../.local/agent-data",
     "build:protocol": "pnpm -C ../../packages/protocol run build",
     "build": "pnpm run build:protocol && tsup && node ../../scripts/check-agent-requires.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",

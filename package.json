@@ -7,9 +7,15 @@
     "build": "pnpm -r --sort build",
     "typecheck": "pnpm -r --sort typecheck",
     "test": "vitest run",
-    "dev:relay": "pnpm --filter @anytimevibe/relay dev",
+    "dev:setup": "node scripts/dev-setup.mjs",
+    "dev:db": "docker compose -f docker-compose.dev.yml up -d",
+    "dev:db:down": "docker compose -f docker-compose.dev.yml down",
+    "dev:db:reset": "docker compose -f docker-compose.dev.yml down -v",
+    "dev:stack": "node scripts/dev-stack.mjs",
+    "dev:relay": "node scripts/run-with-env.mjs .env.local -- pnpm --filter @anytimevibe/relay dev",
     "dev:web": "pnpm --filter @anytimevibe/web dev",
-    "dev:agent": "pnpm --filter @anytimevibe/agent dev"
+    "dev:agent": "pnpm --filter @anytimevibe/agent dev",
+    "dev:agent:local": "node scripts/run-with-env.mjs .env.local -- pnpm --filter @anytimevibe/agent dev:local"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

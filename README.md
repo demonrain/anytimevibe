@@ -94,12 +94,26 @@ pnpm test
 pnpm build
 ```
 
-本地启动 Web、Relay 和 Agent：
+### 本地测试环境（发版前推荐）
+
+完整联调说明见 [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md)。
+
+```bash
+pnpm install
+pnpm dev:setup          # 生成 .env.local + 启动本地 Postgres + 构建 protocol
+pnpm dev:stack          # Relay + Web
+# 另开终端：
+pnpm dev:agent:local    # Electron 连 http://127.0.0.1:8787，数据在 .local/agent-data
+```
+
+浏览器打开 http://127.0.0.1:4173 ，用 `.env.local` 中的 `SETUP_TOKEN` 初始化管理员。
+
+分开启动：
 
 ```bash
 pnpm dev:web
 pnpm dev:relay
-pnpm dev:agent
+pnpm dev:agent:local
 ```
 
 ## Docker 部署

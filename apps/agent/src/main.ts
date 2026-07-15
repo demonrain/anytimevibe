@@ -658,8 +658,14 @@ async function loadConfig(): Promise<void> {
     config.agentId = crypto.randomUUID();
     dirty = true;
   }
+  // Local test: ANYTIMEVIBE_RELAY_URL always wins so dev:agent:local does not stick to prod.
+  const envRelay = process.env.ANYTIMEVIBE_RELAY_URL?.trim().replace(/\/$/, "");
+  if (envRelay && /^https?:\/\//.test(envRelay) && config.relayUrl !== envRelay) {
+    config.relayUrl = envRelay;
+    dirty = true;
+  }
   if (!config.relayUrl) {
-    config.relayUrl = process.env.ANYTIMEVIBE_RELAY_URL ?? DEFAULT_RELAY_URL;
+    config.relayUrl = envRelay || DEFAULT_RELAY_URL;
     dirty = true;
   }
   if (!config.displayName?.trim()) {

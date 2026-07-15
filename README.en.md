@@ -94,12 +94,26 @@ pnpm test
 pnpm build
 ```
 
-Start the local Web app, Relay, and Agent in separate terminals:
+### Local test environment (recommended before release)
+
+Full guide: [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md).
+
+```bash
+pnpm install
+pnpm dev:setup          # .env.local + local Postgres + protocol build
+pnpm dev:stack          # Relay + Web
+# another terminal:
+pnpm dev:agent:local    # Electron → http://127.0.0.1:8787, data under .local/agent-data
+```
+
+Open http://127.0.0.1:4173 and use `SETUP_TOKEN` from `.env.local` for first-time admin setup.
+
+Or start processes separately:
 
 ```bash
 pnpm dev:web
 pnpm dev:relay
-pnpm dev:agent
+pnpm dev:agent:local
 ```
 
 ## Docker Deployment

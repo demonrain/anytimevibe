@@ -21,3 +21,8 @@ artifacts/**/updated-*.png
 artifacts/**/product-*.png
 artifacts/**/AGENTS.md
 artifacts/**/CLAUDE.md
+
+# Local test env / agent userdata
+.env.local
+.local/
+

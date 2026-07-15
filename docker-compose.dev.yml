@@ -1,0 +1,22 @@
+# Local development: PostgreSQL only.
+# Relay / Web / Agent run on the host via pnpm (see docs/LOCAL_DEV.md).
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: anytimevibe
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-anytimevibe_dev}
+      POSTGRES_DB: anytimevibe
+    volumes:
+      - anytimevibe-dev-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U anytimevibe -d anytimevibe"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  anytimevibe-dev-pg:
