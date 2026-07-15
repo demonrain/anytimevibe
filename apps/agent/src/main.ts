@@ -1,5 +1,6 @@
 import {
   app,
+  autoUpdater as electronNativeUpdater,
   BrowserWindow,
   dialog,
   ipcMain,
@@ -10,7 +11,7 @@ import {
   Tray
 } from "electron";
 import { execFile, spawn } from "node:child_process";
-import { promises as fs, readFileSync } from "node:fs";
+import { promises as fs, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -2356,6 +2357,95 @@ function handleError(error: unknown): void {
 }
 
 let updateListenersRegistered = false;
+/** Path to the zip/installer finished by electron-updater (needed for macOS shell fallback). */
+let pendingDownloadedUpdateFile: string | null = null;
+/** Native Squirrel.Mac finished staging the update (macOS only). */
+let macNativeUpdateReady = false;
+
+/** True when the packaged app is still running from a mounted DMG (read-only, cannot self-update). */
+function isRunningFromDmgOrReadOnlyVolume(): boolean {
+  if (process.platform !== "darwin") return false;
+  const exe = process.execPath || "";
+  return exe.startsWith("/Volumes/") || exe.includes("/Volumes/");
+}
+
+/** Path to Foo.app for the running packaged binary. */
+function getDarwinAppBundlePath(): string {
+  // …/Foo.app/Contents/MacOS/<binary> → …/Foo.app
+  return path.resolve(process.execPath, "..", "..", "..");
+}
+
+/**
+ * macOS electron-updater relies on Squirrel.Mac, which often fails for unsigned builds.
+ * Spawn a detached installer that replaces the .app after we quit, then relaunches.
+ */
+function launchMacZipReplaceInstaller(zipPath: string): void {
+  const appBundle = getDarwinAppBundlePath();
+  const script = `#!/bin/bash
+set -euo pipefail
+ZIP=${JSON.stringify(zipPath)}
+APP_BUNDLE=${JSON.stringify(appBundle)}
+LOG="$HOME/Library/Logs/AnytimeVibe-update.log"
+exec >>"$LOG" 2>&1
+echo "[$(date -Iseconds)] start update zip=$ZIP app=$APP_BUNDLE"
+
+# Wait until this app process tree is gone (up to ~45s).
+for i in $(seq 1 90); do
+  if ! pgrep -f "$APP_BUNDLE/Contents/MacOS/" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.5
+done
+sleep 1
+
+if [ ! -f "$ZIP" ]; then
+  echo "zip missing: $ZIP"
+  exit 1
+fi
+
+TMP=$(mktemp -d /tmp/anytimevibe-update.XXXXXX)
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+
+# Unzip (ditto handles zip + resource forks on macOS)
+ditto -x -k "$ZIP" "$TMP"
+NEW_APP=$(find "$TMP" -name "*.app" -type d -maxdepth 4 | head -n 1 || true)
+if [ -z "\${NEW_APP}" ] || [ ! -d "\${NEW_APP}" ]; then
+  echo "no .app found inside zip"
+  find "$TMP" -maxdepth 3 -print
+  exit 1
+fi
+
+PARENT=$(dirname "$APP_BUNDLE")
+if [ ! -w "$PARENT" ]; then
+  echo "parent not writable: $PARENT"
+  exit 1
+fi
+
+BACKUP="\${APP_BUNDLE}.bak-update"
+rm -rf "$BACKUP"
+if [ -d "$APP_BUNDLE" ]; then
+  mv "$APP_BUNDLE" "$BACKUP"
+fi
+# ditto preserves attributes better than cp -R
+ditto "\${NEW_APP}" "$APP_BUNDLE"
+rm -rf "$BACKUP"
+xattr -dr com.apple.quarantine "$APP_BUNDLE" 2>/dev/null || true
+
+echo "update applied, launching"
+open "$APP_BUNDLE" || open -a "$APP_BUNDLE" || true
+echo "[$(date -Iseconds)] done"
+`;
+  const scriptPath = path.join(os.tmpdir(), `anytimevibe-update-${Date.now()}.sh`);
+  writeFileSync(scriptPath, script, { encoding: "utf8", mode: 0o755 });
+  const child = spawn("/bin/bash", [scriptPath], {
+    detached: true,
+    stdio: "ignore",
+    env: process.env
+  });
+  child.unref();
+  console.log(`[update] mac zip installer launched: ${scriptPath} → ${appBundle}`);
+}
 
 function registerUpdateListeners(): void {
   if (updateListenersRegistered) return;
@@ -2363,6 +2453,7 @@ function registerUpdateListeners(): void {
   // Ensure both Windows NSIS and macOS zip feeds auto-download after check.
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.autoRunAppAfterInstall = true;
   autoUpdater.allowDowngrade = false;
   autoUpdater.on("checking-for-update", () => updateState({ update: { status: "checking" } }));
   autoUpdater.on("update-available", (info) => {
@@ -2376,7 +2467,33 @@ function registerUpdateListeners(): void {
   autoUpdater.on("update-not-available", () => updateState({ update: { status: "idle", message: "当前已是最新版本" } }));
   autoUpdater.on("download-progress", (progress) => updateState({ update: { status: "downloading", progress: Math.round(progress.percent) } }));
   autoUpdater.on("update-downloaded", (info) => {
-    updateState({ update: { status: "ready", version: info.version, message: "更新已在后台下载完成" } });
+    const downloadedFile = typeof (info as { downloadedFile?: string }).downloadedFile === "string"
+      ? (info as { downloadedFile: string }).downloadedFile
+      : null;
+    if (downloadedFile) pendingDownloadedUpdateFile = downloadedFile;
+    macNativeUpdateReady = false;
+
+    if (process.platform === "darwin" && isRunningFromDmgOrReadOnlyVolume()) {
+      updateState({
+        update: {
+          status: "error",
+          version: info.version,
+          message: "当前从 DMG 直接运行，无法就地更新。请将「随码」拖入「应用程序」后再检查更新。"
+        }
+      });
+      showWindow();
+      return;
+    }
+
+    updateState({
+      update: {
+        status: "ready",
+        version: info.version,
+        message: process.platform === "darwin"
+          ? "更新已下载。点击「重启更新」将替换应用并自动重新打开。"
+          : "更新已在后台下载完成"
+      }
+    });
     showWindow();
   });
   autoUpdater.on("error", (error) => {
@@ -2395,6 +2512,31 @@ function registerUpdateListeners(): void {
     installingUpdate = true;
     prepareForUpdateQuit();
   });
+
+  // Track native Squirrel.Mac readiness / errors (electron-updater stages zip then feeds Squirrel).
+  if (process.platform === "darwin") {
+    try {
+      electronNativeUpdater.on("update-downloaded", () => {
+        macNativeUpdateReady = true;
+        console.log("[update] native Squirrel.Mac update-downloaded");
+      });
+      electronNativeUpdater.on("error", (error) => {
+        console.error("[update] native Squirrel.Mac error:", error);
+        // Keep status ready if we already have a zip — shell fallback can still install.
+        if (!installingUpdate && publicState.update.status === "ready" && pendingDownloadedUpdateFile) {
+          updateState({
+            update: {
+              ...publicState.update,
+              status: "ready",
+              message: "系统自动更新组件不可用，将在重启时用安装包替换应用（无需签名）。"
+            }
+          });
+        }
+      });
+    } catch (error) {
+      console.error("[update] failed to bind native autoUpdater", error);
+    }
+  }
 }
 
 /** Tear down sockets/codex/UI before the updater replaces the app bundle. */
@@ -2453,23 +2595,68 @@ function installDownloadedUpdate(): void {
     updateState({ update: { status: "error", message: "更新包尚未下载完成，请先等待下载或点击检查更新。" } });
     return;
   }
-  // 1) Mark quit + tear down runtime so no callback touches destroyed UI.
-  // 2) Only then ask electron-updater to install (after the process is idle).
+
+  if (process.platform === "darwin" && isRunningFromDmgOrReadOnlyVolume()) {
+    updateState({
+      update: {
+        status: "error",
+        message: "当前从 DMG 直接运行，无法更新。请先将「随码」拖到「应用程序」文件夹，再打开并检查更新。"
+      }
+    });
+    return;
+  }
+
+  // macOS: always arm zip-replace installer first. Squirrel.Mac often no-ops on unsigned apps;
+  // the previous app.exit() fallback killed the process before any install could run.
+  if (process.platform === "darwin") {
+    const zipPath = pendingDownloadedUpdateFile;
+    if (!zipPath) {
+      updateState({
+        update: {
+          status: "error",
+          message: "未找到已下载的更新包路径，请重新点击「检查更新」后再试。"
+        }
+      });
+      return;
+    }
+    try {
+      launchMacZipReplaceInstaller(zipPath);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      updateState({ update: { status: "error", message: `无法启动 macOS 安装脚本：${message}` } });
+      return;
+    }
+    prepareForUpdateQuit();
+    setTimeout(() => {
+      try {
+        // Best-effort native path when the app is signed / Squirrel staged successfully.
+        autoUpdater.autoRunAppAfterInstall = true;
+        if (macNativeUpdateReady) {
+          autoUpdater.quitAndInstall(false, true);
+        }
+      } catch (error) {
+        console.error("[update] mac quitAndInstall error", error);
+      }
+      // Graceful quit only — never app.exit() on mac; that aborts the detached installer mid-flight.
+      setTimeout(() => {
+        try { app.quit(); } catch { /* ignore */ }
+        setTimeout(() => {
+          // Last resort exit after installer has had time to start waiting on pgrep.
+          try { app.exit(0); } catch { /* ignore */ }
+        }, 4000);
+      }, 800);
+    }, 200);
+    return;
+  }
+
+  // Windows NSIS: standard electron-updater path.
   prepareForUpdateQuit();
-  // Drain pending child-process exit / IPC events before replacing the app.
   setTimeout(() => {
     try {
-      // isSilent=false so the installer UI can run; isForceRunAfter=true restarts the app.
       autoUpdater.quitAndInstall(false, true);
-      // Fallback: if quitAndInstall is a no-op (e.g. app still running from DMG), force quit
-      // so autoInstallOnAppQuit can apply the already-downloaded update on next launch.
       setTimeout(() => {
         if (!installingUpdate) return;
-        try {
-          app.quit();
-        } catch {
-          // ignore
-        }
+        try { app.quit(); } catch { /* ignore */ }
         setTimeout(() => {
           if (installingUpdate) app.exit(0);
         }, 1500);
