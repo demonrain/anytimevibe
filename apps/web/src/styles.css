@@ -313,7 +313,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   background: #fff0eb;
   color: #a63b28;
 }
-/* Soft update notice — not a hard version lock between web and client. */
+/* Soft update notice — tip only; no download chrome (topbar already has downloads). */
 .client-update-banner {
   position: fixed;
   top: var(--topbar-h);
@@ -321,11 +321,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   right: 0;
   z-index: 12;
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px 14px;
-  padding: 8px 14px;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px 8px 14px;
   border-bottom: 1px solid rgba(226,88,50,.35);
   background: rgba(255,240,235,.96);
   backdrop-filter: blur(12px);
@@ -336,7 +335,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   display: grid;
   gap: 2px;
   min-width: 0;
-  flex: 1 1 220px;
+  flex: 1 1 auto;
+  padding: 2px 0;
 }
 .client-update-banner-copy strong {
   font-size: 12px;
@@ -347,28 +347,40 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   line-height: 1.4;
   color: #8a4a38;
 }
-.client-update-banner-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
+.client-update-banner-close {
   flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(226,88,50,.12);
+  color: #a63b28;
+  font-size: 22px;
+  font-weight: 400;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
 }
-.client-update-banner-actions > .client-downloads {
-  margin-top: 0;
-}
-.client-update-banner-actions > .quiet {
-  padding: 6px 10px;
-  font-size: 11px;
-  font-weight: 800;
+.client-update-banner-close:hover {
+  background: rgba(226,88,50,.22);
 }
 @media (max-width: 700px) {
   .client-update-banner {
     top: 58px;
-    padding: 8px 10px;
+    padding: 8px 8px 8px 12px;
+    gap: 6px;
   }
   .client-update-banner-copy strong { font-size: 11px; }
   .client-update-banner-copy span { font-size: 10px; }
+  .client-update-banner-close {
+    width: 40px;
+    height: 40px;
+    font-size: 24px;
+    border-radius: 11px;
+  }
 }
 .settings-row { display: flex; flex-wrap: wrap; gap: 10px 16px; margin: -6px 0 12px; align-items: center; }
 .settings-row .permission-select, .settings-row .reply-detail-select { margin: 0; }

@@ -197,11 +197,15 @@ macOS 包需要在 macOS 或 GitHub Actions `macos-latest` 环境构建。当前
 - [容量评估](docs/CAPACITY.md)：不同注册用户数和并发连接规模的服务器建议。
 - [更新源配置](docs/UPDATE_FEED.md)：桌面客户端后台更新和重启安装流程。
 
-## Star 趋势
+## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=demonrain/anytimevibe&type=Date)](https://www.star-history.com/#demonrain/anytimevibe&Date)
-
-也可以打开 [star-history.com 交互页](https://www.star-history.com/#demonrain/anytimevibe&Date) 查看，或直接访问仓库：[github.com/demonrain/anytimevibe](https://github.com/demonrain/anytimevibe)。
+<a href="https://www.star-history.com/?repos=demonrain%2Fanytimevibe&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&theme=dark&legend=top-left&sealed_token=r6dBJtMY8KMBwqyKA-zCxx131eL7QND6pUwcK3Sd0ghYr9_cmozQzGTE-WufadS5wnicAdz80SxVlJr87JYN6_xwkc60dmWBrdEwuaKCwgm2srBWTOsreQ" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&legend=top-left&sealed_token=r6dBJtMY8KMBwqyKA-zCxx131eL7QND6pUwcK3Sd0ghYr9_cmozQzGTE-WufadS5wnicAdz80SxVlJr87JYN6_xwkc60dmWBrdEwuaKCwgm2srBWTOsreQ" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&legend=top-left&sealed_token=r6dBJtMY8KMBwqyKA-zCxx131eL7QND6pUwcK3Sd0ghYr9_cmozQzGTE-WufadS5wnicAdz80SxVlJr87JYN6_xwkc60dmWBrdEwuaKCwgm2srBWTOsreQ" />
+ </picture>
+</a>
 
 ## 开源协议
 

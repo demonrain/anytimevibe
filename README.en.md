@@ -199,9 +199,13 @@ Client download links and update feeds are configured with `WINDOWS_CLIENT_URL`,
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=demonrain/anytimevibe&type=Date)](https://www.star-history.com/#demonrain/anytimevibe&Date)
-
-Interactive chart: [star-history.com](https://www.star-history.com/#demonrain/anytimevibe&Date) · Repo: [github.com/demonrain/anytimevibe](https://github.com/demonrain/anytimevibe)
+<a href="https://www.star-history.com/?repos=demonrain%2Fanytimevibe&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&theme=dark&legend=top-left&sealed_token=r6dBJtMY8KMBwqyKA-zCxx131eL7QND6pUwcK3Sd0ghYr9_cmozQzGTE-WufadS5wnicAdz80SxVlJr87JYN6_xwkc60dmWBrdEwuaKCwgm2srBWTOsreQ" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&legend=top-left&sealed_token=r6dBJtMY8KMBwqyKA-zCxx131eL7QND6pUwcK3Sd0ghYr9_cmozQzGTE-WufadS5wnicAdz80SxVlJr87JYN6_xwkc60dmWBrdEwuaKCwgm2srBWTOsreQ" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&legend=top-left&sealed_token=r6dBJtMY8KMBwqyKA-zCxx131eL7QND6pUwcK3Sd0ghYr9_cmozQzGTE-WufadS5wnicAdz80SxVlJr87JYN6_xwkc60dmWBrdEwuaKCwgm2srBWTOsreQ" />
+ </picture>
+</a>
 
 See the live repository statistics at [github.com/demonrain/anytimevibe](https://github.com/demonrain/anytimevibe).
 

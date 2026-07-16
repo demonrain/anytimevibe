@@ -576,13 +576,12 @@ export function App() {
   const keyAuthorizationsRef = useRef(new Set<string>());
   /** After task.create, auto-select the first new threadId not in this set. */
   const pendingNewTaskRef = useRef<{ hostId: string; knownIds: Set<string>; expiresAt: number } | null>(null);
-  const [clientUpdateDismissed, setClientUpdateDismissed] = useState(() => {
-    try {
-      return sessionStorage.getItem("client-update-dismissed") === "1";
-    } catch {
-      return false;
-    }
-  });
+  /** In-page only: refresh shows the tip again if the client is still outdated. */
+  const [clientUpdateDismissed, setClientUpdateDismissed] = useState(false);
+  useEffect(() => {
+    // Drop legacy session dismiss so "稍后" from older builds cannot hide tips forever.
+    try { sessionStorage.removeItem("client-update-dismissed"); } catch { /* ignore */ }
+  }, []);
   function selectTask(threadId: string) {
     setSelectedTaskId(threadId);
     setMobilePane("conversation");
@@ -1016,30 +1015,26 @@ export function App() {
     {showClientUpdateBanner && (
       <div className="client-update-banner" role="status">
         <div className="client-update-banner-copy">
-          <strong>{locale === "en" ? "Desktop client update available" : "客户端有新版本"}</strong>
+          <strong>{locale === "en" ? "Client update available" : "客户端有新版本"}</strong>
           <span>
             {clientOutdated
               ? (locale === "en"
-                ? `You are on v${clientVersion}; latest is v${latestClientVersion}. Update to keep features working.`
-                : `当前 v${clientVersion}，线上最新 v${latestClientVersion}。请及时更新客户端，以免新功能不可用。`)
+                ? `Connected client v${clientVersion} is behind latest v${latestClientVersion}. Please update when convenient.`
+                : `当前客户端 v${clientVersion}，线上最新 v${latestClientVersion}，建议及时更新以确保功能正常。`)
               : (locale === "en"
-                ? `Latest client is v${latestClientVersion ?? "—"}. Install or upgrade if this host is outdated.`
-                : `线上最新客户端 v${latestClientVersion ?? "—"}。若本机客户端偏旧，请下载更新。`)}
+                ? `Latest client is v${latestClientVersion ?? "—"}. This host did not report a version.`
+                : `线上最新客户端 v${latestClientVersion ?? "—"}。当前主机未上报版本，请确认客户端已更新。`)}
           </span>
         </div>
-        <div className="client-update-banner-actions">
-          <ClientDownloads downloads={health.clientDownloads} />
-          <button
-            type="button"
-            className="quiet"
-            onClick={() => {
-              setClientUpdateDismissed(true);
-              try { sessionStorage.setItem("client-update-dismissed", "1"); } catch { /* ignore */ }
-            }}
-          >
-            {locale === "en" ? "Dismiss" : "稍后"}
-          </button>
-        </div>
+        <button
+          type="button"
+          className="client-update-banner-close"
+          aria-label={locale === "en" ? "Dismiss" : "关闭"}
+          title={locale === "en" ? "Dismiss" : "关闭"}
+          onClick={() => setClientUpdateDismissed(true)}
+        >
+          ×
+        </button>
       </div>
     )}
 
