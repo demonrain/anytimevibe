@@ -887,9 +887,11 @@ export function App() {
     && !clientVersion
   );
 
-  return <div className="app-shell">
+  const showVersionBanner = clientOutdated || clientVersionUnknown;
+
+  return <div className={`app-shell${showVersionBanner ? " has-version-banner" : ""}`}>
     {error && <ErrorBanner message={error} clear={() => setError("")} />}
-    {(clientOutdated || clientVersionUnknown) && (
+    {showVersionBanner && (
       <div className="version-banner" role="status">
         <div>
           <strong>{clientOutdated ? "客户端版本过旧" : "客户端未上报版本"}</strong>
