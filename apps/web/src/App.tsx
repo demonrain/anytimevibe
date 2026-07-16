@@ -892,9 +892,6 @@ export function App() {
     : clientVersionUnknown
       ? `客户端未上报版本：网页 v${PRODUCT_VERSION} 建议使用客户端 v${MIN_AGENT_VERSION}。`
       : "网页与客户端应对齐同一产品版本";
-  const versionLabel = activeHost
-    ? `Web v${PRODUCT_VERSION} · 客户端 ${clientVersion ? `v${clientVersion}` : "未知"}${clientOutdated ? " · 需更新" : clientVersionUnknown ? " · 请升级" : ""}`
-    : `Web v${PRODUCT_VERSION} · 客户端 v${MIN_AGENT_VERSION}`;
 
   return <div className="app-shell">
     {error && <ErrorBanner message={error} clear={() => setError("")} />}
@@ -905,7 +902,12 @@ export function App() {
           className={`version-chip${versionWarn ? " warn" : ""}`}
           title={versionTitle}
         >
-          {versionLabel}
+          <span className="version-chip-line">Web v{PRODUCT_VERSION}</span>
+          <span className="version-chip-line">
+            {activeHost
+              ? `${locale === "en" ? "Client" : "客户端"} ${clientVersion ? `v${clientVersion}` : (locale === "en" ? "unknown" : "未知")}${clientOutdated ? (locale === "en" ? " · update" : " · 需更新") : clientVersionUnknown ? (locale === "en" ? " · upgrade" : " · 请升级") : ""}`
+              : `${locale === "en" ? "Client" : "客户端"} v${MIN_AGENT_VERSION}`}
+          </span>
         </span>
         <ClientDownloads downloads={health.clientDownloads} />
         <div className="lang-switch" role="group" aria-label={t("lang")}>
@@ -967,37 +969,39 @@ export function App() {
 
     <main className={`workspace mobile-${mobilePane}`}>
       <section className="task-column">
-        <button className="mobile-level-back" type="button" onClick={() => setMobilePane("hosts")}>{t("clients")}</button>
-        <div className="section-title">
-          <div><p className="eyebrow">{t("taskStream")}</p><h1 className="host-title">{activeHost?.name ?? t("noHost")}</h1></div>
-          <div className="section-actions">
-            <button className="sync-tasks" disabled={!activeHost || activeRuntime.online !== true || String(syncStatus[activeHost.id] ?? "").startsWith(t("syncing"))} onClick={() => activeHost && syncHostTasks(activeHost.id).catch((syncError) => setError(syncError.message))}>{activeHost ? syncStatus[activeHost.id] ?? t("syncTasks") : t("syncTasks")}</button>
-            <button className="new-task" disabled={!activeHost || activeRuntime.online !== true} onClick={() => setComposerOpen(true)}>{t("newTask")}</button>
+        <div className="task-column-head">
+          <button className="mobile-level-back" type="button" onClick={() => setMobilePane("hosts")}>{t("clients")}</button>
+          <div className="section-title">
+            <div><p className="eyebrow">{t("taskStream")}</p><h1 className="host-title">{activeHost?.name ?? t("noHost")}</h1></div>
+            <div className="section-actions">
+              <button className="sync-tasks" disabled={!activeHost || activeRuntime.online !== true || String(syncStatus[activeHost.id] ?? "").startsWith(t("syncing"))} onClick={() => activeHost && syncHostTasks(activeHost.id).catch((syncError) => setError(syncError.message))}>{activeHost ? syncStatus[activeHost.id] ?? t("syncTasks") : t("syncTasks")}</button>
+              <button className="new-task" disabled={!activeHost || activeRuntime.online !== true} onClick={() => setComposerOpen(true)}>{t("newTask")}</button>
+            </div>
           </div>
-        </div>
-        <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? t("hostOnline") : activeRuntime.online === false ? t("hostOffline") : t("hostChecking")}</div>
-        {activeHost && keyAuthorizationStatus[activeHost.id] && <div className="key-authorization-note"><div><strong>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "正在授权此浏览器" : "此浏览器尚未取得主机密钥"}</strong><span>{activeRuntime.online === true ? "电脑端会自动完成端到端密钥授权。" : "请先让电脑端客户端上线，再重新授权。"}</span></div><button disabled={keyAuthorizationStatus[activeHost.id] === "authorizing" || activeRuntime.online !== true} onClick={() => authorizeExistingHost(activeHost.id).catch((authorizationError) => setError(authorizationError.message))}>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "授权中…" : "授权此浏览器"}</button></div>}
-        <div className="engine-filter" role="toolbar" aria-label="按编码引擎筛选任务">
-          {(["codex", "claude", "grok"] as CliEngine[]).map((engine) => {
-            const count = tasks.filter((task) => normalizeCliEngine(task.cliEngine) === engine).length;
-            const active = engineFilter === engine;
-            return (
-              <button
-                key={engine}
-                type="button"
-                className={`engine-filter-btn ${active ? "active" : ""}`}
-                title={`${cliEngineLabel(engine)} · ${count}`}
-                aria-pressed={active}
-                onClick={() => setEngineFilter((current) => (current === engine ? null : engine))}
-              >
-                <EngineLogo engine={engine} size={20} />
-                <span className="engine-filter-count">{count}</span>
-              </button>
-            );
-          })}
-          {engineFilter && (
-            <button type="button" className="engine-filter-clear" onClick={() => setEngineFilter(null)}>全部</button>
-          )}
+          <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? t("hostOnline") : activeRuntime.online === false ? t("hostOffline") : t("hostChecking")}</div>
+          {activeHost && keyAuthorizationStatus[activeHost.id] && <div className="key-authorization-note"><div><strong>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "正在授权此浏览器" : "此浏览器尚未取得主机密钥"}</strong><span>{activeRuntime.online === true ? "电脑端会自动完成端到端密钥授权。" : "请先让电脑端客户端上线，再重新授权。"}</span></div><button disabled={keyAuthorizationStatus[activeHost.id] === "authorizing" || activeRuntime.online !== true} onClick={() => authorizeExistingHost(activeHost.id).catch((authorizationError) => setError(authorizationError.message))}>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "授权中…" : "授权此浏览器"}</button></div>}
+          <div className="engine-filter" role="toolbar" aria-label="按编码引擎筛选任务">
+            {(["codex", "claude", "grok"] as CliEngine[]).map((engine) => {
+              const count = tasks.filter((task) => normalizeCliEngine(task.cliEngine) === engine).length;
+              const active = engineFilter === engine;
+              return (
+                <button
+                  key={engine}
+                  type="button"
+                  className={`engine-filter-btn ${active ? "active" : ""}`}
+                  title={`${cliEngineLabel(engine)} · ${count}`}
+                  aria-pressed={active}
+                  onClick={() => setEngineFilter((current) => (current === engine ? null : engine))}
+                >
+                  <EngineLogo engine={engine} size={18} />
+                  <span className="engine-filter-count">{count}</span>
+                </button>
+              );
+            })}
+            {engineFilter && (
+              <button type="button" className="engine-filter-clear" onClick={() => setEngineFilter(null)}>{t("filterAll")}</button>
+            )}
+          </div>
         </div>
         <div className="task-search">
           <input
@@ -1189,7 +1193,7 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     <div className="conversation-head">
       <button className="mobile-back" type="button" onClick={onBack} aria-label="返回任务列表">‹</button>
       <div>
-        <p className="eyebrow">THREAD</p>
+        <p className="eyebrow">{t("sessionRecord")}</p>
         <h2 title={task.title} className="thread-title-row">
           <EngineLogo engine={taskEngine} size={18} className="thread-engine-logo" />
           <span>{task.title}</span>

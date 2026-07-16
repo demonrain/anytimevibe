@@ -98,8 +98,41 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .engine-card small { font-size: 10px; color: #6f756e; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .workspace { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-columns: minmax(0, var(--task-col-w)) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); max-width: 100%; overflow: hidden; }
 .workspace > * { min-height: 0; min-width: 0; }
-.task-column { min-width: 0; max-width: 100%; padding: 16px 14px; border-right: 1px solid var(--line); overflow-x: hidden; overflow-y: auto; }.section-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; min-width: 0; }.section-title > div { min-width: 0; }.section-title h1, .section-title .host-title { margin: 0; font: 700 16px/1.3 "Rockwell", "Noto Serif SC", serif; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }.section-actions { display: flex; gap: 6px; align-items: center; flex: 0 0 auto; }.new-task, .sync-tasks { border: 0; border-radius: 9px; padding: 8px 11px; font-size: 12px; font-weight: 850; cursor: pointer; white-space: nowrap; }.new-task { background: var(--rust); color: white; }.sync-tasks { background: #dfd8c9; color: var(--ink); }.new-task:disabled, .sync-tasks:disabled { opacity: .4; cursor: not-allowed; }
-.connection-note { margin: 12px 0 10px; display: flex; gap: 8px; align-items: center; color: #697068; font-size: 11px; min-width: 0; }.task-search { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; min-width: 0; }.task-search input { min-width: 0; flex: 1 1 auto; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.72); padding: 8px 10px; font-size: 12px; }.task-search small { flex: 0 0 auto; color: #858b84; font-size: 10px; font-weight: 800; }.task-list { display: grid; gap: 8px; min-width: 0; }.task-card { text-align: left; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,250,240,.63); padding: 12px; cursor: pointer; transition: .18s ease; min-width: 0; max-width: 100%; overflow: hidden; }.task-card:hover, .task-card.active { transform: translateY(-1px); border-color: rgba(226,88,50,.6); box-shadow: 0 10px 24px rgba(42,45,37,.08); }.task-card.active { background: var(--cream); }.task-meta, .task-foot { display: flex; justify-content: space-between; gap: 10px; align-items: center; min-width: 0; }.task-meta .task-status { color: var(--moss); font-size: 9px; text-transform: uppercase; font-weight: 900; letter-spacing: .08em; }.task-meta time { font-size: 9px; color: #858b84; flex: 0 0 auto; }.task-card h3 { margin: 8px 0 5px; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.task-card > p { color: #676e67; font-size: 11px; line-height: 1.45; height: 32px; overflow: hidden; margin: 0 0 10px; overflow-wrap: anywhere; word-break: break-word; }.task-foot code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; color: #767c75; }.task-foot b { color: #a03b24; font-size: 9px; flex: 0 0 auto; }
+.task-column {
+  min-width: 0;
+  max-width: 100%;
+  padding: 16px 14px;
+  border-right: 1px solid var(--line);
+  overflow-x: hidden;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.task-column-head { flex: 0 0 auto; min-width: 0; }
+.section-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; min-width: 0; }
+.section-title > div { min-width: 0; }
+.section-title h1, .section-title .host-title { margin: 0; font: 700 16px/1.3 "Rockwell", "Noto Serif SC", serif; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+.section-actions { display: flex; gap: 6px; align-items: center; flex: 0 0 auto; }
+.new-task, .sync-tasks { border: 0; border-radius: 9px; padding: 8px 11px; font-size: 12px; font-weight: 850; cursor: pointer; white-space: nowrap; }
+.new-task { background: var(--rust); color: white; }
+.sync-tasks { background: #dfd8c9; color: var(--ink); }
+.new-task:disabled, .sync-tasks:disabled { opacity: .4; cursor: not-allowed; }
+.connection-note { margin: 12px 0 10px; display: flex; gap: 8px; align-items: center; color: #697068; font-size: 11px; min-width: 0; }
+.task-search { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; min-width: 0; flex: 0 0 auto; }
+.task-search input { min-width: 0; flex: 1 1 auto; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.72); padding: 8px 10px; font-size: 12px; }
+.task-search small { flex: 0 0 auto; color: #858b84; font-size: 10px; font-weight: 800; }
+.task-list { display: grid; gap: 8px; min-width: 0; flex: 1 1 auto; min-height: 0; }
+.task-card { text-align: left; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,250,240,.63); padding: 12px; cursor: pointer; transition: .18s ease; min-width: 0; max-width: 100%; overflow: hidden; }
+.task-card:hover, .task-card.active { transform: translateY(-1px); border-color: rgba(226,88,50,.6); box-shadow: 0 10px 24px rgba(42,45,37,.08); }
+.task-card.active { background: var(--cream); }
+.task-meta, .task-foot { display: flex; justify-content: space-between; gap: 10px; align-items: center; min-width: 0; }
+.task-meta .task-status { color: var(--moss); font-size: 9px; text-transform: uppercase; font-weight: 900; letter-spacing: .08em; }
+.task-meta time { font-size: 9px; color: #858b84; flex: 0 0 auto; }
+.task-card h3 { margin: 8px 0 5px; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-card > p { color: #676e67; font-size: 11px; line-height: 1.45; height: 32px; overflow: hidden; margin: 0 0 10px; overflow-wrap: anywhere; word-break: break-word; }
+.task-foot code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; color: #767c75; }
+.task-foot b { color: #a03b24; font-size: 9px; flex: 0 0 auto; }
 .empty-state { text-align: center; padding: 70px 25px; color: #6f756e; }.empty-state > span { font: 800 36px monospace; color: var(--rust); }.empty-state h3 { color: var(--ink); }
 .conversation-column { min-width: 0; min-height: 0; height: 100%; max-height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; background: rgba(255,255,255,.25); }.conversation-head { padding: 12px 16px 10px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; min-width: 0; flex: 0 0 auto; }.conversation-head > div:first-of-type { min-width: 0; overflow: hidden; }.conversation-head h2 { margin: 0 0 3px; font: 700 16px/1.25 "Rockwell", "Noto Serif SC", serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.conversation-head code { display: block; color: #747b73; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }.tabs { display: flex; background: rgba(23,33,27,.08); border-radius: 9px; padding: 2px; flex: 0 0 auto; }.tabs button { border: 0; background: transparent; padding: 6px 10px; border-radius: 7px; font-size: 11px; cursor: pointer; }.tabs button.active { background: var(--cream); box-shadow: 0 2px 8px rgba(0,0,0,.08); }
 .mobile-back { display: none; }
@@ -119,10 +152,27 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   border: 0; background: transparent; color: var(--moss); font-size: 11px; font-weight: 850; cursor: pointer; padding: 4px 6px;
 }
 .version-chip {
-  display: inline-flex; align-items: center; max-width: min(320px, 42vw);
-  border: 1px solid var(--line); background: rgba(255,250,240,.7); color: #5f665f;
-  border-radius: 999px; padding: 6px 10px; font-size: 10px; font-weight: 800; white-space: nowrap;
-  overflow: hidden; text-overflow: ellipsis;
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px 8px;
+  max-width: min(320px, 46vw);
+  border: 1px solid var(--line);
+  background: rgba(255,250,240,.7);
+  color: #5f665f;
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.version-chip-line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* Desktop: keep one visual line with a separator between chips if both present */
+.version-chip-line + .version-chip-line::before {
+  content: "·";
+  margin-right: 6px;
+  opacity: .55;
 }
 .version-chip.warn {
   border-color: rgba(166,59,40,.45);
@@ -275,6 +325,110 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 @media (max-width: 700px) { .workspace.mobile-hosts { display: none; }.workspace.mobile-hosts + * { min-height: 0; }.app-shell:has(.workspace.mobile-hosts) .rail { display: block; padding: 12px; border-bottom: 0; overflow: visible; }.app-shell:has(.workspace.mobile-hosts) .host-list { display: grid; gap: 9px; }.app-shell:has(.workspace.mobile-hosts) .host-row { min-width: 0; }.app-shell:has(.workspace.mobile-hosts) .host-pill { padding: 13px 12px; }.app-shell:has(.workspace.mobile-tasks) .rail { display: none; }.workspace.mobile-tasks .task-column { min-height: calc(100dvh - 58px); }.mobile-level-back { display: inline-flex; border: 0; background: transparent; color: var(--moss); padding: 2px 0 12px; font-size: 13px; font-weight: 850; cursor: pointer; }.send-shortcut { display: none; } }
 @media (max-width: 700px) {
   .app-shell { height: auto; overflow: visible; }
+  .version-chip {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    border-radius: 10px;
+    padding: 5px 8px;
+    max-width: min(42vw, 150px);
+    line-height: 1.25;
+  }
+  .version-chip-line + .version-chip-line::before { content: none; margin: 0; }
+  .workspace.mobile-tasks {
+    position: fixed;
+    inset: 58px 0 0;
+    z-index: 7;
+    height: auto;
+    min-height: 0;
+    background: var(--paper);
+    display: block;
+  }
+  .workspace.mobile-tasks .task-column {
+    height: 100%;
+    max-height: none;
+    min-height: 0;
+    padding: 8px 10px max(10px, env(safe-area-inset-bottom));
+    border-bottom: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .workspace.mobile-tasks .task-column-head {
+    flex: 0 0 auto;
+    padding-bottom: 2px;
+  }
+  .workspace.mobile-tasks .mobile-level-back {
+    display: inline-flex;
+    padding: 0 0 6px;
+    font-size: 12px;
+  }
+  .workspace.mobile-tasks .section-title {
+    align-items: center;
+    gap: 8px;
+  }
+  .workspace.mobile-tasks .section-title .eyebrow {
+    margin: 0 0 2px;
+    font-size: 9px;
+    letter-spacing: .12em;
+  }
+  .workspace.mobile-tasks .section-title h1,
+  .workspace.mobile-tasks .section-title .host-title {
+    font-size: 17px;
+    line-height: 1.2;
+  }
+  .workspace.mobile-tasks .section-actions {
+    flex-direction: row;
+    align-items: center;
+    gap: 5px;
+  }
+  .workspace.mobile-tasks .new-task,
+  .workspace.mobile-tasks .sync-tasks {
+    padding: 6px 8px;
+    font-size: 11px;
+  }
+  .workspace.mobile-tasks .connection-note {
+    margin: 6px 0 6px;
+    font-size: 10px;
+  }
+  .workspace.mobile-tasks .key-authorization-note {
+    margin: 0 0 6px;
+    padding: 8px 9px;
+    gap: 8px;
+  }
+  .workspace.mobile-tasks .key-authorization-note strong { font-size: 11px; }
+  .workspace.mobile-tasks .key-authorization-note span { font-size: 10px; }
+  .workspace.mobile-tasks .key-authorization-note button { padding: 6px 8px; font-size: 10px; }
+  .workspace.mobile-tasks .engine-filter {
+    margin: 0 0 6px;
+    gap: 6px;
+  }
+  .workspace.mobile-tasks .engine-filter-btn {
+    padding: 5px 7px;
+    border-radius: 10px;
+    font-size: 10px;
+  }
+  .workspace.mobile-tasks .task-search {
+    flex: 0 0 auto;
+    margin: 0 0 8px;
+  }
+  .workspace.mobile-tasks .task-search input {
+    padding: 7px 9px;
+    font-size: 12px;
+  }
+  /* Only the task list scrolls on mobile task pane */
+  .workspace.mobile-tasks .task-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    gap: 8px;
+    padding-bottom: 4px;
+  }
+  .workspace.mobile-tasks .task-card { padding: 11px 12px; border-radius: 13px; }
+  .workspace.mobile-tasks .empty-state { padding: 36px 16px; }
   .workspace.mobile-conversation { position: fixed; inset: 58px 0 0; z-index: 8; height: auto; min-height: 0; background: var(--paper); }
   .workspace.mobile-conversation .conversation-column { height: 100%; max-height: none; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
   .workspace.mobile-conversation .message-stream { height: auto; max-height: none; min-height: 0; }
