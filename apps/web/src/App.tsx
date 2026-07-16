@@ -1045,17 +1045,27 @@ export function App() {
           {filteredTasks.map((task) => {
             const status = taskStatusMeta(task.status);
             const engine = task.cliEngine ? normalizeCliEngine(task.cliEngine) : undefined;
-            return <button key={task.threadId} className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>
+            const updated = new Date(task.updatedAt * 1000);
+            const timeLabel = Number.isFinite(updated.getTime())
+              ? updated.toLocaleString(undefined, {
+                  month: "2-digit",
+                  day: "2-digit",
+                  hour: "2-digit",
+                  minute: "2-digit"
+                })
+              : "";
+            const preview = (task.messages.at(-1)?.text || task.cwd || "").replace(/\s+/g, " ").trim();
+            return <button key={task.threadId} type="button" className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>
               <div className="task-meta">
                 <span className="task-meta-left">
                   {engine && <EngineLogo engine={engine} size={14} className="task-engine-logo" />}
                   <span className={`task-status ${status.tone}`}>{status.label}</span>
                 </span>
-                <time>{new Date(task.updatedAt * 1000).toLocaleString()}</time>
+                {timeLabel && <time dateTime={updated.toISOString()}>{timeLabel}</time>}
               </div>
-              <h3>{task.title}</h3>
-              <p>{task.messages.at(-1)?.text || task.cwd}</p>
-              <div className="task-foot"><code>{shortPath(task.cwd)}</code>{task.approvals.length > 0 && <b>{task.approvals.length}</b>}</div>
+              <h3 title={task.title}>{task.title}</h3>
+              <p title={preview}>{preview}</p>
+              <div className="task-foot"><code title={task.cwd}>{shortPath(task.cwd)}</code>{task.approvals.length > 0 && <b>{task.approvals.length}</b>}</div>
             </button>;
           })}
           {!tasks.length && <div className="empty-state"><span>&gt;_</span><h3>{t("noTasks")}</h3><p>{t("noTasksHint")}</p></div>}
