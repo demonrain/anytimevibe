@@ -415,7 +415,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .message-body { display: grid; gap: 8px; min-width: 0; }
 .message-view-toggle {
   display: inline-flex;
-  align-self: flex-start;
+  width: fit-content;
+  max-width: max-content;
+  justify-self: start;
+  flex: 0 0 auto;
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow: hidden;
@@ -429,6 +432,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   font-weight: 800;
   cursor: pointer;
   color: #697068;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 .message-view-toggle button.active {
   background: var(--ink);
