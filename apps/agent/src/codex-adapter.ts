@@ -140,17 +140,42 @@ export class CodexAdapter {
   }
 }
 
+/** Normalize Codex timestamps (seconds or ms epoch) to unix seconds. */
+export function normalizeUnixSeconds(value: unknown, fallback = Date.now() / 1000): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  // Milliseconds epoch (≈ year 2001+)
+  if (n > 1e12) return n / 1000;
+  return n;
+}
+
 export function threadToSnapshot(thread: JsonObject) {
   const messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string; createdAt?: number }> = [];
   const turns = thread.turns ?? [];
+  let lastActivity = 0;
   for (const turn of turns) {
+    const started = normalizeUnixSeconds(turn.startedAt, 0);
+    const completed = normalizeUnixSeconds(turn.completedAt, 0);
+    lastActivity = Math.max(lastActivity, started, completed);
     for (const item of turn.items ?? []) {
       if (item.type === "userMessage") {
         const text = (item.content ?? []).filter((content: JsonObject) => content.type === "text").map((content: JsonObject) => content.text).join("\n");
-        if (text) messages.push({ id: item.id, role: "user", text, ...(turn.startedAt ? { createdAt: turn.startedAt } : {}) });
+        if (text) {
+          messages.push({
+            id: item.id,
+            role: "user",
+            text,
+            ...(started ? { createdAt: started } : {})
+          });
+        }
       }
       if (item.type === "agentMessage" && item.text) {
-        messages.push({ id: item.id, role: "assistant", text: item.text, ...(turn.completedAt ? { createdAt: turn.completedAt } : {}) });
+        messages.push({
+          id: item.id,
+          role: "assistant",
+          text: item.text,
+          ...(completed || started ? { createdAt: completed || started } : {})
+        });
       }
       if (item.type === "plan" && item.text) messages.push({ id: item.id, role: "system", text: item.text });
     }
@@ -160,14 +185,21 @@ export function threadToSnapshot(thread: JsonObject) {
     const status = String(turn.status ?? "").toLowerCase();
     return turn.id && !turn.completedAt && !terminalStatuses.has(status);
   });
+  const createdAt = normalizeUnixSeconds(thread.createdAt);
+  // Prefer explicit thread.updatedAt, else last turn activity, else createdAt — never invent "now" for idle history.
+  const updatedAt = Math.max(
+    normalizeUnixSeconds(thread.updatedAt, 0),
+    lastActivity,
+    createdAt
+  );
   return {
     threadId: String(thread.id),
     title: String(thread.name || thread.preview || "未命名任务"),
     cwd: String(thread.cwd || ""),
     status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
     ...(activeTurn ? { activeTurnId: String(activeTurn.id) } : {}),
-    createdAt: Number(thread.createdAt ?? Date.now() / 1000),
-    updatedAt: Number(thread.updatedAt ?? Date.now() / 1000),
+    createdAt,
+    updatedAt,
     messages
   };
 }

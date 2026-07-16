@@ -1,126 +1,119 @@
 # 随码产品文档
 
-> 2026-07-11 更新：产品已支持开放注册、多用户数据隔离、客户端环境检测、macOS Agent、客户端自定义名称、统一产品图标、紧凑控制面板与服务端可配置自动更新源。容量与公开服务边界以 [多用户容量评估](CAPACITY.md) 为准。
+> 2026-07-16 更新：产品已支持 **Codex / Claude Code / Grok Build 三引擎**、开放注册、多用户隔离、管理员后台（封禁 / 审计）、macOS Agent、多浏览器密钥授权、客户端自动更新与模型/推理强度选择。容量规划见 [CAPACITY.md](CAPACITY.md)。
 
-> 任务执行策略更新：Web 端不再同步 Codex 流式输出和实时 Diff，只显示处理中状态、审批请求与完成状态。完整对话通过手动同步或登录后的自动同步获取。
-
-> 多浏览器授权更新：Agent 使用现有主机同步密钥为每个新浏览器生成一次性 ECDH 加密授权包，不再通过重新配对轮换主机密钥。多个浏览器可同时解密同一主机的历史与后续事件。
-
-- 文档版本：`v0.3`
-- 产品状态：MVP 已实现
-- 更新日期：2026-07-11
+- 文档版本：`v0.5`
+- 产品状态：多引擎可用
+- 更新日期：2026-07-16
 - 中文产品名：随码
 - 工程 / 英文代号：AnytimeVibe
 - 品牌 slogan 详见 [BRANDING.md](BRANDING.md)
 
 ## 1. 产品概述
 
-**随码**是一个面向个人开发者的远程 Codex 工作台。主 slogan：**离开电脑，任务不用停。** 副 slogan：**随时续上你的代码。**
+**随码**是面向个人开发者与小团队的**远程 AI 编程工作台**。主 slogan：**离开电脑，任务不用停。** 副 slogan：**随时续上你的代码。**
 
-用户通过手机或桌面浏览器中的 PWA，连接自己保持在线的 Windows 或 macOS 电脑，在离开电脑后继续创建、查看和控制 Codex 编程任务。
+用户通过手机或桌面浏览器中的 PWA，连接自己的 Windows / macOS 电脑，选择 **Codex、Claude Code 或 Grok Build** 在本机执行任务，并同步任务状态、流式回复、会话记录、审批与完成通知。
 
-产品不提供传统远程桌面，也不把项目源码复制到云端。随码桌面代理在用户电脑上调用本机 Codex CLI，VPS 中继只负责身份验证、在线路由、Web Push 和端到端加密事件的存储。
+产品**不是**远程桌面，也不把项目源码或引擎凭据上传到中继。桌面 Agent 在用户电脑上调用已安装的编码 CLI；VPS 中继只负责身份验证、在线路由、Web Push 与端到端加密事件的存储。
 
 ### 1.1 产品定位
 
-- 为个人开发者提供“随时继续 Codex 任务”的移动入口。
-- 将 Codex 的线程、状态、Diff 和审批转换为适合移动端操作的界面。
-- 在不公开远程电脑端口、不上传 Codex 凭据的前提下实现公网访问。
+- 为开发者提供“随时继续本机 AI 编程任务”的移动入口。
+- 将多引擎线程、状态、流式输出与审批映射为统一的任务界面。
+- 在不公开电脑端口、不上传引擎凭据的前提下实现公网访问。
 - 用任务式体验替代手机上的完整 IDE 或远程桌面。
 
 ### 1.2 核心价值
 
-- 连续性：离开电脑后仍可继续当前任务和对话。
-- 可控性：命令执行和文件修改审批可以在手机上完成。
-- 可见性：查看任务状态、同步对话与统一 Diff。
-- 安全性：只允许访问电脑端配置的白名单工作区，业务内容端到端加密。
+- 连续性：离开电脑后仍可继续任务与对话。
+- 多引擎：同一工作台管理 Codex / Claude / Grok 任务，可筛选与接力。
+- 可控性：审批与权限模式可在手机上完成。
+- 安全性：白名单工作区 + 业务内容端到端加密。
 
 ## 2. 用户与使用场景
 
 ### 2.1 目标用户
 
-首版面向单用户个人开发者，典型特征如下：
-
-- 日常使用 Codex CLI 进行代码编写、调试或重构。
-- 有一台长期在线或可远程唤醒的 Windows 或 macOS 开发电脑。
-- 希望在通勤、会议间隙或离开工位时继续处理任务。
-- 能自行部署一台带域名和 HTTPS 的 VPS，或由技术人员代为部署。
+- 日常使用 Codex CLI、Claude Code 或 Grok Build 编写、调试或重构。
+- 有一台可保持登录的 Windows 或 macOS 开发电脑。
+- 希望在通勤、会议间隙继续处理任务或处理审批。
+- 能自行或请人部署带域名与 HTTPS 的 VPS（公开服务）。
 
 ### 2.2 典型场景
 
-- 离开工位前已启动重构任务，手机上查看进度并补充要求。
-- Codex 因命令或写文件请求审批，用户通过 Push 通知进入 PWA 完成审批。
-- 在外部临时发现问题，选择已有项目并创建修复任务。
-- 电脑暂时离线，用户查看此前已同步的任务和对话记录。
-- 查看任务产生的 Diff，判断是否需要继续修改或回到电脑详细检查。
+- 离开工位前启动任务，手机上查看进度并补充要求。
+- 引擎请求执行命令或写文件，Push 进入 PWA 完成审批。
+- 在外部发现问题，选择工作区与引擎创建修复任务。
+- 电脑暂时离线时查看已同步的加密历史。
+- 在电脑端「接力」到原生 CLI 会话继续深度工作。
 
 ## 3. 产品目标与边界
 
-### 3.1 MVP 目标
+### 3.1 当前目标（已实现能力）
 
-- 用户可以使用普通用户名和密码登录个人空间。
-- 用户可以将一台或多台 Windows / macOS 主机与 PWA 配对，并为每台客户端设置易记名称。
-- 用户可以在白名单工作区中创建 Codex 任务。
-- 用户可以查看流式回复、继续任务、追加方向或停止任务。
-- 用户可以处理命令执行和文件修改审批。
-- 用户可以查看任务产生的统一 Diff。
-- 用户可以在主机离线时查看已同步的加密历史。
-- 用户可以接收待审批和任务完成 Web Push。
+- 用户名密码登录；支持开放注册与用户级数据隔离。
+- 多台 Windows / macOS 主机配对、自定义名称。
+- 白名单工作区内创建 **Codex / Claude Code / Grok Build** 任务。
+- 流式回复、继续任务、追加方向、停止任务；列表按最后活动时间排序。
+- 引擎检测、权限模式映射、模型 / 推理强度选择（按引擎能力）。
+- 多浏览器主机密钥授权；Web Push 审批与完成通知。
+- 管理员后台：用户封禁 / 解封、角色与审计日志（见 Web `/admin`）。
 
-### 3.2 MVP 非目标
+### 3.2 非目标
 
-- 不提供任意交互式终端。
+- 不提供任意交互式终端或完整远程桌面。
 - 不提供完整文件浏览器或远程文件编辑器。
-- 不提供桌面画面、鼠标和键盘远程控制。
-- 不自动操控 Codex 桌面端 UI。
-- 不支持团队成员、角色权限、共享项目或审计后台。
-- 不支持 Claude Code 等其他编码 Agent。
-- 不保证远程电脑关机或 Windows 用户未登录时可执行任务。
+- 不自动操控各引擎桌面 GUI。
+- 不保证电脑关机或用户未登录时仍可执行任务。
+- 不把源码或引擎 API Key 明文存入中继。
 
 ## 4. 系统架构
 
 ```mermaid
 flowchart LR
-    PWA[移动端 PWA] <-->|HTTPS / WSS\n端到端加密信封| Relay[VPS 中继服务]
-    Relay <-->|出站 WSS\n端到端加密信封| Agent[Windows 托盘代理]
-    Agent <-->|JSONL stdio| Codex[Codex app-server]
-    Codex --> Repo[白名单项目目录]
-    Relay --> DB[(PostgreSQL\n密文事件与账号数据)]
-    Relay --> Push[Web Push 服务]
+    PWA[手机 / 桌面浏览器 PWA] <-->|HTTPS / WSS\n加密事件信封| Relay[VPS 中继服务]
+    Relay <-->|出站 WSS\n加密事件信封| Agent[Windows / macOS Agent]
+    Agent --> Router{本机 CLI 引擎路由}
+    Router <-->|JSONL stdio| Codex[Codex app-server]
+    Router <-->|stream-json| Claude[Claude Code]
+    Router <-->|streaming-json| Grok[Grok Build]
+    Codex --> Workspace[白名单工作区]
+    Claude --> Workspace
+    Grok --> Workspace
+    Relay --> DB[(PostgreSQL)]
+    Relay --> Push[Web Push]
 ```
 
 ### 4.1 PWA
 
-- React + Vite 实现，可安装到手机主屏幕。
-- 提供登录、主机、任务、对话、审批、Diff 和设置界面。
-- 使用 IndexedDB 保存不可导出的同步密钥 `CryptoKey`。
-- 通过 Service Worker 接收 Web Push。
+- React + Vite，可安装到手机主屏幕。
+- 登录、主机、任务、对话、审批、Diff、引擎筛选与设置。
+- IndexedDB 保存同步密钥；Service Worker 接收 Web Push。
 
 ### 4.2 VPS 中继
 
-- Fastify 提供 HTTP API 和 WebSocket 长连接。
-- PostgreSQL 保存账号、会话、主机、配对记录、Push 订阅和密文事件。
-- 不解析 Codex 对话、命令、Diff 或项目源码。
-- Caddy 负责 HTTPS、WSS 和证书自动续期。
+- Fastify HTTP API 与 WebSocket；PostgreSQL 存账号、主机、配对、Push 与密文事件。
+- **不解析**对话、命令、Diff 或项目源码。
+- 管理端 API：用户管理、封禁、审计日志。
+- Caddy 负责 HTTPS / WSS。
 
-### 4.3 Windows 代理
+### 4.3 桌面 Agent
 
-- Electron 托盘程序，随当前 Windows 用户登录启动。
-- 使用 Electron `safeStorage` 保护代理令牌、私钥和同步密钥。
-- 管理允许远程操作的工作区白名单。
-- 启动并管理 `codex app-server --stdio`。
-- 将 Codex 协议事件转换为产品层事件。
+- Electron 托盘（Windows / macOS）。
+- `safeStorage` 保护令牌与密钥；工作区白名单。
+- 检测并调用 Codex / Claude / Grok；本地会话导入；并发远程任务 Tab 与引擎筛选。
+- 原生 CLI 接力与自动更新。
 
-### 4.4 Codex 适配层
+### 4.4 多引擎适配
 
-MVP 针对 Codex CLI `0.144.x`，使用以下非实验协议方法子集：
+| 引擎 | 执行 | 会话 |
+| --- | --- | --- |
+| Codex | `codex app-server --stdio`（建议 0.144.x） | thread/list · resume |
+| Claude Code | `claude -p --output-format stream-json` | `~/.claude/projects` · `--resume` |
+| Grok Build | `grok -p --output-format streaming-json` | sessions · `--resume` |
 
-- 初始化：`initialize`、`initialized`。
-- 线程：`thread/start`、`thread/list`、`thread/read`、`thread/resume`。
-- 回合：`turn/start`、`turn/steer`、`turn/interrupt`。
-- 事件：消息增量、回合完成、Diff 更新和审批请求。
-
-代理检测到不兼容版本时停止接收远程任务，并在托盘窗口显示升级提示。
+任务绑定引擎与可选模型 / 推理强度；列表按 **最后活动时间** 倒序。
 
 ## 5. 功能设计
 
@@ -163,10 +156,10 @@ MVP 针对 Codex CLI `0.144.x`，使用以下非实验协议方法子集：
 
 ### 5.4 任务与对话
 
-一个产品任务对应一台主机、一个工作区和一个 Codex 线程。
+一个产品任务对应一台主机、一个白名单工作区和一个**引擎原生会话**（Codex thread / Claude session / Grok session）。
 
-- 新任务：创建 Codex 线程并发送第一条用户指令。
-- 继续任务：对空闲线程发起新回合。
+- 新任务：选择引擎，创建或恢复原生会话并发送第一条用户指令。
+- 继续任务：对空闲会话发起新回合；列表按最后活动时间排序。
 - 追加方向：使用 `turn/steer` 向正在运行的回合追加指令。
 - 停止任务：使用 `turn/interrupt` 中断指定回合。
 - 历史同步：代理读取 Codex 线程并发布加密线程快照。

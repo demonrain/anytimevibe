@@ -7,15 +7,57 @@
 ![Latest tag](https://img.shields.io/github/v/tag/demonrain/anytimevibe?sort=semver&style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-22%2B-3c873a?style=flat-square)
 
-**离开电脑，任务不用停。随时续上你的代码。**
+**在自己的电脑上跑 Codex / Claude Code / Grok Build，用手机随时续上任务——不是远程桌面，也不把源码和凭据交给云端。**
 
-随码是一个面向个人开发者和小团队的远程 AI 编程工作台：通过手机或浏览器连接自己的 Windows / macOS 电脑，选择 Codex、Claude Code 或 Grok Build 在远程主机上执行任务，并同步任务状态、流式回复、会话记录、审批和完成通知。
+## 20 秒看懂
 
-它不是远程桌面，也不会把项目源码或各引擎凭据上传到中继服务。桌面 Agent 在本机检测并调用已安装的编码 CLI，Relay 只负责身份认证、WebSocket 路由、Web Push 和加密事件存储。
+<p align="center">
+  <img src="docs/media/anytimevibe-promo.gif" alt="随码 20 秒产品预览" width="100%" />
+</p>
 
-## 产品预览
+<p align="center">
+  <a href="docs/media/anytimevibe-promo.webp">WebP 动图</a>
+  ·
+  <a href="docs/media/anytimevibe-promo.mp4">完整 MP4 视频</a>
+  ·
+  <a href="https://github.com/demonrain/anytimevibe/releases/latest">下载桌面客户端</a>
+</p>
 
-<video src="docs/media/anytimevibe-promo.mp4" controls width="100%"></video>
+<details>
+<summary>在支持的阅读器中播放视频</summary>
+
+<video src="docs/media/anytimevibe-promo.mp4" poster="docs/media/anytimevibe-promo-poster.jpg" controls width="100%"></video>
+
+</details>
+
+## 立即体验
+
+| 步骤 | 做什么 |
+| --- | --- |
+| 1 | [下载 Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest) 并安装，添加白名单工作区 |
+| 2 | 打开 Web PWA（自建部署或体验实例），登录并输入客户端配对码 |
+| 3 | 新建任务时选择 **Codex / Claude Code / Grok Build**，在手机上查看进度、继续对话与审批 |
+
+自建中继见下方 [Docker 部署](#docker-部署)。本地开发见 [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md)。
+
+## 三个核心优势
+
+1. **任务式远程，而不是整机远控** — 只同步任务状态、流式回复、审批与 Diff，不必盯着桌面画面。
+2. **引擎在你自己的电脑上** — Agent 本机调用已安装的 CLI；源码、API Key、会话文件不上传中继。
+3. **三引擎同一工作台** — 每个任务绑定引擎与原生会话，可筛选、接力，刷新浏览器也不丢上下文。
+
+## 为什么不用 SSH、远程桌面或 Tailscale？
+
+| | 随码 | SSH / 终端 | 远程桌面 | Tailscale 组网 |
+| --- | --- | --- | --- | --- |
+| 手机上的体验 | 任务卡片、流式回复、审批按钮 | 小屏敲终端 | 看整屏桌面、点鼠标 | 只解决网络连通 |
+| 代码与凭据 | 留在本机；中继只存密文事件 | 取决于你怎么用 | 画面在远端，风险面更大 | 不负责任务与审批 |
+| 多 CLI | Codex / Claude / Grok 统一列表 | 自己切工具 | 自己开窗口 | 无 |
+| 典型场景 | 通勤续任务、审批、看进度 | 运维与脚本 | 需要完整 GUI 时 | 需要安全组网时 |
+
+随码**不替代** SSH 或 RDP：当你需要完整终端或桌面时，用「电脑接力」回到本机原生 CLI。它补的是「离开工位后仍能驱动本机 AI 编程任务」这一段。
+
+## 产品截图
 
 | 多引擎任务选择 | 原生 CLI 接力 |
 | --- | --- |
@@ -30,25 +72,17 @@
 1. 在手机或桌面浏览器登录 Web PWA，选择已配对的电脑和白名单工作区。
 2. 新建任务时选择 Codex、Claude Code 或 Grok Build，并使用该引擎对应的权限模式。
 3. Windows / macOS Agent 在本机启动选定 CLI，实时同步阶段日志、回复和任务状态。
-4. 需要完整终端体验时，点击“电脑接力”，Agent 使用对应引擎的原生会话 ID 恢复任务；刷新或更换浏览器也能继续同步。
+4. 需要完整终端体验时，点击「电脑接力」，Agent 使用对应引擎的原生会话 ID 恢复任务。
 
-## 能做什么
+## 能做什么（摘要）
 
-- 多用户注册、登录和用户级主机隔离。
-- 配对多台 Windows / macOS 主机，并为主机设置易记名称。
-- 在白名单工作区选择 Codex、Claude Code 或 Grok Build 创建任务。
-- 每个任务保留所属引擎、原生会话 ID、权限模式和流式输出。
-- 手机下发命令，远程电脑执行；电脑端按引擎一键接力到同一原生会话。
-- 任务队列、处理中、已完成、失败和离线状态同步。
-- Web Push 审批与任务完成通知。
-- 根据不同 CLI 映射 Read Only、Full Access、Bypass permissions、Always approve 等权限。
-- 多浏览器设备授权，避免每个浏览器重复配对同一主机。
-- 客户端检测三种引擎的安装状态和版本，并展示每台主机可用的引擎。
-- 导入 Claude Code / Grok Build 本地会话，与 Web 创建的任务统一显示。
-- 客户端环境检测、Codex 安装指引、自动更新和 Windows / macOS 安装包。
-- 手动同步或登录后自动同步任务记录和会话历史。
+- 多用户隔离、多主机配对、工作区白名单。
+- 三引擎创建任务、流式输出、权限映射、原生会话接力。
+- 任务列表按最后活动时间排序；可按引擎筛选。
+- Web Push 审批 / 完成通知；多浏览器授权同一主机密钥。
+- 客户端环境检测、引擎安装指引、自动更新。
 
-当前边界：不同 CLI 的审批与输出能力存在差异，随码会映射为统一任务体验；不提供任意终端、远程桌面、文件浏览器或桌面 UI 自动化。Agent 必须在电脑用户已登录且至少一个受支持引擎已安装并完成登录时在线工作。
+当前边界：各 CLI 能力存在差异，产品会映射为统一任务体验；不提供任意终端、远程桌面或文件浏览器。Agent 需在用户已登录的桌面会话中运行，且至少一种引擎已安装并登录。
 
 ## 支持的编码引擎
 

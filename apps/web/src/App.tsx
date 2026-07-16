@@ -23,7 +23,6 @@ import {
   type ReasoningEffort,
   type Workspace,
   PRODUCT_VERSION,
-  MIN_AGENT_VERSION,
   compareSemver
 } from "@anytimevibe/protocol";
 import { api, websocketUrl } from "./api";
@@ -36,7 +35,15 @@ import {
 } from "./i18n/locales";
 import { getHostKey, removeHostKey, saveHostKey } from "./key-store";
 
-type Health = { ok: boolean; needsSetup: boolean; registrationEnabled: boolean; vapidPublicKey: string | null; clientDownloads: { windows: string | null; mac: string | null } };
+type Health = {
+  ok: boolean;
+  needsSetup: boolean;
+  registrationEnabled: boolean;
+  vapidPublicKey: string | null;
+  clientDownloads: { windows: string | null; mac: string | null };
+  /** Latest published desktop agent version (from GitHub / env); soft update only. */
+  latestClientVersion?: string | null;
+};
 type User = { id: string; username: string; isAdmin?: boolean };
 type Host = {
   id: string;
@@ -362,12 +369,17 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const model = event.model ?? existing?.model;
     const reasoningEffort = event.reasoningEffort ?? existing?.reasoningEffort;
     const contextUsage = event.contextUsage ?? existing?.contextUsage;
+    // Never let a stale snapshot push a recently active task down the list.
+    const updatedAt = Math.max(
+      Number(event.updatedAt) || 0,
+      existing?.updatedAt ?? 0
+    );
     next.tasks[event.threadId] = {
       threadId: event.threadId,
       title: event.title || "未命名任务",
       cwd: event.cwd,
       status: event.status,
-      updatedAt: event.updatedAt,
+      updatedAt: updatedAt || Date.now() / 1000,
       diff: existing?.diff ?? "",
       messages: event.messages,
       approvals: existing?.approvals ?? [],
@@ -562,10 +574,40 @@ export function App() {
   const autoSyncedHostsRef = useRef(new Set<string>());
   const [keyAuthorizationStatus, setKeyAuthorizationStatus] = useState<Record<string, "missing" | "authorizing">>({});
   const keyAuthorizationsRef = useRef(new Set<string>());
+  /** After task.create, auto-select the first new threadId not in this set. */
+  const pendingNewTaskRef = useRef<{ hostId: string; knownIds: Set<string>; expiresAt: number } | null>(null);
+  const [clientUpdateDismissed, setClientUpdateDismissed] = useState(() => {
+    try {
+      return sessionStorage.getItem("client-update-dismissed") === "1";
+    } catch {
+      return false;
+    }
+  });
   function selectTask(threadId: string) {
     setSelectedTaskId(threadId);
     setMobilePane("conversation");
     window.scrollTo({ top: 0, behavior: "instant" });
+  }
+
+  function markExpectingNewTask(hostId: string, knownIds: Iterable<string>) {
+    pendingNewTaskRef.current = {
+      hostId,
+      knownIds: new Set(knownIds),
+      expiresAt: Date.now() + 90_000
+    };
+  }
+
+  function maybeSelectNewTask(hostId: string, threadId: string | undefined) {
+    if (!threadId) return;
+    const pending = pendingNewTaskRef.current;
+    if (!pending || pending.hostId !== hostId) return;
+    if (Date.now() > pending.expiresAt) {
+      pendingNewTaskRef.current = null;
+      return;
+    }
+    if (pending.knownIds.has(threadId)) return;
+    pendingNewTaskRef.current = null;
+    selectTask(threadId);
   }
 
   useEffect(() => {
@@ -622,6 +664,10 @@ export function App() {
         ...current,
         [envelope.hostId]: reduceEvent(current[envelope.hostId] ?? emptyRuntime(), event)
       }));
+      // Auto-open the task just created via the new-task dialog.
+      if ("threadId" in event && typeof event.threadId === "string") {
+        maybeSelectNewTask(envelope.hostId, event.threadId);
+      }
     }
     if (envelope.persist) localStorage.setItem(`sync:${envelope.hostId}`, String(envelope.sequence));
   });
@@ -900,15 +946,18 @@ export function App() {
   });
   const activeTask = filteredTasks.find((task) => task.threadId === selectedTaskId)
     ?? tasks.find((task) => task.threadId === selectedTaskId)
-    ?? filteredTasks[0]
+    ?? (selectedTaskId ? null : filteredTasks[0])
     ?? null;
 
   const clientVersion = activeRuntime.agentVersion;
+  const latestClientVersion = health.latestClientVersion?.replace(/^v/i, "") || null;
+  // Soft update only: compare connected client to latest published release (not web PRODUCT_VERSION).
   const clientOutdated = Boolean(
     activeHost
     && activeRuntime.online === true
     && clientVersion
-    && compareSemver(clientVersion, MIN_AGENT_VERSION) < 0
+    && latestClientVersion
+    && compareSemver(clientVersion, latestClientVersion) < 0
   );
   const clientVersionUnknown = Boolean(
     activeHost
@@ -917,10 +966,17 @@ export function App() {
   );
   const versionWarn = clientOutdated || clientVersionUnknown;
   const versionTitle = clientOutdated
-    ? `客户端过旧：网页 v${PRODUCT_VERSION} 需要客户端 ≥ v${MIN_AGENT_VERSION}，当前 v${clientVersion}。请更新客户端。`
+    ? (locale === "en"
+      ? `Desktop client v${clientVersion} is behind latest v${latestClientVersion}. Update for best compatibility.`
+      : `客户端 v${clientVersion} 低于线上最新 v${latestClientVersion}，建议尽快更新以确保功能正常。`)
     : clientVersionUnknown
-      ? `客户端未上报版本：网页 v${PRODUCT_VERSION} 建议使用客户端 v${MIN_AGENT_VERSION}。`
-      : "网页与客户端应对齐同一产品版本";
+      ? (locale === "en"
+        ? `Client did not report a version. Latest release is v${latestClientVersion ?? "—"}.`
+        : `客户端未上报版本。线上最新客户端为 v${latestClientVersion ?? "—"}。`)
+      : (locale === "en"
+        ? `Web v${PRODUCT_VERSION}${clientVersion ? ` · Client v${clientVersion}` : ""}${latestClientVersion ? ` · Latest client v${latestClientVersion}` : ""}`
+        : `网页 v${PRODUCT_VERSION}${clientVersion ? ` · 客户端 v${clientVersion}` : ""}${latestClientVersion ? ` · 最新客户端 v${latestClientVersion}` : ""}`);
+  const showClientUpdateBanner = versionWarn && !clientUpdateDismissed;
 
   return <div className="app-shell">
     {error && <ErrorBanner message={error} clear={() => setError("")} />}
@@ -934,8 +990,10 @@ export function App() {
           <span className="version-chip-line">Web v{PRODUCT_VERSION}</span>
           <span className="version-chip-line">
             {activeHost
-              ? `${locale === "en" ? "Client" : "客户端"} ${clientVersion ? `v${clientVersion}` : (locale === "en" ? "unknown" : "未知")}${clientOutdated ? (locale === "en" ? " · update" : " · 需更新") : clientVersionUnknown ? (locale === "en" ? " · upgrade" : " · 请升级") : ""}`
-              : `${locale === "en" ? "Client" : "客户端"} v${MIN_AGENT_VERSION}`}
+              ? `${locale === "en" ? "Client" : "客户端"} ${clientVersion ? `v${clientVersion}` : (locale === "en" ? "unknown" : "未知")}${clientOutdated ? (locale === "en" ? " · update" : " · 需更新") : clientVersionUnknown ? (locale === "en" ? " · ?" : " · 未知") : ""}`
+              : latestClientVersion
+                ? `${locale === "en" ? "Client" : "客户端"} ${locale === "en" ? "latest" : "最新"} v${latestClientVersion}`
+                : `${locale === "en" ? "Client" : "客户端"} —`}
           </span>
         </span>
         <ClientDownloads downloads={health.clientDownloads} />
@@ -954,6 +1012,36 @@ export function App() {
         </div>
       </div>
     </header>
+
+    {showClientUpdateBanner && (
+      <div className="client-update-banner" role="status">
+        <div className="client-update-banner-copy">
+          <strong>{locale === "en" ? "Desktop client update available" : "客户端有新版本"}</strong>
+          <span>
+            {clientOutdated
+              ? (locale === "en"
+                ? `You are on v${clientVersion}; latest is v${latestClientVersion}. Update to keep features working.`
+                : `当前 v${clientVersion}，线上最新 v${latestClientVersion}。请及时更新客户端，以免新功能不可用。`)
+              : (locale === "en"
+                ? `Latest client is v${latestClientVersion ?? "—"}. Install or upgrade if this host is outdated.`
+                : `线上最新客户端 v${latestClientVersion ?? "—"}。若本机客户端偏旧，请下载更新。`)}
+          </span>
+        </div>
+        <div className="client-update-banner-actions">
+          <ClientDownloads downloads={health.clientDownloads} />
+          <button
+            type="button"
+            className="quiet"
+            onClick={() => {
+              setClientUpdateDismissed(true);
+              try { sessionStorage.setItem("client-update-dismissed", "1"); } catch { /* ignore */ }
+            }}
+          >
+            {locale === "en" ? "Dismiss" : "稍后"}
+          </button>
+        </div>
+      </div>
+    )}
 
     <aside className="rail">
       <div className="rail-heading"><span>{t("remoteHosts")}</span><button onClick={() => setPairingOpen(true)}>＋</button></div>
@@ -1090,6 +1178,11 @@ export function App() {
       onCreate={async (cwd, prompt, title, engine, mode, model, reasoningEffort) => {
         setPermissionMode(mode);
         localStorage.setItem("permission-mode", mode);
+        // Remember existing threads so the first new threadId from the host is selected.
+        markExpectingNewTask(activeHost.id, Object.keys(activeRuntime.tasks));
+        // Clear engine filter so the new task is visible in the list immediately.
+        setEngineFilter(null);
+        setMobilePane("conversation");
         await sendCommand(activeHost.id, {
           type: "task.create",
           commandId: crypto.randomUUID(),
@@ -1316,7 +1409,7 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
               onChange={(event) => {
                 const next = event.target.value;
                 setModel(next);
-                saveTaskUiPrefs(task.threadId, { model: next || undefined });
+                if (next) saveTaskUiPrefs(task.threadId, { model: next });
               }}
               disabled={!modelOptions.length}
             >
@@ -1331,7 +1424,7 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
               onChange={(event) => {
                 const next = event.target.value as ReasoningEffort;
                 setReasoningEffort(next);
-                saveTaskUiPrefs(task.threadId, { reasoningEffort: next || undefined });
+                if (next) saveTaskUiPrefs(task.threadId, { reasoningEffort: next });
               }}
               disabled={!effortOptions.length}
             >

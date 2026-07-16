@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld("anytimeVibe", {
   relayTask: (threadId: string) => ipcRenderer.invoke("agent:relay-task", threadId),
   refreshTasks: () => ipcRenderer.invoke("agent:refresh-tasks"),
   refreshEngines: () => ipcRenderer.invoke("agent:refresh-engines"),
+  selectActivity: (threadId: string) => ipcRenderer.invoke("agent:select-activity", threadId),
   windowMinimize: () => ipcRenderer.invoke("agent:window-minimize"),
   windowClose: () => ipcRenderer.invoke("agent:window-close"),
   openFeedback: () => ipcRenderer.invoke("agent:open-feedback"),

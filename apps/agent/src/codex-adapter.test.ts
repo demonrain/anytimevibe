@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { codexPermissionParams, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
+import { codexPermissionParams, normalizeUnixSeconds, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
 
 describe("threadToSnapshot", () => {
   it("maps Codex CLI permission labels to app-server settings", () => {
@@ -49,5 +49,16 @@ describe("threadToSnapshot", () => {
       turns: [{ id: "turn-active", status: "inProgress", startedAt: 3, items: [] }]
     });
     expect(snapshot.activeTurnId).toBe("turn-active");
+  });
+
+  it("normalizes ms timestamps and prefers last turn activity for updatedAt", () => {
+    expect(normalizeUnixSeconds(1_700_000_000_000)).toBe(1_700_000_000);
+    const snapshot = threadToSnapshot({
+      id: "thread-2",
+      createdAt: 100,
+      updatedAt: 100,
+      turns: [{ startedAt: 200, completedAt: 300, items: [] }]
+    });
+    expect(snapshot.updatedAt).toBe(300);
   });
 });

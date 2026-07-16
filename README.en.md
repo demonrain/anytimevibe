@@ -7,15 +7,57 @@
 ![Latest tag](https://img.shields.io/github/v/tag/demonrain/anytimevibe?sort=semver&style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-22%2B-3c873a?style=flat-square)
 
-**Leave the desk. Keep the task moving. Resume your code anywhere.**
+**Run Codex, Claude Code, or Grok Build on your own machine—and keep the task moving from your phone. Not a remote desktop. Not a cloud that holds your source or API keys.**
 
-AnytimeVibe is a remote AI coding workspace for individual developers and small teams. A phone or desktop browser connects to a Windows or macOS computer, where Codex, Claude Code, or Grok Build executes the selected task. The Web app synchronizes task state, streamed replies, approvals, completion notifications, and conversation history.
+## 20-second overview
 
-It is not a remote desktop. It does not upload project source code or engine credentials to the relay. The desktop Agent detects and runs installed coding CLIs locally; the Relay handles authentication, WebSocket routing, Web Push, and encrypted event storage.
+<p align="center">
+  <img src="docs/media/anytimevibe-promo.gif" alt="AnytimeVibe 20-second product preview" width="100%" />
+</p>
 
-## Product Preview
+<p align="center">
+  <a href="docs/media/anytimevibe-promo.webp">WebP animation</a>
+  ·
+  <a href="docs/media/anytimevibe-promo.mp4">Full MP4 video</a>
+  ·
+  <a href="https://github.com/demonrain/anytimevibe/releases/latest">Download desktop agent</a>
+</p>
 
-<video src="docs/media/anytimevibe-promo.mp4" controls width="100%"></video>
+<details>
+<summary>Play video where supported</summary>
+
+<video src="docs/media/anytimevibe-promo.mp4" poster="docs/media/anytimevibe-promo-poster.jpg" controls width="100%"></video>
+
+</details>
+
+## Try it now
+
+| Step | Action |
+| --- | --- |
+| 1 | [Download the Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest), install it, and add allow-listed workspaces |
+| 2 | Open the Web PWA, sign in, and enter the pairing code from the agent |
+| 3 | Create a task with **Codex / Claude Code / Grok Build**, then follow progress, continue the chat, and approve from your phone |
+
+Self-host the relay via [Docker deployment](#docker-deployment). Local development: [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md).
+
+## Three reasons to use it
+
+1. **Task-native remote, not full desktop control** — stream replies, status, approvals, and diffs without babysitting a remote screen.
+2. **Engines stay on your PC** — the Agent runs installed CLIs locally; source, keys, and session files never go to the relay as plaintext.
+3. **One workbench for three engines** — each task keeps its engine and native session; filter, hand off, and resume across browsers.
+
+## Why not just SSH, remote desktop, or Tailscale?
+
+| | AnytimeVibe | SSH / terminal | Remote desktop | Tailscale |
+| --- | --- | --- | --- | --- |
+| Phone UX | Task cards, streaming, approval buttons | Tiny terminal | Full desktop | Connectivity only |
+| Code & secrets | Stay local; relay stores encrypted envelopes | Depends on you | Larger GUI attack surface | No task/approval layer |
+| Multi-CLI | Codex / Claude / Grok in one list | You switch tools | You open windows | N/A |
+| Best for | Continue coding tasks away from the desk | Ops & scripts | Full GUI work | Secure networking |
+
+AnytimeVibe does **not** replace SSH or RDP. Use “Handoff to computer” when you need a full native CLI. It fills the gap between leaving your desk and still driving local AI coding agents.
+
+## Screenshots
 
 | Multi-engine task selection | Native CLI handoff |
 | --- | --- |
@@ -25,30 +67,22 @@ It is not a remote desktop. It does not upload project source code or engine cre
 | --- | --- |
 | ![Codex, Claude, and Grok tasks in one stream](docs/media/task-stream.png) | ![Permission mapping for each coding engine](docs/media/permissions.png) |
 
-## Core Workflow
+## Core workflow
 
-1. Sign in to the Web PWA from a phone or desktop browser and choose a paired computer and an allowed workspace.
-2. Choose Codex, Claude Code, or Grok Build and select the permission mode supported by that engine.
-3. The Windows or macOS Agent starts the selected local CLI and streams stages, replies, and task state.
-4. For a full terminal workflow, click “Handoff to computer”. The Agent resumes the provider-native session with the matching CLI; refreshing or switching browsers keeps synchronization intact.
+1. Sign in to the Web PWA and choose a paired computer plus an allow-listed workspace.
+2. Create a task with Codex, Claude Code, or Grok Build and a matching permission mode.
+3. The Agent starts the selected local CLI and streams stages, replies, and status.
+4. For a full terminal, hand off to the provider-native session on the computer.
 
-## Features
+## Features (summary)
 
-- Multi-user registration, authentication, and per-user host isolation.
-- Multiple paired Windows and macOS hosts with custom display names.
-- Create tasks with Codex, Claude Code, or Grok Build in allow-listed workspaces.
-- Preserve the owning engine, native session ID, permission mode, and streamed output per task.
-- Send commands from a phone and hand the same native engine session back to the desktop CLI.
-- Synchronized queued, processing, completed, failed, and offline states.
-- Web Push notifications for approvals and task completion.
-- Engine-aware permissions including Read Only, Full Access, Bypass permissions, and Always approve.
-- Multi-browser device authorization without re-pairing the same host for every browser.
-- Detection and version reporting for all three engines on every paired host.
-- Import of local Claude Code and Grok Build sessions into the unified Web task list.
-- Client environment checks, Codex installation guidance, automatic updates, and Windows / macOS installers.
-- Manual or post-login task and conversation synchronization.
+- Multi-user isolation, multi-host pairing, workspace allow-lists.
+- Three engines, streaming output, permission mapping, native session handoff.
+- Task list ordered by last activity; filter by engine.
+- Web Push for approvals/completion; multi-browser host-key authorization.
+- Client environment detection, install helpers, auto-update.
 
-Current boundary: approval and output capabilities differ between CLIs and are mapped into one task experience. AnytimeVibe does not provide an arbitrary terminal, remote desktop, file browser, or desktop UI automation. The Agent must be online in a logged-in desktop session with at least one supported engine installed and authenticated.
+Boundary: CLI capabilities differ and are mapped into one UX. No arbitrary terminal, remote desktop, or file browser. The Agent must run in a logged-in desktop session with at least one engine installed and signed in.
 
 ## Supported Coding Engines
 

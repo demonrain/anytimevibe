@@ -184,6 +184,11 @@ async function main(): Promise<void> {
     const rows = await sql<Array<{ count: number }>>`SELECT count(*)::int AS count FROM users`;
     const count = rows[0]?.count ?? 0;
     const policy = await resolveRegistrationPolicy(sql, config.REGISTRATION_ENABLED, config.MAX_USERS);
+    const { getLatestClientVersion } = await import("./latest-client-version");
+    const latestClientVersion = await getLatestClientVersion({
+      ...(config.LATEST_CLIENT_VERSION ? { override: config.LATEST_CLIENT_VERSION } : {}),
+      ...(config.GITHUB_RELEASES_LATEST_URL ? { releasesUrl: config.GITHUB_RELEASES_LATEST_URL } : {})
+    });
     return {
       ok: true,
       needsSetup: count === 0,
@@ -192,6 +197,8 @@ async function main(): Promise<void> {
         windows: config.WINDOWS_CLIENT_URL ?? null,
         mac: config.MAC_CLIENT_URL ?? null
       },
+      /** Latest desktop agent release (for soft update prompts; not a hard web↔client bind). */
+      latestClientVersion,
       vapidPublicKey: config.VAPID_PUBLIC_KEY ?? null
     };
   });

@@ -3,12 +3,14 @@ import { z } from "zod";
 export const PROTOCOL_VERSION = 1 as const;
 
 /**
- * Product release version shared by web + desktop agent.
- * Keep apps/web and apps/agent package.json versions aligned with this on each release.
- * Frontend warns when the connected agent reports a lower version.
+ * Web / monorepo product version (display + packaging).
+ * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
+ * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.31";
-/** Minimum desktop agent version required by this frontend build (usually equals PRODUCT_VERSION). */
+export const PRODUCT_VERSION = "0.4.32";
+/**
+ * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
+ */
 export const MIN_AGENT_VERSION = PRODUCT_VERSION;
 
 /** Compare dotted versions (ignores leading v). Returns negative if a < b. */

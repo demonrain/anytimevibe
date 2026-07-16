@@ -39,7 +39,7 @@ import {
   type Workspace,
   PRODUCT_VERSION
 } from "@anytimevibe/protocol";
-import { CodexAdapter, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
+import { CodexAdapter, normalizeUnixSeconds, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
 import { ensureClaudeWorkspaceTrusted } from "./cli/claude-trust";
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { interruptHeadlessThread, runHeadlessTurn } from "./cli/headless-runner";
@@ -91,7 +91,11 @@ type PublicState = {
   environment: EnvironmentState;
   update: UpdateState;
   tasks: AgentTask[];
+  /** @deprecated Prefer activities + selectedActivityThreadId (kept for older UI paint paths). */
   activity?: ActivityState;
+  /** Concurrent remote tasks currently tracked in the agent panel. */
+  activities: ActivityState[];
+  selectedActivityThreadId?: string;
 };
 
 type AgentTask = {
@@ -109,6 +113,8 @@ type ActivityState = {
   prompt: string;
   status: "processing" | "completed" | "failed" | "interrupted";
   output: string;
+  engine?: CliEngine;
+  updatedAt: number;
 };
 
 type EnvironmentState = {
@@ -146,7 +152,8 @@ let publicState: PublicState = {
   workspaces: [],
   environment: initialEnvironment,
   update: { status: "idle" },
-  tasks: []
+  tasks: [],
+  activities: []
 };
 const taskStore = new TaskStore();
 
@@ -200,24 +207,102 @@ const pendingPrompts = new Map<string, string>();
 const pendingRequestTypes = new Map<string, "command" | "file" | "permission" | "input">();
 /** threadId -> active turnId for streaming turn.delta to web */
 const activeTurnByThread = new Map<string, string>();
-let activityOutputBuffer = "";
-let activityFlushTimer: NodeJS.Timeout | null = null;
-const activityItems = new Map<string, string>();
+/** Per-thread local activity buffers (multi-task concurrent remote runs). */
+const activityOutputBuffers = new Map<string, string>();
+const activityFlushTimers = new Map<string, NodeJS.Timeout>();
+const activityItemsByThread = new Map<string, Map<string, string>>();
 /** Pending remote stream chunks: key = threadId\\0itemId */
 const remoteDeltaBuffers = new Map<string, string>();
 let remoteDeltaFlushTimer: NodeJS.Timeout | null = null;
 
-function startLocalActivity(threadId: string, prompt: string, title = "远程任务"): void {
-  activityOutputBuffer = "";
-  activityItems.clear();
-  if (activityFlushTimer) clearTimeout(activityFlushTimer);
-  activityFlushTimer = null;
-  updateState({ activity: { threadId, title, prompt, status: "processing", output: "" } });
+function resolveActivityEngine(threadId: string): CliEngine | undefined {
+  return taskStore.get(threadId)?.engine
+    || publicState.tasks.find((item) => item.threadId === threadId)?.engine;
+}
+
+function syncActivitiesState(nextActivities: ActivityState[], selectedThreadId?: string): void {
+  const selected = selectedThreadId
+    ?? publicState.selectedActivityThreadId
+    ?? nextActivities.find((item) => item.status === "processing")?.threadId
+    ?? nextActivities[0]?.threadId;
+  const selectedActivity = nextActivities.find((item) => item.threadId === selected);
+  const next: PublicState = {
+    ...publicState,
+    activities: nextActivities,
+    relayUrl: config?.relayUrl ?? publicState.relayUrl,
+    displayName: config ? resolvedDisplayName() : publicState.displayName,
+    codexVersion,
+    workspaces: config?.workspaces ?? publicState.workspaces
+  };
+  if (selected) next.selectedActivityThreadId = selected;
+  else delete next.selectedActivityThreadId;
+  if (selectedActivity) next.activity = selectedActivity;
+  else delete next.activity;
+  publicState = next;
+  if (quitting || installingUpdate) return;
+  try {
+    if (isWindowAlive()) windowRef!.webContents.send("agent:state", publicState);
+  } catch {
+    // ignore
+  }
+  try {
+    rebuildTray();
+  } catch {
+    // ignore
+  }
+}
+
+function startLocalActivity(threadId: string, prompt: string, title = "远程任务", engine?: CliEngine): void {
+  activityOutputBuffers.set(threadId, "");
+  activityItemsByThread.set(threadId, new Map());
+  const existingTimer = activityFlushTimers.get(threadId);
+  if (existingTimer) clearTimeout(existingTimer);
+  activityFlushTimers.delete(threadId);
+  const now = Date.now() / 1000;
+  const resolvedEngine = engine || resolveActivityEngine(threadId);
+  const entry: ActivityState = {
+    threadId,
+    title,
+    prompt,
+    status: "processing",
+    output: "",
+    updatedAt: now,
+    ...(resolvedEngine ? { engine: resolvedEngine } : {})
+  };
+  const next = [
+    entry,
+    ...publicState.activities.filter((item) => item.threadId !== threadId)
+  ].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 12);
+  syncActivitiesState(next, threadId);
+  // Bump task list so the active thread rises to the top by last activity.
+  touchAgentTask(threadId, { title, status: "active", ...(resolvedEngine ? { engine: resolvedEngine } : {}) });
 }
 
 function appendLocalActivityStage(threadId: string, text: string): void {
   if (!text.trim()) return;
-  appendLocalActivity(threadId, `${activityOutputBuffer || publicState.activity?.output ? "\n\n" : ""}${text.trim()}`);
+  const buf = activityOutputBuffers.get(threadId) ?? "";
+  const current = publicState.activities.find((item) => item.threadId === threadId)?.output ?? "";
+  appendLocalActivity(threadId, `${buf || current ? "\n\n" : ""}${text.trim()}`);
+}
+
+function touchAgentTask(threadId: string, patch: Partial<AgentTask> = {}): void {
+  const now = Date.now() / 1000;
+  const existing = publicState.tasks.find((item) => item.threadId === threadId);
+  const stored = taskStore.get(threadId);
+  const engine = patch.engine || existing?.engine || stored?.engine;
+  const task: AgentTask = {
+    threadId,
+    title: patch.title || existing?.title || stored?.title || "远程任务",
+    cwd: patch.cwd || existing?.cwd || stored?.cwd || "",
+    status: patch.status || existing?.status || stored?.status || "active",
+    updatedAt: now,
+    ...(engine ? { engine } : {})
+  };
+  updateState({
+    tasks: [task, ...publicState.tasks.filter((item) => item.threadId !== threadId)]
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, 200)
+  });
 }
 
 function activityItemKey(params: Record<string, any>): string {
@@ -250,29 +335,48 @@ function activityItemResult(item: Record<string, any>): string {
 }
 
 function appendLocalActivity(threadId: string, delta: string): void {
-  if (publicState.activity?.threadId !== threadId) return;
-  activityOutputBuffer += delta;
-  if (activityFlushTimer) return;
-  activityFlushTimer = setTimeout(() => {
-    activityFlushTimer = null;
-    const activity = publicState.activity;
-    if (!activity || activity.threadId !== threadId) return;
-    const output = (activity.output + activityOutputBuffer).slice(-100_000);
-    activityOutputBuffer = "";
-    updateState({ activity: { ...activity, output } });
+  if (!publicState.activities.some((item) => item.threadId === threadId)) return;
+  activityOutputBuffers.set(threadId, (activityOutputBuffers.get(threadId) ?? "") + delta);
+  if (activityFlushTimers.has(threadId)) return;
+  const timer = setTimeout(() => {
+    activityFlushTimers.delete(threadId);
+    const activity = publicState.activities.find((item) => item.threadId === threadId);
+    if (!activity) return;
+    const chunk = activityOutputBuffers.get(threadId) ?? "";
+    activityOutputBuffers.set(threadId, "");
+    const output = (activity.output + chunk).slice(-100_000);
+    const next = publicState.activities.map((item) =>
+      item.threadId === threadId
+        ? { ...item, output, updatedAt: Date.now() / 1000 }
+        : item
+    ).sort((a, b) => b.updatedAt - a.updatedAt);
+    syncActivitiesState(next, publicState.selectedActivityThreadId);
   }, 50);
+  activityFlushTimers.set(threadId, timer);
 }
 
 function finishLocalActivity(threadId: string, status: string): void {
-  const activity = publicState.activity;
-  if (!activity || activity.threadId !== threadId) return;
-  const output = (activity.output + activityOutputBuffer).slice(-100_000);
-  activityOutputBuffer = "";
-  if (activityFlushTimer) clearTimeout(activityFlushTimer);
-  activityFlushTimer = null;
+  const activity = publicState.activities.find((item) => item.threadId === threadId);
+  if (!activity) return;
+  const chunk = activityOutputBuffers.get(threadId) ?? "";
+  activityOutputBuffers.set(threadId, "");
+  const timer = activityFlushTimers.get(threadId);
+  if (timer) clearTimeout(timer);
+  activityFlushTimers.delete(threadId);
   const normalized = status.toLowerCase();
-  const finalStatus: ActivityState["status"] = normalized.includes("interrupt") ? "interrupted" : normalized.includes("fail") ? "failed" : "completed";
-  updateState({ activity: { ...activity, output, status: finalStatus } });
+  const finalStatus: ActivityState["status"] = normalized.includes("interrupt")
+    ? "interrupted"
+    : normalized.includes("fail")
+      ? "failed"
+      : "completed";
+  const now = Date.now() / 1000;
+  const next = publicState.activities.map((item) =>
+    item.threadId === threadId
+      ? { ...item, output: (item.output + chunk).slice(-100_000), status: finalStatus, updatedAt: now }
+      : item
+  ).sort((a, b) => b.updatedAt - a.updatedAt);
+  syncActivitiesState(next, publicState.selectedActivityThreadId);
+  touchAgentTask(threadId, { status: finalStatus });
 }
 
 function queueRemoteDelta(threadId: string, itemId: string, delta: string): void {
@@ -512,6 +616,18 @@ function rendererHtml(): string {
   .workspace small{color:#747a73;margin-top:1px;font-size:10px}
   .task-main{display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 auto}
   .engine-badge{width:18px;height:18px;border-radius:5px;object-fit:cover;flex:0 0 auto;background:#fff;box-shadow:0 0 0 1px rgba(23,33,27,.08)}
+  .engine-filter{display:flex;align-items:center;gap:6px;margin-top:7px;flex-wrap:wrap}
+  .engine-filter-btn{display:inline-flex;align-items:center;gap:5px;border:1px solid rgba(23,33,27,.14);background:rgba(255,250,240,.72);color:#17211b;border-radius:10px;padding:5px 8px;cursor:pointer;font-weight:800;font-size:10px}
+  .engine-filter-btn.active{border-color:rgba(45,118,83,.5);background:rgba(45,118,83,.1);box-shadow:0 0 0 2px rgba(45,118,83,.1)}
+  .engine-filter-btn .engine-badge{width:16px;height:16px}
+  .engine-filter-clear{border:0;background:transparent;color:#2d7653;padding:4px 6px;font-size:10px;font-weight:850;cursor:pointer}
+  .activity-tabs{display:flex;gap:5px;overflow-x:auto;padding:2px 0 6px;margin-top:4px}
+  .activity-tab{display:inline-flex;align-items:center;gap:5px;max-width:160px;border:1px solid rgba(23,33,27,.12);background:#eee6d8;color:#17211b;border-radius:9px;padding:5px 8px;font-size:10px;font-weight:800;cursor:pointer;flex:0 0 auto}
+  .activity-tab.active{background:#17211b;color:#fff;border-color:#17211b}
+  .activity-tab .engine-badge{width:14px;height:14px}
+  .activity-tab span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px}
+  .activity-tab .dot-mini{width:6px;height:6px;border-radius:50%;background:#9a9f98;flex:0 0 auto}
+  .activity-tab .dot-mini.run{background:#3bab70;box-shadow:0 0 0 3px rgba(59,171,112,.16)}
   .empty{text-align:center;color:#888;padding:8px;font-size:11px}
   .stack{display:grid;gap:6px;margin-top:6px}
   .label{font-size:10px;font-weight:800;color:#6b726b;letter-spacing:.04em}
@@ -585,7 +701,18 @@ function rendererHtml(): string {
   var tasksOpen=false;
   var lastTasks=[];
   var taskQuery='';
+  var engineFilter=null;
+  var lastActivities=[];
+  var selectedActivityId=null;
   function escapeHtml(value){return String(value||'').replace(/[&<>"']/g,function(char){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[char];});}
+  function formatActivityTime(ts){
+    var n=Number(ts)||0;
+    if(!n) return '';
+    if(n>1e12) n=n/1000;
+    try{
+      return new Date(n*1000).toLocaleString(undefined,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+    }catch(e){ return ''; }
+  }
   function paint(state){
     try{
       if(!state) return;
@@ -625,7 +752,9 @@ function rendererHtml(): string {
         });
       }
       renderUpdate(state.update||{status:'idle'});
-      renderActivity(state.activity);
+      lastActivities=state.activities&&state.activities.length?state.activities:(state.activity?[state.activity]:[]);
+      selectedActivityId=state.selectedActivityThreadId||(lastActivities[0]&&lastActivities[0].threadId)||null;
+      renderActivity(lastActivities, selectedActivityId);
       renderTasks(state.tasks||[]);
     }catch(err){
       if(detail) detail.textContent='界面渲染异常：'+(err&&err.message?err.message:String(err));
@@ -644,29 +773,71 @@ function rendererHtml(): string {
     if(checkBtn&&api) checkBtn.addEventListener('click',function(){api.checkUpdate();});
     if(installBtn&&api) installBtn.addEventListener('click',function(){api.installUpdate();});
   }
-  function renderActivity(activity){
+  function renderActivity(activities, selectedId){
     if(!activityBox) return;
-    if(!activity){activityBox.style.display='none';activityBox.innerHTML='';return;}
+    activities=activities||[];
+    if(!activities.length){activityBox.style.display='none';activityBox.innerHTML='';return;}
     activityBox.style.display='block';
     var labels={processing:'处理中',completed:'已完成',failed:'失败',interrupted:'已停止'};
-    activityBox.innerHTML='<div class="status"><h2>当前远程任务</h2><b>'+(labels[activity.status]||activity.status)+'</b></div><p class="detail"><strong>'+escapeHtml(activity.title)+'</strong> · '+escapeHtml(activity.prompt)+'</p><pre class="activity">'+escapeHtml(activity.output||'等待 Codex 输出…')+'</pre>';
+    var selected=activities.find(function(item){return item.threadId===selectedId;})||activities[0];
+    var tabs=activities.map(function(item){
+      var eng=item.engine||detectEngine(item);
+      var active=selected&&item.threadId===selected.threadId;
+      return '<button type="button" class="activity-tab'+(active?' active':'')+'" data-activity="'+escapeHtml(item.threadId)+'">'
+        +engineLogo(eng)
+        +'<span class="dot-mini'+(item.status==='processing'?' run':'')+'"></span>'
+        +'<span title="'+escapeHtml(item.title||'')+'">'+escapeHtml(item.title||item.threadId.slice(0,8))+'</span>'
+        +'</button>';
+    }).join('');
+    activityBox.innerHTML='<div class="status"><h2>当前远程任务</h2><b>'+(labels[selected.status]||selected.status)+'</b></div>'
+      +(activities.length>1?'<div class="activity-tabs">'+tabs+'</div>':'')
+      +'<p class="detail">'+engineLogo(selected.engine||detectEngine(selected))+' <strong>'+escapeHtml(selected.title)+'</strong> · '+escapeHtml(selected.prompt)+'</p>'
+      +'<pre class="activity">'+escapeHtml(selected.output||'等待引擎输出…')+'</pre>';
     var output=activityBox.querySelector('pre');
     if(output) output.scrollTop=output.scrollHeight;
+    activityBox.querySelectorAll('[data-activity]').forEach(function(button){
+      button.addEventListener('click',function(){
+        var id=button.getAttribute('data-activity');
+        if(!id) return;
+        selectedActivityId=id;
+        if(api&&api.selectActivity){
+          api.selectActivity(id).then(function(state){ if(state) paint(state); }).catch(function(){
+            renderActivity(lastActivities, id);
+          });
+        } else {
+          renderActivity(lastActivities, id);
+        }
+      });
+    });
   }
   function renderTasks(tasks){
     if(!taskBox) return;
-    lastTasks=tasks||[];
+    lastTasks=(tasks||[]).slice().sort(function(a,b){return (Number(b.updatedAt)||0)-(Number(a.updatedAt)||0);});
     var q=taskQuery.trim().toLowerCase();
-    var filtered=!q?lastTasks:lastTasks.filter(function(task){
-      var hay=((task.title||'')+' '+(task.cwd||'')+' '+(task.status||'')).toLowerCase();
+    var filtered=lastTasks.filter(function(task){
+      var eng=detectEngine(task);
+      if(engineFilter&&eng!==engineFilter) return false;
+      if(!q) return true;
+      var hay=((task.title||'')+' '+(task.cwd||'')+' '+(task.status||'')+' '+(eng||'')).toLowerCase();
       return hay.indexOf(q)>=0;
     });
-    taskBox.innerHTML='<div class="status"><h2>'+escapeHtml(t('relay'))+'</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?t('collapse'):t('expand'))+' · '+filtered.length+(q?'/'+lastTasks.length:'')+'</button></div>'
+    var counts={codex:0,claude:0,grok:0};
+    lastTasks.forEach(function(task){ var e=detectEngine(task); if(counts[e]!=null) counts[e]+=1; });
+    var filterBar='<div class="engine-filter" role="toolbar" aria-label="engine filter">'
+      +['codex','claude','grok'].map(function(eng){
+        return '<button type="button" class="engine-filter-btn'+(engineFilter===eng?' active':'')+'" data-engine-filter="'+eng+'" title="'+eng+' · '+counts[eng]+'">'
+          +engineLogo(eng)+'<span>'+counts[eng]+'</span></button>';
+      }).join('')
+      +(engineFilter?'<button type="button" class="engine-filter-clear" data-engine-filter-clear="1">'+(locale==='en'?'All':'全部')+'</button>':'')
+      +'</div>';
+    taskBox.innerHTML='<div class="status"><h2>'+escapeHtml(t('relay'))+'</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?t('collapse'):t('expand'))+' · '+filtered.length+(q||engineFilter?'/'+lastTasks.length:'')+'</button></div>'
+      +(tasksOpen?filterBar:'')
       +(tasksOpen?'<div class="stack" style="margin-top:7px"><input id="taskSearch" placeholder="'+escapeHtml(t('search'))+'" value="'+escapeHtml(taskQuery)+'"></div>':'')
       +(tasksOpen?(filtered.length?'<div class="workspaces" style="margin-top:7px">'+filtered.map(function(task){
           var engine=detectEngine(task);
-          return '<div class="workspace"><div class="task-main">'+engineLogo(engine)+'<div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+'</small></div></div><button data-relay="'+escapeHtml(task.threadId)+'">'+escapeHtml(t('open'))+'</button></div>';
-        }).join('')+'</div>':'<div class="empty">'+(q?t('noMatch'):t('noTask'))+'</div>'):'');
+          var when=formatActivityTime(task.updatedAt);
+          return '<div class="workspace"><div class="task-main">'+engineLogo(engine)+'<div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+(when?' · '+when:'')+'</small></div></div><button data-relay="'+escapeHtml(task.threadId)+'">'+escapeHtml(t('open'))+'</button></div>';
+        }).join('')+'</div>':'<div class="empty">'+(q||engineFilter?t('noMatch'):t('noTask'))+'</div>'):'');
     var toggle=document.querySelector('#toggleTasks');
     if(toggle) toggle.addEventListener('click',function(){
       tasksOpen=!tasksOpen;
@@ -680,6 +851,15 @@ function rendererHtml(): string {
     if(search){
       search.addEventListener('input',function(){taskQuery=search.value;renderTasks(lastTasks);var el=document.querySelector('#taskSearch');if(el){el.focus();var n=el.value.length;try{el.setSelectionRange(n,n);}catch(e){}}});
     }
+    taskBox.querySelectorAll('[data-engine-filter]').forEach(function(button){
+      button.addEventListener('click',function(){
+        var eng=button.getAttribute('data-engine-filter');
+        engineFilter=engineFilter===eng?null:eng;
+        renderTasks(lastTasks);
+      });
+    });
+    var clearFilter=taskBox.querySelector('[data-engine-filter-clear]');
+    if(clearFilter) clearFilter.addEventListener('click',function(){ engineFilter=null; renderTasks(lastTasks); });
     taskBox.querySelectorAll('[data-relay]').forEach(function(button){
       button.addEventListener('click',function(){
         if(!api) return;
@@ -1980,7 +2160,7 @@ async function runHeadlessTaskTurn(options: {
   stored.updatedAt = now;
   await taskStore.upsert(stored);
   await publishStoredTaskSnapshot(options.threadId);
-  startLocalActivity(options.threadId, options.prompt, stored.title);
+  startLocalActivity(options.threadId, options.prompt, stored.title, options.engine);
   activeTurnByThread.set(options.threadId, turnId);
 
   // Ensure GUI-spawned agent can see user-installed CLIs on PATH.
@@ -2108,7 +2288,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {})
       });
       await publishThread(thread.id);
-      startLocalActivity(thread.id, command.prompt, command.title || command.prompt.slice(0, 80));
+      startLocalActivity(thread.id, command.prompt, command.title || command.prompt.slice(0, 80), "codex");
       const turnPayload: Record<string, unknown> = {
         threadId: thread.id,
         clientUserMessageId: command.commandId,
@@ -2167,7 +2347,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       }
       await ensureCodex();
       await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
-      startLocalActivity(command.threadId, command.prompt, "继续远程任务");
+      startLocalActivity(command.threadId, command.prompt, "继续远程任务", "codex");
       if (stored && (command.model || command.reasoningEffort)) {
         if (command.model) stored.model = command.model;
         if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
@@ -2197,7 +2377,9 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     if (command.type === "turn.steer") {
       await ensureCodex();
       await codex!.request("thread/resume", { threadId: command.threadId });
-      if (publicState.activity?.threadId !== command.threadId) startLocalActivity(command.threadId, command.prompt, "追加远程指令");
+      if (!publicState.activities.some((item) => item.threadId === command.threadId && item.status === "processing")) {
+        startLocalActivity(command.threadId, command.prompt, "追加远程指令", "codex");
+      }
       pendingPrompts.set(command.threadId, command.prompt);
       await codex!.request("turn/steer", {
         threadId: command.threadId,
@@ -2297,8 +2479,10 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const label = activityItemLabel(item);
     const key = activityItemKey(params);
     const threadId = String(params.threadId ?? "");
-    if (label && key && !activityItems.has(key)) {
-      activityItems.set(key, item.type);
+    const items = activityItemsByThread.get(threadId) ?? new Map<string, string>();
+    if (label && key && !items.has(key)) {
+      items.set(key, item.type);
+      activityItemsByThread.set(threadId, items);
       appendLocalActivityStage(threadId, `▶ ${label}`);
       // Stage markers stream to web progressively (CLI-like phases).
       queueRemoteDelta(threadId, `stage:${key}`, `\n▶ ${label}\n`);
@@ -2309,8 +2493,9 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const item = params.item ?? {};
     const key = activityItemKey(params);
     const threadId = String(params.threadId ?? "");
-    if (key && activityItems.has(key)) {
-      activityItems.delete(key);
+    const items = activityItemsByThread.get(threadId);
+    if (key && items?.has(key)) {
+      items.delete(key);
       const result = activityItemResult(item);
       if (result) {
         appendLocalActivityStage(threadId, `✓ ${result}`);
@@ -2344,10 +2529,11 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   }
   if (message.method === "agent/log") {
     const line = String(message.params?.line ?? "").trim();
-    const threadId = publicState.activity?.threadId;
-    if (line && threadId && activeTurnByThread.has(threadId)) {
-      appendLocalActivity(threadId, `\n${line}`);
-      queueRemoteDelta(threadId, "cli-log", `\n${line}\n`);
+    if (line) {
+      for (const threadId of activeTurnByThread.keys()) {
+        appendLocalActivity(threadId, `\n${line}`);
+        queueRemoteDelta(threadId, "cli-log", `\n${line}\n`);
+      }
     }
   }
   if (message.method === "turn/started") {
@@ -2355,6 +2541,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const threadId = String(params.threadId ?? params.turn?.threadId ?? "");
     const turnId = String(params.turnId ?? params.turn?.id ?? "");
     if (threadId && turnId) activeTurnByThread.set(threadId, turnId);
+    if (threadId) touchAgentTask(threadId, { status: "active", engine: "codex" });
   }
   if (message.method === "turn/completed") {
     const params = message.params;
@@ -2364,7 +2551,8 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     activeTurnByThread.delete(threadId);
     await publish({ type: "turn.completed", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: params.threadId, turnId: params.turn.id, status: String(params.turn.status) }, true, "completed");
     // Refresh snapshot so final assistant text is complete even if some deltas were dropped.
-    try { await publishThread(threadId); } catch { /* ignore */ }
+    // Touch updatedAt so web/agent lists reorder by last activity (not create time).
+    try { await publishThread(threadId, { touch: true }); } catch { /* ignore */ }
   }
   if (message.method === "serverRequest/resolved") {
     pendingRequestTypes.delete(String(message.params.requestId));
@@ -2455,10 +2643,20 @@ async function publishHostStatus(): Promise<void> {
   }, true);
 }
 
-async function publishThread(threadId: string): Promise<void> {
+async function publishThread(threadId: string, options: { touch?: boolean } = {}): Promise<void> {
   const result = await codex!.request("thread/read", { threadId, includeTurns: true });
   const snapshot = threadToSnapshot(result.thread);
-  const task: AgentTask = { threadId: snapshot.threadId, title: snapshot.title, cwd: snapshot.cwd, status: snapshot.status, updatedAt: snapshot.updatedAt, engine: "codex" };
+  const updatedAt = options.touch
+    ? Math.max(normalizeUnixSeconds(snapshot.updatedAt), Date.now() / 1000)
+    : normalizeUnixSeconds(snapshot.updatedAt);
+  const task: AgentTask = {
+    threadId: snapshot.threadId,
+    title: snapshot.title,
+    cwd: snapshot.cwd,
+    status: snapshot.status,
+    updatedAt,
+    engine: "codex"
+  };
   updateState({
     tasks: [task, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)]
       .sort((left, right) => right.updatedAt - left.updatedAt)
@@ -2469,6 +2667,7 @@ async function publishThread(threadId: string): Promise<void> {
     eventId: crypto.randomUUID(),
     occurredAt: new Date().toISOString(),
     ...snapshot,
+    updatedAt,
     cliEngine: "codex"
   }, true);
 }
@@ -2501,14 +2700,24 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
       title: String(thread.name || thread.preview || "未命名任务"),
       cwd: String(thread.cwd || ""),
       status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
-      updatedAt: Number(thread.updatedAt ?? Date.now() / 1000),
+      updatedAt: normalizeUnixSeconds(thread.updatedAt),
       engine: "codex" as const
     }));
   } catch {
     // Codex optional when listing Claude/Grok tasks.
   }
   const byId = new Map<string, AgentTask>();
-  for (const task of [...storedTasks, ...codexTasks]) byId.set(task.threadId, task);
+  // Prefer the record with the newer last-activity time when the same id appears twice.
+  for (const task of [...storedTasks, ...codexTasks]) {
+    const prev = byId.get(task.threadId);
+    const normalized: AgentTask = {
+      ...task,
+      updatedAt: normalizeUnixSeconds(task.updatedAt)
+    };
+    if (!prev || normalized.updatedAt >= normalizeUnixSeconds(prev.updatedAt)) {
+      byId.set(task.threadId, normalized);
+    }
+  }
   const tasks = [...byId.values()].sort((left, right) => right.updatedAt - left.updatedAt).slice(0, listLimit);
   updateState({ tasks });
 }
@@ -3016,10 +3225,10 @@ function prepareForUpdateQuit(): void {
     clearTimeout(pairingTimer);
     pairingTimer = null;
   }
-  if (activityFlushTimer) {
-    clearTimeout(activityFlushTimer);
-    activityFlushTimer = null;
-  }
+  for (const timer of activityFlushTimers.values()) clearTimeout(timer);
+  activityFlushTimers.clear();
+  activityOutputBuffers.clear();
+  activityItemsByThread.clear();
   try {
     socket?.removeAllListeners();
     socket?.close();
@@ -3299,6 +3508,12 @@ function registerIpc(): void {
     } catch {
       // ignore
     }
+    return publicState;
+  });
+  ipcMain.handle("agent:select-activity", async (_event, threadId: string) => {
+    const id = String(threadId || "");
+    if (!id || !publicState.activities.some((item) => item.threadId === id)) return publicState;
+    syncActivitiesState(publicState.activities, id);
     return publicState;
   });
   ipcMain.handle("agent:refresh-engines", async () => {

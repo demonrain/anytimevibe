@@ -17,6 +17,15 @@ const configSchema = z.object({
   // Leave empty to show「敬请期待」on the web UI when no macOS package is published.
   MAC_CLIENT_URL: urlWithDefault("https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent.dmg"),
   UPDATE_FEED_URL: optionalUrl,
+  /** Optional pinned latest client semver (e.g. 0.4.31). When set, health skips GitHub lookup. */
+  LATEST_CLIENT_VERSION: z.preprocess(
+    (value) => (value === "" || value == null ? undefined : value),
+    z.string().min(1).optional()
+  ),
+  GITHUB_RELEASES_LATEST_URL: z.preprocess(
+    (value) => (value === "" || value == null ? undefined : value),
+    z.string().url().optional()
+  ),
   VAPID_PUBLIC_KEY: z.string().optional(),
   VAPID_PRIVATE_KEY: z.string().optional(),
   VAPID_SUBJECT: z.string().default("mailto:admin@localhost")
