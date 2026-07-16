@@ -421,35 +421,6 @@ function ErrorBanner({ message, clear }: { message: string; clear(): void }) {
   return <button className="error-banner" onClick={clear}>{message}<span>关闭</span></button>;
 }
 
-function VersionToast({
-  title,
-  message,
-  downloads,
-  onClose
-}: {
-  title: string;
-  message: string;
-  downloads: Health["clientDownloads"];
-  onClose(): void;
-}) {
-  return (
-    <div className="version-toast" role="status">
-      <div className="version-toast-body">
-        <strong>{title}</strong>
-        <span>{message}</span>
-        <div className="version-toast-actions">
-          {downloads.windows && <a href={downloads.windows} onClick={(event) => event.stopPropagation()}>Windows</a>}
-          {downloads.mac && <a href={downloads.mac} onClick={(event) => event.stopPropagation()}>macOS</a>}
-          {!downloads.windows && !downloads.mac && (
-            <a href="https://github.com/demonrain/anytimevibe/releases" target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>下载更新</a>
-          )}
-        </div>
-      </div>
-      <button type="button" className="version-toast-close" onClick={onClose} aria-label="关闭">关闭</button>
-    </div>
-  );
-}
-
 function ClientDownloads({ downloads }: { downloads: Health["clientDownloads"] }) {
   if (!downloads.windows && !downloads.mac) {
     return <div className="client-downloads"><span>桌面客户端</span><button type="button" className="client-download-soon" onClick={() => window.alert("macOS 客户端正在准备中，敬请期待。")}>macOS · 敬请期待</button></div>;
@@ -558,8 +529,6 @@ export function App() {
   const [taskQuery, setTaskQuery] = useState("");
   /** Quick filter task list by coding engine; null = all engines. */
   const [engineFilter, setEngineFilter] = useState<CliEngine | null>(null);
-  /** Session-only dismiss for floating client-version toast. */
-  const [versionToastDismissed, setVersionToastDismissed] = useState(false);
   const taskSearchTimerRef = useRef<number | null>(null);
   const autoSyncedHostsRef = useRef(new Set<string>());
   const [keyAuthorizationStatus, setKeyAuthorizationStatus] = useState<Record<string, "missing" | "authorizing">>({});
@@ -917,36 +886,26 @@ export function App() {
     && activeRuntime.online === true
     && !clientVersion
   );
-
-  const showVersionToast = !versionToastDismissed && (clientOutdated || clientVersionUnknown);
-
-  // Re-show toast when switching hosts or when a newly reported version becomes outdated.
-  useEffect(() => {
-    setVersionToastDismissed(false);
-  }, [selectedHostId, clientVersion, clientOutdated, clientVersionUnknown]);
+  const versionWarn = clientOutdated || clientVersionUnknown;
+  const versionTitle = clientOutdated
+    ? `客户端过旧：网页 v${PRODUCT_VERSION} 需要客户端 ≥ v${MIN_AGENT_VERSION}，当前 v${clientVersion}。请更新客户端。`
+    : clientVersionUnknown
+      ? `客户端未上报版本：网页 v${PRODUCT_VERSION} 建议使用客户端 v${MIN_AGENT_VERSION}。`
+      : "网页与客户端应对齐同一产品版本";
+  const versionLabel = activeHost
+    ? `Web v${PRODUCT_VERSION} · 客户端 ${clientVersion ? `v${clientVersion}` : "未知"}${clientOutdated ? " · 需更新" : clientVersionUnknown ? " · 请升级" : ""}`
+    : `Web v${PRODUCT_VERSION} · 客户端 v${MIN_AGENT_VERSION}`;
 
   return <div className="app-shell">
     {error && <ErrorBanner message={error} clear={() => setError("")} />}
-    {showVersionToast && (
-      <VersionToast
-        title={clientOutdated ? "客户端版本过旧" : "客户端未上报版本"}
-        message={
-          clientOutdated
-            ? `当前网页 v${PRODUCT_VERSION} 需要桌面客户端 ≥ v${MIN_AGENT_VERSION}，检测到 v${clientVersion}。请更新客户端以保证多引擎与任务同步正常。`
-            : `当前网页 v${PRODUCT_VERSION}。请升级到对应版本的桌面客户端（v${MIN_AGENT_VERSION}）以获得完整能力与版本校验。`
-        }
-        downloads={health.clientDownloads}
-        onClose={() => setVersionToastDismissed(true)}
-      />
-    )}
     <header className="topbar">
       <div className="brand"><span className="brand-mark" aria-hidden="true"><img src="/icon.svg" alt="" /></span><div><strong>{t("brand")}</strong><small>{t("brandTag")}</small></div></div>
       <div className="top-actions">
-        <span className="version-chip" title="网页与客户端应对齐同一产品版本">
-          Web v{PRODUCT_VERSION}
-          {activeHost
-            ? ` · 客户端 ${clientVersion ? `v${clientVersion}` : "未知"}`
-            : ` · 客户端 v${MIN_AGENT_VERSION}`}
+        <span
+          className={`version-chip${versionWarn ? " warn" : ""}`}
+          title={versionTitle}
+        >
+          {versionLabel}
         </span>
         <ClientDownloads downloads={health.clientDownloads} />
         <div className="lang-switch" role="group" aria-label={t("lang")}>
