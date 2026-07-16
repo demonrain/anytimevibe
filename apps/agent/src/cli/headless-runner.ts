@@ -117,6 +117,7 @@ type ParseState = {
   sawThoughtStage: boolean;
   lastProgressAt: number;
   contextUsage?: ContextUsage;
+  model?: string;
 };
 
 function handleClaudeLine(
@@ -138,7 +139,8 @@ function handleClaudeLine(
   if (type === "system") {
     const subtype = String(parsed.subtype || "");
     if (subtype === "init") {
-      const model = parsed.model ? `（模型 ${parsed.model}）` : "";
+      if (parsed.model) state.model = String(parsed.model);
+      const model = state.model ? `（模型 ${state.model}）` : "";
       emitDelta(onEvent, options, "stage:init", "stage", `\n▶ Claude 会话初始化${model}\n`);
     } else if (subtype === "api_retry") {
       const attempt = parsed.attempt ?? "?";
@@ -400,7 +402,8 @@ export async function runHeadlessTurn(
         providerSessionId: state.sessionId || options.providerSessionId || options.threadId,
         status,
         text: state.text || state.errorMessage,
-        ...(state.contextUsage ? { contextUsage: state.contextUsage } : {})
+        ...(state.contextUsage ? { contextUsage: state.contextUsage } : {}),
+        ...(state.model || options.model ? { model: state.model || options.model } : {})
       });
     };
 

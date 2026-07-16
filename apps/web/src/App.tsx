@@ -16,6 +16,8 @@ import {
   type ClientCommand,
   type ContextUsage,
   type EncryptedEnvelope,
+  type EngineCapability,
+  type EngineModelOption,
   type PairingPublicInfo,
   type PermissionMode,
   type ReasoningEffort,
@@ -61,62 +63,64 @@ type Task = {
   contextUsage?: ContextUsage;
 };
 
-/** Per-engine model presets (value "" = use CLI / host default). */
-function modelOptionsForEngine(engine: CliEngine): Array<{ value: string; label: string }> {
-  if (engine === "claude") {
-    return [
-      { value: "", label: "默认模型" },
-      { value: "opus", label: "Opus" },
-      { value: "sonnet", label: "Sonnet" },
-      { value: "haiku", label: "Haiku" },
-      { value: "claude-opus-4-8", label: "claude-opus-4-8" },
-      { value: "claude-sonnet-4-5", label: "claude-sonnet-4-5" }
-    ];
-  }
-  if (engine === "grok") {
-    return [
-      { value: "", label: "默认模型" },
-      { value: "grok-4.5", label: "Grok 4.5" },
-      { value: "grok-4", label: "Grok 4" }
-    ];
-  }
-  return [
-    { value: "", label: "默认模型" },
-    { value: "gpt-5.6-sol", label: "gpt-5.6-sol" },
-    { value: "o3", label: "o3" },
-    { value: "o4-mini", label: "o4-mini" },
-    { value: "gpt-5", label: "gpt-5" }
-  ];
+function capabilityForEngine(
+  capabilities: EngineCapability[] | undefined,
+  engine: CliEngine
+): EngineCapability | undefined {
+  return capabilities?.find((item) => item.engine === engine);
 }
 
-/** Effort labels differ by vendor; values are normalized for the protocol. */
-function effortOptionsForEngine(engine: CliEngine): Array<{ value: ReasoningEffort | ""; label: string }> {
-  if (engine === "claude") {
-    return [
-      { value: "", label: "默认推理强度" },
-      { value: "low", label: "low" },
-      { value: "medium", label: "medium" },
-      { value: "high", label: "high" },
-      { value: "xhigh", label: "xhigh" },
-      { value: "max", label: "max" }
-    ];
+/** Prefer host-reported models; always include the task's current model if missing. */
+function modelOptionsFromHost(
+  capabilities: EngineCapability[] | undefined,
+  engine: CliEngine,
+  currentModel?: string
+): EngineModelOption[] {
+  const cap = capabilityForEngine(capabilities, engine);
+  const models = [...(cap?.models ?? [])];
+  const seen = new Set(models.map((item) => item.id));
+  if (currentModel && !seen.has(currentModel)) {
+    models.unshift({ id: currentModel, label: currentModel });
   }
-  if (engine === "grok") {
-    return [
-      { value: "", label: "默认 reasoning effort" },
-      { value: "low", label: "low" },
-      { value: "medium", label: "medium" },
-      { value: "high", label: "high" }
-    ];
+  return models;
+}
+
+function effortOptionsFromHost(
+  capabilities: EngineCapability[] | undefined,
+  engine: CliEngine,
+  currentEffort?: ReasoningEffort
+): ReasoningEffort[] {
+  const cap = capabilityForEngine(capabilities, engine);
+  const base = cap?.reasoningEfforts?.length
+    ? [...cap.reasoningEfforts]
+    : engine === "claude"
+      ? (["low", "medium", "high", "xhigh", "max"] as ReasoningEffort[])
+      : engine === "grok"
+        ? (["low", "medium", "high"] as ReasoningEffort[])
+        : (["low", "medium", "high", "xhigh"] as ReasoningEffort[]);
+  if (currentEffort && !base.includes(currentEffort)) base.unshift(currentEffort);
+  return base;
+}
+
+function draftStorageKey(threadId: string): string {
+  return `task-draft:${threadId}`;
+}
+
+function loadTaskDraft(threadId: string): string {
+  try {
+    return sessionStorage.getItem(draftStorageKey(threadId)) ?? "";
+  } catch {
+    return "";
   }
-  // Codex model_reasoning_effort
-  return [
-    { value: "", label: "默认 reasoning effort" },
-    { value: "low", label: "low" },
-    { value: "medium", label: "medium" },
-    { value: "high", label: "high" },
-    { value: "xhigh", label: "xhigh" }
-  ];
+}
+
+function saveTaskDraft(threadId: string, text: string): void {
+  try {
+    if (!text.trim()) sessionStorage.removeItem(draftStorageKey(threadId));
+    else sessionStorage.setItem(draftStorageKey(threadId), text);
+  } catch {
+    // ignore quota / private mode
+  }
 }
 
 function formatContextUsage(usage?: ContextUsage): string | null {
@@ -136,6 +140,7 @@ type HostRuntime = {
   workspaces: Workspace[];
   tasks: Record<string, Task>;
   availableEngines?: CliEngineInfo[];
+  engineCapabilities?: EngineCapability[];
   /** Desktop agent version reported by host.status.agentVersion */
   agentVersion?: string;
 };
@@ -317,6 +322,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     next.online = event.online;
     next.workspaces = event.workspaces;
     if (event.availableEngines) next.availableEngines = event.availableEngines;
+    if (event.engineCapabilities) next.engineCapabilities = event.engineCapabilities;
     if (event.agentVersion) next.agentVersion = event.agentVersion;
     return next;
   }
@@ -1035,7 +1041,7 @@ export function App() {
       </section>
 
       <section className="conversation-column">
-        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} replyDetail={replyDetail} onPermissionModeChange={(mode) => { const next = normalizePermissionMode(mode); setPermissionMode(next); localStorage.setItem("permission-mode", next); }} onReplyDetailChange={(detail) => { const next = normalizeReplyDetail(detail); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>{t("pickTask")}</h2><p>{t("pickTaskHint")}</p></div>}
+        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} replyDetail={replyDetail} engineCapabilities={activeRuntime.engineCapabilities ?? []} onPermissionModeChange={(mode) => { const next = normalizePermissionMode(mode); setPermissionMode(next); localStorage.setItem("permission-mode", next); }} onReplyDetailChange={(detail) => { const next = normalizeReplyDetail(detail); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>{t("pickTask")}</h2><p>{t("pickTaskHint")}</p></div>}
       </section>
     </main>
 
@@ -1045,6 +1051,7 @@ export function App() {
       workspaces={activeRuntime.workspaces}
       online={activeRuntime.online}
       availableEngines={activeRuntime.availableEngines ?? []}
+      engineCapabilities={activeRuntime.engineCapabilities ?? []}
       onClose={() => setComposerOpen(false)}
       onRefreshWorkspaces={() => sendCommand(activeHost.id, { type: "host.refresh", commandId: crypto.randomUUID() })}
       onCreate={async (cwd, prompt, title, engine, mode, model, reasoningEffort) => {
@@ -1067,9 +1074,9 @@ export function App() {
   </div>;
 }
 
-function TaskConversation({ task, online, visible, permissionMode, replyDetail, onPermissionModeChange, onReplyDetailChange, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; permissionMode: PermissionMode; replyDetail: ReplyDetail; onPermissionModeChange(mode: PermissionMode): void; onReplyDetailChange(detail: ReplyDetail): void; onBack(): void; onCommand(command: ClientCommand): void }) {
+function TaskConversation({ task, online, visible, permissionMode, replyDetail, engineCapabilities, onPermissionModeChange, onReplyDetailChange, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; permissionMode: PermissionMode; replyDetail: ReplyDetail; engineCapabilities: EngineCapability[]; onPermissionModeChange(mode: PermissionMode): void; onReplyDetailChange(detail: ReplyDetail): void; onBack(): void; onCommand(command: ClientCommand): void }) {
   const { t, locale } = useI18n();
-  const [prompt, setPrompt] = useState("");
+  const [prompt, setPrompt] = useState(() => loadTaskDraft(task.threadId));
   const [pendingPrompt, setPendingPrompt] = useState("");
   const [pendingMessageCount, setPendingMessageCount] = useState(0);
   const [commandQueue, setCommandQueue] = useState<string[]>(() => {
@@ -1078,8 +1085,13 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
   });
   const [tab, setTab] = useState<"chat" | "diff">("chat");
   const taskEngine = normalizeCliEngine(task.cliEngine);
-  const [model, setModel] = useState(task.model || "");
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(task.reasoningEffort || "");
+  const cap = capabilityForEngine(engineCapabilities, taskEngine);
+  const modelOptions = modelOptionsFromHost(engineCapabilities, taskEngine, task.model || cap?.currentModel);
+  const effortOptions = effortOptionsFromHost(engineCapabilities, taskEngine, task.reasoningEffort || cap?.currentReasoningEffort);
+  const [model, setModel] = useState(task.model || cap?.currentModel || modelOptions[0]?.id || "");
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(
+    task.reasoningEffort || cap?.currentReasoningEffort || effortOptions[0] || ""
+  );
   const messageStreamRef = useRef<HTMLDivElement | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1087,8 +1099,6 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
   const previousThreadRef = useRef(task.threadId);
   const running = Boolean(task.activeTurnId);
   const permissionOptions = permissionOptionsForEngine(taskEngine, locale);
-  const modelOptions = modelOptionsForEngine(taskEngine);
-  const effortOptions = effortOptionsForEngine(taskEngine);
   const contextLabel = formatContextUsage(task.contextUsage);
   const isMac = isMacPlatform();
   const visibleMessages = replyDetail === "detailed"
@@ -1102,10 +1112,20 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     }
   }, [task.threadId, taskEngine]);
 
+  // Keep selectors aligned with the task's live model/effort from the host (not a static default).
   useEffect(() => {
-    setModel(task.model || "");
-    setReasoningEffort(task.reasoningEffort || "");
-  }, [task.threadId, task.model, task.reasoningEffort]);
+    const nextModel = task.model || cap?.currentModel || modelOptions[0]?.id || "";
+    const nextEffort = task.reasoningEffort || cap?.currentReasoningEffort || effortOptions[0] || "";
+    setModel(nextModel);
+    setReasoningEffort(nextEffort);
+    // modelOptions/effortOptions are derived; only re-sync when task or host current values change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task.threadId, task.model, task.reasoningEffort, cap?.currentModel, cap?.currentReasoningEffort]);
+
+  // Persist in-progress edits so switching tasks and back restores the draft.
+  useEffect(() => {
+    saveTaskDraft(task.threadId, prompt);
+  }, [task.threadId, prompt]);
 
   function turnStartCommand(text: string): ClientCommand {
     return {
@@ -1130,6 +1150,7 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
       onCommand(turnStartCommand(submittedPrompt));
     }
     setPrompt("");
+    saveTaskDraft(task.threadId, "");
   }
 
   useEffect(() => {
@@ -1184,11 +1205,13 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
           <span>{task.title}</span>
         </h2>
         <code title={task.cwd}>{task.cwd}</code>
-        {(model || task.model || reasoningEffort || task.reasoningEffort || contextLabel) && (
-          <p className="thread-meta-line">
-            {[model || task.model, reasoningEffort || task.reasoningEffort, contextLabel].filter(Boolean).join(" · ")}
-          </p>
-        )}
+        <p className="thread-meta-line" title="当前任务模型 / 推理强度 / 上下文">
+          {[
+            `模型 ${task.model || model || "未知"}`,
+            `推理 ${task.reasoningEffort || reasoningEffort || "未知"}`,
+            contextLabel
+          ].filter(Boolean).join(" · ")}
+        </p>
       </div>
       <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>{t("chat")}</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>{t("diff")}</button></div>
     </div>
@@ -1231,14 +1254,16 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
         <small>
           <label className="composer-permission">
             模型
-            <select value={model} onChange={(event) => setModel(event.target.value)}>
-              {modelOptions.map((option) => <option key={option.value || "default"} value={option.value}>{option.label}</option>)}
+            <select value={model} onChange={(event) => setModel(event.target.value)} disabled={!modelOptions.length}>
+              {!modelOptions.length && <option value="">主机未上报模型列表</option>}
+              {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
             </select>
           </label>
           <label className="composer-permission">
             推理强度
-            <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort | "")}>
-              {effortOptions.map((option) => <option key={option.value || "default"} value={option.value}>{option.label}</option>)}
+            <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)} disabled={!effortOptions.length}>
+              {!effortOptions.length && <option value="">—</option>}
+              {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
             </select>
           </label>
           <label className="composer-permission">
@@ -1319,11 +1344,12 @@ function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): voi
   </section></div>;
 }
 
-function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, onRefreshWorkspaces, onCreate }: {
+function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapabilities, onClose, onRefreshWorkspaces, onCreate }: {
   host: Host;
   workspaces: Workspace[];
   online: boolean | null;
   availableEngines: CliEngineInfo[];
+  engineCapabilities: EngineCapability[];
   onClose(): void;
   onRefreshWorkspaces(): Promise<void>;
   onCreate(cwd: string, prompt: string, title: string, engine: CliEngine, permissionMode: PermissionMode, model?: string, reasoningEffort?: ReasoningEffort): Promise<void>;
@@ -1334,15 +1360,17 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [engine, setEngine] = useState<CliEngine | "">(ready[0]?.engine ?? "");
-  const permissionOptions = permissionOptionsForEngine(engine ? normalizeCliEngine(engine) : "codex", locale);
+  const engineId = engine ? normalizeCliEngine(engine) : "codex";
+  const permissionOptions = permissionOptionsForEngine(engineId, locale);
   const [taskPermission, setTaskPermission] = useState<PermissionMode>(permissionOptions[0]?.value ?? "ask-for-approval");
-  const [model, setModel] = useState("");
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">("");
+  const cap = capabilityForEngine(engineCapabilities, engineId);
+  const modelOptions = modelOptionsFromHost(engineCapabilities, engineId, cap?.currentModel);
+  const effortOptions = effortOptionsFromHost(engineCapabilities, engineId, cap?.currentReasoningEffort);
+  const [model, setModel] = useState(cap?.currentModel || modelOptions[0]?.id || "");
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(cap?.currentReasoningEffort || effortOptions[0] || "");
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
-  const modelOptions = modelOptionsForEngine(engine ? normalizeCliEngine(engine) : "codex");
-  const effortOptions = effortOptionsForEngine(engine ? normalizeCliEngine(engine) : "codex");
 
   // When host.status arrives after open, pick the first allowlisted path.
   useEffect(() => {
@@ -1359,11 +1387,14 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
   }, [availableEngines]);
 
   useEffect(() => {
-    const options = permissionOptionsForEngine(engine ? normalizeCliEngine(engine) : "codex", locale);
+    const options = permissionOptionsForEngine(engineId, locale);
     setTaskPermission((current) => (options.some((item) => item.value === current) ? current : options[0]!.value));
-    setModel("");
-    setReasoningEffort("");
-  }, [engine, locale]);
+    const nextCap = capabilityForEngine(engineCapabilities, engineId);
+    const nextModels = modelOptionsFromHost(engineCapabilities, engineId, nextCap?.currentModel);
+    const nextEfforts = effortOptionsFromHost(engineCapabilities, engineId, nextCap?.currentReasoningEffort);
+    setModel(nextCap?.currentModel || nextModels[0]?.id || "");
+    setReasoningEffort(nextCap?.currentReasoningEffort || nextEfforts[0] || "");
+  }, [engine, locale, engineCapabilities]);
 
   // Pull latest whitelist from the agent once when the dialog opens (avoid dep on unstable callback identity).
   const refreshRef = useRef(onRefreshWorkspaces);
@@ -1435,13 +1466,15 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
       </div>
     </div>
     <label>模型
-      <select value={model} onChange={(event) => setModel(event.target.value)} disabled={!engine}>
-        {modelOptions.map((option) => <option key={option.value || "default"} value={option.value}>{option.label}</option>)}
+      <select value={model} onChange={(event) => setModel(event.target.value)} disabled={!engine || !modelOptions.length}>
+        {!modelOptions.length && <option value="">主机未上报模型列表</option>}
+        {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
       </select>
     </label>
     <label>推理强度
-      <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort | "")} disabled={!engine}>
-        {effortOptions.map((option) => <option key={option.value || "default"} value={option.value}>{option.label}</option>)}
+      <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)} disabled={!engine || !effortOptions.length}>
+        {!effortOptions.length && <option value="">—</option>}
+        {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
       </select>
     </label>
     <label>权限模式

@@ -44,6 +44,7 @@ import { ensureClaudeWorkspaceTrusted } from "./cli/claude-trust";
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { interruptHeadlessThread, runHeadlessTurn } from "./cli/headless-runner";
 import { importLocalCliSessions } from "./cli/import-sessions";
+import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
 import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix } from "./local-proxy";
@@ -85,6 +86,7 @@ type PublicState = {
   /** Default coding CLI for new tasks. */
   cliEngine: CliEngine;
   availableEngines: CliEngineInfo[];
+  engineCapabilities: EngineCapability[];
   workspaces: Workspace[];
   environment: EnvironmentState;
   update: UpdateState;
@@ -140,6 +142,7 @@ let publicState: PublicState = {
   codexVersion,
   cliEngine: "codex",
   availableEngines: [],
+  engineCapabilities: [],
   workspaces: [],
   environment: initialEnvironment,
   update: { status: "idle" },
@@ -2009,6 +2012,7 @@ async function runHeadlessTaskTurn(options: {
   const latest = taskStore.get(options.threadId) ?? stored;
   if (result.providerSessionId) latest.providerSessionId = result.providerSessionId;
   if (result.contextUsage) latest.contextUsage = result.contextUsage;
+  if (result.model) latest.model = result.model;
   latest.status = result.status;
   latest.updatedAt = Date.now() / 1000;
   if (result.text.trim()) {
@@ -2416,12 +2420,16 @@ function publishAgentMeta(fields: { name?: string; codexVersion?: string; platfo
 
 async function refreshAvailableEngines(): Promise<void> {
   const codexReady = Boolean(publicState.environment.codexCompatible || codex);
-  const availableEngines = await detectAvailableEngines({
-    codexReady,
-    codexVersion: codexVersion || publicState.environment.codexVersion || "unknown"
-  });
+  const [availableEngines, engineCapabilities] = await Promise.all([
+    detectAvailableEngines({
+      codexReady,
+      codexVersion: codexVersion || publicState.environment.codexVersion || "unknown"
+    }),
+    discoverEngineCapabilities().catch(() => [] as EngineCapability[])
+  ]);
   updateState({
     availableEngines,
+    engineCapabilities,
     cliEngine: taskStore.getDefaultEngine()
   });
 }
@@ -2436,6 +2444,7 @@ async function publishHostStatus(): Promise<void> {
     workspaces: config.workspaces,
     cliEngine: taskStore.getDefaultEngine(),
     availableEngines: publicState.availableEngines,
+    engineCapabilities: publicState.engineCapabilities,
     agentVersion: PRODUCT_VERSION
   }, true);
 }

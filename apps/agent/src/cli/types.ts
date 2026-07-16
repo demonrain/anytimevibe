@@ -44,6 +44,8 @@ export type HeadlessRunResult = {
   status: "completed" | "failed" | "interrupted";
   text: string;
   contextUsage?: ContextUsage;
+  /** Model actually used by the CLI when reported. */
+  model?: string;
 };
 
 export function normalizeCliEngine(value: string | null | undefined): CliEngine {

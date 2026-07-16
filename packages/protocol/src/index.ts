@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Keep apps/web and apps/agent package.json versions aligned with this on each release.
  * Frontend warns when the connected agent reports a lower version.
  */
-export const PRODUCT_VERSION = "0.4.28";
+export const PRODUCT_VERSION = "0.4.29";
 /** Minimum desktop agent version required by this frontend build (usually equals PRODUCT_VERSION). */
 export const MIN_AGENT_VERSION = PRODUCT_VERSION;
 
@@ -79,6 +79,24 @@ export type CliEngineInfo = z.infer<typeof cliEngineInfoSchema>;
 /** Reasoning / thinking intensity — vendor labels differ; values are normalized. */
 export const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
+
+/** A model selectable on the host for a given coding CLI. */
+export const engineModelOptionSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  contextWindow: z.number().positive().optional()
+});
+export type EngineModelOption = z.infer<typeof engineModelOptionSchema>;
+
+/** Host-reported model/effort catalog for one engine (from local CLI config/cache). */
+export const engineCapabilitySchema = z.object({
+  engine: cliEngineSchema,
+  models: z.array(engineModelOptionSchema),
+  reasoningEfforts: z.array(reasoningEffortSchema),
+  currentModel: z.string().optional(),
+  currentReasoningEffort: reasoningEffortSchema.optional()
+});
+export type EngineCapability = z.infer<typeof engineCapabilitySchema>;
 
 export const contextUsageSchema = z.object({
   inputTokens: z.number().nonnegative().optional(),
@@ -170,6 +188,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     cliEngine: cliEngineSchema.optional(),
     /** Detected engines and readiness. */
     availableEngines: z.array(cliEngineInfoSchema).optional(),
+    /** Per-engine model/effort catalogs from the host machine. */
+    engineCapabilities: z.array(engineCapabilitySchema).optional(),
     /** Desktop agent app version (AnytimeVibe client). */
     agentVersion: z.string().optional()
   }),
