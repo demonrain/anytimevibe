@@ -10,6 +10,11 @@ const execFileAsync = promisify(execFile);
 
 const resolvedCommandCache = new Map<string, string | null>();
 
+/** Clear binary resolution cache (call after install / recheck). */
+export function clearEngineBinaryCache(): void {
+  resolvedCommandCache.clear();
+}
+
 async function pathExists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
@@ -39,6 +44,30 @@ async function runVersion(command: string, args: string[]): Promise<string | nul
   }
 }
 
+function enrichedPathEnv(): NodeJS.ProcessEnv {
+  const home = os.homedir();
+  const extras = process.platform === "win32"
+    ? [
+        path.join(home, ".grok", "bin"),
+        path.join(home, ".local", "bin"),
+        path.join(process.env.LOCALAPPDATA || "", "Programs", "claude"),
+        path.join(process.env.LOCALAPPDATA || "", "Microsoft", "WinGet", "Links"),
+        path.join(process.env.APPDATA || "", "npm"),
+        path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs")
+      ]
+    : [
+        path.join(home, ".grok", "bin"),
+        path.join(home, ".local", "bin"),
+        path.join(home, ".claude", "local"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin"
+      ];
+  const sep = process.platform === "win32" ? ";" : ":";
+  const current = process.env.PATH || process.env.Path || "";
+  const merged = [...extras.filter(Boolean), current].join(sep);
+  return { ...process.env, PATH: merged, Path: merged };
+}
+
 /** Resolve an absolute executable path so Electron (often PATH-starved) can spawn CLIs. */
 export async function resolveCommandPath(command: string): Promise<string | null> {
   if (resolvedCommandCache.has(command)) return resolvedCommandCache.get(command) ?? null;
@@ -47,13 +76,14 @@ export async function resolveCommandPath(command: string): Promise<string | null
     return command;
   }
 
+  const env = enrichedPathEnv();
   const isWindows = process.platform === "win32";
   try {
     if (isWindows) {
       const { stdout } = await execFileAsync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `where ${command}`], {
         timeout: 8_000,
         windowsHide: true,
-        env: process.env,
+        env,
         maxBuffer: 256_000
       });
       const hit = stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
@@ -62,12 +92,12 @@ export async function resolveCommandPath(command: string): Promise<string | null
         return hit;
       }
     } else {
-      const { stdout } = await execFileAsync("which", [command], {
+      const { stdout } = await execFileAsync("/bin/bash", ["-lc", `command -v ${command} || true`], {
         timeout: 8_000,
-        env: process.env,
+        env,
         maxBuffer: 256_000
       });
-      const hit = stdout.trim();
+      const hit = stdout.trim().split(/\r?\n/).map((line) => line.trim()).find(Boolean);
       if (hit && await pathExists(hit)) {
         resolvedCommandCache.set(command, hit);
         return hit;
@@ -82,7 +112,9 @@ export async function resolveCommandPath(command: string): Promise<string | null
     ? [
         path.join(home, "AppData", "Local", "Microsoft", "WinGet", "Links", `${command}.exe`),
         path.join(home, ".local", "bin", `${command}.exe`),
+        path.join(home, ".local", "bin", command),
         path.join(home, ".grok", "bin", "grok.exe"),
+        path.join(home, ".grok", "bin", command),
         path.join(process.env.LOCALAPPDATA || "", "Programs", "claude", "claude.exe"),
         path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs", `${command}.cmd`),
         path.join(process.env.APPDATA || "", "npm", `${command}.cmd`)
@@ -90,8 +122,13 @@ export async function resolveCommandPath(command: string): Promise<string | null
     : [
         path.join(home, ".local", "bin", command),
         path.join(home, ".grok", "bin", "grok"),
+        path.join(home, ".grok", "bin", command),
+        path.join(home, ".claude", "local", "claude"),
+        path.join(home, ".claude", "local", command),
         "/usr/local/bin/" + command,
-        "/opt/homebrew/bin/" + command
+        "/opt/homebrew/bin/" + command,
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude"
       ];
 
   for (const candidate of candidates) {
@@ -108,10 +145,23 @@ export async function resolveCommandPath(command: string): Promise<string | null
       const entries = await fs.readdir(wingetRoot).catch(() => [] as string[]);
       for (const entry of entries) {
         if (!/ClaudeCode|Anthropic/i.test(entry)) continue;
-        const exe = path.join(wingetRoot, entry, "claude.exe");
-        if (await pathExists(exe)) {
-          resolvedCommandCache.set(command, exe);
-          return exe;
+        // Package layout varies: claude.exe may be nested
+        const direct = path.join(wingetRoot, entry, "claude.exe");
+        if (await pathExists(direct)) {
+          resolvedCommandCache.set(command, direct);
+          return direct;
+        }
+        try {
+          const nested = await fs.readdir(path.join(wingetRoot, entry));
+          for (const name of nested) {
+            const exe = path.join(wingetRoot, entry, name, "claude.exe");
+            if (await pathExists(exe)) {
+              resolvedCommandCache.set(command, exe);
+              return exe;
+            }
+          }
+        } catch {
+          // ignore
         }
       }
     } catch {
@@ -119,7 +169,7 @@ export async function resolveCommandPath(command: string): Promise<string | null
     }
   }
 
-  resolvedCommandCache.set(command, null);
+  // Do not cache null permanently — install may happen between checks.
   return null;
 }
 
@@ -139,6 +189,7 @@ export async function detectAvailableEngines(options: {
   codexReady: boolean;
   codexVersion: string;
 }): Promise<CliEngineInfo[]> {
+  clearEngineBinaryCache();
   const claudePath = await resolveEngineBinary("claude");
   const grokPath = await resolveEngineBinary("grok");
   const claudeRaw = claudePath ? await runVersion(claudePath, ["--version"]) : null;
@@ -156,12 +207,12 @@ export async function detectAvailableEngines(options: {
     {
       engine: "claude",
       ready: Boolean(claudePath && claudeVersion),
-      ...(claudeVersion ? { version: claudeVersion } : { detail: "未检测到 claude 命令，请安装并登录 Claude Code CLI" })
+      ...(claudeVersion ? { version: claudeVersion } : { detail: claudePath ? "claude 已找到但无法读取版本" : "未检测到 claude 命令，请安装并登录 Claude Code CLI" })
     },
     {
       engine: "grok",
       ready: Boolean(grokPath && grokVersion),
-      ...(grokVersion ? { version: grokVersion } : { detail: "未检测到 grok 命令，请安装 Grok Build CLI" })
+      ...(grokVersion ? { version: grokVersion } : { detail: grokPath ? "grok 已找到但无法读取版本" : "未检测到 grok 命令，请安装 Grok Build CLI" })
     }
   ];
 }

@@ -50,6 +50,20 @@ export const cliEngineInfoSchema = z.object({
 });
 export type CliEngineInfo = z.infer<typeof cliEngineInfoSchema>;
 
+/** Reasoning / thinking intensity — vendor labels differ; values are normalized. */
+export const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
+export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
+
+export const contextUsageSchema = z.object({
+  inputTokens: z.number().nonnegative().optional(),
+  outputTokens: z.number().nonnegative().optional(),
+  totalTokens: z.number().nonnegative().optional(),
+  /** Model context window size when known. */
+  contextWindow: z.number().positive().optional(),
+  remainingTokens: z.number().nonnegative().optional()
+});
+export type ContextUsage = z.infer<typeof contextUsageSchema>;
+
 export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
     type: z.literal("task.create"),
@@ -58,7 +72,11 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     title: z.string().min(1).max(160).optional(),
     permissionMode: permissionModeSchema.optional(),
     /** Override host default CLI engine for this task. */
-    cliEngine: cliEngineSchema.optional()
+    cliEngine: cliEngineSchema.optional(),
+    /** Optional model id / alias for the selected engine. */
+    model: z.string().trim().min(1).max(120).optional(),
+    /** Optional reasoning effort (Codex/Claude/Grok naming mapped server-side). */
+    reasoningEffort: reasoningEffortSchema.optional()
   }),
   commandBase.extend({
     type: z.literal("thread.resume"),
@@ -68,7 +86,9 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     type: z.literal("turn.start"),
     threadId: z.string().min(1),
     prompt: z.string().min(1),
-    permissionMode: permissionModeSchema.optional()
+    permissionMode: permissionModeSchema.optional(),
+    model: z.string().trim().min(1).max(120).optional(),
+    reasoningEffort: reasoningEffortSchema.optional()
   }),
   commandBase.extend({
     type: z.literal("turn.steer"),
@@ -149,6 +169,9 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     updatedAt: z.number(),
     /** Which coding CLI owns this thread. */
     cliEngine: cliEngineSchema.optional(),
+    model: z.string().optional(),
+    reasoningEffort: reasoningEffortSchema.optional(),
+    contextUsage: contextUsageSchema.optional(),
     messages: z.array(z.object({
       id: z.string(),
       role: z.enum(["user", "assistant", "system"]),
@@ -173,7 +196,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     type: z.literal("turn.completed"),
     threadId: z.string(),
     turnId: z.string(),
-    status: z.string()
+    status: z.string(),
+    contextUsage: contextUsageSchema.optional()
   }),
   eventBase.extend({
     type: z.literal("diff.updated"),

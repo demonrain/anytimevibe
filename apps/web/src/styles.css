@@ -72,6 +72,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .task-engine-logo { box-shadow: 0 0 0 1px rgba(23,33,27,.08); }
 .thread-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .thread-title-row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-meta-line { margin: 4px 0 0; font-size: 10px; color: #6b726b; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .thread-engine-logo { flex: 0 0 auto; }
 .engine-picker { display: grid; gap: 8px; }
 .engine-picker-label { font-size: 13px; font-weight: 750; }

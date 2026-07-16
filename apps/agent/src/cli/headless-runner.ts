@@ -1,8 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
-import type { CliEngine, PermissionMode } from "@anytimevibe/protocol";
+import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/protocol";
 import { collectLocalProxyEnv, mergeProxyIntoEnv } from "../local-proxy";
 import { windowsCmdArguments } from "../windows-command";
+import { ensureClaudeWorkspaceTrusted } from "./claude-trust";
 import { resolveEngineBinary } from "./detect";
 import type { BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
 
@@ -18,13 +19,15 @@ const HEADLESS_TIMEOUT_MS = Number(process.env.ANYTIMEVIBE_HEADLESS_TIMEOUT_MS |
 
 function permissionArgs(engine: CliEngine, mode: PermissionMode): string[] {
   if (engine === "claude") {
+    // Headless must never stop on trust/permission prompts (workspace trust is pre-marked separately).
     if (mode === "full-access") {
       return ["--permission-mode", "bypassPermissions", "--dangerously-skip-permissions"];
     }
     if (mode === "read-only") {
       return ["--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep"];
     }
-    return ["--permission-mode", "acceptEdits"];
+    // acceptEdits still needs non-interactive safety for untrusted-folder edge cases
+    return ["--permission-mode", "acceptEdits", "--dangerously-skip-permissions"];
   }
   // grok: always-approve so headless never blocks on TTY
   if (mode === "read-only") {
@@ -36,9 +39,8 @@ function permissionArgs(engine: CliEngine, mode: PermissionMode): string[] {
 function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
   const args: string[] = [];
   if (engine === "claude") {
-    // Do NOT default to "sonnet" — many proxy setups map sonnet → offline models
-    // (e.g. claude-opus-4-6). Only pass --model when explicitly configured.
-    const model = (process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "").trim();
+    // Prefer per-task model; fall back to env; never force offline "sonnet" aliases.
+    const model = (options.model || process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "").trim();
     args.push(
       "-p", options.prompt,
       "--output-format", "stream-json",
@@ -46,22 +48,46 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
       "--include-partial-messages"
     );
     if (model) args.push("--model", model);
+    if (options.reasoningEffort) args.push("--effort", options.reasoningEffort);
     // Only use --bare when API key is present (bare skips keychain/OAuth).
     if (process.env.ANTHROPIC_API_KEY) args.push("--bare");
     if (options.providerSessionId) args.push("--resume", options.providerSessionId);
     args.push(...permissionArgs(engine, options.permissionMode));
     return args;
   }
-  const model = (process.env.GROK_MODEL || process.env.XAI_MODEL || "").trim();
+  const model = (options.model || process.env.GROK_MODEL || process.env.XAI_MODEL || "").trim();
   args.push(
     "-p", options.prompt,
     "--output-format", "streaming-json",
     "--cwd", options.cwd
   );
   if (model) args.push("--model", model);
+  if (options.reasoningEffort && options.reasoningEffort !== "max") {
+    // Grok uses --reasoning-effort; "max" maps to high for compatibility
+    args.push("--reasoning-effort", options.reasoningEffort === "xhigh" ? "high" : options.reasoningEffort);
+  } else if (options.reasoningEffort === "max" || options.reasoningEffort === "xhigh") {
+    args.push("--reasoning-effort", "high");
+  }
   if (options.providerSessionId) args.push("--resume", options.providerSessionId);
   args.push(...permissionArgs(engine, options.permissionMode));
   return args;
+}
+
+function usageFromUnknown(raw: unknown, contextWindow?: number): ContextUsage | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const u = raw as Record<string, unknown>;
+  const input = Number(u.input_tokens ?? u.inputTokens ?? u.prompt_tokens ?? 0) || 0;
+  const output = Number(u.output_tokens ?? u.outputTokens ?? u.completion_tokens ?? 0) || 0;
+  const total = Number(u.total_tokens ?? u.totalTokens ?? input + output) || input + output;
+  const window = contextWindow || Number(u.context_window ?? u.contextWindow ?? 0) || undefined;
+  if (!input && !output && !total) return undefined;
+  return {
+    ...(input ? { inputTokens: input } : {}),
+    ...(output ? { outputTokens: output } : {}),
+    ...(total ? { totalTokens: total } : {}),
+    ...(window ? { contextWindow: window } : {}),
+    ...(window && total ? { remainingTokens: Math.max(0, window - total) } : {})
+  };
 }
 
 function emitDelta(
@@ -90,6 +116,7 @@ type ParseState = {
   sawAssistant: boolean;
   sawThoughtStage: boolean;
   lastProgressAt: number;
+  contextUsage?: ContextUsage;
 };
 
 function handleClaudeLine(
@@ -166,12 +193,21 @@ function handleClaudeLine(
   }
   if (type === "result") {
     if (parsed.session_id) state.sessionId = String(parsed.session_id);
+    const usage = usageFromUnknown(parsed.usage, Number(parsed.context_window) || undefined);
+    if (usage) {
+      state.contextUsage = usage;
+      onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
+    }
     if (typeof parsed.result === "string" && parsed.result) {
       if (parsed.is_error) {
         state.failed = true;
         state.errorMessage = parsed.result;
-        onEvent({ type: "error", threadId: options.threadId, message: parsed.result });
-        emitDelta(onEvent, options, "stage:error", "stage", `\n✗ ${parsed.result}\n`);
+        // Common after interactive trust decline
+        if (/trust|workspace|not.*allowed|permission/i.test(parsed.result)) {
+          state.errorMessage = `${parsed.result}\n（若曾在接力终端拒绝信任目录，请在本机重新接力并选择信任，或删除该目录后重建任务）`;
+        }
+        onEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+        emitDelta(onEvent, options, "stage:error", "stage", `\n✗ ${state.errorMessage}\n`);
       } else if (!state.sawAssistant) {
         state.text = parsed.result;
         state.sawAssistant = true;
@@ -227,6 +263,11 @@ function handleGrokLine(
   }
   if (type === "end") {
     if (parsed.sessionId) state.sessionId = String(parsed.sessionId);
+    const usage = usageFromUnknown(parsed.usage, Number(parsed.context_window ?? parsed.contextWindow) || undefined);
+    if (usage) {
+      state.contextUsage = usage;
+      onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
+    }
     if (!state.sawAssistant && typeof parsed.text === "string" && parsed.text) {
       state.text = parsed.text;
       state.sawAssistant = true;
@@ -280,6 +321,15 @@ export async function runHeadlessTurn(
     safeOnEvent({ type: "turn.completed", threadId: options.threadId, turnId: options.turnId, status: "failed" });
     await eventChain;
     return { providerSessionId: options.providerSessionId || options.threadId, status: "failed", text: message };
+  }
+
+  // Avoid interactive trust prompt fallout: pre-accept workspace for Claude.
+  if (engine === "claude") {
+    try {
+      await ensureClaudeWorkspaceTrusted(options.cwd);
+    } catch {
+      // ignore
+    }
   }
 
   const args = buildArgs(engine, options);
@@ -349,7 +399,8 @@ export async function runHeadlessTurn(
       resolve({
         providerSessionId: state.sessionId || options.providerSessionId || options.threadId,
         status,
-        text: state.text || state.errorMessage
+        text: state.text || state.errorMessage,
+        ...(state.contextUsage ? { contextUsage: state.contextUsage } : {})
       });
     };
 
@@ -418,7 +469,8 @@ export async function runHeadlessTurn(
     type: "turn.completed",
     threadId: options.threadId,
     turnId: options.turnId,
-    status: result.status
+    status: result.status,
+    ...(result.contextUsage ? { contextUsage: result.contextUsage } : {})
   });
   await eventChain;
   return result;

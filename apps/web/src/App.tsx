@@ -14,9 +14,11 @@ import {
   type CliEngine,
   type CliEngineInfo,
   type ClientCommand,
+  type ContextUsage,
   type EncryptedEnvelope,
   type PairingPublicInfo,
   type PermissionMode,
+  type ReasoningEffort,
   type Workspace
 } from "@anytimevibe/protocol";
 import { api, websocketUrl } from "./api";
@@ -51,7 +53,81 @@ type Task = {
   messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string }>;
   approvals: Approval[];
   cliEngine?: CliEngine;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
+  contextUsage?: ContextUsage;
 };
+
+/** Per-engine model presets (value "" = use CLI / host default). */
+function modelOptionsForEngine(engine: CliEngine): Array<{ value: string; label: string }> {
+  if (engine === "claude") {
+    return [
+      { value: "", label: "默认模型" },
+      { value: "opus", label: "Opus" },
+      { value: "sonnet", label: "Sonnet" },
+      { value: "haiku", label: "Haiku" },
+      { value: "claude-opus-4-8", label: "claude-opus-4-8" },
+      { value: "claude-sonnet-4-5", label: "claude-sonnet-4-5" }
+    ];
+  }
+  if (engine === "grok") {
+    return [
+      { value: "", label: "默认模型" },
+      { value: "grok-4.5", label: "Grok 4.5" },
+      { value: "grok-4", label: "Grok 4" }
+    ];
+  }
+  return [
+    { value: "", label: "默认模型" },
+    { value: "gpt-5.6-sol", label: "gpt-5.6-sol" },
+    { value: "o3", label: "o3" },
+    { value: "o4-mini", label: "o4-mini" },
+    { value: "gpt-5", label: "gpt-5" }
+  ];
+}
+
+/** Effort labels differ by vendor; values are normalized for the protocol. */
+function effortOptionsForEngine(engine: CliEngine): Array<{ value: ReasoningEffort | ""; label: string }> {
+  if (engine === "claude") {
+    return [
+      { value: "", label: "默认推理强度" },
+      { value: "low", label: "low" },
+      { value: "medium", label: "medium" },
+      { value: "high", label: "high" },
+      { value: "xhigh", label: "xhigh" },
+      { value: "max", label: "max" }
+    ];
+  }
+  if (engine === "grok") {
+    return [
+      { value: "", label: "默认 reasoning effort" },
+      { value: "low", label: "low" },
+      { value: "medium", label: "medium" },
+      { value: "high", label: "high" }
+    ];
+  }
+  // Codex model_reasoning_effort
+  return [
+    { value: "", label: "默认 reasoning effort" },
+    { value: "low", label: "low" },
+    { value: "medium", label: "medium" },
+    { value: "high", label: "high" },
+    { value: "xhigh", label: "xhigh" }
+  ];
+}
+
+function formatContextUsage(usage?: ContextUsage): string | null {
+  if (!usage) return null;
+  const total = usage.totalTokens ?? ((usage.inputTokens || 0) + (usage.outputTokens || 0));
+  const window = usage.contextWindow;
+  if (window && (usage.remainingTokens != null || total)) {
+    const remaining = usage.remainingTokens ?? Math.max(0, window - total);
+    const pct = Math.max(0, Math.min(100, Math.round((remaining / window) * 100)));
+    return `上下文剩余 ${remaining.toLocaleString()} / ${window.toLocaleString()}（${pct}%）`;
+  }
+  if (total) return `已用约 ${total.toLocaleString()} tokens`;
+  return null;
+}
 type HostRuntime = {
   online: boolean | null;
   workspaces: Workspace[];
@@ -242,6 +318,9 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   if (event.type === "thread.snapshot") {
     const existing = next.tasks[event.threadId];
     const engine = event.cliEngine ?? existing?.cliEngine;
+    const model = event.model ?? existing?.model;
+    const reasoningEffort = event.reasoningEffort ?? existing?.reasoningEffort;
+    const contextUsage = event.contextUsage ?? existing?.contextUsage;
     next.tasks[event.threadId] = {
       threadId: event.threadId,
       title: event.title || "未命名任务",
@@ -252,7 +331,10 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       messages: event.messages,
       approvals: existing?.approvals ?? [],
       ...(engine ? { cliEngine: engine } : {}),
-      ...(event.activeTurnId ? { activeTurnId: event.activeTurnId } : {})
+      ...(event.activeTurnId ? { activeTurnId: event.activeTurnId } : {}),
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(contextUsage ? { contextUsage } : {})
     };
     return next;
   }
@@ -316,6 +398,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   if (event.type === "turn.completed") {
     task.status = event.status;
     delete task.activeTurnId;
+    if (event.contextUsage) task.contextUsage = event.contextUsage;
   }
   if (event.type === "diff.updated") task.diff = event.diff;
   if (event.type === "approval.requested") task.approvals.push(event);
@@ -894,7 +977,7 @@ export function App() {
       availableEngines={activeRuntime.availableEngines ?? []}
       onClose={() => setComposerOpen(false)}
       onRefreshWorkspaces={() => sendCommand(activeHost.id, { type: "host.refresh", commandId: crypto.randomUUID() })}
-      onCreate={async (cwd, prompt, title, engine, mode) => {
+      onCreate={async (cwd, prompt, title, engine, mode, model, reasoningEffort) => {
         setPermissionMode(mode);
         localStorage.setItem("permission-mode", mode);
         await sendCommand(activeHost.id, {
@@ -904,7 +987,9 @@ export function App() {
           prompt,
           permissionMode: mode,
           cliEngine: engine,
-          ...(title ? { title } : {})
+          ...(title ? { title } : {}),
+          ...(model ? { model } : {}),
+          ...(reasoningEffort ? { reasoningEffort } : {})
         });
         setComposerOpen(false);
       }}
@@ -922,14 +1007,19 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     catch { return []; }
   });
   const [tab, setTab] = useState<"chat" | "diff">("chat");
+  const taskEngine = normalizeCliEngine(task.cliEngine);
+  const [model, setModel] = useState(task.model || "");
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(task.reasoningEffort || "");
   const messageStreamRef = useRef<HTMLDivElement | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const stickToBottomRef = useRef(true);
   const previousThreadRef = useRef(task.threadId);
   const running = Boolean(task.activeTurnId);
-  const taskEngine = normalizeCliEngine(task.cliEngine);
   const permissionOptions = permissionOptionsForEngine(taskEngine, locale);
+  const modelOptions = modelOptionsForEngine(taskEngine);
+  const effortOptions = effortOptionsForEngine(taskEngine);
+  const contextLabel = formatContextUsage(task.contextUsage);
   const isMac = isMacPlatform();
   const visibleMessages = replyDetail === "detailed"
     ? task.messages
@@ -942,6 +1032,23 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     }
   }, [task.threadId, taskEngine]);
 
+  useEffect(() => {
+    setModel(task.model || "");
+    setReasoningEffort(task.reasoningEffort || "");
+  }, [task.threadId, task.model, task.reasoningEffort]);
+
+  function turnStartCommand(text: string): ClientCommand {
+    return {
+      type: "turn.start",
+      commandId: crypto.randomUUID(),
+      threadId: task.threadId,
+      prompt: text,
+      permissionMode,
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {})
+    };
+  }
+
   function submitPrompt() {
     if (!prompt.trim() || online !== true) return;
     const submittedPrompt = prompt.trim();
@@ -950,7 +1057,7 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     else {
       setPendingPrompt(submittedPrompt);
       setPendingMessageCount(task.messages.length);
-      onCommand({ type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: submittedPrompt, permissionMode });
+      onCommand(turnStartCommand(submittedPrompt));
     }
     setPrompt("");
   }
@@ -966,8 +1073,8 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     setPendingPrompt(nextPrompt);
     setPendingMessageCount(task.messages.length);
     stickToBottomRef.current = true;
-    onCommand({ type: "turn.start", commandId: crypto.randomUUID(), threadId: task.threadId, prompt: nextPrompt, permissionMode });
-  }, [commandQueue, online, onCommand, pendingPrompt, permissionMode, running, task.threadId]);
+    onCommand(turnStartCommand(nextPrompt));
+  }, [commandQueue, online, onCommand, pendingPrompt, permissionMode, running, task.threadId, model, reasoningEffort]);
 
   useEffect(() => {
     const latestMessage = task.messages.at(-1);
@@ -1007,6 +1114,11 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
           <span>{task.title}</span>
         </h2>
         <code title={task.cwd}>{task.cwd}</code>
+        {(model || task.model || reasoningEffort || task.reasoningEffort || contextLabel) && (
+          <p className="thread-meta-line">
+            {[model || task.model, reasoningEffort || task.reasoningEffort, contextLabel].filter(Boolean).join(" · ")}
+          </p>
+        )}
       </div>
       <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>{t("chat")}</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>{t("diff")}</button></div>
     </div>
@@ -1047,6 +1159,18 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
       }} placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"} />
       <div>
         <small>
+          <label className="composer-permission">
+            模型
+            <select value={model} onChange={(event) => setModel(event.target.value)}>
+              {modelOptions.map((option) => <option key={option.value || "default"} value={option.value}>{option.label}</option>)}
+            </select>
+          </label>
+          <label className="composer-permission">
+            推理强度
+            <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort | "")}>
+              {effortOptions.map((option) => <option key={option.value || "default"} value={option.value}>{option.label}</option>)}
+            </select>
+          </label>
           <label className="composer-permission">
             {t("currentPermission")}
             <select value={permissionMode} onChange={(event) => onPermissionModeChange(normalizePermissionMode(event.target.value))}>
@@ -1132,7 +1256,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
   availableEngines: CliEngineInfo[];
   onClose(): void;
   onRefreshWorkspaces(): Promise<void>;
-  onCreate(cwd: string, prompt: string, title: string, engine: CliEngine, permissionMode: PermissionMode): Promise<void>;
+  onCreate(cwd: string, prompt: string, title: string, engine: CliEngine, permissionMode: PermissionMode, model?: string, reasoningEffort?: ReasoningEffort): Promise<void>;
 }) {
   const { locale } = useI18n();
   const ready = readyEngines(availableEngines);
@@ -1142,9 +1266,13 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
   const [engine, setEngine] = useState<CliEngine | "">(ready[0]?.engine ?? "");
   const permissionOptions = permissionOptionsForEngine(engine ? normalizeCliEngine(engine) : "codex", locale);
   const [taskPermission, setTaskPermission] = useState<PermissionMode>(permissionOptions[0]?.value ?? "ask-for-approval");
+  const [model, setModel] = useState("");
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">("");
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
+  const modelOptions = modelOptionsForEngine(engine ? normalizeCliEngine(engine) : "codex");
+  const effortOptions = effortOptionsForEngine(engine ? normalizeCliEngine(engine) : "codex");
 
   // When host.status arrives after open, pick the first allowlisted path.
   useEffect(() => {
@@ -1163,6 +1291,8 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
   useEffect(() => {
     const options = permissionOptionsForEngine(engine ? normalizeCliEngine(engine) : "codex", locale);
     setTaskPermission((current) => (options.some((item) => item.value === current) ? current : options[0]!.value));
+    setModel("");
+    setReasoningEffort("");
   }, [engine, locale]);
 
   // Pull latest whitelist from the agent once when the dialog opens (avoid dep on unstable callback identity).
@@ -1191,7 +1321,15 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
     setLoading(true);
     setError("");
     try {
-      await onCreate(cwd, prompt, title, engine, taskPermission);
+      await onCreate(
+        cwd,
+        prompt,
+        title,
+        engine,
+        taskPermission,
+        model || undefined,
+        reasoningEffort || undefined
+      );
     } catch (createError) {
       setError(createError instanceof Error ? createError.message : "任务创建失败");
       setLoading(false);
@@ -1226,6 +1364,16 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, onClose, on
         })}
       </div>
     </div>
+    <label>模型
+      <select value={model} onChange={(event) => setModel(event.target.value)} disabled={!engine}>
+        {modelOptions.map((option) => <option key={option.value || "default"} value={option.value}>{option.label}</option>)}
+      </select>
+    </label>
+    <label>推理强度
+      <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort | "")} disabled={!engine}>
+        {effortOptions.map((option) => <option key={option.value || "default"} value={option.value}>{option.label}</option>)}
+      </select>
+    </label>
     <label>权限模式
       <select value={taskPermission} onChange={(event) => setTaskPermission(normalizePermissionMode(event.target.value))} disabled={!engine}>
         {permissionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}

@@ -38,11 +38,13 @@ import {
   type Workspace
 } from "@anytimevibe/protocol";
 import { CodexAdapter, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
-import { detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
+import { ensureClaudeWorkspaceTrusted } from "./cli/claude-trust";
+import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { interruptHeadlessThread, runHeadlessTurn } from "./cli/headless-runner";
 import { importLocalCliSessions } from "./cli/import-sessions";
 import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
+import type { ContextUsage, ReasoningEffort } from "@anytimevibe/protocol";
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
@@ -831,16 +833,29 @@ async function resolveMacLoginPath(): Promise<string> {
 async function applyMacLoginPathToProcess(): Promise<void> {
   if (process.platform !== "darwin") return;
   cachedMacLoginPath = null;
-  process.env.PATH = await resolveMacLoginPath();
+  const home = os.homedir();
+  const extras = [
+    path.join(home, ".grok", "bin"),
+    path.join(home, ".local", "bin"),
+    path.join(home, ".claude", "local"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin"
+  ].join(":");
+  const login = await resolveMacLoginPath();
+  process.env.PATH = `${extras}:${login}`;
 }
 
 async function findOnMacPath(command: string): Promise<string | null> {
   const loginPath = await resolveMacLoginPath();
+  const home = os.homedir();
   const candidates: string[] = [];
   for (const dir of loginPath.split(":")) {
     if (dir) candidates.push(path.join(dir, command));
   }
   candidates.unshift(
+    path.join(home, ".grok", "bin", command),
+    path.join(home, ".local", "bin", command),
+    path.join(home, ".claude", "local", command),
     path.join("/opt/homebrew/bin", command),
     path.join("/usr/local/bin", command),
     path.join("/usr/bin", command)
@@ -1324,67 +1339,66 @@ fi
 
 async function installGrokOnWindows(): Promise<void> {
   await applyWindowsPathToProcess();
-  updateState({ detail: "正在打开 PowerShell 安装 Grok Build（Windows 原生，不用 WSL）…" });
-  // NEVER use bash/WSL here — it installs linux-x86_64 into the WSL root filesystem.
-  await openWindowsPowerShellScript(`
-Write-Host '============================================'
-Write-Host '  AnytimeVibe - install Grok Build (Windows)'
-Write-Host '============================================'
-Write-Host ''
-Write-Host 'Using PowerShell installer (native Windows). WSL/bash is intentionally skipped.'
-Write-Host ("Proxy HTTPS_PROXY=" + $(if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } else { 'none' }))
-$bin = Join-Path $env:USERPROFILE '.grok\\bin'
-$grokExe = Join-Path $bin 'grok.exe'
-$installed = $false
-try {
-  Write-Host '[1] irm https://x.ai/cli/install.ps1 | iex'
-  Invoke-Expression (Invoke-RestMethod -Uri 'https://x.ai/cli/install.ps1' -TimeoutSec 90)
-  if (Test-Path $grokExe) { $installed = $true }
-} catch {
-  Write-Host ("install.ps1 failed: " + $_.Exception.Message)
-}
-if (-not $installed) {
-  try {
-    Write-Host '[2] fallback: download windows binary via install API…'
-    New-Item -ItemType Directory -Force -Path $bin | Out-Null
-    # Some releases expose a direct windows asset; best-effort.
-    $candidates = @(
-      'https://x.ai/cli/download/windows-x86_64/grok.exe',
-      'https://x.ai/cli/download/latest/windows-x86_64/grok.exe'
-    )
-    foreach ($url in $candidates) {
-      try {
-        Write-Host ("  trying " + $url)
-        Invoke-WebRequest -Uri $url -OutFile $grokExe -UseBasicParsing -TimeoutSec 120
-        if ((Test-Path $grokExe) -and ((Get-Item $grokExe).Length -gt 1000000)) { $installed = $true; break }
-      } catch {
-        Write-Host ("  " + $_.Exception.Message)
-      }
-    }
-  } catch {
-    Write-Host ("fallback failed: " + $_.Exception.Message)
-  }
-}
-if (Test-Path $grokExe) {
-  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if (-not $userPath) { $userPath = '' }
-  if ($userPath -notlike ('*' + $bin + '*')) {
-    [Environment]::SetEnvironmentVariable('Path', ($bin + ';' + $userPath), 'User')
-    Write-Host ("Added to user PATH: " + $bin)
-  }
-  $env:Path = $bin + ';' + $env:Path
-  Write-Host ''
-  & $grokExe --version
-  Write-Host ''
-  Write-Host 'Install OK. Close this window and click 重新检测 in AnytimeVibe.'
-} else {
-  Write-Host ''
-  Write-Host 'FAILED: grok.exe not found under' $bin
-  Write-Host 'Check network/proxy. Do not use WSL bash installer on Windows.'
-  Write-Host 'Manual: open PowerShell and run:  irm https://x.ai/cli/install.ps1 | iex'
-}
-`);
-  updateState({ detail: "已打开 PowerShell 安装 Grok Build。完成后请点击「重新检测」。" });
+  updateState({ detail: "正在打开安装窗口安装 Grok Build（Windows 原生，不用 WSL）…" });
+  // Use cmd-visible console (same as other installers) so the window never flashes closed.
+  // NEVER call bash/WSL — that installs linux-x86_64 into the WSL root.
+  const proxyLines = await proxyShellLines("win32");
+  const stamp = Date.now();
+  const ps1Path = path.join(app.getPath("temp"), `anytimevibe-grok-install-${stamp}.ps1`);
+  const ps1 = [
+    "$ErrorActionPreference = 'Continue'",
+    "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "Write-Host '============================================'",
+    "Write-Host '  AnytimeVibe - Grok Build (Windows native)'",
+    "Write-Host '============================================'",
+    "Write-Host ''",
+    "Write-Host ('HTTPS_PROXY=' + $(if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } else { 'none' }))",
+    "$bin = Join-Path $env:USERPROFILE '.grok\\bin'",
+    "$grokExe = Join-Path $bin 'grok.exe'",
+    "New-Item -ItemType Directory -Force -Path $bin | Out-Null",
+    "try {",
+    "  Write-Host '[1] Download official install.ps1 ...'",
+    "  $script = Invoke-RestMethod -Uri 'https://x.ai/cli/install.ps1' -TimeoutSec 120",
+    "  Write-Host '[2] Running installer ...'",
+    "  Invoke-Expression $script",
+    "} catch {",
+    "  Write-Host ('Installer error: ' + $_.Exception.Message)",
+    "  Write-Host 'If this is a network error, configure system proxy or set HTTPS_PROXY.'",
+    "}",
+    "if (Test-Path $grokExe) {",
+    "  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')",
+    "  if (-not $userPath) { $userPath = '' }",
+    "  if ($userPath -notlike ('*' + $bin + '*')) {",
+    "    [Environment]::SetEnvironmentVariable('Path', ($bin + ';' + $userPath), 'User')",
+    "    Write-Host ('Added user PATH: ' + $bin)",
+    "  }",
+    "  $env:Path = $bin + ';' + $env:Path",
+    "  Write-Host ''",
+    "  & $grokExe --version",
+    "  Write-Host ''",
+    "  Write-Host 'Install OK. Close this window and click 重新检测.'",
+    "} else {",
+    "  Write-Host ''",
+    "  Write-Host ('FAILED: grok.exe not found at ' + $grokExe)",
+    "  Write-Host 'Manual: open PowerShell and run:'",
+    "  Write-Host '  irm https://x.ai/cli/install.ps1 | iex'",
+    "}"
+  ].join("\r\n");
+  await fs.writeFile(ps1Path, ps1, "utf8");
+  await openWindowsVisibleConsole([
+    "echo ============================================",
+    "echo   AnytimeVibe - install Grok Build (Windows)",
+    "echo ============================================",
+    "echo.",
+    ...proxyLines,
+    `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${ps1Path.replace(/"/g, "")}"`,
+    "echo.",
+    "if exist \"%USERPROFILE%\\.grok\\bin\\grok.exe\" (\"%USERPROFILE%\\.grok\\bin\\grok.exe\" --version) else (echo grok.exe not found yet)",
+    "echo.",
+    "echo Close this window and click 重新检测 in AnytimeVibe."
+  ]);
+  updateState({ detail: "已打开 Grok Build 安装窗口。完成后请点击「重新检测」。" });
 }
 
 async function installGrokOnMac(): Promise<void> {
@@ -1841,6 +1855,15 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     await taskStore.setProviderSession(event.threadId, event.providerSessionId);
     return;
   }
+  if (event.type === "usage") {
+    const task = taskStore.get(event.threadId);
+    if (task) {
+      task.contextUsage = event.contextUsage;
+      task.updatedAt = Date.now() / 1000;
+      await taskStore.upsert(task);
+    }
+    return;
+  }
   if (event.type === "error") {
     handleError(new Error(event.message));
     // Also surface to web clients as a persisted error event when possible.
@@ -1858,14 +1881,28 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     activeTurnByThread.delete(event.threadId);
     finishLocalActivity(event.threadId, event.status);
     await taskStore.setStatus(event.threadId, event.status);
+    if (event.contextUsage) {
+      const task = taskStore.get(event.threadId);
+      if (task) {
+        task.contextUsage = event.contextUsage;
+        await taskStore.upsert(task);
+      }
+    }
     await publish({
       type: "turn.completed",
       eventId: crypto.randomUUID(),
       occurredAt: new Date().toISOString(),
       threadId: event.threadId,
       turnId: event.turnId,
-      status: event.status
+      status: event.status,
+      ...(event.contextUsage ? { contextUsage: event.contextUsage } : {})
     }, true, "completed");
+    // Push latest snapshot so web sees contextUsage / final status for multi-CLI tasks.
+    try {
+      await publishStoredTaskSnapshot(event.threadId);
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -1896,6 +1933,9 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     cliEngine: task.engine,
+    ...(task.model ? { model: task.model } : {}),
+    ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
+    ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
     messages: task.messages
   }, true);
 }
@@ -1908,6 +1948,8 @@ async function runHeadlessTaskTurn(options: {
   title?: string;
   permissionMode: PermissionMode;
   isNew: boolean;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
 }): Promise<void> {
   const turnId = crypto.randomUUID();
   const now = Date.now() / 1000;
@@ -1922,9 +1964,13 @@ async function runHeadlessTaskTurn(options: {
       status: "active",
       createdAt: now,
       updatedAt: now,
-      messages: []
+      messages: [],
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {})
     };
   }
+  if (options.model) stored.model = options.model;
+  if (options.reasoningEffort) stored.reasoningEffort = options.reasoningEffort;
   stored.messages.push({ id: crypto.randomUUID(), role: "user", text: options.prompt });
   stored.status = "active";
   stored.updatedAt = now;
@@ -1939,6 +1985,7 @@ async function runHeadlessTaskTurn(options: {
   } catch {
     // ignore PATH enrichment failures
   }
+  clearEngineBinaryCache();
 
   // Resume only when we already have a provider-native session id from a prior turn.
   const resumeId = stored.providerSessionId.trim() || undefined;
@@ -1948,7 +1995,11 @@ async function runHeadlessTaskTurn(options: {
     cwd: options.cwd,
     prompt: options.prompt,
     permissionMode: options.permissionMode,
-    ...(resumeId ? { providerSessionId: resumeId } : {})
+    ...(resumeId ? { providerSessionId: resumeId } : {}),
+    ...(options.model || stored.model ? { model: options.model || stored.model } : {}),
+    ...(options.reasoningEffort || stored.reasoningEffort
+      ? { reasoningEffort: options.reasoningEffort || stored.reasoningEffort }
+      : {})
   }, async (event) => {
     // Must await so publish sequence numbers and delta flush stay ordered.
     await handleBackendStreamEvent(event);
@@ -1956,6 +2007,7 @@ async function runHeadlessTaskTurn(options: {
 
   const latest = taskStore.get(options.threadId) ?? stored;
   if (result.providerSessionId) latest.providerSessionId = result.providerSessionId;
+  if (result.contextUsage) latest.contextUsage = result.contextUsage;
   latest.status = result.status;
   latest.updatedAt = Date.now() / 1000;
   if (result.text.trim()) {
@@ -2014,12 +2066,26 @@ async function handleCommand(command: ClientCommand): Promise<void> {
           prompt: command.prompt,
           ...(command.title ? { title: command.title } : {}),
           permissionMode: mode,
-          isNew: true
+          isNew: true,
+          ...(command.model ? { model: command.model } : {}),
+          ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {})
         });
         return;
       }
       await ensureCodex();
-      const started = await codex!.request("thread/start", threadStartParams(command.cwd, mode));
+      const startParams: Record<string, unknown> = { ...threadStartParams(command.cwd, mode) };
+      if (command.model) startParams.model = command.model;
+      if (command.reasoningEffort) {
+        // Codex app-server / config use model_reasoning_effort style values.
+        startParams.modelReasoningEffort = command.reasoningEffort;
+      }
+      let started: any;
+      try {
+        started = await codex!.request("thread/start", startParams);
+      } catch {
+        // Older app-server builds may reject model fields — retry bare params.
+        started = await codex!.request("thread/start", threadStartParams(command.cwd, mode));
+      }
       const thread = started.thread;
       localThreadId = thread.id;
       if (command.title) await codex!.request("thread/name/set", { threadId: thread.id, name: command.title });
@@ -2032,15 +2098,28 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         status: "active",
         createdAt: Date.now() / 1000,
         updatedAt: Date.now() / 1000,
-        messages: []
+        messages: [],
+        ...(command.model ? { model: command.model } : {}),
+        ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {})
       });
       await publishThread(thread.id);
       startLocalActivity(thread.id, command.prompt, command.title || command.prompt.slice(0, 80));
-      const turn = await codex!.request("turn/start", {
+      const turnPayload: Record<string, unknown> = {
         threadId: thread.id,
         clientUserMessageId: command.commandId,
         input: [{ type: "text", text: command.prompt, text_elements: [] }]
-      });
+      };
+      if (command.model) turnPayload.model = command.model;
+      let turn: any;
+      try {
+        turn = await codex!.request("turn/start", turnPayload);
+      } catch {
+        turn = await codex!.request("turn/start", {
+          threadId: thread.id,
+          clientUserMessageId: command.commandId,
+          input: [{ type: "text", text: command.prompt, text_elements: [] }]
+        });
+      }
       activeTurnByThread.set(thread.id, String(turn.turn.id));
       await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: thread.id, turnId: turn.turn.id, prompt: command.prompt }, true);
       return;
@@ -2067,18 +2146,39 @@ async function handleCommand(command: ClientCommand): Promise<void> {
           prompt: command.prompt,
           title: stored.title,
           permissionMode: mode,
-          isNew: false
+          isNew: false,
+          ...(command.model || stored.model ? { model: command.model || stored.model } : {}),
+          ...(command.reasoningEffort || stored.reasoningEffort
+            ? { reasoningEffort: command.reasoningEffort || stored.reasoningEffort }
+            : {})
         });
         return;
       }
       await ensureCodex();
       await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
       startLocalActivity(command.threadId, command.prompt, "继续远程任务");
-      const result = await codex!.request("turn/start", {
+      if (stored && (command.model || command.reasoningEffort)) {
+        if (command.model) stored.model = command.model;
+        if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+        await taskStore.upsert(stored);
+      }
+      const turnPayload: Record<string, unknown> = {
         threadId: command.threadId,
         clientUserMessageId: command.commandId,
         input: [{ type: "text", text: command.prompt, text_elements: [] }]
-      });
+      };
+      const model = command.model || stored?.model;
+      if (model) turnPayload.model = model;
+      let result: any;
+      try {
+        result = await codex!.request("turn/start", turnPayload);
+      } catch {
+        result = await codex!.request("turn/start", {
+          threadId: command.threadId,
+          clientUserMessageId: command.commandId,
+          input: [{ type: "text", text: command.prompt, text_elements: [] }]
+        });
+      }
       activeTurnByThread.set(command.threadId, String(result.turn.id));
       await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: result.turn.id, prompt: command.prompt }, true);
       return;
@@ -2591,10 +2691,17 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   if (engine === "claude") {
     const binary = await resolveEngineBinary("claude");
     if (!binary) throw new Error("未找到 Claude Code CLI，无法接力");
+    // Pre-trust cwd so "Do you trust this folder?" decline does not poison later web runs.
+    try {
+      await ensureClaudeWorkspaceTrusted(cwd);
+    } catch {
+      // ignore
+    }
     // Do not force --model (default "sonnet" often maps to offline proxy models and
     // drops the user into the interactive model picker). Only pass when explicitly set.
-    const model = (process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "").trim();
+    const model = (stored?.model || process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "").trim();
     const args = [
+      // Skip trust prompt if this Claude build supports it via env; still pre-mark trust above.
       ...(model ? ["--model", model] : []),
       ...(providerSessionId ? ["--resume", providerSessionId] : [])
     ];
@@ -3070,6 +3177,7 @@ function registerIpc(): void {
     } catch {
       // ignore
     }
+    clearEngineBinaryCache();
     const environment = await detectEnvironment();
     const availableEngines = await detectAvailableEngines({
       codexReady: environment.codexCompatible,
