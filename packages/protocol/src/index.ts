@@ -2,6 +2,32 @@ import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1 as const;
 
+/**
+ * Product release version shared by web + desktop agent.
+ * Keep apps/web and apps/agent package.json versions aligned with this on each release.
+ * Frontend warns when the connected agent reports a lower version.
+ */
+export const PRODUCT_VERSION = "0.4.28";
+/** Minimum desktop agent version required by this frontend build (usually equals PRODUCT_VERSION). */
+export const MIN_AGENT_VERSION = PRODUCT_VERSION;
+
+/** Compare dotted versions (ignores leading v). Returns negative if a < b. */
+export function compareSemver(a: string, b: string): number {
+  const parse = (value: string) =>
+    value.replace(/^v/i, "").split(/[.+-]/).map((part) => {
+      const n = Number.parseInt(part, 10);
+      return Number.isFinite(n) ? n : 0;
+    });
+  const left = parse(a);
+  const right = parse(b);
+  const len = Math.max(left.length, right.length);
+  for (let i = 0; i < len; i += 1) {
+    const d = (left[i] ?? 0) - (right[i] ?? 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
 export const encryptedEnvelopeSchema = z.object({
   v: z.literal(PROTOCOL_VERSION),
   messageId: z.string().uuid(),
@@ -143,7 +169,9 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     /** Preferred coding CLI on this host. */
     cliEngine: cliEngineSchema.optional(),
     /** Detected engines and readiness. */
-    availableEngines: z.array(cliEngineInfoSchema).optional()
+    availableEngines: z.array(cliEngineInfoSchema).optional(),
+    /** Desktop agent app version (AnytimeVibe client). */
+    agentVersion: z.string().optional()
   }),
   eventBase.extend({
     type: z.literal("sync.completed"),

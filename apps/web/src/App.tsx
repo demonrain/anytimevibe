@@ -19,7 +19,10 @@ import {
   type PairingPublicInfo,
   type PermissionMode,
   type ReasoningEffort,
-  type Workspace
+  type Workspace,
+  PRODUCT_VERSION,
+  MIN_AGENT_VERSION,
+  compareSemver
 } from "@anytimevibe/protocol";
 import { api, websocketUrl } from "./api";
 import { useI18n } from "./i18n/I18nProvider";
@@ -133,6 +136,8 @@ type HostRuntime = {
   workspaces: Workspace[];
   tasks: Record<string, Task>;
   availableEngines?: CliEngineInfo[];
+  /** Desktop agent version reported by host.status.agentVersion */
+  agentVersion?: string;
 };
 
 function taskStatusMeta(status: string): { label: string; tone: string } {
@@ -312,6 +317,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     next.online = event.online;
     next.workspaces = event.workspaces;
     if (event.availableEngines) next.availableEngines = event.availableEngines;
+    if (event.agentVersion) next.agentVersion = event.agentVersion;
     return next;
   }
   if (event.type === "sync.completed" || event.type === "sync.progress") return next;
@@ -515,6 +521,8 @@ export function App() {
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => normalizePermissionMode(localStorage.getItem("permission-mode")));
   const [replyDetail, setReplyDetail] = useState<ReplyDetail>(() => normalizeReplyDetail(localStorage.getItem(REPLY_DETAIL_STORAGE_KEY)));
   const [taskQuery, setTaskQuery] = useState("");
+  /** Quick filter task list by coding engine; null = all engines. */
+  const [engineFilter, setEngineFilter] = useState<CliEngine | null>(null);
   const taskSearchTimerRef = useRef<number | null>(null);
   const autoSyncedHostsRef = useRef(new Set<string>());
   const [keyAuthorizationStatus, setKeyAuthorizationStatus] = useState<Record<string, "missing" | "authorizing">>({});
@@ -845,7 +853,12 @@ export function App() {
   const activeRuntime = selectedHostId ? runtime[selectedHostId] ?? emptyRuntime() : emptyRuntime();
   const tasks = Object.values(activeRuntime.tasks).sort((left, right) => right.updatedAt - left.updatedAt);
   const normalizedTaskQuery = taskQuery.trim().toLowerCase();
-  const filteredTasks = !normalizedTaskQuery ? tasks : tasks.filter((task) => {
+  const filteredTasks = tasks.filter((task) => {
+    if (engineFilter) {
+      const engine = task.cliEngine ? normalizeCliEngine(task.cliEngine) : "codex";
+      if (engine !== engineFilter) return false;
+    }
+    if (!normalizedTaskQuery) return true;
     const messageText = task.messages.map((message) => message.text).join("\n");
     const haystack = `${task.title}\n${task.cwd}\n${task.status}\n${messageText}`.toLowerCase();
     return haystack.includes(normalizedTaskQuery);
@@ -855,11 +868,49 @@ export function App() {
     ?? filteredTasks[0]
     ?? null;
 
+  const clientVersion = activeRuntime.agentVersion;
+  const clientOutdated = Boolean(
+    activeHost
+    && activeRuntime.online === true
+    && clientVersion
+    && compareSemver(clientVersion, MIN_AGENT_VERSION) < 0
+  );
+  const clientVersionUnknown = Boolean(
+    activeHost
+    && activeRuntime.online === true
+    && !clientVersion
+  );
+
   return <div className="app-shell">
     {error && <ErrorBanner message={error} clear={() => setError("")} />}
+    {(clientOutdated || clientVersionUnknown) && (
+      <div className="version-banner" role="status">
+        <div>
+          <strong>{clientOutdated ? "客户端版本过旧" : "客户端未上报版本"}</strong>
+          <span>
+            {clientOutdated
+              ? `当前网页 v${PRODUCT_VERSION} 需要桌面客户端 ≥ v${MIN_AGENT_VERSION}，检测到 v${clientVersion}。请更新客户端以保证多引擎与任务同步正常。`
+              : `当前网页 v${PRODUCT_VERSION}。请升级到对应版本的桌面客户端（v${MIN_AGENT_VERSION}）以获得完整能力与版本校验。`}
+          </span>
+        </div>
+        <div className="version-banner-actions">
+          {health.clientDownloads.windows && <a href={health.clientDownloads.windows}>Windows</a>}
+          {health.clientDownloads.mac && <a href={health.clientDownloads.mac}>macOS</a>}
+          {!health.clientDownloads.windows && !health.clientDownloads.mac && (
+            <a href="https://github.com/demonrain/anytimevibe/releases" target="_blank" rel="noreferrer">下载更新</a>
+          )}
+        </div>
+      </div>
+    )}
     <header className="topbar">
       <div className="brand"><span className="brand-mark" aria-hidden="true"><img src="/icon.svg" alt="" /></span><div><strong>{t("brand")}</strong><small>{t("brandTag")}</small></div></div>
       <div className="top-actions">
+        <span className="version-chip" title="网页与客户端应对齐同一产品版本">
+          Web v{PRODUCT_VERSION}
+          {activeHost
+            ? ` · 客户端 ${clientVersion ? `v${clientVersion}` : "未知"}`
+            : ` · 客户端 v${MIN_AGENT_VERSION}`}
+        </span>
         <ClientDownloads downloads={health.clientDownloads} />
         <div className="lang-switch" role="group" aria-label={t("lang")}>
           <button type="button" className={locale === "zh-CN" ? "active" : ""} onClick={() => setLocale("zh-CN")}>中文</button>
@@ -930,8 +981,27 @@ export function App() {
         </div>
         <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? t("hostOnline") : activeRuntime.online === false ? t("hostOffline") : t("hostChecking")}</div>
         {activeHost && keyAuthorizationStatus[activeHost.id] && <div className="key-authorization-note"><div><strong>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "正在授权此浏览器" : "此浏览器尚未取得主机密钥"}</strong><span>{activeRuntime.online === true ? "电脑端会自动完成端到端密钥授权。" : "请先让电脑端客户端上线，再重新授权。"}</span></div><button disabled={keyAuthorizationStatus[activeHost.id] === "authorizing" || activeRuntime.online !== true} onClick={() => authorizeExistingHost(activeHost.id).catch((authorizationError) => setError(authorizationError.message))}>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "授权中…" : "授权此浏览器"}</button></div>}
-        <div className="settings-row">
-          <label className="reply-detail-select">{t("agentReplyDetail")}<select value={replyDetail} onChange={(event) => { const next = normalizeReplyDetail(event.target.value); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }}><option value="concise">{t("replyConcise")}</option><option value="detailed">{t("replyDetailed")}</option></select></label>
+        <div className="engine-filter" role="toolbar" aria-label="按编码引擎筛选任务">
+          {(["codex", "claude", "grok"] as CliEngine[]).map((engine) => {
+            const count = tasks.filter((task) => normalizeCliEngine(task.cliEngine) === engine).length;
+            const active = engineFilter === engine;
+            return (
+              <button
+                key={engine}
+                type="button"
+                className={`engine-filter-btn ${active ? "active" : ""}`}
+                title={`${cliEngineLabel(engine)} · ${count}`}
+                aria-pressed={active}
+                onClick={() => setEngineFilter((current) => (current === engine ? null : engine))}
+              >
+                <EngineLogo engine={engine} size={20} />
+                <span className="engine-filter-count">{count}</span>
+              </button>
+            );
+          })}
+          {engineFilter && (
+            <button type="button" className="engine-filter-clear" onClick={() => setEngineFilter(null)}>全部</button>
+          )}
         </div>
         <div className="task-search">
           <input
@@ -940,7 +1010,7 @@ export function App() {
             placeholder={t("searchTasks")}
             aria-label={t("searchTasks")}
           />
-          {normalizedTaskQuery && <small>{filteredTasks.length}/{tasks.length}</small>}
+          {(normalizedTaskQuery || engineFilter) && <small>{filteredTasks.length}/{tasks.length}</small>}
         </div>
         <div className="task-list">
           {filteredTasks.map((task) => {

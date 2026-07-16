@@ -35,7 +35,9 @@ import {
   type ClientCommand,
   type EncryptedEnvelope,
   type PermissionMode,
-  type Workspace
+  type ReasoningEffort,
+  type Workspace,
+  PRODUCT_VERSION
 } from "@anytimevibe/protocol";
 import { CodexAdapter, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
 import { ensureClaudeWorkspaceTrusted } from "./cli/claude-trust";
@@ -44,7 +46,6 @@ import { interruptHeadlessThread, runHeadlessTurn } from "./cli/headless-runner"
 import { importLocalCliSessions } from "./cli/import-sessions";
 import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
-import type { ContextUsage, ReasoningEffort } from "@anytimevibe/protocol";
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
@@ -590,7 +591,7 @@ function rendererHtml(): string {
       if(detail) detail.textContent=state.detail||'';
       if(relay && document.activeElement!==relay) relay.value=state.relayUrl||'';
       if(displayName && document.activeElement!==displayName) displayName.value=state.displayName||'';
-      if(meta) meta.textContent='Codex '+(state.codexVersion||'')+(state.hostId?' · '+String(state.hostId).slice(0,8):'');
+      if(meta) meta.textContent='客户端 v'+${JSON.stringify(PRODUCT_VERSION)}+' · Codex '+(state.codexVersion||'')+(state.hostId?' · '+String(state.hostId).slice(0,8):'');
       var env=state.environment||{nodeInstalled:false,codexCompatible:false,codexInstalled:false};
       var engines=state.availableEngines||[];
       var nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">一键安装</button>':'';
@@ -2434,7 +2435,8 @@ async function publishHostStatus(): Promise<void> {
     name: resolvedDisplayName(), platform: `${process.platform} ${os.release()}`, codexVersion,
     workspaces: config.workspaces,
     cliEngine: taskStore.getDefaultEngine(),
-    availableEngines: publicState.availableEngines
+    availableEngines: publicState.availableEngines,
+    agentVersion: PRODUCT_VERSION
   }, true);
 }
 
