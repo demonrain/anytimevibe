@@ -1,4 +1,6 @@
 import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   agentEventSchema,
   base64ToBytes,
@@ -352,6 +354,56 @@ function isProcessStreamMessage(message: { id: string; role: string }): boolean 
 /** Strip control characters that can break layout engines while keeping newlines/tabs. */
 function sanitizeDisplayText(text: string): string {
   return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u2028\u2029]/g, "");
+}
+
+/** Assistant reply: markdown preview by default, toggle to raw source. */
+function AssistantMessageBody({ text }: { text: string }) {
+  const { locale } = useI18n();
+  const clean = sanitizeDisplayText(text);
+  const [mode, setMode] = useState<"preview" | "source">("preview");
+  return (
+    <div className="message-body">
+      <div className="message-view-toggle" role="group" aria-label={locale === "en" ? "View mode" : "显示模式"}>
+        <button
+          type="button"
+          className={mode === "preview" ? "active" : ""}
+          onClick={() => setMode("preview")}
+        >
+          {locale === "en" ? "Preview" : "预览"}
+        </button>
+        <button
+          type="button"
+          className={mode === "source" ? "active" : ""}
+          onClick={() => setMode("source")}
+        >
+          {locale === "en" ? "Source" : "源码"}
+        </button>
+      </div>
+      {mode === "source" ? (
+        <pre className="message-source">{clean}</pre>
+      ) : (
+        <div className="message-markdown">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              a: ({ href, children }) => (
+                <a href={href} target="_blank" rel="noreferrer noopener">{children}</a>
+              ),
+              // Avoid nesting pre inside pre from default code block layout.
+              pre: ({ children }) => <div className="md-pre">{children}</div>,
+              code: ({ className, children, ...props }) => {
+                const inline = !className;
+                if (inline) return <code className="md-code-inline" {...props}>{children}</code>;
+                return <pre className="md-code-block"><code className={className} {...props}>{children}</code></pre>;
+              }
+            }}
+          >
+            {clean}
+          </ReactMarkdown>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
@@ -1485,7 +1537,15 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
             : process
               ? t("replyProcess")
               : assistantEngineBadge(taskEngine);
-        return <article key={message.id} className={`message ${message.role}${process ? " process" : ""}`}><span>{label}</span><pre>{sanitizeDisplayText(message.text)}</pre></article>;
+        const isAssistantReply = message.role === "assistant" && !process;
+        return (
+          <article key={message.id} className={`message ${message.role}${process ? " process" : ""}`}>
+            <span>{label}</span>
+            {isAssistantReply
+              ? <AssistantMessageBody text={message.text} />
+              : <pre>{sanitizeDisplayText(message.text)}</pre>}
+          </article>
+        );
       })}
       {pendingPrompt && <article className="message user pending"><span>YOU · 发送中</span><pre>{sanitizeDisplayText(pendingPrompt)}</pre></article>}
       {(running || pendingPrompt) && <article className="processing-card"><span className="processing-spinner" /><div><strong>{t("processing")}</strong><p>{t("processingHint")}</p></div></article>}

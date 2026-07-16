@@ -408,10 +408,107 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 /* Message list must own the scroll: parent height is fixed, this row is minmax(0,1fr). */
 .message-stream { min-height: 0; min-width: 0; height: 100%; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; touch-action: pan-y; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }.message-end { flex: 0 0 1px; width: 100%; }
 /* Do not use overflow:hidden / width:fit-content on bubbles — they collapse multi-line pre height in Chromium. */
-.message { max-width: 88%; min-width: 0; flex: 0 0 auto; animation: rise .25s ease both; }.message > span { display: block; font-size: 9px; letter-spacing: .14em; color: #8b9089; font-weight: 900; margin-bottom: 5px; }.message pre, .approval-card pre { margin: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; word-wrap: break-word; font-family: "Cascadia Code", Consolas, "Segoe UI Mono", monospace; font-size: var(--msg-font); line-height: var(--msg-lh); overflow-x: auto; overflow-y: visible; tab-size: 2; }.message.user { align-self: flex-end; background: var(--ink); color: #f8f1e5; padding: 10px 12px; border-radius: 14px 14px 4px 14px; }.message.user > span { color: rgba(255,255,255,.5); }.message.assistant { align-self: flex-start; background: var(--cream); border: 1px solid var(--line); padding: 11px 12px; border-radius: 4px 14px 14px 14px; box-shadow: 0 6px 16px rgba(0,0,0,.03); }
+.message { max-width: 88%; min-width: 0; flex: 0 0 auto; animation: rise .25s ease both; }.message > span { display: block; font-size: 9px; letter-spacing: .14em; color: #8b9089; font-weight: 900; margin-bottom: 5px; }.message pre, .approval-card pre, .message-source { margin: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; word-wrap: break-word; font-family: "Cascadia Code", Consolas, "Segoe UI Mono", monospace; font-size: var(--msg-font); line-height: var(--msg-lh); overflow-x: auto; overflow-y: visible; tab-size: 2; }.message.user { align-self: flex-end; background: var(--ink); color: #f8f1e5; padding: 10px 12px; border-radius: 14px 14px 4px 14px; }.message.user > span { color: rgba(255,255,255,.5); }.message.assistant { align-self: flex-start; background: var(--cream); border: 1px solid var(--line); padding: 11px 12px; border-radius: 4px 14px 14px 14px; box-shadow: 0 6px 16px rgba(0,0,0,.03); }
 .message.pending { opacity: .72; }
 .message.process { max-width: 96%; opacity: .92; border-style: dashed; }
 .message.process > span { color: #7a8478; }
+.message-body { display: grid; gap: 8px; min-width: 0; }
+.message-view-toggle {
+  display: inline-flex;
+  align-self: flex-start;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(255,255,255,.45);
+}
+.message-view-toggle button {
+  border: 0;
+  background: transparent;
+  padding: 4px 9px;
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer;
+  color: #697068;
+}
+.message-view-toggle button.active {
+  background: var(--ink);
+  color: #fff;
+}
+.message-markdown {
+  min-width: 0;
+  font-size: var(--msg-font);
+  line-height: var(--msg-lh);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.message-markdown > :first-child { margin-top: 0; }
+.message-markdown > :last-child { margin-bottom: 0; }
+.message-markdown p { margin: 0 0 .65em; }
+.message-markdown h1, .message-markdown h2, .message-markdown h3, .message-markdown h4 {
+  margin: .85em 0 .4em;
+  font-family: "Rockwell", "Noto Serif SC", serif;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.message-markdown h1 { font-size: 1.25em; }
+.message-markdown h2 { font-size: 1.12em; }
+.message-markdown h3 { font-size: 1.05em; }
+.message-markdown ul, .message-markdown ol { margin: 0 0 .65em; padding-left: 1.35em; }
+.message-markdown li { margin: .15em 0; }
+.message-markdown blockquote {
+  margin: 0 0 .65em;
+  padding: .35em .75em;
+  border-left: 3px solid rgba(226,88,50,.55);
+  color: #5c635c;
+  background: rgba(23,33,27,.04);
+  border-radius: 0 8px 8px 0;
+}
+.message-markdown a { color: var(--moss); font-weight: 700; text-decoration: underline; text-underline-offset: 2px; }
+.message-markdown table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0 0 .65em;
+  font-size: 12px;
+  display: block;
+  overflow-x: auto;
+}
+.message-markdown th, .message-markdown td {
+  border: 1px solid var(--line);
+  padding: 6px 8px;
+  text-align: left;
+}
+.message-markdown th { background: rgba(23,33,27,.06); font-weight: 800; }
+.message-markdown hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: .8em 0;
+}
+.message-markdown .md-code-inline {
+  font-family: "Cascadia Code", Consolas, "Segoe UI Mono", monospace;
+  font-size: .92em;
+  padding: .1em .35em;
+  border-radius: 5px;
+  background: rgba(23,33,27,.07);
+}
+.message-markdown .md-pre { margin: 0 0 .65em; }
+.message-markdown .md-code-block {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #17211b;
+  color: #e8eee8;
+  overflow-x: auto;
+  white-space: pre;
+  font-family: "Cascadia Code", Consolas, "Segoe UI Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.message-markdown .md-code-block code {
+  font: inherit;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
 .approval-card { border: 1px solid rgba(226,88,50,.5); background: #fff3e9; border-radius: 14px; padding: 12px; box-shadow: 0 10px 22px rgba(150,67,39,.08); min-width: 0; max-width: 100%; overflow: hidden; }.approval-label { color: var(--rust); letter-spacing: .17em; font-size: 9px; font-weight: 900; }.approval-card h3 { margin: 6px 0; font-size: 14px; overflow-wrap: anywhere; }.approval-card pre { max-height: 160px; overflow: auto; }.approval-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }.approval-actions button { border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; background: white; cursor: pointer; font-size: 12px; }.approval-actions .approve { background: var(--moss); color: white; border-color: var(--moss); }
 .processing-card { display: flex; gap: 12px; align-items: center; border: 1px solid rgba(45,118,83,.3); background: rgba(45,118,83,.08); border-radius: 14px; padding: 12px; color: var(--ink); min-width: 0; }.processing-card p { margin: 4px 0 0; color: #667068; font-size: 11px; line-height: 1.45; }.processing-spinner { width: 18px; height: 18px; flex: 0 0 auto; border: 2px solid rgba(45,118,83,.2); border-top-color: var(--moss); border-radius: 50%; animation: spin .8s linear infinite; }
 .resend-card {

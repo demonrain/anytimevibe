@@ -32,10 +32,12 @@
 
 ## 立即体验
 
+**演示地址：** [https://vibe.demonrain.top/](https://vibe.demonrain.top/)
+
 | 步骤 | 做什么 |
 | --- | --- |
 | 1 | [下载 Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest) 并安装，添加白名单工作区 |
-| 2 | 打开 Web PWA（自建部署或体验实例），登录并输入客户端配对码 |
+| 2 | 打开 [演示站](https://vibe.demonrain.top/) 或自建 Web PWA，登录并输入客户端配对码 |
 | 3 | 新建任务时选择 **Codex / Claude Code / Grok Build**，在手机上查看进度、继续对话与审批 |
 
 自建中继见下方 [Docker 部署](#docker-部署)。本地开发见 [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md)。

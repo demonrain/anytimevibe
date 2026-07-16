@@ -32,10 +32,12 @@
 
 ## Try it now
 
+**Demo:** [https://vibe.demonrain.top/](https://vibe.demonrain.top/)
+
 | Step | Action |
 | --- | --- |
 | 1 | [Download the Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest), install it, and add allow-listed workspaces |
-| 2 | Open the Web PWA, sign in, and enter the pairing code from the agent |
+| 2 | Open the [demo site](https://vibe.demonrain.top/) or your self-hosted Web PWA, sign in, and enter the pairing code from the agent |
 | 3 | Create a task with **Codex / Claude Code / Grok Build**, then follow progress, continue the chat, and approve from your phone |
 
 Self-host the relay via [Docker deployment](#docker-deployment). Local development: [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md).

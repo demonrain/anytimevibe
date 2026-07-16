@@ -1608,11 +1608,103 @@ fi
   updateState({ detail: "已打开 Terminal 安装 Grok Build。完成后请点击「重新检测」。" });
 }
 
+async function installNodeOnWindows(): Promise<void> {
+  if (process.platform !== "win32") throw new Error("installNodeOnWindows is Windows-only");
+  await applyWindowsPathToProcess();
+  updateState({ detail: "正在打开 Node.js 一键安装窗口…" });
+  const proxyLines = await proxyShellLines("win32");
+  await openWindowsVisibleConsole([
+    "echo ============================================",
+    "echo   AnytimeVibe - install Node.js LTS",
+    "echo ============================================",
+    "echo.",
+    ...proxyLines,
+    "where node >nul 2>&1 && (",
+    "  echo Node.js already on PATH:",
+    "  node --version",
+    "  npm --version 2>nul",
+    "  goto :done",
+    ")",
+    "where winget >nul 2>&1 && (",
+    "  echo [1] winget install OpenJS.NodeJS.LTS ...",
+    "  winget install --id OpenJS.NodeJS.LTS -e --accept-package-agreements --accept-source-agreements",
+    "  goto :after",
+    ")",
+    "echo winget not found, downloading official LTS MSI ...",
+    "set \"MSI=%TEMP%\\anytimevibe-nodejs-lts.msi\"",
+    "powershell -NoLogo -ExecutionPolicy Bypass -Command \"try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://nodejs.org/dist/v22.14.0/node-v22.14.0-x64.msi' -OutFile $env:TEMP\\anytimevibe-nodejs-lts.msi -UseBasicParsing } catch { exit 1 }\"",
+    "if exist \"%MSI%\" (",
+    "  echo [2] msiexec install ...",
+    "  msiexec /i \"%MSI%\" /qn /norestart",
+    ") else (",
+    "  echo Download failed. Opening nodejs.org ...",
+    "  start \"\" \"https://nodejs.org/en/download\"",
+    ")",
+    ":after",
+    "echo.",
+    "for /f \"tokens=2*\" %%A in ('reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\" /v Path 2^>nul') do set \"SYSPATH=%%B\"",
+    "for /f \"tokens=2*\" %%A in ('reg query \"HKCU\\Environment\" /v Path 2^>nul') do set \"USERPATH=%%B\"",
+    "set \"PATH=%ProgramFiles%\\nodejs;%APPDATA%\\npm;%SYSPATH%;%USERPATH%;%PATH%\"",
+    "where node 2>nul",
+    "node --version 2>nul",
+    "npm --version 2>nul",
+    ":done",
+    "echo.",
+    "echo Done. Close this window, restart AnytimeVibe, then click 重新检测."
+  ]);
+  updateState({ detail: "已打开 Node.js 安装窗口。完成后请重启随码并点击「重新检测」。" });
+}
+
+async function installNodeOnMac(): Promise<void> {
+  updateState({ detail: "正在打开 Terminal 安装 Node.js…" });
+  await openMacTerminalScript(`
+echo "Installing Node.js LTS…"
+export HOMEBREW_NO_AUTO_UPDATE=1
+export HOMEBREW_NO_ENV_HINTS=1
+OK=0
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+  node --version
+  npm --version
+  echo "Node.js already installed"
+  OK=1
+elif command -v brew >/dev/null 2>&1; then
+  echo "[1] brew install node@22 …"
+  brew install node@22 && brew link --overwrite --force node@22 && OK=1
+  if [ "$OK" != "1" ]; then
+    brew install node && OK=1
+  fi
+fi
+if [ "$OK" != "1" ]; then
+  echo "[2] official pkg installer …"
+  PKG="/tmp/anytimevibe-node-lts.pkg"
+  if curl -fsSL --connect-timeout 25 --max-time 300 -o "$PKG" "https://nodejs.org/dist/v22.14.0/node-v22.14.0.pkg"; then
+    sudo installer -pkg "$PKG" -target / && OK=1
+  fi
+fi
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+if command -v node >/dev/null 2>&1; then
+  node --version
+  npm --version 2>/dev/null || true
+  echo "安装成功"
+else
+  echo "安装失败：请检查网络/代理，或打开 https://nodejs.org/en/download 手动安装。"
+  open "https://nodejs.org/en/download" 2>/dev/null || true
+fi
+`);
+  updateState({ detail: "已打开 Terminal 安装 Node.js。完成后请重启随码并点击「重新检测」。" });
+}
+
 async function installEnvironment(target: "node" | "codex" | "claude" | "grok"): Promise<void> {
   if (target === "node") {
-    await shell.openExternal("https://nodejs.org/en/download");
-    updateState({ detail: "已打开 Node.js 下载页。安装完成后请重启随码并点击「重新检测」。" });
-    return;
+    if (process.platform === "win32") {
+      await installNodeOnWindows();
+      return;
+    }
+    if (process.platform === "darwin") {
+      await installNodeOnMac();
+      return;
+    }
+    throw new Error("当前系统暂不支持一键安装 Node.js。");
   }
   if (target === "claude") {
     if (process.platform === "win32") {
