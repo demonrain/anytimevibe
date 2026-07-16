@@ -10,9 +10,48 @@ import type { BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamD
 type ActiveRun = {
   child: ChildProcess;
   turnId: string;
+  /** Set by interruptHeadlessThread; exit handler must treat as interrupted not failed. */
+  interrupted: boolean;
 };
 
 const activeByThread = new Map<string, ActiveRun>();
+
+/**
+ * Kill the CLI process tree. On Windows headless spawns go through cmd.exe — bare
+ * child.kill() only ends the shell and leaves claude/grok running.
+ */
+function killChildTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (!pid) {
+    try { child.kill(); } catch { /* ignore */ }
+    return;
+  }
+  if (process.platform === "win32") {
+    try {
+      const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore"
+      });
+      killer.on("error", () => {
+        try { child.kill(); } catch { /* ignore */ }
+      });
+      return;
+    } catch {
+      // fall through
+    }
+  } else {
+    try { child.kill("SIGTERM"); } catch { /* ignore */ }
+    setTimeout(() => {
+      try {
+        if (!child.killed) child.kill("SIGKILL");
+      } catch {
+        // ignore
+      }
+    }, 1_500);
+    return;
+  }
+  try { child.kill(); } catch { /* ignore */ }
+}
 
 /** Default headless timeout (Claude rate-limit retries can take a while). */
 const HEADLESS_TIMEOUT_MS = Number(process.env.ANYTIMEVIBE_HEADLESS_TIMEOUT_MS || 8 * 60_000);
@@ -299,7 +338,8 @@ export async function runHeadlessTurn(
 ): Promise<HeadlessRunResult> {
   const existing = activeByThread.get(options.threadId);
   if (existing) {
-    try { existing.child.kill(); } catch { /* ignore */ }
+    existing.interrupted = true;
+    killChildTree(existing.child);
     activeByThread.delete(options.threadId);
   }
 
@@ -379,7 +419,8 @@ export async function runHeadlessTurn(
   } catch {
     // ignore
   }
-  activeByThread.set(options.threadId, { child, turnId: options.turnId });
+  const runMeta: ActiveRun = { child, turnId: options.turnId, interrupted: false };
+  activeByThread.set(options.threadId, runMeta);
 
   const state: ParseState = {
     sessionId: options.providerSessionId || "",
@@ -413,7 +454,7 @@ export async function runHeadlessTurn(
       state.errorMessage = `${engine === "claude" ? "Claude" : "Grok"} 执行超时（${Math.round(HEADLESS_TIMEOUT_MS / 1000)}s），已终止`;
       safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
       emitDelta(safeOnEvent, options, "stage:timeout", "stage", `\n✗ ${state.errorMessage}\n`);
-      try { child.kill(); } catch { /* ignore */ }
+      killChildTree(child);
       finish("failed");
     }, HEADLESS_TIMEOUT_MS);
 
@@ -444,14 +485,20 @@ export async function runHeadlessTurn(
       });
     }
     child.on("error", (error) => {
+      if (runMeta.interrupted) {
+        finish("interrupted");
+        return;
+      }
       state.failed = true;
       state.errorMessage = error.message;
       safeOnEvent({ type: "error", threadId: options.threadId, message: error.message });
       finish("failed");
     });
     child.on("exit", (code, signal) => {
-      if (signal === "SIGTERM" || signal === "SIGINT") {
-        finish(state.failed ? "failed" : "interrupted");
+      // Windows taskkill often reports null signal + non-zero code — honor interrupt flag.
+      if (runMeta.interrupted || signal === "SIGTERM" || signal === "SIGINT" || signal === "SIGKILL") {
+        emitDelta(safeOnEvent, options, "stage:interrupt", "stage", "\n■ 已停止远程任务\n");
+        finish("interrupted");
         return;
       }
       if (state.failed || (code !== 0 && code !== null)) {
@@ -483,11 +530,13 @@ export async function runHeadlessTurn(
 export function interruptHeadlessThread(threadId: string): boolean {
   const active = activeByThread.get(threadId);
   if (!active) return false;
-  try {
-    active.child.kill();
-  } catch {
-    // ignore
-  }
-  activeByThread.delete(threadId);
+  active.interrupted = true;
+  killChildTree(active.child);
+  // Keep map entry until exit so the exit handler can read interrupted=true.
   return true;
+}
+
+/** Whether a headless CLI is currently running for this thread. */
+export function isHeadlessThreadActive(threadId: string): boolean {
+  return activeByThread.has(threadId);
 }

@@ -199,9 +199,10 @@ macOS 包需要在 macOS 或 GitHub Actions `macos-latest` 环境构建。当前
 
 ## Star 趋势
 
-![AnytimeVibe GitHub Star History](https://api.star-history.com/svg?repos=demonrain/anytimevibe&type=Date)
+[![AnytimeVibe Star History](https://starchart.cc/demonrain/anytimevibe.svg?variant=adaptive)](https://starchart.cc/demonrain/anytimevibe)
 
-也可以直接查看仓库的实时 Star 数：[github.com/demonrain/anytimevibe](https://github.com/demonrain/anytimevibe)。
+> 图表由 [starchart.cc](https://starchart.cc/demonrain/anytimevibe) 提供（GitHub README 中比 `api.star-history.com` 更稳定）。  
+> 交互式历史：[star-history.com](https://www.star-history.com/#demonrain/anytimevibe&Date) · 仓库：[github.com/demonrain/anytimevibe](https://github.com/demonrain/anytimevibe)
 
 ## 开源协议
 

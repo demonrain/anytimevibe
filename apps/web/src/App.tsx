@@ -1303,6 +1303,43 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     saveTaskDraft(task.threadId, "");
   }
 
+  /** Stop the active turn for real (agent kills CLI process tree). */
+  function stopTurn() {
+    setPendingPrompt("");
+    setCommandQueue([]);
+    saveTaskDraft(task.threadId, "");
+    // Always send interrupt: headless kill is keyed by threadId; turnId is for event correlation.
+    onCommand({
+      type: "turn.interrupt",
+      commandId: crypto.randomUUID(),
+      threadId: task.threadId,
+      turnId: task.activeTurnId || crypto.randomUUID()
+    });
+  }
+
+  /** Last user message eligible for resend after failure / stop. */
+  const lastUserPrompt = [...task.messages].reverse().find((message) => message.role === "user")?.text?.trim() || "";
+  const lastMessage = task.messages.at(-1);
+  const statusFailed = ["failed", "error", "interrupted", "cancelled", "canceled", "stopped"].includes(
+    String(task.status || "").toLowerCase()
+  );
+  const endedWithSystemError = lastMessage?.role === "system" && Boolean(lastMessage.text?.trim());
+  const canResend = Boolean(
+    lastUserPrompt
+    && online === true
+    && !running
+    && !pendingPrompt
+    && (statusFailed || endedWithSystemError)
+  );
+
+  function resendLastPrompt() {
+    if (!canResend || !lastUserPrompt) return;
+    stickToBottomRef.current = true;
+    setPendingPrompt(lastUserPrompt);
+    setPendingMessageCount(task.messages.length);
+    onCommand(turnStartCommand(lastUserPrompt));
+  }
+
   useEffect(() => {
     localStorage.setItem(`command-queue:${task.threadId}`, JSON.stringify(commandQueue));
   }, [commandQueue, task.threadId]);
@@ -1321,6 +1358,15 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     const latestMessage = task.messages.at(-1);
     if (pendingPrompt && task.messages.length > pendingMessageCount && latestMessage?.role === "user" && latestMessage.text === pendingPrompt) setPendingPrompt("");
   }, [pendingMessageCount, pendingPrompt, task.messages]);
+
+  // Clear optimistic "sending" when the turn ends in failure before a user bubble lands.
+  useEffect(() => {
+    if (!pendingPrompt) return;
+    const status = String(task.status || "").toLowerCase();
+    if (["failed", "error", "interrupted", "cancelled", "canceled", "stopped"].includes(status) && !task.activeTurnId) {
+      setPendingPrompt("");
+    }
+  }, [pendingPrompt, task.status, task.activeTurnId]);
 
   useLayoutEffect(() => {
     const textarea = composerTextareaRef.current;
@@ -1381,7 +1427,16 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
         return <article key={message.id} className={`message ${message.role}${process ? " process" : ""}`}><span>{label}</span><pre>{sanitizeDisplayText(message.text)}</pre></article>;
       })}
       {pendingPrompt && <article className="message user pending"><span>YOU · 发送中</span><pre>{sanitizeDisplayText(pendingPrompt)}</pre></article>}
-      {running && <article className="processing-card"><span className="processing-spinner" /><div><strong>{t("processing")}</strong><p>{t("processingHint")}</p></div></article>}
+      {(running || pendingPrompt) && <article className="processing-card"><span className="processing-spinner" /><div><strong>{t("processing")}</strong><p>{t("processingHint")}</p></div></article>}
+      {canResend && (
+        <article className="resend-card">
+          <div>
+            <strong>{locale === "en" ? "Last turn failed or stopped" : "上次发送失败或已停止"}</strong>
+            <p>{locale === "en" ? "Resend the last user message to the host." : "可将上一条用户消息重新下发到主机。"}</p>
+          </div>
+          <button type="button" className="resend" onClick={resendLastPrompt}>{t("resend")}</button>
+        </article>
+      )}
       {commandQueue.length > 0 && <section className="command-queue"><div><strong>{t("queue")}</strong><span>{commandQueue.length}</span></div>{commandQueue.map((queuedPrompt, index) => <article key={`${index}:${queuedPrompt}`}><b>{index + 1}</b><p>{sanitizeDisplayText(queuedPrompt)}</p></article>)}</section>}
       {task.approvals.map((approval) => <article className="approval-card" key={String(approval.requestId)}>
         <div className="approval-label">{t("actionRequired")}</div><h3>{approval.title}</h3><pre>{sanitizeDisplayText(approval.detail)}</pre>
@@ -1450,7 +1505,16 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
             {" "}{t("sendShortcut")}
           </span>
         </small>
-        {running && task.activeTurnId && <button type="button" className="stop" onClick={() => onCommand({ type: "turn.interrupt", commandId: crypto.randomUUID(), threadId: task.threadId, turnId: task.activeTurnId! })}>{t("stop")}</button>}
+        {(running || pendingPrompt) && (
+          <button type="button" className="stop" onClick={stopTurn} disabled={online !== true}>
+            {t("stop")}
+          </button>
+        )}
+        {canResend && !running && !pendingPrompt && (
+          <button type="button" className="resend" onClick={resendLastPrompt} disabled={online !== true}>
+            {t("resend")}
+          </button>
+        )}
         <button className="send" disabled={online !== true || !prompt.trim()}>{t("send")}</button>
       </div>
     </form>

@@ -199,7 +199,10 @@ Client download links and update feeds are configured with `WINDOWS_CLIENT_URL`,
 
 ## Star History
 
-![AnytimeVibe GitHub Star History](https://api.star-history.com/svg?repos=demonrain/anytimevibe&type=Date)
+[![AnytimeVibe Star History](https://starchart.cc/demonrain/anytimevibe.svg?variant=adaptive)](https://starchart.cc/demonrain/anytimevibe)
+
+> Chart via [starchart.cc](https://starchart.cc/demonrain/anytimevibe) (more reliable in GitHub READMEs than `api.star-history.com`).  
+> Interactive history: [star-history.com](https://www.star-history.com/#demonrain/anytimevibe&Date) · Repo: [github.com/demonrain/anytimevibe](https://github.com/demonrain/anytimevibe)
 
 See the live repository statistics at [github.com/demonrain/anytimevibe](https://github.com/demonrain/anytimevibe).
 

@@ -42,7 +42,7 @@ import {
 import { CodexAdapter, normalizeUnixSeconds, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
 import { ensureClaudeWorkspaceTrusted } from "./cli/claude-trust";
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
-import { interruptHeadlessThread, runHeadlessTurn } from "./cli/headless-runner";
+import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn } from "./cli/headless-runner";
 import { importLocalCliSessions } from "./cli/import-sessions";
 import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
 import { TaskStore } from "./cli/task-store";
@@ -2393,13 +2393,32 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     }
     if (command.type === "turn.interrupt") {
       const stored = taskStore.get(command.threadId);
-      if (stored && stored.engine !== "codex") {
-        interruptHeadlessThread(command.threadId);
+      const listed = publicState.tasks.find((item) => item.threadId === command.threadId);
+      const engine = stored?.engine || listed?.engine;
+      // Claude/Grok: force-kill process tree (cmd shim leaves orphans if only child.kill()).
+      if ((engine && engine !== "codex") || isHeadlessThreadActive(command.threadId)) {
+        const killed = interruptHeadlessThread(command.threadId);
         finishLocalActivity(command.threadId, "interrupted");
         activeTurnByThread.delete(command.threadId);
-        await taskStore.setStatus(command.threadId, "interrupted");
+        if (stored) await taskStore.setStatus(command.threadId, "interrupted");
         await flushRemoteDeltas();
-        await publish({ type: "turn.completed", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: command.turnId, status: "interrupted" }, true, "completed");
+        await publish({
+          type: "turn.completed",
+          eventId: crypto.randomUUID(),
+          occurredAt: new Date().toISOString(),
+          threadId: command.threadId,
+          turnId: command.turnId,
+          status: "interrupted"
+        }, true, "completed");
+        if (!killed) {
+          await publish({
+            type: "error",
+            eventId: crypto.randomUUID(),
+            occurredAt: new Date().toISOString(),
+            threadId: command.threadId,
+            message: "未找到正在运行的本地 CLI 进程（可能已结束）。已将任务标记为停止。"
+          }, true);
+        }
         return;
       }
       await ensureCodex();
