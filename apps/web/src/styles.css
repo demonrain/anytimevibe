@@ -69,15 +69,6 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
     "rail workspace";
   overflow: hidden;
 }
-/* Optional version banner must not steal topbar/rail/workspace cells. */
-.app-shell.has-version-banner {
-  grid-template-rows: auto var(--topbar-h) minmax(0, 1fr);
-  grid-template-areas:
-    "banner banner"
-    "topbar topbar"
-    "rail workspace";
-}
-.app-shell > .version-banner { grid-area: banner; min-width: 0; }
 .app-shell > .topbar { grid-area: topbar; }
 .app-shell > .rail { grid-area: rail; min-height: 0; }
 .app-shell > .workspace { grid-area: workspace; min-height: 0; min-width: 0; }
@@ -133,26 +124,58 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   border-radius: 999px; padding: 6px 10px; font-size: 10px; font-weight: 800; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis;
 }
-.version-banner {
-  z-index: 12;
+/* Floating toast — same pattern as .error-banner; does not affect app-shell grid. */
+.version-toast {
+  position: fixed;
+  left: 50%;
+  top: 14px;
+  transform: translateX(-50%);
+  z-index: 100;
+  width: min(640px, calc(100% - 28px));
+  border: 0;
+  border-radius: 12px;
+  background: #a63b28;
+  color: white;
+  padding: 12px 15px;
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
   gap: 12px;
-  flex-wrap: wrap;
-  padding: 9px 14px;
-  background: #fff1e6;
-  border-bottom: 1px solid rgba(226,88,50,.35);
-  color: #7a3418;
-  min-width: 0;
+  text-align: left;
+  box-shadow: 0 15px 45px rgba(94,24,13,.28);
+  animation: rise .2s ease both;
 }
-.version-banner > div:first-child { min-width: 0; flex: 1 1 220px; }
-.version-banner strong { display: block; font-size: 13px; margin-bottom: 2px; }
-.version-banner span { display: block; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
-.version-banner-actions { display: flex; gap: 8px; flex-wrap: wrap; flex: 0 0 auto; }
-.version-banner-actions a {
-  border-radius: 8px; padding: 7px 10px; background: var(--rust); color: white; text-decoration: none; font-size: 12px; font-weight: 800;
+.version-toast-body { min-width: 0; flex: 1 1 auto; display: grid; gap: 4px; }
+.version-toast-body strong { font-size: 13px; }
+.version-toast-body > span { font-size: 12px; line-height: 1.45; opacity: .95; overflow-wrap: anywhere; }
+.version-toast-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.version-toast-actions a {
+  border-radius: 8px;
+  padding: 5px 9px;
+  background: rgba(255,255,255,.18);
+  color: white;
+  text-decoration: none;
+  font-size: 11px;
+  font-weight: 800;
+  border: 1px solid rgba(255,255,255,.35);
 }
+.version-toast-actions a:hover { background: rgba(255,255,255,.28); }
+.version-toast-close {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: white;
+  opacity: .75;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  padding: 2px 0 0 8px;
+  white-space: nowrap;
+}
+.version-toast-close:hover { opacity: 1; }
+/* When both error + version toasts show, stack the version toast lower. */
+.error-banner + .version-toast,
+.app-shell:has(.error-banner) .version-toast { top: 72px; }
 .settings-row { display: flex; flex-wrap: wrap; gap: 10px 16px; margin: -6px 0 12px; align-items: center; }
 .settings-row .permission-select, .settings-row .reply-detail-select { margin: 0; }
 .key-authorization-note { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: -8px 0 18px; padding: 12px 13px; border: 1px solid rgba(226,88,50,.35); border-radius: 13px; background: rgba(226,88,50,.08); }.key-authorization-note div { display: grid; gap: 3px; }.key-authorization-note strong { font-size: 12px; }.key-authorization-note span { color: #71766f; font-size: 11px; }.key-authorization-note button { flex: 0 0 auto; border: 0; border-radius: 9px; padding: 8px 10px; background: var(--rust); color: white; font-size: 11px; font-weight: 850; cursor: pointer; }.key-authorization-note button:disabled { opacity: .5; cursor: not-allowed; }
@@ -279,14 +302,6 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
     grid-template-columns: 1fr;
     grid-template-rows: 60px auto minmax(0, 1fr);
     grid-template-areas:
-      "topbar"
-      "rail"
-      "workspace";
-  }
-  .app-shell.has-version-banner {
-    grid-template-rows: auto 60px auto minmax(0, 1fr);
-    grid-template-areas:
-      "banner"
       "topbar"
       "rail"
       "workspace";
