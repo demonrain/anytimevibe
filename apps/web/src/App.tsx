@@ -356,28 +356,31 @@ function sanitizeDisplayText(text: string): string {
   return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u2028\u2029]/g, "");
 }
 
-/** Assistant reply: markdown preview by default, toggle to raw source. */
-function AssistantMessageBody({ text }: { text: string }) {
+/** Assistant reply: header (engine label + view toggle) and markdown/source body. */
+function AssistantMessageCard({ label, text }: { label: string; text: string }) {
   const { locale } = useI18n();
   const clean = sanitizeDisplayText(text);
   const [mode, setMode] = useState<"preview" | "source">("preview");
   return (
-    <div className="message-body">
-      <div className="message-view-toggle" role="group" aria-label={locale === "en" ? "View mode" : "显示模式"}>
-        <button
-          type="button"
-          className={mode === "preview" ? "active" : ""}
-          onClick={() => setMode("preview")}
-        >
-          {locale === "en" ? "Preview" : "预览"}
-        </button>
-        <button
-          type="button"
-          className={mode === "source" ? "active" : ""}
-          onClick={() => setMode("source")}
-        >
-          {locale === "en" ? "Source" : "源码"}
-        </button>
+    <>
+      <div className="message-head">
+        <span className="message-label">{label}</span>
+        <div className="message-view-toggle" role="group" aria-label={locale === "en" ? "View mode" : "显示模式"}>
+          <button
+            type="button"
+            className={mode === "preview" ? "active" : ""}
+            onClick={() => setMode("preview")}
+          >
+            {locale === "en" ? "Preview" : "预览"}
+          </button>
+          <button
+            type="button"
+            className={mode === "source" ? "active" : ""}
+            onClick={() => setMode("source")}
+          >
+            {locale === "en" ? "Source" : "源码"}
+          </button>
+        </div>
       </div>
       {mode === "source" ? (
         <pre className="message-source">{clean}</pre>
@@ -389,7 +392,6 @@ function AssistantMessageBody({ text }: { text: string }) {
               a: ({ href, children }) => (
                 <a href={href} target="_blank" rel="noreferrer noopener">{children}</a>
               ),
-              // Avoid nesting pre inside pre from default code block layout.
               pre: ({ children }) => <div className="md-pre">{children}</div>,
               code: ({ className, children, ...props }) => {
                 const inline = !className;
@@ -402,7 +404,7 @@ function AssistantMessageBody({ text }: { text: string }) {
           </ReactMarkdown>
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -1540,10 +1542,12 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
         const isAssistantReply = message.role === "assistant" && !process;
         return (
           <article key={message.id} className={`message ${message.role}${process ? " process" : ""}`}>
-            <span>{label}</span>
             {isAssistantReply
-              ? <AssistantMessageBody text={message.text} />
-              : <pre>{sanitizeDisplayText(message.text)}</pre>}
+              ? <AssistantMessageCard label={label} text={message.text} />
+              : <>
+                  <span>{label}</span>
+                  <pre>{sanitizeDisplayText(message.text)}</pre>
+                </>}
           </article>
         );
       })}

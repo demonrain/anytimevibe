@@ -408,32 +408,47 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 /* Message list must own the scroll: parent height is fixed, this row is minmax(0,1fr). */
 .message-stream { min-height: 0; min-width: 0; height: 100%; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; touch-action: pan-y; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }.message-end { flex: 0 0 1px; width: 100%; }
 /* Do not use overflow:hidden / width:fit-content on bubbles — they collapse multi-line pre height in Chromium. */
-.message { max-width: 88%; min-width: 0; flex: 0 0 auto; animation: rise .25s ease both; }.message > span { display: block; font-size: 9px; letter-spacing: .14em; color: #8b9089; font-weight: 900; margin-bottom: 5px; }.message pre, .approval-card pre, .message-source { margin: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; word-wrap: break-word; font-family: "Cascadia Code", Consolas, "Segoe UI Mono", monospace; font-size: var(--msg-font); line-height: var(--msg-lh); overflow-x: auto; overflow-y: visible; tab-size: 2; }.message.user { align-self: flex-end; background: var(--ink); color: #f8f1e5; padding: 10px 12px; border-radius: 14px 14px 4px 14px; }.message.user > span { color: rgba(255,255,255,.5); }.message.assistant { align-self: flex-start; background: var(--cream); border: 1px solid var(--line); padding: 11px 12px; border-radius: 4px 14px 14px 14px; box-shadow: 0 6px 16px rgba(0,0,0,.03); }
+.message { max-width: 88%; min-width: 0; flex: 0 0 auto; animation: rise .25s ease both; }.message > span, .message-label { display: block; font-size: 9px; letter-spacing: .14em; color: #8b9089; font-weight: 900; margin-bottom: 5px; }.message pre, .approval-card pre, .message-source { margin: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; word-wrap: break-word; font-family: "Cascadia Code", Consolas, "Segoe UI Mono", monospace; font-size: var(--msg-font); line-height: var(--msg-lh); overflow-x: auto; overflow-y: visible; tab-size: 2; }.message.user { align-self: flex-end; background: var(--ink); color: #f8f1e5; padding: 10px 12px; border-radius: 14px 14px 4px 14px; }.message.user > span { color: rgba(255,255,255,.5); }.message.assistant { align-self: flex-start; background: var(--cream); border: 1px solid var(--line); padding: 11px 12px; border-radius: 4px 14px 14px 14px; box-shadow: 0 6px 16px rgba(0,0,0,.03); }
 .message.pending { opacity: .72; }
 .message.process { max-width: 96%; opacity: .92; border-style: dashed; }
 .message.process > span { color: #7a8478; }
-.message-body { display: grid; gap: 8px; min-width: 0; }
+.message-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 6px;
+}
+.message-head .message-label {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+}
 .message-view-toggle {
   display: inline-flex;
   width: fit-content;
   max-width: max-content;
-  justify-self: start;
   flex: 0 0 auto;
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow: hidden;
-  background: rgba(255,255,255,.45);
+  background: rgba(255,255,255,.55);
 }
 .message-view-toggle button {
   border: 0;
   background: transparent;
-  padding: 4px 9px;
+  padding: 3px 8px;
   font-size: 10px;
   font-weight: 800;
   cursor: pointer;
   color: #697068;
   flex: 0 0 auto;
   white-space: nowrap;
+  line-height: 1.2;
 }
 .message-view-toggle button.active {
   background: var(--ink);
