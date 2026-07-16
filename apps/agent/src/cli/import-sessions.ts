@@ -11,6 +11,44 @@ const execFileAsync = promisify(execFile);
 
 type HistoryMessage = StoredTask["messages"][number];
 
+/** Keep failure/interrupt from AnytimeVibe turns; only default brand-new CLI imports to completed. */
+function mergeImportStatus(existing: StoredTask | undefined): string {
+  if (!existing?.status) return "completed";
+  const status = existing.status.toLowerCase();
+  if (status === "active" || status === "running" || status === "processing") return "active";
+  if (["failed", "error", "interrupted", "cancelled", "canceled", "stopped"].includes(status)) {
+    return existing.status;
+  }
+  return existing.status || "completed";
+}
+
+/**
+ * Resolve the store record for a native CLI session.
+ * Web-created Claude/Grok tasks use a UUID threadId and store the CLI id in providerSessionId —
+ * never create a second task keyed only by the native session id.
+ */
+function resolveExistingForProviderSession(
+  store: TaskStore,
+  providerSessionId: string,
+  engine: "claude" | "grok"
+): StoredTask | undefined {
+  return store.findByProviderSession(providerSessionId, engine) || store.get(providerSessionId);
+}
+
+async function removeOrphanNativeDuplicate(
+  store: TaskStore,
+  providerSessionId: string,
+  keepThreadId: string
+): Promise<void> {
+  if (providerSessionId === keepThreadId) return;
+  const orphan = store.get(providerSessionId);
+  if (!orphan) return;
+  // Only drop pure native-keyed clones of the same session.
+  if (orphan.threadId === providerSessionId && (orphan.providerSessionId === providerSessionId || !orphan.providerSessionId)) {
+    await store.remove(providerSessionId);
+  }
+}
+
 function textFromContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -240,7 +278,7 @@ async function importGrokSessions(store: TaskStore, limit: number): Promise<numb
 
   let added = 0;
   for (const hit of hits.slice(0, limit)) {
-    const existing = store.get(hit.id);
+    const existing = resolveExistingForProviderSession(store, hit.id, "grok");
     let meta: Awaited<ReturnType<typeof readGrokSessionDir>> = { messages: [] };
     if (hit.dir) {
       meta = await readGrokSessionDir(hit.dir, hit.id);
@@ -252,23 +290,28 @@ async function importGrokSessions(store: TaskStore, limit: number): Promise<numb
       if (match) meta = await readGrokSessionDir(match.dir, hit.id);
     }
 
-    const messages = meta.messages.length ? meta.messages : (existing?.messages || []);
-    // Preserve AnytimeVibe-owned fields (model/effort/context) — local CLI session dirs do not store them.
+    const importedMessages = meta.messages.length ? meta.messages : [];
+    const messages = importedMessages.length >= (existing?.messages?.length ?? 0)
+      ? importedMessages
+      : (existing?.messages || importedMessages);
+    // Keep AnytimeVibe threadId (UUID) when this native session was already bound to a web task.
+    const threadId = existing?.threadId || hit.id;
     const task: StoredTask = {
-      threadId: hit.id,
+      threadId,
       engine: "grok",
       providerSessionId: hit.id,
       cwd: meta.cwd || existing?.cwd || "",
-      title: meta.title || existing?.title || `Grok ${hit.id.slice(0, 8)}`,
-      status: existing?.status === "active" ? "active" : "completed",
+      title: existing?.title || meta.title || `Grok ${hit.id.slice(0, 8)}`,
+      status: mergeImportStatus(existing),
       createdAt: existing?.createdAt ?? hit.mtime,
       updatedAt: Math.max(existing?.updatedAt ?? 0, meta.updatedAt ?? 0, hit.mtime),
-      messages,
+      messages: messages.slice(-80),
       ...(existing?.model ? { model: existing.model } : {}),
       ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
       ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})
     };
     await store.upsert(task);
+    await removeOrphanNativeDuplicate(store, hit.id, threadId);
     added += 1;
   }
   return added;
@@ -320,7 +363,7 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
   hits.sort((a, b) => b.mtime - a.mtime);
   let added = 0;
   for (const hit of hits.slice(0, limit)) {
-    const existing = store.get(hit.id);
+    const existing = resolveExistingForProviderSession(store, hit.id, "claude");
     const messages: HistoryMessage[] = [];
     try {
       const raw = await fs.readFile(hit.file, "utf8");
@@ -351,25 +394,77 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
       // ignore
     }
     const titleFromUser = [...messages].reverse().find((m) => m.role === "user")?.text?.slice(0, 80);
-    // Preserve AnytimeVibe-owned fields — Claude jsonl does not include our model/effort prefs.
+    const mergedMessages = messages.length >= (existing?.messages?.length ?? 0)
+      ? messages
+      : (existing?.messages || messages);
+    // Keep AnytimeVibe threadId (UUID) when this native session was already bound to a web task.
+    const threadId = existing?.threadId || hit.id;
     const task: StoredTask = {
-      threadId: hit.id,
+      threadId,
       engine: "claude",
       providerSessionId: hit.id,
       cwd: hit.cwd || existing?.cwd || "",
       title: existing?.title || titleFromUser || `Claude ${hit.id.slice(0, 8)}`,
-      status: existing?.status === "active" ? "active" : "completed",
+      status: mergeImportStatus(existing),
       createdAt: existing?.createdAt ?? hit.mtime,
       updatedAt: Math.max(existing?.updatedAt ?? 0, hit.mtime),
-      messages: messages.length ? messages.slice(-80) : (existing?.messages || []),
+      messages: mergedMessages.slice(-80),
       ...(existing?.model ? { model: existing.model } : {}),
       ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
       ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})
     };
     await store.upsert(task);
+    await removeOrphanNativeDuplicate(store, hit.id, threadId);
     added += 1;
   }
   return added;
+}
+
+/**
+ * Collapse Claude/Grok duplicates: same engine + provider session should be one task.
+ * Prefer the AnytimeVibe UUID record; keep failed/interrupted over a stale "completed" clone.
+ */
+export async function dedupeMultiCliTasks(store: TaskStore): Promise<number> {
+  const groups = new Map<string, StoredTask[]>();
+  // list(1000) is enough for agent index size; import only keeps a recent window anyway.
+  for (const task of store.list(1000)) {
+    if (task.engine !== "claude" && task.engine !== "grok") continue;
+    const native = (task.providerSessionId || task.threadId || "").trim();
+    if (!native) continue;
+    const key = `${task.engine}:${native}`;
+    const list = groups.get(key) ?? [];
+    list.push(task);
+    groups.set(key, list);
+  }
+  let removed = 0;
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    group.sort((a, b) => {
+      const aWeb = a.providerSessionId && a.providerSessionId !== a.threadId ? 1 : 0;
+      const bWeb = b.providerSessionId && b.providerSessionId !== b.threadId ? 1 : 0;
+      if (bWeb !== aWeb) return bWeb - aWeb;
+      const aFail = /failed|error|interrupt|stop|cancel/i.test(a.status) ? 1 : 0;
+      const bFail = /failed|error|interrupt|stop|cancel/i.test(b.status) ? 1 : 0;
+      if (bFail !== aFail) return bFail - aFail;
+      if ((b.messages?.length || 0) !== (a.messages?.length || 0)) {
+        return (b.messages?.length || 0) - (a.messages?.length || 0);
+      }
+      return b.updatedAt - a.updatedAt;
+    });
+    const keep = group[0]!;
+    const failed = group.find((item) => /failed|error|interrupt|stop|cancel/i.test(item.status));
+    if (failed && /completed|idle|unknown/i.test(keep.status)) {
+      keep.status = failed.status;
+      keep.updatedAt = Math.max(keep.updatedAt, failed.updatedAt);
+      await store.upsert(keep);
+    }
+    for (const extra of group.slice(1)) {
+      if (extra.threadId === keep.threadId) continue;
+      await store.remove(extra.threadId);
+      removed += 1;
+    }
+  }
+  return removed;
 }
 
 /** Import local Claude/Grok CLI sessions into the agent task index for web sync. */
@@ -378,5 +473,10 @@ export async function importLocalCliSessions(store: TaskStore, limit = 40): Prom
     importGrokSessions(store, limit),
     importClaudeSessions(store, limit)
   ]);
+  try {
+    await dedupeMultiCliTasks(store);
+  } catch {
+    // ignore
+  }
   return { grok, claude };
 }

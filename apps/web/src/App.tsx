@@ -65,6 +65,8 @@ type Task = {
   messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string }>;
   approvals: Approval[];
   cliEngine?: CliEngine;
+  /** Native Claude/Grok session id when known — used to hide import duplicates. */
+  providerSessionId?: string;
   model?: string;
   reasoningEffort?: ReasoningEffort;
   contextUsage?: ContextUsage;
@@ -369,26 +371,66 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const model = event.model ?? existing?.model;
     const reasoningEffort = event.reasoningEffort ?? existing?.reasoningEffort;
     const contextUsage = event.contextUsage ?? existing?.contextUsage;
+    const providerSessionId = event.providerSessionId ?? existing?.providerSessionId;
     // Never let a stale snapshot push a recently active task down the list.
     const updatedAt = Math.max(
       Number(event.updatedAt) || 0,
       existing?.updatedAt ?? 0
     );
+    // Prefer failed/interrupted over a later import that marked the same session "completed".
+    const incomingStatus = String(event.status || "");
+    const existingStatus = String(existing?.status || "");
+    const preferExistingStatus = existing
+      && /failed|error|interrupt|stop|cancel/i.test(existingStatus)
+      && /completed|idle|unknown/i.test(incomingStatus);
+    const status = preferExistingStatus ? existingStatus : (incomingStatus || existingStatus || "unknown");
     next.tasks[event.threadId] = {
       threadId: event.threadId,
-      title: event.title || "未命名任务",
-      cwd: event.cwd,
-      status: event.status,
+      title: event.title || existing?.title || "未命名任务",
+      cwd: event.cwd || existing?.cwd || "",
+      status,
       updatedAt: updatedAt || Date.now() / 1000,
       diff: existing?.diff ?? "",
-      messages: event.messages,
+      messages: event.messages?.length ? event.messages : (existing?.messages ?? []),
       approvals: existing?.approvals ?? [],
       ...(engine ? { cliEngine: engine } : {}),
       ...(event.activeTurnId ? { activeTurnId: event.activeTurnId } : {}),
+      ...(providerSessionId ? { providerSessionId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
       ...(contextUsage ? { contextUsage } : {})
     };
+    // Collapse Claude/Grok import clones: same engine + native session id → keep one task.
+    if (engine && engine !== "codex" && providerSessionId) {
+      for (const [id, task] of Object.entries(next.tasks)) {
+        if (id === event.threadId) continue;
+        if (task.cliEngine !== engine) continue;
+        const sameNative = task.providerSessionId === providerSessionId
+          || task.threadId === providerSessionId
+          || (providerSessionId && event.threadId === task.providerSessionId);
+        if (!sameNative) continue;
+        // Prefer AnytimeVibe UUID task (threadId !== providerSessionId) over native-keyed import.
+        const keepIncoming = event.threadId !== providerSessionId || task.threadId === providerSessionId;
+        if (keepIncoming) {
+          // Merge useful fields from the clone before drop.
+          const kept = next.tasks[event.threadId]!;
+          if (/failed|error|interrupt|stop|cancel/i.test(task.status) && /completed|idle|unknown/i.test(kept.status)) {
+            kept.status = task.status;
+          }
+          kept.updatedAt = Math.max(kept.updatedAt, task.updatedAt);
+          if (!kept.messages.length && task.messages.length) kept.messages = task.messages;
+          delete next.tasks[id];
+        } else {
+          const kept = task;
+          if (/failed|error|interrupt|stop|cancel/i.test(status) && /completed|idle|unknown/i.test(kept.status)) {
+            kept.status = status;
+          }
+          kept.updatedAt = Math.max(kept.updatedAt, updatedAt);
+          if (providerSessionId) kept.providerSessionId = providerSessionId;
+          delete next.tasks[event.threadId];
+        }
+      }
+    }
     return next;
   }
   if (event.type === "error") {

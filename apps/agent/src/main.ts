@@ -2117,6 +2117,7 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     cliEngine: task.engine,
+    ...(task.providerSessionId ? { providerSessionId: task.providerSessionId } : {}),
     ...(task.model ? { model: task.model } : {}),
     ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),

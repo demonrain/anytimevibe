@@ -46,6 +46,24 @@ export class TaskStore {
     return this.data.tasks[threadId];
   }
 
+  /**
+   * Prefer AnytimeVibe web tasks (UUID threadId + providerSessionId = native id)
+   * over pure CLI imports keyed by native id alone.
+   */
+  findByProviderSession(providerSessionId: string, engine?: CliEngine): StoredTask | undefined {
+    const id = providerSessionId.trim();
+    if (!id) return undefined;
+    const matches = Object.values(this.data.tasks).filter((task) => {
+      if (engine && task.engine !== engine) return false;
+      return task.providerSessionId === id || task.threadId === id;
+    });
+    if (!matches.length) return undefined;
+    // Web-created multi-CLI tasks: threadId is UUID, providerSessionId is native session.
+    const webBound = matches.find((task) => task.providerSessionId === id && task.threadId !== id);
+    if (webBound) return webBound;
+    return matches.find((task) => task.threadId === id) || matches[0];
+  }
+
   list(limit = 50): StoredTask[] {
     return Object.values(this.data.tasks)
       .sort((a, b) => b.updatedAt - a.updatedAt)
@@ -54,6 +72,12 @@ export class TaskStore {
 
   async upsert(task: StoredTask): Promise<void> {
     this.data.tasks[task.threadId] = task;
+    await this.save();
+  }
+
+  async remove(threadId: string): Promise<void> {
+    if (!this.data.tasks[threadId]) return;
+    delete this.data.tasks[threadId];
     await this.save();
   }
 

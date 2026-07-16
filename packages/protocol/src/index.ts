@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.33";
+export const PRODUCT_VERSION = "0.4.34";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -219,6 +219,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     updatedAt: z.number(),
     /** Which coding CLI owns this thread. */
     cliEngine: cliEngineSchema.optional(),
+    /** Provider-native session id (Claude/Grok); used to collapse import duplicates on web. */
+    providerSessionId: z.string().optional(),
     model: z.string().optional(),
     reasoningEffort: reasoningEffortSchema.optional(),
     contextUsage: contextUsageSchema.optional(),
