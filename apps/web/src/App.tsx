@@ -123,6 +123,35 @@ function saveTaskDraft(threadId: string, text: string): void {
   }
 }
 
+/** Per-task model / reasoning prefs so the UI survives refresh before the next host snapshot. */
+function taskPrefsKey(threadId: string): string {
+  return `task-prefs:${threadId}`;
+}
+
+type TaskUiPrefs = { model?: string; reasoningEffort?: ReasoningEffort };
+
+function loadTaskUiPrefs(threadId: string): TaskUiPrefs {
+  try {
+    const raw = localStorage.getItem(taskPrefsKey(threadId));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as TaskUiPrefs;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveTaskUiPrefs(threadId: string, prefs: TaskUiPrefs): void {
+  try {
+    const current = loadTaskUiPrefs(threadId);
+    const next: TaskUiPrefs = { ...current, ...prefs };
+    if (!next.model && !next.reasoningEffort) localStorage.removeItem(taskPrefsKey(threadId));
+    else localStorage.setItem(taskPrefsKey(threadId), JSON.stringify(next));
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
 function formatContextUsage(usage?: ContextUsage): string | null {
   if (!usage) return null;
   const total = usage.totalTokens ?? ((usage.inputTokens || 0) + (usage.outputTokens || 0));
@@ -1080,11 +1109,22 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
   const [tab, setTab] = useState<"chat" | "diff">("chat");
   const taskEngine = normalizeCliEngine(task.cliEngine);
   const cap = capabilityForEngine(engineCapabilities, taskEngine);
-  const modelOptions = modelOptionsFromHost(engineCapabilities, taskEngine, task.model || cap?.currentModel);
-  const effortOptions = effortOptionsFromHost(engineCapabilities, taskEngine, task.reasoningEffort || cap?.currentReasoningEffort);
-  const [model, setModel] = useState(task.model || cap?.currentModel || modelOptions[0]?.id || "");
+  const uiPrefs = loadTaskUiPrefs(task.threadId);
+  const modelOptions = modelOptionsFromHost(
+    engineCapabilities,
+    taskEngine,
+    task.model || uiPrefs.model || cap?.currentModel
+  );
+  const effortOptions = effortOptionsFromHost(
+    engineCapabilities,
+    taskEngine,
+    task.reasoningEffort || uiPrefs.reasoningEffort || cap?.currentReasoningEffort
+  );
+  const [model, setModel] = useState(
+    () => task.model || uiPrefs.model || cap?.currentModel || modelOptions[0]?.id || ""
+  );
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(
-    task.reasoningEffort || cap?.currentReasoningEffort || effortOptions[0] || ""
+    () => task.reasoningEffort || uiPrefs.reasoningEffort || cap?.currentReasoningEffort || effortOptions[0] || ""
   );
   const messageStreamRef = useRef<HTMLDivElement | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
@@ -1106,13 +1146,26 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     }
   }, [task.threadId, taskEngine]);
 
-  // Keep selectors aligned with the task's live model/effort from the host (not a static default).
+  // Prefer host task snapshot, then local prefs, then host defaults (never clobber a saved high with low).
   useEffect(() => {
-    const nextModel = task.model || cap?.currentModel || modelOptions[0]?.id || "";
-    const nextEffort = task.reasoningEffort || cap?.currentReasoningEffort || effortOptions[0] || "";
+    const prefs = loadTaskUiPrefs(task.threadId);
+    const nextModel = task.model || prefs.model || cap?.currentModel || modelOptions[0]?.id || "";
+    const nextEffort =
+      task.reasoningEffort
+      || prefs.reasoningEffort
+      || cap?.currentReasoningEffort
+      || effortOptions[0]
+      || "";
     setModel(nextModel);
     setReasoningEffort(nextEffort);
-    // modelOptions/effortOptions are derived; only re-sync when task or host current values change.
+    // Mirror authoritative host values into local prefs when present.
+    if (task.model || task.reasoningEffort) {
+      saveTaskUiPrefs(task.threadId, {
+        ...(task.model ? { model: task.model } : {}),
+        ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {})
+      });
+    }
+    // modelOptions/effortOptions are derived; re-sync when task or host current values change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.threadId, task.model, task.reasoningEffort, cap?.currentModel, cap?.currentReasoningEffort]);
 
@@ -1248,14 +1301,30 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
         <small>
           <label className="composer-permission">
             模型
-            <select value={model} onChange={(event) => setModel(event.target.value)} disabled={!modelOptions.length}>
+            <select
+              value={model}
+              onChange={(event) => {
+                const next = event.target.value;
+                setModel(next);
+                saveTaskUiPrefs(task.threadId, { model: next || undefined });
+              }}
+              disabled={!modelOptions.length}
+            >
               {!modelOptions.length && <option value="">主机未上报模型列表</option>}
               {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
             </select>
           </label>
           <label className="composer-permission">
             推理强度
-            <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)} disabled={!effortOptions.length}>
+            <select
+              value={reasoningEffort}
+              onChange={(event) => {
+                const next = event.target.value as ReasoningEffort;
+                setReasoningEffort(next);
+                saveTaskUiPrefs(task.threadId, { reasoningEffort: next || undefined });
+              }}
+              disabled={!effortOptions.length}
+            >
               {!effortOptions.length && <option value="">—</option>}
               {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
             </select>

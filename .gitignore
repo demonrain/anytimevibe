@@ -22,7 +22,24 @@ artifacts/**/product-*.png
 artifacts/**/AGENTS.md
 artifacts/**/CLAUDE.md
 
-# Local test env / agent userdata
+# Local test env / agent userdata / scratch (never commit)
 .env.local
+.env.*.local
 .local/
+*.local.json
+*.local.yaml
+*.local.yml
+.DS_Store
+Thumbs.db
+
+# Local debug / scratch notes (keep on machine only)
+/tmp/
+/scratch/
+/.scratch/
+debug/
+.debug/
+*.debug.*
+.idea/
+.vscode/*
+!.vscode/extensions.json
 

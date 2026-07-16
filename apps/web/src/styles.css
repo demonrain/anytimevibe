@@ -101,14 +101,16 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .task-column {
   min-width: 0;
   max-width: 100%;
+  height: 100%;
+  max-height: 100%;
   padding: 16px 14px;
   border-right: 1px solid var(--line);
-  overflow-x: hidden;
-  overflow-y: auto;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   min-height: 0;
 }
+/* Header + search stay put; only .task-list scrolls (desktop + tablet). */
 .task-column-head { flex: 0 0 auto; min-width: 0; }
 .section-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; min-width: 0; }
 .section-title > div { min-width: 0; }
@@ -122,15 +124,66 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .task-search { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; min-width: 0; flex: 0 0 auto; }
 .task-search input { min-width: 0; flex: 1 1 auto; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.72); padding: 8px 10px; font-size: 12px; }
 .task-search small { flex: 0 0 auto; color: #858b84; font-size: 10px; font-weight: 800; }
-.task-list { display: grid; gap: 8px; min-width: 0; flex: 1 1 auto; min-height: 0; }
-.task-card { text-align: left; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,250,240,.63); padding: 12px; cursor: pointer; transition: .18s ease; min-width: 0; max-width: 100%; overflow: hidden; }
+.task-list {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* Do not stretch row tracks when few tasks fill a tall column. */
+  align-content: start;
+  grid-auto-rows: max-content;
+}
+.task-card {
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255,250,240,.63);
+  padding: 12px;
+  cursor: pointer;
+  transition: .18s ease;
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+  min-height: 118px;
+  max-height: 148px;
+  height: 118px;
+  overflow: hidden;
+  align-self: start;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
 .task-card:hover, .task-card.active { transform: translateY(-1px); border-color: rgba(226,88,50,.6); box-shadow: 0 10px 24px rgba(42,45,37,.08); }
 .task-card.active { background: var(--cream); }
-.task-meta, .task-foot { display: flex; justify-content: space-between; gap: 10px; align-items: center; min-width: 0; }
+.task-meta, .task-foot { display: flex; justify-content: space-between; gap: 10px; align-items: center; min-width: 0; flex: 0 0 auto; }
 .task-meta .task-status { color: var(--moss); font-size: 9px; text-transform: uppercase; font-weight: 900; letter-spacing: .08em; }
 .task-meta time { font-size: 9px; color: #858b84; flex: 0 0 auto; }
-.task-card h3 { margin: 8px 0 5px; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.task-card > p { color: #676e67; font-size: 11px; line-height: 1.45; height: 32px; overflow: hidden; margin: 0 0 10px; overflow-wrap: anywhere; word-break: break-word; }
+.task-card h3 {
+  margin: 8px 0 5px;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.task-card > p {
+  color: #676e67;
+  font-size: 11px;
+  line-height: 1.45;
+  height: 32px;
+  min-height: 32px;
+  max-height: 32px;
+  overflow: hidden;
+  margin: 0 0 10px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  flex: 0 0 auto;
+}
+.task-foot { margin-top: auto; }
 .task-foot code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; color: #767c75; }
 .task-foot b { color: #a03b24; font-size: 9px; flex: 0 0 auto; }
 .empty-state { text-align: center; padding: 70px 25px; color: #6f756e; }.empty-state > span { font: 800 36px monospace; color: var(--rust); }.empty-state h3 { color: var(--ink); }
@@ -315,14 +368,40 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   .host-list { display: flex; }
   .host-add-mobile { display: block; }
   .host-row { min-width: 200px; }
-  .workspace { height: auto; min-height: calc(100vh - 120px); grid-template-columns: 1fr; grid-template-rows: none; }
-  .task-column { border-right: 0; max-height: 46vh; border-bottom: 1px solid var(--line); padding: 14px 12px; }
+  .workspace { height: auto; min-height: calc(100vh - 120px); grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+  .task-column {
+    border-right: 0;
+    height: auto;
+    max-height: 46vh;
+    border-bottom: 1px solid var(--line);
+    padding: 14px 12px;
+    overflow: hidden;
+  }
   .conversation-column { min-height: 54vh; height: auto; max-height: none; }
   .message-stream { height: auto; max-height: 54vh; }
   .settings-row { flex-direction: column; align-items: stretch; }
 }
-@media (max-width: 700px) { .auth-shell { grid-template-columns: 1fr; }.auth-story { min-height: 0; padding: 44px 25px 58px; }.auth-story h1 { gap: 15px; font-size: 48px; line-height: 1; }.auth-story > p:not(.eyebrow) { margin-top: 23px; font-size: 14px; }.featured-engines { margin-top: 23px; }.featured-engines-head { margin-bottom: 8px; }.featured-engines-head strong { display: none; }.featured-engine-grid { gap: 7px; }.featured-engine { grid-template-columns: 1fr; justify-items: center; gap: 6px; padding: 10px 5px 9px; text-align: center; }.featured-engine-logo { width: 36px; height: 36px; border-radius: 10px; }.featured-engine-logo img { width: 25px; height: 25px; }.featured-engine-copy { justify-items: center; gap: 1px; }.featured-engine-copy strong { max-width: 100%; font-size: 10px; }.featured-engine-copy small { max-width: 100%; font-size: 9px; }.signal-line { margin-top: 23px; }.client-downloads { margin-top: 18px; }.auth-card { margin-top: -34px; z-index: 2; padding: 27px; }.app-shell { grid-template-rows: 58px auto minmax(0, 1fr); }.topbar { min-height: 58px; padding: 0 12px; }.brand { gap: 8px; }.brand > span { width: 36px; height: 36px; }.brand strong { font-size: 17px; }.brand small, .quiet, .top-actions > .client-downloads { display: none; }.rail { padding: 8px 10px; }.host-list { gap: 6px; }.host-row { min-width: 170px; }.host-pill { padding: 9px 10px; }.host-add-mobile { padding: 9px 11px; }.workspace { display: block; min-height: 0; }.workspace.mobile-tasks .conversation-column { display: none; }.workspace.mobile-conversation .task-column { display: none; }.workspace.mobile-conversation { height: calc(100dvh - 58px); }.workspace.mobile-conversation .conversation-column { height: 100%; min-height: 0; }.app-shell:has(.workspace.mobile-conversation) .rail { display: none; }.task-column { max-height: none; min-height: calc(100dvh - 116px); padding: 18px 12px max(22px, env(safe-area-inset-bottom)); border-bottom: 0; }.section-title { align-items: center; }.section-title h1 { font-size: 22px; }.section-actions { flex-direction: column-reverse; align-items: stretch; }.new-task, .sync-tasks { padding: 8px 10px; font-size: 11px; }.connection-note { margin: 14px 0 16px; }.task-list { gap: 9px; }.task-card { padding: 14px; border-radius: 15px; }.task-card h3 { margin: 9px 0 5px; }.task-card > p { margin-bottom: 10px; height: 36px; }.conversation-head { min-width: 0; padding: 10px 10px 9px; align-items: center; gap: 8px; }.mobile-back { display: grid; place-items: center; flex: 0 0 auto; width: 36px; height: 36px; border: 1px solid var(--line); border-radius: 11px; background: var(--cream); font-size: 28px; line-height: 1; cursor: pointer; }.conversation-head > div:first-of-type { min-width: 0; flex: 1; }.conversation-head .eyebrow { margin-bottom: 2px; }.conversation-head h2 { margin: 0; font-size: 17px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.conversation-head code { display: none; }.tabs { flex: 0 0 auto; }.tabs button { padding: 6px 8px; font-size: 11px; }.message-stream { padding: 13px 11px; gap: 13px; }.message { max-width: 96%; }.message pre, .approval-card pre { font-size: 12px; line-height: 1.55; }.message.user, .message.assistant { padding: 12px 13px; }.composer { padding: 9px 10px max(9px, env(safe-area-inset-bottom)); }.composer textarea { min-height: 54px; max-height: 118px; resize: none; padding: 10px 11px; }.composer > div { margin-top: 6px; }.composer small { font-size: 10px; }.composer button { padding: 7px 11px; }.modal { padding: 24px 20px; }.top-actions { gap: 4px; } }
-@media (max-width: 700px) { .workspace.mobile-hosts { display: none; }.workspace.mobile-hosts + * { min-height: 0; }.app-shell:has(.workspace.mobile-hosts) .rail { display: block; padding: 12px; border-bottom: 0; overflow: visible; }.app-shell:has(.workspace.mobile-hosts) .host-list { display: grid; gap: 9px; }.app-shell:has(.workspace.mobile-hosts) .host-row { min-width: 0; }.app-shell:has(.workspace.mobile-hosts) .host-pill { padding: 13px 12px; }.app-shell:has(.workspace.mobile-tasks) .rail { display: none; }.workspace.mobile-tasks .task-column { min-height: calc(100dvh - 58px); }.mobile-level-back { display: inline-flex; border: 0; background: transparent; color: var(--moss); padding: 2px 0 12px; font-size: 13px; font-weight: 850; cursor: pointer; }.send-shortcut { display: none; } }
+@media (max-width: 700px) { .auth-shell { grid-template-columns: 1fr; }.auth-story { min-height: 0; padding: 44px 25px 58px; }.auth-story h1 { gap: 15px; font-size: 48px; line-height: 1; }.auth-story > p:not(.eyebrow) { margin-top: 23px; font-size: 14px; }.featured-engines { margin-top: 23px; }.featured-engines-head { margin-bottom: 8px; }.featured-engines-head strong { display: none; }.featured-engine-grid { gap: 7px; }.featured-engine { grid-template-columns: 1fr; justify-items: center; gap: 6px; padding: 10px 5px 9px; text-align: center; }.featured-engine-logo { width: 36px; height: 36px; border-radius: 10px; }.featured-engine-logo img { width: 25px; height: 25px; }.featured-engine-copy { justify-items: center; gap: 1px; }.featured-engine-copy strong { max-width: 100%; font-size: 10px; }.featured-engine-copy small { max-width: 100%; font-size: 9px; }.signal-line { margin-top: 23px; }.client-downloads { margin-top: 18px; }.auth-card { margin-top: -34px; z-index: 2; padding: 27px; }.app-shell { grid-template-rows: 58px auto minmax(0, 1fr); }.topbar { min-height: 58px; padding: 0 12px; }.brand { gap: 8px; }.brand > span { width: 36px; height: 36px; }.brand strong { font-size: 17px; }.brand small, .quiet, .top-actions > .client-downloads { display: none; }.rail { padding: 8px 10px; }.host-list { gap: 6px; }.host-row { min-width: 170px; }.host-pill { padding: 9px 10px; }.host-add-mobile { padding: 9px 11px; }.workspace { display: block; min-height: 0; }.workspace.mobile-tasks .conversation-column { display: none; }.workspace.mobile-conversation .task-column { display: none; }.workspace.mobile-conversation { height: calc(100dvh - 58px); }.workspace.mobile-conversation .conversation-column { height: 100%; min-height: 0; }.app-shell:has(.workspace.mobile-conversation) .rail { display: none; }.task-column { max-height: none; min-height: 0; height: auto; padding: 18px 12px max(22px, env(safe-area-inset-bottom)); border-bottom: 0; }.section-title { align-items: center; }.section-title h1 { font-size: 22px; }.section-actions { flex-direction: column-reverse; align-items: stretch; }.new-task, .sync-tasks { padding: 8px 10px; font-size: 11px; }.connection-note { margin: 14px 0 16px; }.task-list { gap: 9px; }.task-card { padding: 14px; border-radius: 15px; min-height: 112px; max-height: 140px; height: 112px; }.task-card h3 { margin: 9px 0 5px; }.task-card > p { margin-bottom: 10px; height: 32px; min-height: 32px; max-height: 32px; }.conversation-head { min-width: 0; padding: 10px 10px 9px; align-items: center; gap: 8px; }.mobile-back { display: grid; place-items: center; flex: 0 0 auto; width: 36px; height: 36px; border: 1px solid var(--line); border-radius: 11px; background: var(--cream); font-size: 28px; line-height: 1; cursor: pointer; }.conversation-head > div:first-of-type { min-width: 0; flex: 1; }.conversation-head .eyebrow { margin-bottom: 2px; }.conversation-head h2 { margin: 0; font-size: 17px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.conversation-head code { display: none; }.tabs { flex: 0 0 auto; }.tabs button { padding: 6px 8px; font-size: 11px; }.message-stream { padding: 13px 11px; gap: 13px; }.message { max-width: 96%; }.message pre, .approval-card pre { font-size: 12px; line-height: 1.55; }.message.user, .message.assistant { padding: 12px 13px; }.composer { padding: 9px 10px max(9px, env(safe-area-inset-bottom)); }.composer textarea { min-height: 54px; max-height: 118px; resize: none; padding: 10px 11px; }.composer > div { margin-top: 6px; }.composer small { font-size: 10px; }.composer button { padding: 7px 11px; }.modal { padding: 24px 20px; }.top-actions { gap: 4px; } }
+@media (max-width: 700px) {
+  .workspace.mobile-hosts { display: none; }
+  .workspace.mobile-hosts + * { min-height: 0; }
+  .app-shell:has(.workspace.mobile-hosts) .rail { display: block; padding: 12px; border-bottom: 0; overflow: visible; }
+  .app-shell:has(.workspace.mobile-hosts) .host-list { display: grid; gap: 9px; }
+  .app-shell:has(.workspace.mobile-hosts) .host-row { min-width: 0; }
+  .app-shell:has(.workspace.mobile-hosts) .host-pill { padding: 13px 12px; }
+  .app-shell:has(.workspace.mobile-tasks) .rail { display: none; }
+  .mobile-level-back {
+    display: inline-flex;
+    border: 0;
+    background: transparent;
+    color: var(--moss);
+    padding: 2px 0 12px;
+    font-size: 13px;
+    font-weight: 850;
+    cursor: pointer;
+  }
+  .send-shortcut { display: none; }
+}
 @media (max-width: 700px) {
   .app-shell { height: auto; overflow: visible; }
   .version-chip {
@@ -335,18 +414,31 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
     line-height: 1.25;
   }
   .version-chip-line + .version-chip-line::before { content: none; margin: 0; }
+  /*
+   * Mobile task pane: full viewport under topbar.
+   * Explicit height (not only inset) so % height children scroll reliably on iOS/WebKit.
+   * Header + search fixed; only .task-list scrolls — same model as desktop.
+   */
   .workspace.mobile-tasks {
     position: fixed;
-    inset: 58px 0 0;
+    top: 58px;
+    right: 0;
+    bottom: 0;
+    left: 0;
     z-index: 7;
-    height: auto;
+    height: calc(100dvh - 58px);
+    max-height: calc(100dvh - 58px);
     min-height: 0;
     background: var(--paper);
-    display: block;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
   .workspace.mobile-tasks .task-column {
+    flex: 1 1 auto;
+    width: 100%;
     height: 100%;
-    max-height: none;
+    max-height: 100%;
     min-height: 0;
     padding: 8px 10px max(10px, env(safe-area-inset-bottom));
     border-bottom: 0;
@@ -416,7 +508,6 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
     padding: 7px 9px;
     font-size: 12px;
   }
-  /* Only the task list scrolls on mobile task pane */
   .workspace.mobile-tasks .task-list {
     flex: 1 1 auto;
     min-height: 0;
@@ -426,12 +517,42 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
     -webkit-overflow-scrolling: touch;
     gap: 8px;
     padding-bottom: 4px;
+    align-content: start;
+    grid-auto-rows: max-content;
   }
-  .workspace.mobile-tasks .task-card { padding: 11px 12px; border-radius: 13px; }
+  .workspace.mobile-tasks .task-card {
+    padding: 11px 12px;
+    border-radius: 13px;
+    min-height: 112px;
+    max-height: 140px;
+    height: 112px;
+  }
   .workspace.mobile-tasks .empty-state { padding: 36px 16px; }
-  .workspace.mobile-conversation { position: fixed; inset: 58px 0 0; z-index: 8; height: auto; min-height: 0; background: var(--paper); }
-  .workspace.mobile-conversation .conversation-column { height: 100%; max-height: none; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
-  .workspace.mobile-conversation .message-stream { height: auto; max-height: none; min-height: 0; }
+  .workspace.mobile-conversation {
+    position: fixed;
+    top: 58px;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 8;
+    height: calc(100dvh - 58px);
+    max-height: calc(100dvh - 58px);
+    min-height: 0;
+    background: var(--paper);
+    overflow: hidden;
+  }
+  .workspace.mobile-conversation .conversation-column {
+    height: 100%;
+    max-height: 100%;
+    min-height: 0;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+  }
+  .workspace.mobile-conversation .message-stream {
+    height: auto;
+    max-height: none;
+    min-height: 0;
+  }
   .workspace.mobile-conversation .conversation-head { position: relative; z-index: 2; background: rgba(242,234,219,.96); }
   .workspace.mobile-conversation .mobile-back { position: relative; z-index: 3; }
 }

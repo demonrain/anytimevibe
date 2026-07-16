@@ -253,6 +253,7 @@ async function importGrokSessions(store: TaskStore, limit: number): Promise<numb
     }
 
     const messages = meta.messages.length ? meta.messages : (existing?.messages || []);
+    // Preserve AnytimeVibe-owned fields (model/effort/context) — local CLI session dirs do not store them.
     const task: StoredTask = {
       threadId: hit.id,
       engine: "grok",
@@ -262,7 +263,10 @@ async function importGrokSessions(store: TaskStore, limit: number): Promise<numb
       status: existing?.status === "active" ? "active" : "completed",
       createdAt: existing?.createdAt ?? hit.mtime,
       updatedAt: Math.max(existing?.updatedAt ?? 0, meta.updatedAt ?? 0, hit.mtime),
-      messages
+      messages,
+      ...(existing?.model ? { model: existing.model } : {}),
+      ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
+      ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})
     };
     await store.upsert(task);
     added += 1;
@@ -347,6 +351,7 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
       // ignore
     }
     const titleFromUser = [...messages].reverse().find((m) => m.role === "user")?.text?.slice(0, 80);
+    // Preserve AnytimeVibe-owned fields — Claude jsonl does not include our model/effort prefs.
     const task: StoredTask = {
       threadId: hit.id,
       engine: "claude",
@@ -356,7 +361,10 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
       status: existing?.status === "active" ? "active" : "completed",
       createdAt: existing?.createdAt ?? hit.mtime,
       updatedAt: Math.max(existing?.updatedAt ?? 0, hit.mtime),
-      messages: messages.length ? messages.slice(-80) : (existing?.messages || [])
+      messages: messages.length ? messages.slice(-80) : (existing?.messages || []),
+      ...(existing?.model ? { model: existing.model } : {}),
+      ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
+      ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})
     };
     await store.upsert(task);
     added += 1;

@@ -2144,6 +2144,12 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       const mode = command.permissionMode ?? "ask-for-approval";
       const stored = taskStore.get(command.threadId);
       if (stored && (stored.engine === "claude" || stored.engine === "grok")) {
+        // Persist UI-selected model/effort before the turn so refresh/import keep them.
+        if (command.model || command.reasoningEffort) {
+          if (command.model) stored.model = command.model;
+          if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+          await taskStore.upsert(stored);
+        }
         await runHeadlessTaskTurn({
           engine: stored.engine,
           threadId: command.threadId,
