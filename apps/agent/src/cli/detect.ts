@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { CliEngine, CliEngineInfo } from "@anytimevibe/protocol";
-import { windowsCmdArguments } from "../windows-command";
+import {
+  windowsCmdArguments,
+  windowsExecutableRank,
+  windowsLauncherCandidates
+} from "../windows-command";
 
 const execFileAsync = promisify(execFile);
 
@@ -22,6 +26,29 @@ async function pathExists(filePath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Pick the best spawnable Windows path.
+ * npm global installs often leave both `claude` (bash shim) and `claude.cmd`;
+ * `where` may return the extensionless file first, which spawn() cannot run (ENOENT).
+ */
+async function preferWindowsExecutable(hits: string[]): Promise<string | null> {
+  const expanded: string[] = [];
+  for (const hit of hits) {
+    const trimmed = hit?.trim();
+    if (!trimmed) continue;
+    for (const candidate of windowsLauncherCandidates(trimmed)) {
+      if (!expanded.includes(candidate)) expanded.push(candidate);
+    }
+  }
+  const existing: string[] = [];
+  for (const candidate of expanded) {
+    if (await pathExists(candidate)) existing.push(candidate);
+  }
+  if (!existing.length) return null;
+  existing.sort((a, b) => windowsExecutableRank(a) - windowsExecutableRank(b));
+  return existing[0] ?? null;
 }
 
 async function runVersion(command: string, args: string[]): Promise<string | null> {
@@ -71,25 +98,48 @@ function enrichedPathEnv(): NodeJS.ProcessEnv {
 /** Resolve an absolute executable path so Electron (often PATH-starved) can spawn CLIs. */
 export async function resolveCommandPath(command: string): Promise<string | null> {
   if (resolvedCommandCache.has(command)) return resolvedCommandCache.get(command) ?? null;
-  if (path.isAbsolute(command) && await pathExists(command)) {
-    resolvedCommandCache.set(command, command);
-    return command;
+
+  const isWindows = process.platform === "win32";
+  if (path.isAbsolute(command)) {
+    if (isWindows) {
+      const preferred = await preferWindowsExecutable([command]);
+      if (preferred) {
+        resolvedCommandCache.set(command, preferred);
+        return preferred;
+      }
+    } else if (await pathExists(command)) {
+      resolvedCommandCache.set(command, command);
+      return command;
+    }
   }
 
   const env = enrichedPathEnv();
-  const isWindows = process.platform === "win32";
   try {
     if (isWindows) {
-      const { stdout } = await execFileAsync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `where ${command}`], {
-        timeout: 8_000,
-        windowsHide: true,
-        env,
-        maxBuffer: 256_000
-      });
-      const hit = stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
-      if (hit && await pathExists(hit)) {
-        resolvedCommandCache.set(command, hit);
-        return hit;
+      // where.exe lists every match; prefer .cmd/.exe over extensionless npm shims.
+      const whereTargets = /\.(cmd|exe|bat|com)$/i.test(command)
+        ? [command]
+        : [command, `${command}.cmd`, `${command}.exe`, `${command}.bat`];
+      const hits: string[] = [];
+      for (const target of whereTargets) {
+        try {
+          const { stdout } = await execFileAsync("where.exe", [target], {
+            timeout: 8_000,
+            windowsHide: true,
+            env,
+            maxBuffer: 256_000
+          });
+          for (const line of stdout.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+            if (!hits.includes(line)) hits.push(line);
+          }
+        } catch {
+          // try next target
+        }
+      }
+      const preferred = await preferWindowsExecutable(hits);
+      if (preferred) {
+        resolvedCommandCache.set(command, preferred);
+        return preferred;
       }
     } else {
       const { stdout } = await execFileAsync("/bin/bash", ["-lc", `command -v ${command} || true`], {
@@ -110,14 +160,17 @@ export async function resolveCommandPath(command: string): Promise<string | null
   const home = os.homedir();
   const candidates = isWindows
     ? [
+        // Prefer .cmd/.exe first — never pick extensionless npm bash shims before them.
+        path.join(process.env.APPDATA || "", "npm", `${command}.cmd`),
+        path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs", `${command}.cmd`),
         path.join(home, "AppData", "Local", "Microsoft", "WinGet", "Links", `${command}.exe`),
         path.join(home, ".local", "bin", `${command}.exe`),
-        path.join(home, ".local", "bin", command),
+        path.join(home, ".local", "bin", `${command}.cmd`),
         path.join(home, ".grok", "bin", "grok.exe"),
-        path.join(home, ".grok", "bin", command),
+        path.join(home, ".grok", "bin", `${command}.exe`),
         path.join(process.env.LOCALAPPDATA || "", "Programs", "claude", "claude.exe"),
-        path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs", `${command}.cmd`),
-        path.join(process.env.APPDATA || "", "npm", `${command}.cmd`)
+        path.join(home, ".local", "bin", command),
+        path.join(home, ".grok", "bin", command)
       ]
     : [
         path.join(home, ".local", "bin", command),
@@ -131,10 +184,18 @@ export async function resolveCommandPath(command: string): Promise<string | null
         "/usr/local/bin/claude"
       ];
 
-  for (const candidate of candidates) {
-    if (candidate && await pathExists(candidate)) {
-      resolvedCommandCache.set(command, candidate);
-      return candidate;
+  if (isWindows) {
+    const preferred = await preferWindowsExecutable(candidates.filter(Boolean));
+    if (preferred) {
+      resolvedCommandCache.set(command, preferred);
+      return preferred;
+    }
+  } else {
+    for (const candidate of candidates) {
+      if (candidate && await pathExists(candidate)) {
+        resolvedCommandCache.set(command, candidate);
+        return candidate;
+      }
     }
   }
 

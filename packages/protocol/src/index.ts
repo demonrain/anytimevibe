@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Keep apps/web and apps/agent package.json versions aligned with this on each release.
  * Frontend warns when the connected agent reports a lower version.
  */
-export const PRODUCT_VERSION = "0.4.30";
+export const PRODUCT_VERSION = "0.4.31";
 /** Minimum desktop agent version required by this frontend build (usually equals PRODUCT_VERSION). */
 export const MIN_AGENT_VERSION = PRODUCT_VERSION;
 

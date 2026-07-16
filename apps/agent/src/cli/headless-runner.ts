@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/protocol";
 import { collectLocalProxyEnv, mergeProxyIntoEnv } from "../local-proxy";
-import { windowsCmdArguments } from "../windows-command";
+import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { ensureClaudeWorkspaceTrusted } from "./claude-trust";
 import { resolveEngineBinary } from "./detect";
 import type { BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
@@ -335,8 +335,9 @@ export async function runHeadlessTurn(
   }
 
   const args = buildArgs(engine, options);
-  const isWindows = process.platform === "win32";
-  const useCmdShim = isWindows && /\.cmd$/i.test(command);
+  // On Windows, npm global CLIs are often `claude.cmd` / extensionless shims.
+  // CreateProcess cannot spawn those directly → ENOENT; always go through cmd.exe.
+  const useCmdShim = windowsNeedsCmdShim(command);
   const executable = useCmdShim ? (process.env.ComSpec ?? "cmd.exe") : command;
   const finalArgs = useCmdShim ? windowsCmdArguments(command, args) : args;
 
