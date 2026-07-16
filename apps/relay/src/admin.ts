@@ -239,7 +239,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: AdminContext, ses
     if (!user) return reply.code(404).send({ error: "user_not_found" });
 
     const hosts = await sql<Array<Record<string, unknown>>>`
-      SELECT id, name, platform, codex_version, created_at, last_seen_at, revoked_at
+      SELECT id, name, platform, codex_version, agent_version, created_at, last_seen_at, revoked_at
       FROM hosts WHERE user_id = ${userId}
       ORDER BY created_at DESC
     `;
@@ -388,11 +388,12 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: AdminContext, ses
 
     const hosts = await sql<Array<Record<string, unknown>>>`
       SELECT
-        h.id, h.name, h.platform, h.codex_version, h.created_at, h.last_seen_at, h.revoked_at,
-        u.id AS user_id, u.username
+        h.id, h.name, h.platform, h.codex_version, h.agent_version, h.created_at, h.last_seen_at, h.revoked_at,
+        u.id AS user_id, u.username,
+        (SELECT count(*)::int FROM sync_events se WHERE se.host_id = h.id) AS event_count
       FROM hosts h
       JOIN users u ON u.id = h.user_id
-      WHERE (${pattern}::text IS NULL OR h.name ILIKE ${pattern} OR u.username ILIKE ${pattern})
+      WHERE (${pattern}::text IS NULL OR h.name ILIKE ${pattern} OR u.username ILIKE ${pattern} OR COALESCE(h.agent_version, '') ILIKE ${pattern})
         AND (
           ${query.status} = 'all'
           OR (${query.status} = 'active' AND h.revoked_at IS NULL)
@@ -467,6 +468,99 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: AdminContext, ses
     }
     await writeAudit(sql, admin.id, "host.disconnect", "host", hostId, { name: hosts[0].name, wasOnline: Boolean(socket) });
     return { ok: true, wasOnline: Boolean(socket) };
+  });
+
+  /** Permanently delete a host row and cascaded sync_events (for bad / test data). */
+  app.delete("/api/admin/hosts/:hostId", async (request, reply) => {
+    const admin = await requireAdmin(sql, request, reply, sessionCookie);
+    if (!admin) return;
+    const { hostId } = request.params as { hostId: string };
+    const existing = await sql<Array<{ id: string; name: string; userId: string; revokedAt: string | null }>>`
+      SELECT id, name, user_id, revoked_at FROM hosts WHERE id = ${hostId} LIMIT 1
+    `;
+    if (!existing[0]) return reply.code(404).send({ error: "host_not_found" });
+    agentSockets.get(hostId)?.close(4003, "deleted_by_admin");
+    agentSockets.delete(hostId);
+    // Clear pairing leftovers that still point at this host.
+    await sql`UPDATE pairings SET host_id = NULL WHERE host_id = ${hostId}`;
+    const [events] = await sql<Array<{ count: number }>>`
+      SELECT count(*)::int AS count FROM sync_events WHERE host_id = ${hostId}
+    `;
+    await sql`DELETE FROM hosts WHERE id = ${hostId}`;
+    await writeAudit(sql, admin.id, "host.delete", "host", hostId, {
+      name: existing[0].name,
+      userId: existing[0].userId,
+      wasRevoked: Boolean(existing[0].revokedAt),
+      deletedEvents: events?.count ?? 0
+    });
+    return { ok: true, deletedEvents: events?.count ?? 0 };
+  });
+
+  /** Drop encrypted history for a host without removing the host itself. */
+  app.post("/api/admin/hosts/:hostId/purge-events", async (request, reply) => {
+    const admin = await requireAdmin(sql, request, reply, sessionCookie);
+    if (!admin) return;
+    const { hostId } = request.params as { hostId: string };
+    const hosts = await sql`SELECT id, name FROM hosts WHERE id = ${hostId} LIMIT 1`;
+    if (!hosts[0]) return reply.code(404).send({ error: "host_not_found" });
+    const deleted = await sql`DELETE FROM sync_events WHERE host_id = ${hostId} RETURNING id`;
+    await writeAudit(sql, admin.id, "host.purge_events", "host", hostId, {
+      name: hosts[0].name,
+      deleted: deleted.length
+    });
+    return { ok: true, deleted: deleted.length };
+  });
+
+  /** Bulk-delete revoked hosts (and their sync_events via cascade). */
+  app.post("/api/admin/hosts/cleanup-revoked", async (request, reply) => {
+    const admin = await requireAdmin(sql, request, reply, sessionCookie);
+    if (!admin) return;
+    const body = z.object({
+      olderThanDays: z.coerce.number().int().min(0).max(3650).default(0)
+    }).parse(request.body ?? {});
+    const days = body.olderThanDays;
+    const revoked = days <= 0
+      ? await sql<Array<{ id: string; name: string }>>`
+          SELECT id, name FROM hosts WHERE revoked_at IS NOT NULL
+        `
+      : await sql<Array<{ id: string; name: string }>>`
+          SELECT id, name FROM hosts
+          WHERE revoked_at IS NOT NULL
+            AND revoked_at < now() - ${`${days} days`}::interval
+        `;
+    for (const host of revoked) {
+      agentSockets.get(String(host.id))?.close(4003, "deleted_by_admin");
+      agentSockets.delete(String(host.id));
+      await sql`UPDATE pairings SET host_id = NULL WHERE host_id = ${host.id}`;
+    }
+    const result = days <= 0
+      ? await sql`DELETE FROM hosts WHERE revoked_at IS NOT NULL RETURNING id`
+      : await sql`
+          DELETE FROM hosts
+          WHERE revoked_at IS NOT NULL
+            AND revoked_at < now() - ${`${days} days`}::interval
+          RETURNING id
+        `;
+    await writeAudit(sql, admin.id, "host.cleanup_revoked", "host", undefined, {
+      olderThanDays: days,
+      deleted: result.length,
+      names: revoked.map((item) => item.name).slice(0, 50)
+    });
+    return { ok: true, deleted: result.length };
+  });
+
+  /** Remove expired / abandoned pairing rows. */
+  app.post("/api/admin/pairings/cleanup", async (request, reply) => {
+    const admin = await requireAdmin(sql, request, reply, sessionCookie);
+    if (!admin) return;
+    const result = await sql`
+      DELETE FROM pairings
+      WHERE expires_at < now()
+         OR status IN ('expired', 'failed', 'cancelled')
+      RETURNING id
+    `;
+    await writeAudit(sql, admin.id, "pairing.cleanup", "pairing", undefined, { deleted: result.length });
+    return { ok: true, deleted: result.length };
   });
 
   app.get("/api/admin/settings", async (request, reply) => {

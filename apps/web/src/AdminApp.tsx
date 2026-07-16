@@ -45,6 +45,8 @@ type AdminHost = {
   name: string;
   platform: string;
   codexVersion: string;
+  agentVersion?: string | null;
+  eventCount?: number;
   createdAt: string;
   lastSeenAt: string | null;
   revokedAt: string | null;
@@ -353,7 +355,7 @@ export function AdminApp() {
         <header className="admin-header">
           <div><p className="eyebrow">HOSTS</p><h1>主机管理</h1><small>共 {hostTotal} 台</small></div>
           <div className="admin-toolbar">
-            <input value={hostQuery} onChange={(event) => setHostQuery(event.target.value)} placeholder="搜索主机或用户" />
+            <input value={hostQuery} onChange={(event) => setHostQuery(event.target.value)} placeholder="搜索主机 / 用户 / 客户端版本" />
             <select value={hostStatus} onChange={(event) => setHostStatus(event.target.value as typeof hostStatus)}>
               <option value="all">全部</option>
               <option value="active">有效</option>
@@ -362,8 +364,25 @@ export function AdminApp() {
               <option value="revoked">已撤销</option>
             </select>
             <button className="quiet" onClick={() => runAction("hosts", loadHosts)}>查询</button>
+            <button className="quiet" disabled={busyId === "cleanup-pairings"} onClick={() => runAction("cleanup-pairings", async () => {
+              if (!window.confirm("清理过期/失败的配对记录？")) return;
+              const result = await api<{ deleted: number }>("/api/admin/pairings/cleanup", { method: "POST", body: "{}" });
+              window.alert(`已清理 ${result.deleted} 条配对记录`);
+            })}>清理配对垃圾</button>
+            <button className="danger" disabled={busyId === "cleanup-revoked"} onClick={() => runAction("cleanup-revoked", async () => {
+              if (!window.confirm("永久删除全部「已撤销」主机及其密文事件？此操作不可恢复。")) return;
+              const result = await api<{ deleted: number }>("/api/admin/hosts/cleanup-revoked", {
+                method: "POST",
+                body: JSON.stringify({ olderThanDays: 0 })
+              });
+              window.alert(`已删除 ${result.deleted} 台已撤销主机`);
+              await loadHosts();
+            })}>清理已撤销主机</button>
           </div>
         </header>
+        <p className="admin-hint" style={{ margin: "0 0 12px" }}>
+          「客户端」列为桌面 Agent 上报的版本（上线后自动同步）。「撤销」仅禁用配对；「删除」永久移除主机与同步密文，用于清理错误/测试数据。
+        </p>
         <div className="admin-table-wrap">
           <table className="admin-table">
             <thead>
@@ -372,7 +391,9 @@ export function AdminApp() {
                 <th>用户</th>
                 <th>平台</th>
                 <th>状态</th>
+                <th>客户端</th>
                 <th>Codex</th>
+                <th>事件数</th>
                 <th>最近在线</th>
                 <th>操作</th>
               </tr>
@@ -390,22 +411,39 @@ export function AdminApp() {
                         ? <span className="pill ok">在线</span>
                         : <span className="pill">离线</span>}
                   </td>
-                  <td>{host.codexVersion}</td>
+                  <td>
+                    {host.agentVersion
+                      ? <code>v{String(host.agentVersion).replace(/^v/i, "")}</code>
+                      : <span className="admin-note">未上报</span>}
+                  </td>
+                  <td>{host.codexVersion || "—"}</td>
+                  <td>{host.eventCount ?? 0}</td>
                   <td>{formatTime(host.lastSeenAt)}</td>
                   <td className="admin-actions">
                     <button disabled={Boolean(host.revokedAt) || busyId === host.id} onClick={() => runAction(host.id, async () => {
                       await api(`/api/admin/hosts/${host.id}/disconnect`, { method: "POST" });
                       await loadHosts();
-                    })}>断开连接</button>
+                    })}>断开</button>
+                    <button disabled={busyId === host.id} onClick={() => runAction(host.id, async () => {
+                      if (!window.confirm(`清空主机「${host.name}」的全部同步密文事件？主机记录会保留。`)) return;
+                      const result = await api<{ deleted: number }>(`/api/admin/hosts/${host.id}/purge-events`, { method: "POST" });
+                      window.alert(`已删除 ${result.deleted} 条事件`);
+                      await loadHosts();
+                    })}>清空事件</button>
                     <button className="danger" disabled={Boolean(host.revokedAt) || busyId === host.id} onClick={() => runAction(host.id, async () => {
-                      if (!window.confirm(`确定撤销主机「${host.name}」？`)) return;
+                      if (!window.confirm(`确定撤销主机「${host.name}」？用户将无法再连接该主机。`)) return;
                       await api(`/api/admin/hosts/${host.id}/revoke`, { method: "POST" });
                       await loadHosts();
                     })}>撤销</button>
+                    <button className="danger" disabled={busyId === host.id} onClick={() => runAction(host.id, async () => {
+                      if (!window.confirm(`永久删除主机「${host.name}」及其密文事件？此操作不可恢复。`)) return;
+                      await api(`/api/admin/hosts/${host.id}`, { method: "DELETE" });
+                      await loadHosts();
+                    })}>删除</button>
                   </td>
                 </tr>
               ))}
-              {!hosts.length && <tr><td colSpan={7} className="admin-empty">没有匹配的主机</td></tr>}
+              {!hosts.length && <tr><td colSpan={9} className="admin-empty">没有匹配的主机</td></tr>}
             </tbody>
           </table>
         </div>

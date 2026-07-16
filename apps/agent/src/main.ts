@@ -2296,10 +2296,12 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         input: [{ type: "text", text: command.prompt, text_elements: [] }]
       };
       if (command.model) turnPayload.model = command.model;
+      if (command.reasoningEffort) turnPayload.modelReasoningEffort = command.reasoningEffort;
       let turn: any;
       try {
         turn = await codex!.request("turn/start", turnPayload);
       } catch {
+        // Older app-server builds may reject model/effort fields — retry bare params.
         turn = await codex!.request("turn/start", {
           threadId: thread.id,
           clientUserMessageId: command.commandId,
@@ -2360,7 +2362,9 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         input: [{ type: "text", text: command.prompt, text_elements: [] }]
       };
       const model = command.model || stored?.model;
+      const effort = command.reasoningEffort || stored?.reasoningEffort;
       if (model) turnPayload.model = model;
+      if (effort) turnPayload.modelReasoningEffort = effort;
       let result: any;
       try {
         result = await codex!.request("turn/start", turnPayload);
@@ -2618,14 +2622,15 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   }
 }
 
-function publishAgentMeta(fields: { name?: string; codexVersion?: string; platform?: string } = {}): void {
+function publishAgentMeta(fields: { name?: string; codexVersion?: string; platform?: string; agentVersion?: string } = {}): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   try {
     socket.send(JSON.stringify({
       type: "agent.meta",
       name: fields.name ?? resolvedDisplayName(),
       codexVersion: fields.codexVersion ?? codexVersion,
-      platform: fields.platform ?? `${process.platform} ${os.release()}`
+      platform: fields.platform ?? `${process.platform} ${os.release()}`,
+      agentVersion: fields.agentVersion ?? PRODUCT_VERSION
     }));
   } catch {
     // ignore
@@ -2666,6 +2671,7 @@ async function publishHostStatus(): Promise<void> {
 async function publishThread(threadId: string, options: { touch?: boolean } = {}): Promise<void> {
   const result = await codex!.request("thread/read", { threadId, includeTurns: true });
   const snapshot = threadToSnapshot(result.thread);
+  const stored = taskStore.get(threadId);
   const updatedAt = options.touch
     ? Math.max(normalizeUnixSeconds(snapshot.updatedAt), Date.now() / 1000)
     : normalizeUnixSeconds(snapshot.updatedAt);
@@ -2682,13 +2688,17 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
       .sort((left, right) => right.updatedAt - left.updatedAt)
       .slice(0, 200)
   });
+  // Codex app-server snapshots do not carry our UI model/effort — merge from local task store.
   await publish({
     type: "thread.snapshot",
     eventId: crypto.randomUUID(),
     occurredAt: new Date().toISOString(),
     ...snapshot,
     updatedAt,
-    cliEngine: "codex"
+    cliEngine: "codex",
+    ...(stored?.model ? { model: stored.model } : {}),
+    ...(stored?.reasoningEffort ? { reasoningEffort: stored.reasoningEffort } : {}),
+    ...(stored?.providerSessionId ? { providerSessionId: stored.providerSessionId } : { providerSessionId: threadId })
   }, true);
 }
 

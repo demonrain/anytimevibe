@@ -657,16 +657,19 @@ async function main(): Promise<void> {
           const meta = z.object({
             name: z.string().trim().min(1).max(64).optional(),
             codexVersion: z.string().trim().min(1).max(80).optional(),
-            platform: z.string().trim().min(1).max(120).optional()
+            platform: z.string().trim().min(1).max(120).optional(),
+            agentVersion: z.string().trim().min(1).max(40).optional()
           }).parse(parsed);
           const nextName = meta.name?.trim();
           const nextCodex = meta.codexVersion?.trim();
           const nextPlatform = meta.platform?.trim();
+          const nextAgentVersion = meta.agentVersion?.trim();
           await sql`
             UPDATE hosts SET
               name = COALESCE(${nextName ?? null}, name),
               codex_version = COALESCE(${nextCodex ?? null}, codex_version),
               platform = COALESCE(${nextPlatform ?? null}, platform),
+              agent_version = COALESCE(${nextAgentVersion ?? null}, agent_version),
               last_seen_at = now()
             WHERE id = ${host.id}
           `;
@@ -674,7 +677,8 @@ async function main(): Promise<void> {
             hostId: host.id,
             ...(nextName ? { name: nextName } : {}),
             ...(nextCodex ? { codexVersion: nextCodex } : {}),
-            ...(nextPlatform ? { platform: nextPlatform } : {})
+            ...(nextPlatform ? { platform: nextPlatform } : {}),
+            ...(nextAgentVersion ? { agentVersion: nextAgentVersion } : {})
           }));
           return;
         }

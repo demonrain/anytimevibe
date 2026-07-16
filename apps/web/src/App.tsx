@@ -617,7 +617,13 @@ export function App() {
   const [keyAuthorizationStatus, setKeyAuthorizationStatus] = useState<Record<string, "missing" | "authorizing">>({});
   const keyAuthorizationsRef = useRef(new Set<string>());
   /** After task.create, auto-select the first new threadId not in this set. */
-  const pendingNewTaskRef = useRef<{ hostId: string; knownIds: Set<string>; expiresAt: number } | null>(null);
+  const pendingNewTaskRef = useRef<{
+    hostId: string;
+    knownIds: Set<string>;
+    expiresAt: number;
+    model?: string;
+    reasoningEffort?: ReasoningEffort;
+  } | null>(null);
   /** In-page only: refresh shows the tip again if the client is still outdated. */
   const [clientUpdateDismissed, setClientUpdateDismissed] = useState(false);
   useEffect(() => {
@@ -630,11 +636,17 @@ export function App() {
     window.scrollTo({ top: 0, behavior: "instant" });
   }
 
-  function markExpectingNewTask(hostId: string, knownIds: Iterable<string>) {
+  function markExpectingNewTask(
+    hostId: string,
+    knownIds: Iterable<string>,
+    prefs?: { model?: string; reasoningEffort?: ReasoningEffort }
+  ) {
     pendingNewTaskRef.current = {
       hostId,
       knownIds: new Set(knownIds),
-      expiresAt: Date.now() + 90_000
+      expiresAt: Date.now() + 90_000,
+      ...(prefs?.model ? { model: prefs.model } : {}),
+      ...(prefs?.reasoningEffort ? { reasoningEffort: prefs.reasoningEffort } : {})
     };
   }
 
@@ -648,6 +660,13 @@ export function App() {
     }
     if (pending.knownIds.has(threadId)) return;
     pendingNewTaskRef.current = null;
+    // Bind create-dialog model/effort before conversation mounts (snapshot may lag).
+    if (pending.model || pending.reasoningEffort) {
+      saveTaskUiPrefs(threadId, {
+        ...(pending.model ? { model: pending.model } : {}),
+        ...(pending.reasoningEffort ? { reasoningEffort: pending.reasoningEffort } : {})
+      });
+    }
     selectTask(threadId);
   }
 
@@ -1216,7 +1235,10 @@ export function App() {
         setPermissionMode(mode);
         localStorage.setItem("permission-mode", mode);
         // Remember existing threads so the first new threadId from the host is selected.
-        markExpectingNewTask(activeHost.id, Object.keys(activeRuntime.tasks));
+        markExpectingNewTask(activeHost.id, Object.keys(activeRuntime.tasks), {
+          ...(model ? { model } : {}),
+          ...(reasoningEffort ? { reasoningEffort } : {})
+        });
         // Clear engine filter so the new task is visible in the list immediately.
         setEngineFilter(null);
         setMobilePane("conversation");
@@ -1286,28 +1308,30 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     }
   }, [task.threadId, taskEngine]);
 
-  // Prefer host task snapshot, then local prefs, then host defaults (never clobber a saved high with low).
+  // Prefer task snapshot, then local prefs. Do not clobber user/task high effort with host default low.
   useEffect(() => {
     const prefs = loadTaskUiPrefs(task.threadId);
-    const nextModel = task.model || prefs.model || cap?.currentModel || modelOptions[0]?.id || "";
-    const nextEffort =
-      task.reasoningEffort
-      || prefs.reasoningEffort
-      || cap?.currentReasoningEffort
-      || effortOptions[0]
-      || "";
-    setModel(nextModel);
-    setReasoningEffort(nextEffort);
-    // Mirror authoritative host values into local prefs when present.
-    if (task.model || task.reasoningEffort) {
-      saveTaskUiPrefs(task.threadId, {
-        ...(task.model ? { model: task.model } : {}),
-        ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {})
-      });
+    if (task.model) {
+      setModel(task.model);
+      saveTaskUiPrefs(task.threadId, { model: task.model });
+    } else if (prefs.model) {
+      setModel(prefs.model);
+    } else {
+      setModel((current) => current || cap?.currentModel || modelOptions[0]?.id || "");
     }
-    // modelOptions/effortOptions are derived; re-sync when task or host current values change.
+
+    if (task.reasoningEffort) {
+      setReasoningEffort(task.reasoningEffort);
+      saveTaskUiPrefs(task.threadId, { reasoningEffort: task.reasoningEffort });
+    } else if (prefs.reasoningEffort) {
+      setReasoningEffort(prefs.reasoningEffort);
+    } else {
+      setReasoningEffort((current) =>
+        current || cap?.currentReasoningEffort || effortOptions[0] || ""
+      );
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [task.threadId, task.model, task.reasoningEffort, cap?.currentModel, cap?.currentReasoningEffort]);
+  }, [task.threadId, task.model, task.reasoningEffort]);
 
   // Persist in-progress edits so switching tasks and back restores the draft.
   useEffect(() => {
@@ -1656,12 +1680,22 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
   useEffect(() => {
     const options = permissionOptionsForEngine(engineId, locale);
     setTaskPermission((current) => (options.some((item) => item.value === current) ? current : options[0]!.value));
+  }, [engine, locale]);
+
+  // Only fill defaults when empty/invalid — never wipe a user-selected high effort when host.status refreshes.
+  useEffect(() => {
     const nextCap = capabilityForEngine(engineCapabilities, engineId);
     const nextModels = modelOptionsFromHost(engineCapabilities, engineId, nextCap?.currentModel);
     const nextEfforts = effortOptionsFromHost(engineCapabilities, engineId, nextCap?.currentReasoningEffort);
-    setModel(nextCap?.currentModel || nextModels[0]?.id || "");
-    setReasoningEffort(nextCap?.currentReasoningEffort || nextEfforts[0] || "");
-  }, [engine, locale, engineCapabilities]);
+    setModel((current) => {
+      if (current && nextModels.some((item) => item.id === current)) return current;
+      return nextCap?.currentModel || nextModels[0]?.id || "";
+    });
+    setReasoningEffort((current) => {
+      if (current && nextEfforts.includes(current as ReasoningEffort)) return current;
+      return nextCap?.currentReasoningEffort || nextEfforts[0] || "";
+    });
+  }, [engine, engineCapabilities]);
 
   // Pull latest whitelist from the agent once when the dialog opens (avoid dep on unstable callback identity).
   const refreshRef = useRef(onRefreshWorkspaces);
