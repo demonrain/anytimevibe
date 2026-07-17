@@ -1003,6 +1003,7 @@ function rendererHtml(): string {
       var env=state.environment||{nodeInstalled:false,codexCompatible:false,codexInstalled:false};
       var engines=state.availableEngines||[];
       var nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">一键安装</button>':'';
+      // Codex install needs npm; only show after Node is present (unlike Claude/Grok).
       var codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">'+(env.codexInstalled?'安装兼容版':'一键安装')+'</button>':'';
       if(environment){
         var engineExtra=engines.filter(function(item){return item.engine!=='codex';}).map(function(item){
