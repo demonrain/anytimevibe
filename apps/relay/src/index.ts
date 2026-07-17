@@ -24,33 +24,50 @@ type SocketLike = {
   on(event: "close" | "error", listener: () => void): void;
 };
 
+/** Traditional handle: letters, digits, underscore, dot, hyphen. */
+const usernameHandlePattern = /^[a-zA-Z0-9_.-]+$/;
+/**
+ * Practical email for registration / login identity (stored in users.username).
+ * Keeps validation permissive enough for common addresses without being a full RFC parser.
+ */
+const usernameEmailPattern =
+  /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+
 const usernameField = z
   .string()
   .trim()
-  .min(3, "用户名至少 3 个字符")
-  .max(64, "用户名最多 64 个字符")
-  .regex(/^[a-zA-Z0-9_.-]+$/, "用户名仅支持字母、数字、下划线、点、短横线");
+  .min(3, "用户名或邮箱至少 3 个字符")
+  .max(128, "用户名或邮箱最多 128 个字符")
+  .refine(
+    (value) => usernameHandlePattern.test(value) || usernameEmailPattern.test(value),
+    "请填写用户名（字母、数字、下划线、点、短横线）或有效邮箱"
+  );
 
 const passwordField = z
   .string()
   .min(6, "密码至少 6 位")
   .max(256, "密码过长");
 
+function normalizeAccountName(username: string): string {
+  // Email identity is case-insensitive; keep handle casing as entered.
+  return username.includes("@") ? username.toLowerCase() : username;
+}
+
 const setupBody = z.object({
   setupToken: z.string().min(1, "请填写设置令牌"),
   username: usernameField,
   password: passwordField
-});
+}).transform((body) => ({ ...body, username: normalizeAccountName(body.username) }));
 
 const loginBody = z.object({
-  username: z.string().trim().min(1, "请输入用户名"),
+  username: z.string().trim().min(1, "请输入用户名或邮箱"),
   password: z.string().min(1, "请输入密码")
-});
+}).transform((body) => ({ ...body, username: normalizeAccountName(body.username) }));
 
 const registerBody = z.object({
   username: usernameField,
   password: passwordField
-});
+}).transform((body) => ({ ...body, username: normalizeAccountName(body.username) }));
 
 const agentPairBody = z.object({
   secret: z.string().min(24),
@@ -231,7 +248,7 @@ async function main(): Promise<void> {
     `;
     const user = rows[0];
     if (!user || !(await verifyPassword(user.passwordHash, body.password))) {
-      return reply.code(401).send({ error: "invalid_credentials", message: "用户名或密码错误" });
+      return reply.code(401).send({ error: "invalid_credentials", message: "用户名/邮箱或密码错误" });
     }
     if (user.disabledAt) {
       return reply.code(403).send({ error: "account_disabled", message: "账号已被禁用" });
@@ -261,7 +278,7 @@ async function main(): Promise<void> {
       await sql`INSERT INTO users (id, username, password_hash, is_admin) VALUES (${userId}, ${body.username}, ${passwordHash}, false)`;
     } catch (error) {
       if ((error as { code?: string }).code === "23505") {
-        return reply.code(409).send({ error: "username_taken", message: "用户名已被占用" });
+        return reply.code(409).send({ error: "username_taken", message: "用户名或邮箱已被占用" });
       }
       throw error;
     }

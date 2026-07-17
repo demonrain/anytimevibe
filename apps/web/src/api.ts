@@ -10,11 +10,11 @@ type ApiErrorBody = {
 const ERROR_LABELS: Record<string, string> = {
   invalid_request: "请求参数无效",
   empty_json_body: "请求体不能为空",
-  invalid_credentials: "用户名或密码错误",
+  invalid_credentials: "用户名/邮箱或密码错误",
   account_disabled: "账号已被禁用",
   registration_disabled: "当前未开放注册",
   user_limit_reached: "注册人数已达上限",
-  username_taken: "用户名已被占用",
+  username_taken: "用户名或邮箱已被占用",
   invalid_setup_token: "设置令牌不正确",
   already_initialized: "服务已初始化",
   internal_error: "服务器内部错误"
@@ -30,7 +30,7 @@ function formatApiError(body: ApiErrorBody, status: number): string {
     const parts: string[] = [];
     for (const [field, messages] of Object.entries(fieldErrors)) {
       if (!messages?.length) continue;
-      const label = field === "username" ? "用户名" : field === "password" ? "密码" : field === "setupToken" ? "设置令牌" : field;
+      const label = field === "username" ? "用户名/邮箱" : field === "password" ? "密码" : field === "setupToken" ? "设置令牌" : field;
       parts.push(`${label}：${messages[0]}`);
     }
     if (parts.length) return parts.join("；");
