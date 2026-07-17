@@ -215,9 +215,245 @@ const activityItemsByThread = new Map<string, Map<string, string>>();
 const remoteDeltaBuffers = new Map<string, string>();
 let remoteDeltaFlushTimer: NodeJS.Timeout | null = null;
 
+/**
+ * Durable per-thread follow-up queue queue.
+ * Web may close the browser after enqueueing a second task while the first still runs;
+ * the agent must own the queue so prompts still execute after the active turn ends.
+ */
+type QueuedTurnStart = {
+  commandId: string;
+  prompt: string;
+  permissionMode?: PermissionMode;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
+};
+const turnQueueByThread = new Map<string, QueuedTurnStart[]>();
+/** Covers the gap between accepting turn.start and activeTurnByThread being set. */
+const turnStartingByThread = new Set<string>();
+let turnQueueFilePath = "";
+const WS_CONNECT_TIMEOUT_MS = 15_000;
+const PATH_REFRESH_TIMEOUT_MS = 8_000;
+
+/** In-app diagnostics ring buffer + append-only log file for user troubleshooting. */
+type AgentLogLevel = "info" | "warn" | "error";
+type AgentLogEntry = {
+  id: string;
+  ts: string;
+  level: AgentLogLevel;
+  message: string;
+};
+const MAX_AGENT_LOGS = 1_000;
+const agentLogs: AgentLogEntry[] = [];
+let agentLogFilePath = "";
+
+function formatLogExtra(value: unknown): string {
+  if (value === undefined || value === null || value === "") return "";
+  if (value instanceof Error) return value.stack || value.message;
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function appendAgentLog(level: AgentLogLevel, message: string, extra?: unknown): void {
+  const extraText = formatLogExtra(extra);
+  const full = (extraText ? `${message} ${extraText}` : message).replace(/\s+/g, " ").trim().slice(0, 4_000);
+  if (!full) return;
+  const entry: AgentLogEntry = {
+    id: crypto.randomUUID(),
+    ts: new Date().toISOString(),
+    level,
+    message: full
+  };
+  agentLogs.push(entry);
+  while (agentLogs.length > MAX_AGENT_LOGS) agentLogs.shift();
+  if (agentLogFilePath) {
+    const line = `${entry.ts} [${entry.level}] ${entry.message}\n`;
+    void fs.appendFile(agentLogFilePath, line, "utf8").catch(() => undefined);
+  }
+  if (level === "error") console.error(`[agent] ${entry.message}`);
+  else if (level === "warn") console.warn(`[agent] ${entry.message}`);
+  // Live push to open log panel (does not go through agent:state to avoid UI thrash).
+  if (!quitting && !installingUpdate) {
+    try {
+      if (isWindowAlive()) windowRef!.webContents.send("agent:log", entry);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function logInfo(message: string, extra?: unknown): void {
+  appendAgentLog("info", message, extra);
+}
+function logWarn(message: string, extra?: unknown): void {
+  appendAgentLog("warn", message, extra);
+}
+function logError(message: string, extra?: unknown): void {
+  appendAgentLog("error", message, extra);
+}
+
+async function initAgentLogFile(userDataDir: string): Promise<void> {
+  agentLogFilePath = path.join(userDataDir, "agent.log");
+  try {
+    await fs.mkdir(userDataDir, { recursive: true });
+    // Soft-rotate when file grows large so disk use stays bounded.
+    try {
+      const stat = await fs.stat(agentLogFilePath);
+      if (stat.size > 2 * 1024 * 1024) {
+        const bak = `${agentLogFilePath}.1`;
+        await fs.rm(bak, { force: true }).catch(() => undefined);
+        await fs.rename(agentLogFilePath, bak).catch(() => undefined);
+      }
+    } catch {
+      // first run / missing file
+    }
+    logInfo(`客户端启动 v${PRODUCT_VERSION}`, `${process.platform} ${os.release()} · ${process.arch}`);
+  } catch {
+    agentLogFilePath = "";
+  }
+}
+
 function resolveActivityEngine(threadId: string): CliEngine | undefined {
   return taskStore.get(threadId)?.engine
     || publicState.tasks.find((item) => item.threadId === threadId)?.engine;
+}
+
+function isThreadTurnBusy(threadId: string): boolean {
+  return turnStartingByThread.has(threadId)
+    || activeTurnByThread.has(threadId)
+    || isHeadlessThreadActive(threadId);
+}
+
+async function persistTurnQueue(): Promise<void> {
+  if (!turnQueueFilePath) return;
+  const payload: Record<string, QueuedTurnStart[]> = {};
+  for (const [threadId, items] of turnQueueByThread) {
+    if (items.length > 0) payload[threadId] = items;
+  }
+  try {
+    await fs.mkdir(path.dirname(turnQueueFilePath), { recursive: true });
+    await fs.writeFile(turnQueueFilePath, JSON.stringify(payload, null, 2), "utf8");
+  } catch {
+    // ignore disk errors — in-memory queue still works for the current process
+  }
+}
+
+async function loadTurnQueue(userDataDir: string): Promise<void> {
+  turnQueueFilePath = path.join(userDataDir, "turn-queue.json");
+  turnQueueByThread.clear();
+  try {
+    const raw = JSON.parse(await fs.readFile(turnQueueFilePath, "utf8")) as Record<string, unknown>;
+    if (!raw || typeof raw !== "object") return;
+    for (const [threadId, items] of Object.entries(raw)) {
+      if (!threadId || !Array.isArray(items)) continue;
+      const cleaned: QueuedTurnStart[] = [];
+      for (const item of items) {
+        if (!item || typeof item !== "object") continue;
+        const prompt = String((item as QueuedTurnStart).prompt ?? "").trim();
+        const commandId = String((item as QueuedTurnStart).commandId ?? "").trim() || crypto.randomUUID();
+        if (!prompt) continue;
+        const entry: QueuedTurnStart = { commandId, prompt };
+        const mode = (item as QueuedTurnStart).permissionMode;
+        if (
+          mode === "read-only"
+          || mode === "ask-for-approval"
+          || mode === "approve-for-me"
+          || mode === "full-access"
+          || mode === "inherit"
+          || mode === "workspace-write"
+        ) {
+          entry.permissionMode = mode;
+        }
+        const model = String((item as QueuedTurnStart).model ?? "").trim();
+        if (model) entry.model = model;
+        const effort = (item as QueuedTurnStart).reasoningEffort;
+        if (
+          effort === "low"
+          || effort === "medium"
+          || effort === "high"
+          || effort === "xhigh"
+          || effort === "max"
+        ) {
+          entry.reasoningEffort = effort;
+        }
+        cleaned.push(entry);
+      }
+      if (cleaned.length) turnQueueByThread.set(threadId, cleaned);
+    }
+  } catch {
+    // missing or corrupt file — start empty
+  }
+}
+
+async function enqueueTurnStart(command: Extract<ClientCommand, { type: "turn.start" }>): Promise<void> {
+  const list = turnQueueByThread.get(command.threadId) ?? [];
+  const entry: QueuedTurnStart = {
+    commandId: command.commandId,
+    prompt: command.prompt
+  };
+  if (command.permissionMode) entry.permissionMode = command.permissionMode;
+  if (command.model) entry.model = command.model;
+  if (command.reasoningEffort) entry.reasoningEffort = command.reasoningEffort;
+  list.push(entry);
+  turnQueueByThread.set(command.threadId, list);
+  await persistTurnQueue();
+  logInfo(`线程 ${command.threadId.slice(0, 8)} 忙碌，后续指令已入队`, `queue=${list.length}`);
+  updateState({
+    detail: `任务「${command.threadId.slice(0, 8)}…」当前忙碌，已排队第 ${list.length} 条后续指令（关闭浏览器后仍会执行）。`
+  });
+}
+
+async function clearTurnQueue(threadId: string): Promise<void> {
+  if (!turnQueueByThread.has(threadId)) return;
+  turnQueueByThread.delete(threadId);
+  await persistTurnQueue();
+}
+
+function scheduleDrainTurnQueue(threadId: string): void {
+  setImmediate(() => {
+    void drainTurnQueue(threadId).catch(handleError);
+  });
+}
+
+async function drainTurnQueue(threadId: string): Promise<void> {
+  if (isThreadTurnBusy(threadId)) return;
+  const list = turnQueueByThread.get(threadId);
+  if (!list?.length) return;
+  const next = list.shift()!;
+  if (list.length === 0) turnQueueByThread.delete(threadId);
+  else turnQueueByThread.set(threadId, list);
+  await persistTurnQueue();
+  logInfo(`执行排队指令`, `thread=${threadId.slice(0, 8)} remaining=${list.length}`);
+  await handleCommand({
+    type: "turn.start",
+    commandId: next.commandId,
+    threadId,
+    prompt: next.prompt,
+    ...(next.permissionMode ? { permissionMode: next.permissionMode } : {}),
+    ...(next.model ? { model: next.model } : {}),
+    ...(next.reasoningEffort ? { reasoningEffort: next.reasoningEffort } : {})
+  });
+}
+
+function scheduleDrainAllTurnQueues(): void {
+  for (const threadId of turnQueueByThread.keys()) {
+    scheduleDrainTurnQueue(threadId);
+  }
+}
+
+/** Bound PATH refresh so a hung shell never blocks relay reconnect forever. */
+async function applyLoginPathToProcessBounded(): Promise<void> {
+  try {
+    await Promise.race([
+      applyLoginPathToProcess(),
+      new Promise<void>((resolve) => setTimeout(resolve, PATH_REFRESH_TIMEOUT_MS))
+    ]);
+  } catch {
+    // ignore
+  }
 }
 
 function syncActivitiesState(nextActivities: ActivityState[], selectedThreadId?: string): void {
@@ -573,9 +809,25 @@ function rendererHtml(): string {
   .shell{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px;padding:12px 12px 10px;border-radius:18px;background:rgba(242,234,219,.92);border:1px solid rgba(23,33,27,.14);box-shadow:0 18px 40px rgba(23,33,27,.18);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);overflow:hidden}
   .titlebar{display:flex;align-items:center;gap:10px;-webkit-app-region:drag;app-region:drag;padding:2px 2px 4px;cursor:default;user-select:none;-webkit-user-select:none}
   .titlebar,.titlebar *{user-select:none;-webkit-user-select:none}
-  .titlebar .win-actions{-webkit-app-region:no-drag;app-region:no-drag;margin-left:auto;display:flex;gap:4px}
+  .titlebar .win-actions{-webkit-app-region:no-drag;app-region:no-drag;margin-left:auto;display:flex;gap:4px;align-items:center}
   .titlebar .win-actions button{width:28px;height:24px;padding:0;border-radius:7px;background:#e7ddcd;color:#17211b;font-size:12px;line-height:1}
+  .titlebar .win-actions button.logs-btn{width:auto;min-width:36px;padding:0 8px;font-size:11px;font-weight:800}
   .titlebar .win-actions button.close{background:#e25832;color:#fff}
+  .log-modal-backdrop{position:fixed;inset:0;z-index:80;display:none;align-items:center;justify-content:center;padding:14px;background:rgba(23,33,27,.48);-webkit-app-region:no-drag;app-region:no-drag}
+  .log-modal-backdrop.open{display:flex}
+  .log-modal{width:100%;max-width:440px;height:min(74vh,540px);display:flex;flex-direction:column;background:rgba(255,250,240,.98);border:1px solid rgba(23,33,27,.14);border-radius:14px;box-shadow:0 22px 48px rgba(23,33,27,.28);overflow:hidden}
+  .log-modal header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border-bottom:1px solid rgba(23,33,27,.1)}
+  .log-modal header h3{margin:0;font:700 13px Rockwell,serif}
+  .log-modal header .log-actions{display:flex;flex-wrap:wrap;gap:4px}
+  .log-modal header button{padding:5px 8px;font-size:10px}
+  .log-view{flex:1;min-height:0;overflow:auto;background:#17211b;color:#c8d0c8;padding:10px;font:10px/1.5 "Cascadia Code",Consolas,monospace;white-space:pre-wrap;word-break:break-word;user-select:text;-webkit-user-select:text}
+  .log-view .log-line{display:block;margin:0 0 3px;border-bottom:1px solid rgba(255,255,255,.04);padding-bottom:2px}
+  .log-view .log-line .ts{color:#7a857a;margin-right:6px}
+  .log-view .log-line.info .lvl{color:#7ec8a3}
+  .log-view .log-line.warn .lvl{color:#e6c07b}
+  .log-view .log-line.error .lvl{color:#ff8f7a}
+  .log-view .log-line .msg{color:#e8eee8}
+  .log-modal footer{padding:8px 12px;border-top:1px solid rgba(23,33,27,.08);font-size:10px;color:#6b726b}
   .scroll{flex:1;min-height:0;overflow-x:hidden;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding-right:2px}
   .mark{width:34px;height:34px;border-radius:10px;overflow:hidden;background:#17211b;flex:0 0 auto;box-shadow:0 6px 14px rgba(23,33,27,.16)}
   .mark img{width:100%;height:100%;display:block;object-fit:cover}
@@ -641,7 +893,7 @@ function rendererHtml(): string {
   .footer .lang-switch button{border:0;border-radius:0;background:#eee6d8;color:#6b726b;padding:5px 8px;font-size:10px}
   .footer .lang-switch button.active{background:#17211b;color:#fff}
   </style></head><body><div class="frame"><main class="shell">
-  <div class="titlebar">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1 id="brandTitle">随码</h1><p id="brandTag">随时续上你的代码 · ${platformLabel}</p></div><div class="win-actions"><button type="button" id="winMin" title="最小化">–</button><button type="button" id="winClose" class="close" title="关闭">×</button></div></div>
+  <div class="titlebar">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1 id="brandTitle">随码</h1><p id="brandTag">随时续上你的代码 · ${platformLabel}</p></div><div class="win-actions"><button type="button" id="openLogs" class="logs-btn" title="运行日志">日志</button><button type="button" id="winMin" title="最小化">–</button><button type="button" id="winClose" class="close" title="关闭">×</button></div></div>
   <div class="scroll">
   <section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
   <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="updateBox" class="update-row"></div></section>
@@ -651,7 +903,24 @@ function rendererHtml(): string {
   <section class="card" id="taskBox"></section>
   </div>
   <footer class="footer"><div class="author"><strong id="authorStrong">随码 AnytimeVibe</strong><br><span id="authorLine">作者 · demonrain · 开源项目</span></div><div class="footer-actions"><div class="lang-switch"><button type="button" id="langZh" class="active">中文</button><button type="button" id="langEn">EN</button></div><button type="button" id="feedback" class="feedback">反馈问题</button></div></footer>
-  </main></div><script>
+  </main></div>
+  <div id="logModal" class="log-modal-backdrop" aria-hidden="true">
+    <div class="log-modal" role="dialog" aria-labelledby="logModalTitle">
+      <header>
+        <h3 id="logModalTitle">运行日志</h3>
+        <div class="log-actions">
+          <button type="button" id="logRefresh" class="secondary">刷新</button>
+          <button type="button" id="logCopy" class="secondary">复制</button>
+          <button type="button" id="logClear" class="secondary">清空</button>
+          <button type="button" id="logOpenFile" class="secondary">打开文件</button>
+          <button type="button" id="logClose">关闭</button>
+        </div>
+      </header>
+      <div id="logView" class="log-view"></div>
+      <footer id="logFooter">最近运行记录 · 便于排查连接与任务问题</footer>
+    </div>
+  </div>
+  <script>
   (function(){
   var platformLabel=${JSON.stringify(platformLabel)};
   var initialState=${initialStateJson};
@@ -670,8 +939,8 @@ function rendererHtml(): string {
     return 'codex';
   }
   var I18N={
-    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',expand:'展开',collapse:'收起',open:'接力'},
-    en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',expand:'Expand',collapse:'Collapse',open:'Open'}
+    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',logs:'日志',logTitle:'运行日志',logRefresh:'刷新',logCopy:'复制',logClear:'清空',logOpenFile:'打开文件',logClose:'关闭',logEmpty:'暂无日志',logFooter:'最近运行记录 · 便于排查连接与任务问题',logCopied:'已复制到剪贴板',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',expand:'展开',collapse:'收起',open:'接力'},
+    en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',logs:'Logs',logTitle:'Runtime logs',logRefresh:'Refresh',logCopy:'Copy',logClear:'Clear',logOpenFile:'Open file',logClose:'Close',logEmpty:'No logs yet',logFooter:'Recent runtime events for troubleshooting',logCopied:'Copied to clipboard',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',expand:'Expand',collapse:'Collapse',open:'Open'}
   };
   var locale=(function(){try{return localStorage.getItem('anytimevibe-locale')==='en'?'en':'zh-CN';}catch(e){return 'zh-CN';}})();
   function t(key){return (I18N[locale]&&I18N[locale][key])||I18N.en[key]||key}
@@ -682,6 +951,14 @@ function rendererHtml(): string {
     if(el=document.querySelector('#authorStrong')) el.textContent=t('authorStrong');
     if(el=document.querySelector('#authorLine')) el.textContent=t('authorLine');
     if(el=document.querySelector('#feedback')) el.textContent=t('feedback');
+    if(el=document.querySelector('#openLogs')) el.textContent=t('logs');
+    if(el=document.querySelector('#logModalTitle')) el.textContent=t('logTitle');
+    if(el=document.querySelector('#logRefresh')) el.textContent=t('logRefresh');
+    if(el=document.querySelector('#logCopy')) el.textContent=t('logCopy');
+    if(el=document.querySelector('#logClear')) el.textContent=t('logClear');
+    if(el=document.querySelector('#logOpenFile')) el.textContent=t('logOpenFile');
+    if(el=document.querySelector('#logClose')) el.textContent=t('logClose');
+    if(el=document.querySelector('#logFooter')) el.textContent=t('logFooter');
     if(el=document.querySelector('#langZh')) el.classList.toggle('active',locale==='zh-CN');
     if(el=document.querySelector('#langEn')) el.classList.toggle('active',locale==='en');
   }
@@ -721,7 +998,7 @@ function rendererHtml(): string {
       if(detail) detail.textContent=state.detail||'';
       if(relay && document.activeElement!==relay) relay.value=state.relayUrl||'';
       if(displayName && document.activeElement!==displayName) displayName.value=state.displayName||'';
-      if(meta) meta.textContent='客户端 v'+${JSON.stringify(PRODUCT_VERSION)}+' · Codex '+(state.codexVersion||'')+(state.hostId?' · '+String(state.hostId).slice(0,8):'');
+      if(meta) meta.textContent='客户端 v'+${JSON.stringify(PRODUCT_VERSION)}+(state.hostId?' · '+String(state.hostId).slice(0,8):'');
       var env=state.environment||{nodeInstalled:false,codexCompatible:false,codexInstalled:false};
       var engines=state.availableEngines||[];
       var nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">一键安装</button>':'';
@@ -872,6 +1149,53 @@ function rendererHtml(): string {
       });
     });
   }
+  var logEntries=[];
+  var logStickBottom=true;
+  var logView=document.querySelector('#logView');
+  var logModal=document.querySelector('#logModal');
+  function formatLogTs(ts){
+    try{
+      var d=new Date(ts);
+      if(isNaN(d.getTime())) return String(ts||'');
+      return d.toLocaleTimeString(undefined,{hour12:false})+'.'+String(d.getMilliseconds()).padStart(3,'0');
+    }catch(e){ return String(ts||''); }
+  }
+  function renderLogView(){
+    if(!logView) return;
+    if(!logEntries.length){
+      logView.innerHTML='<div class="log-line info"><span class="msg">'+escapeHtml(t('logEmpty'))+'</span></div>';
+      return;
+    }
+    var html=logEntries.map(function(entry){
+      var level=entry.level==='error'||entry.level==='warn'?entry.level:'info';
+      return '<div class="log-line '+level+'"><span class="ts">'+escapeHtml(formatLogTs(entry.ts))+'</span><span class="lvl">['+escapeHtml(level)+']</span> <span class="msg">'+escapeHtml(entry.message||'')+'</span></div>';
+    }).join('');
+    var nearBottom=logView.scrollHeight-logView.scrollTop-logView.clientHeight<48;
+    logView.innerHTML=html;
+    if(logStickBottom||nearBottom) logView.scrollTop=logView.scrollHeight;
+  }
+  function loadLogs(){
+    if(!api||!api.getLogs) return Promise.resolve();
+    return api.getLogs().then(function(list){
+      logEntries=Array.isArray(list)?list:[];
+      renderLogView();
+    }).catch(function(err){
+      logEntries=[{ts:new Date().toISOString(),level:'error',message:'读取日志失败：'+(err&&err.message?err.message:String(err))}];
+      renderLogView();
+    });
+  }
+  function openLogModal(){
+    if(!logModal) return;
+    logModal.classList.add('open');
+    logModal.setAttribute('aria-hidden','false');
+    logStickBottom=true;
+    loadLogs();
+  }
+  function closeLogModal(){
+    if(!logModal) return;
+    logModal.classList.remove('open');
+    logModal.setAttribute('aria-hidden','true');
+  }
   function bindUi(){
     var el;
     if((el=document.querySelector('#saveRelay'))&&api) el.addEventListener('click',function(){api.setRelayUrl(relay.value);});
@@ -890,6 +1214,30 @@ function rendererHtml(): string {
     if((el=document.querySelector('#winMin'))&&api) el.addEventListener('click',function(){api.windowMinimize();});
     if((el=document.querySelector('#winClose'))&&api) el.addEventListener('click',function(){api.windowClose();});
     if((el=document.querySelector('#feedback'))&&api) el.addEventListener('click',function(){api.openFeedback();});
+    if(el=document.querySelector('#openLogs')) el.addEventListener('click',function(){ openLogModal(); });
+    if(el=document.querySelector('#logClose')) el.addEventListener('click',function(){ closeLogModal(); });
+    if(logModal) logModal.addEventListener('click',function(ev){ if(ev.target===logModal) closeLogModal(); });
+    if(logView) logView.addEventListener('scroll',function(){
+      logStickBottom=logView.scrollHeight-logView.scrollTop-logView.clientHeight<48;
+    });
+    if((el=document.querySelector('#logRefresh'))&&api) el.addEventListener('click',function(){ loadLogs(); });
+    if((el=document.querySelector('#logCopy'))&&api) el.addEventListener('click',function(){
+      var text=logEntries.map(function(e){return (e.ts||'')+' ['+(e.level||'info')+'] '+(e.message||'');}).join('\\n');
+      if(navigator.clipboard&&navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(function(){ alert(t('logCopied')); }).catch(function(){ prompt('Copy logs:', text); });
+      } else {
+        prompt('Copy logs:', text);
+      }
+    });
+    if((el=document.querySelector('#logClear'))&&api) el.addEventListener('click',function(){
+      api.clearLogs().then(function(list){
+        logEntries=Array.isArray(list)?list:[];
+        renderLogView();
+      }).catch(function(error){ alert(error&&error.message?error.message:String(error)); });
+    });
+    if((el=document.querySelector('#logOpenFile'))&&api) el.addEventListener('click',function(){
+      api.openLogFile().catch(function(error){ alert(error&&error.message?error.message:String(error)); });
+    });
     if(el=document.querySelector('#langZh')) el.addEventListener('click',function(){locale='zh-CN';try{localStorage.setItem('anytimevibe-locale',locale);}catch(e){} applyLocale(); paint(initialState); refresh();});
     if(el=document.querySelector('#langEn')) el.addEventListener('click',function(){locale='en';try{localStorage.setItem('anytimevibe-locale',locale);}catch(e){} applyLocale(); paint(initialState); refresh();});
   }
@@ -906,6 +1254,14 @@ function rendererHtml(): string {
     if(detail) detail.textContent='预加载桥接失败：window.anytimeVibe 不可用。请重装客户端。';
   } else {
     try{ api.onState(function(state){ paint(state); }); }catch(e){ console.error(e); }
+    try{
+      if(api.onLog) api.onLog(function(entry){
+        if(!entry) return;
+        logEntries.push(entry);
+        if(logEntries.length>1000) logEntries=logEntries.slice(-1000);
+        if(logModal&&logModal.classList.contains('open')) renderLogView();
+      });
+    }catch(e){ console.error(e); }
     refresh();
   }
   })();
@@ -1227,15 +1583,45 @@ async function detectEnvironment(): Promise<EnvironmentState> {
   };
 }
 
+/** Codex-only probe for Codex install/login helpers. Never gates the relay connection. */
 async function findCodex(): Promise<void> {
   const environment = await detectEnvironment();
   updateState({ environment });
   if (!environment.nodeInstalled) throw new Error("未检测到 Node.js，请先完成环境安装。");
   if (!environment.codexInstalled) throw new Error("未检测到 Codex CLI，请点击环境检测区域的一键安装。");
   if (!environment.codexCompatible) {
-    updateState({ status: "incompatible", detail: `当前仅支持 codex-cli 0.144.x，检测到 ${environment.codexVersion}。`, environment });
-    throw new Error("Unsupported Codex version");
+    throw new Error(
+      environment.codexVersion
+        ? `Codex CLI 版本不兼容（需要 0.144.x，当前 ${environment.codexVersion}）。Claude / Grok 任务不受影响。`
+        : "Codex CLI 版本不兼容（需要 0.144.x）。Claude / Grok 任务不受影响。"
+    );
   }
+}
+
+/** True when at least one of Codex / Claude / Grok is usable for remote tasks. */
+function anyCodingEngineReady(
+  environment: EnvironmentState = publicState.environment,
+  engines: CliEngineInfo[] = publicState.availableEngines
+): boolean {
+  if (environment.codexCompatible) return true;
+  return engines.some((item) => item.ready);
+}
+
+/** Status for the agent panel — never mark incompatible solely because Codex is missing. */
+function statusForEngineAvailability(options: {
+  environment?: EnvironmentState;
+  engines?: CliEngineInfo[];
+  paired?: boolean;
+}): PublicState["status"] {
+  const environment = options.environment ?? publicState.environment;
+  const engines = options.engines ?? publicState.availableEngines;
+  const paired = options.paired ?? Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
+  if (!anyCodingEngineReady(environment, engines)) return "incompatible";
+  if (socket?.readyState === WebSocket.OPEN) return "online";
+  if (paired) return publicState.status === "connecting" ? "connecting" : "offline";
+  if (config.pairing) return "pairing";
+  if (config.relayUrl) return "waiting_pairing";
+  return "unconfigured";
 }
 
 // ---- Windows-only Codex install (in-process npm; console only for login) ----
@@ -1852,23 +2238,14 @@ async function connect(force = false): Promise<void> {
     updateState({ status: "offline", detail: reconnectBlockedReason });
     return;
   }
-  // Refresh toolchain paths before deciding compatibility (important on macOS GUI launches).
-  await applyLoginPathToProcess();
-  if (!/^0\.144\./.test(codexVersion)) {
-    const environment = await detectEnvironment();
-    updateState({ environment });
-    if (!environment.codexCompatible) {
-      updateState({
-        status: "incompatible",
-        detail: environment.codexInstalled
-          ? `当前仅支持 codex-cli 0.144.x，检测到 ${environment.codexVersion}。`
-          : "未检测到兼容的 Codex CLI，中继将暂不连接。"
-      });
-      return;
-    }
-  }
+  // Never hard-gate relay on Codex alone — Claude/Grok-only hosts must still connect.
+  // PATH refresh is best-effort and time-bounded so a hung shell cannot freeze reconnect.
+  await applyLoginPathToProcessBounded();
+
   if (!force && socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+  // force=true always proceeds even if a previous attempt left connecting=true.
   if (connecting && !force) return;
+  logInfo(force ? "开始连接中继（强制）" : "开始连接中继", config.relayUrl);
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -1884,9 +2261,13 @@ async function connect(force = false): Promise<void> {
   if (previousSocket) {
     previousSocket.removeAllListeners();
     try {
-      previousSocket.close();
+      previousSocket.terminate();
     } catch {
-      // ignore
+      try {
+        previousSocket.close();
+      } catch {
+        // ignore
+      }
     }
   }
   try {
@@ -1905,17 +2286,50 @@ async function connect(force = false): Promise<void> {
     handleError(error);
     return;
   }
-  const connection = new WebSocket(`${wsUrl(config.relayUrl)}/ws/agent?hostId=${encodeURIComponent(config.hostId)}`, {
-    headers: { authorization: `Bearer ${token}` }
-  });
+  let connection: WebSocket;
+  try {
+    connection = new WebSocket(`${wsUrl(config.relayUrl)}/ws/agent?hostId=${encodeURIComponent(config.hostId)}`, {
+      headers: { authorization: `Bearer ${token}` }
+    });
+  } catch (error) {
+    connecting = false;
+    const message = error instanceof Error ? error.message : String(error);
+    scheduleReconnect(`无法创建中继连接：${message}，正在重试。`);
+    return;
+  }
   socket = connection;
   let pingTimer: NodeJS.Timeout | null = null;
+  let connectTimer: NodeJS.Timeout | null = null;
   const clearPing = () => {
     if (pingTimer) {
       clearInterval(pingTimer);
       pingTimer = null;
     }
   };
+  const clearConnectTimer = () => {
+    if (connectTimer) {
+      clearTimeout(connectTimer);
+      connectTimer = null;
+    }
+  };
+  // If open never fires (hung TCP / dead proxy), free connecting and retry.
+  connectTimer = setTimeout(() => {
+    if (generation !== connectGeneration || socket !== connection) return;
+    if (connection.readyState === WebSocket.OPEN) return;
+    clearConnectTimer();
+    connecting = false;
+    try {
+      connection.removeAllListeners();
+      connection.terminate();
+    } catch {
+      // ignore
+    }
+    if (socket === connection) socket = null;
+    logWarn(`连接中继超时（${Math.round(WS_CONNECT_TIMEOUT_MS / 1000)}s）`, config.relayUrl);
+    scheduleReconnect(`连接中继超时（${Math.round(WS_CONNECT_TIMEOUT_MS / 1000)}s），正在重试。`);
+  }, WS_CONNECT_TIMEOUT_MS);
+  connectTimer.unref?.();
+
   connection.on("open", () => {
     if (generation !== connectGeneration || socket !== connection) {
       try {
@@ -1925,9 +2339,11 @@ async function connect(force = false): Promise<void> {
       }
       return;
     }
+    clearConnectTimer();
     connecting = false;
     reconnectAttempt = 0;
     reconnectBlockedReason = null;
+    logInfo("中继 WebSocket 已连接", config.relayUrl);
     // Keepalive: reverse proxies often idle-drop sockets without ping frames.
     clearPing();
     pingTimer = setInterval(() => {
@@ -1947,12 +2363,25 @@ async function connect(force = false): Promise<void> {
     // Keep the relay socket online even if Codex bootstrap fails, otherwise macOS
     // (missing GUI PATH / codex shebang) will flap between offline and reconnect.
     void (async () => {
-      updateState({ status: "online", detail: "代理在线。Codex 凭据和项目文件均保留在本机。" });
+      updateState({ status: "online", detail: "代理在线。凭据和项目文件均保留在本机。" });
+      // Resume any durable follow-up prompts queued while a prior turn was running.
+      scheduleDrainAllTurnQueues();
       // Always push workspaces/online status — must not depend on Codex being ready.
       try {
         if (generation === connectGeneration && socket === connection) await publishHostStatus();
       } catch {
         // ignore; connect path continues
+      }
+      // Codex is optional; failures must not mark the host offline or block the UI.
+      // Skip ensureCodex entirely when Codex is absent so Claude/Grok-only hosts stay clean.
+      const codexOk = Boolean(publicState.environment.codexCompatible || /^0\.144\./.test(codexVersion));
+      if (!codexOk) {
+        logInfo("中继已连接（未安装兼容 Codex，使用 Claude / Grok 即可）");
+        updateState({
+          status: "online",
+          detail: "代理在线。未安装 Codex 也可使用 Claude Code / Grok Build 下发任务。"
+        });
+        return;
       }
       try {
         await ensureCodex();
@@ -1964,11 +2393,12 @@ async function connect(force = false): Promise<void> {
       } catch (error) {
         if (generation !== connectGeneration || socket !== connection) return;
         const message = error instanceof Error ? error.message : String(error);
+        logWarn("中继已连接，但 Codex 未就绪", message);
         updateState({
           status: "online",
-          detail: `中继已连接，但 Codex 尚未就绪：${message}`
+          detail: `中继已连接（Codex 可选未就绪：${message}）`
         });
-        // Still report meta so admin sees live codex version even if ensureCodex failed mid-way.
+        // Still report meta so admin sees live status even if ensureCodex failed mid-way.
         publishAgentMeta();
       }
     })();
@@ -1979,10 +2409,12 @@ async function connect(force = false): Promise<void> {
   });
   connection.on("close", (code, reason) => {
     if (generation !== connectGeneration) return;
+    clearConnectTimer();
     clearPing();
     connecting = false;
     if (socket === connection) socket = null;
     const why = reason?.toString?.() || `code ${code}`;
+    logWarn("中继连接已关闭", `${why}`);
     // 4002 = replaced by a newer agent socket for the same host — do not fight it.
     if (code === 4002) {
       updateState({ status: "offline", detail: "连接已被新的代理实例替换。" });
@@ -1992,6 +2424,7 @@ async function connect(force = false): Promise<void> {
     if (code === 1000 && (quitting || installingUpdate)) return;
     if (FATAL_WS_CODES.has(code) || /unauthorized|revoked|missing_credentials|user_deleted/i.test(why)) {
       reconnectBlockedReason = `中继拒绝连接（${why}）。请重新配对。`;
+      logError("中继拒绝连接（停止自动重试）", why);
       updateState({ status: "offline", detail: reconnectBlockedReason });
       return;
     }
@@ -2000,6 +2433,8 @@ async function connect(force = false): Promise<void> {
   connection.on("error", (error) => {
     if (generation !== connectGeneration) return;
     // Do not close here — the 'close' event will follow and owns reconnect.
+    // If close never comes (rare), the connect timer still recovers us.
+    logError("中继 WebSocket 错误", error.message || "网络错误");
     if (socket === connection) {
       updateState({ status: "offline", detail: `无法连接中继：${error.message || "网络错误"}，正在重试。` });
     }
@@ -2008,7 +2443,8 @@ async function connect(force = false): Promise<void> {
 
 function scheduleReconnect(detail: string): void {
   if (quitting) return;
-  if (publicState.status === "incompatible") return;
+  // "incompatible" used to mean Codex-only; multi-CLI hosts should still retry relay.
+  // Only skip auto-reconnect when auth is permanently blocked.
   if (reconnectBlockedReason) {
     updateState({ status: "offline", detail: reconnectBlockedReason });
     return;
@@ -2017,6 +2453,8 @@ function scheduleReconnect(detail: string): void {
     updateState({ status: "waiting_pairing", detail: "等待配对连接，请生成配对码并在 Web 端完成授权。" });
     return;
   }
+  // Ensure we never stay stuck with connecting=true after a failed attempt.
+  connecting = false;
   updateState({ status: "offline", detail });
   if (reconnectTimer) return;
   reconnectAttempt += 1;
@@ -2027,6 +2465,7 @@ function scheduleReconnect(detail: string): void {
     reconnectTimer = null;
     connect().catch(handleError);
   }, delay);
+  reconnectTimer.unref?.();
 }
 
 async function ensureCodex(): Promise<void> {
@@ -2036,9 +2475,10 @@ async function ensureCodex(): Promise<void> {
     const environment = await detectEnvironment();
     updateState({ environment });
     if (!environment.codexCompatible) {
+      // Codex is optional — callers that need Codex catch this; relay stays connected.
       throw new Error(environment.codexInstalled
-        ? `Codex 版本不兼容（需要 0.144.x，当前 ${environment.codexVersion}）`
-        : "未检测到 Codex CLI");
+        ? `Codex 版本不兼容（需要 0.144.x，当前 ${environment.codexVersion}）；可用 Claude / Grok`
+        : "未检测到 Codex CLI（可选）；可用 Claude / Grok");
     }
   }
   codex = new CodexAdapter(codexCommand, (message) => {
@@ -2051,7 +2491,7 @@ async function ensureCodex(): Promise<void> {
     // Do not tear down the relay socket when Codex exits; keep online for reconnect of Codex only.
     updateState({
       status: socket?.readyState === WebSocket.OPEN ? "online" : publicState.status,
-      detail: `Codex 已停止：${detail}`
+      detail: `Codex 已停止：${detail}（Claude / Grok 任务不受影响）`
     });
   });
   await codex.start();
@@ -2305,6 +2745,8 @@ async function runHeadlessTaskTurn(options: {
   }
   await taskStore.upsert(latest);
   await publishStoredTaskSnapshot(options.threadId);
+  // Headless turn fully settled — run any follow-ups queued while this turn was active.
+  scheduleDrainTurnQueue(options.threadId);
 }
 
 async function handleCommand(command: ClientCommand): Promise<void> {
@@ -2416,60 +2858,72 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "turn.start") {
-      const mode = command.permissionMode ?? "ask-for-approval";
-      const stored = taskStore.get(command.threadId);
-      if (stored && (stored.engine === "claude" || stored.engine === "grok")) {
-        // Persist UI-selected model/effort before the turn so refresh/import keep them.
-        if (command.model || command.reasoningEffort) {
+      // If this thread already has a running turn, durable-queue the follow-up
+      // so closing the browser does not drop it (web localStorage alone is not enough).
+      if (isThreadTurnBusy(command.threadId)) {
+        await enqueueTurnStart(command);
+        return;
+      }
+      turnStartingByThread.add(command.threadId);
+      try {
+        logInfo("开始执行 turn.start", `thread=${command.threadId.slice(0, 8)} prompt=${command.prompt.slice(0, 80)}`);
+        const mode = command.permissionMode ?? "ask-for-approval";
+        const stored = taskStore.get(command.threadId);
+        if (stored && (stored.engine === "claude" || stored.engine === "grok")) {
+          // Persist UI-selected model/effort before the turn so refresh/import keep them.
+          if (command.model || command.reasoningEffort) {
+            if (command.model) stored.model = command.model;
+            if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+            await taskStore.upsert(stored);
+          }
+          await runHeadlessTaskTurn({
+            engine: stored.engine,
+            threadId: command.threadId,
+            cwd: stored.cwd,
+            prompt: command.prompt,
+            title: stored.title,
+            permissionMode: mode,
+            isNew: false,
+            ...(command.model || stored.model ? { model: command.model || stored.model } : {}),
+            ...(command.reasoningEffort || stored.reasoningEffort
+              ? { reasoningEffort: command.reasoningEffort || stored.reasoningEffort }
+              : {})
+          });
+          return;
+        }
+        await ensureCodex();
+        await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
+        startLocalActivity(command.threadId, command.prompt, "继续远程任务", "codex");
+        if (stored && (command.model || command.reasoningEffort)) {
           if (command.model) stored.model = command.model;
           if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
           await taskStore.upsert(stored);
         }
-        await runHeadlessTaskTurn({
-          engine: stored.engine,
-          threadId: command.threadId,
-          cwd: stored.cwd,
-          prompt: command.prompt,
-          title: stored.title,
-          permissionMode: mode,
-          isNew: false,
-          ...(command.model || stored.model ? { model: command.model || stored.model } : {}),
-          ...(command.reasoningEffort || stored.reasoningEffort
-            ? { reasoningEffort: command.reasoningEffort || stored.reasoningEffort }
-            : {})
-        });
-        return;
-      }
-      await ensureCodex();
-      await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
-      startLocalActivity(command.threadId, command.prompt, "继续远程任务", "codex");
-      if (stored && (command.model || command.reasoningEffort)) {
-        if (command.model) stored.model = command.model;
-        if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
-        await taskStore.upsert(stored);
-      }
-      const turnPayload: Record<string, unknown> = {
-        threadId: command.threadId,
-        clientUserMessageId: command.commandId,
-        input: [{ type: "text", text: command.prompt, text_elements: [] }]
-      };
-      const model = command.model || stored?.model;
-      const effort = command.reasoningEffort || stored?.reasoningEffort;
-      if (model) turnPayload.model = model;
-      if (effort) turnPayload.modelReasoningEffort = effort;
-      let result: any;
-      try {
-        result = await codex!.request("turn/start", turnPayload);
-      } catch {
-        result = await codex!.request("turn/start", {
+        const turnPayload: Record<string, unknown> = {
           threadId: command.threadId,
           clientUserMessageId: command.commandId,
           input: [{ type: "text", text: command.prompt, text_elements: [] }]
-        });
+        };
+        const model = command.model || stored?.model;
+        const effort = command.reasoningEffort || stored?.reasoningEffort;
+        if (model) turnPayload.model = model;
+        if (effort) turnPayload.modelReasoningEffort = effort;
+        let result: any;
+        try {
+          result = await codex!.request("turn/start", turnPayload);
+        } catch {
+          result = await codex!.request("turn/start", {
+            threadId: command.threadId,
+            clientUserMessageId: command.commandId,
+            input: [{ type: "text", text: command.prompt, text_elements: [] }]
+          });
+        }
+        activeTurnByThread.set(command.threadId, String(result.turn.id));
+        await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: result.turn.id, prompt: command.prompt }, true);
+        return;
+      } finally {
+        turnStartingByThread.delete(command.threadId);
       }
-      activeTurnByThread.set(command.threadId, String(result.turn.id));
-      await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: result.turn.id, prompt: command.prompt }, true);
-      return;
     }
     if (command.type === "turn.steer") {
       await ensureCodex();
@@ -2489,6 +2943,9 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "turn.interrupt") {
+      // Stop cancels both the active turn and any durable follow-ups for this thread.
+      logWarn("收到 turn.interrupt，停止任务并清空队列", command.threadId.slice(0, 8));
+      await clearTurnQueue(command.threadId);
       const stored = taskStore.get(command.threadId);
       const listed = publicState.tasks.find((item) => item.threadId === command.threadId);
       const engine = stored?.engine || listed?.engine;
@@ -2497,6 +2954,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         const killed = interruptHeadlessThread(command.threadId);
         finishLocalActivity(command.threadId, "interrupted");
         activeTurnByThread.delete(command.threadId);
+        turnStartingByThread.delete(command.threadId);
         if (stored) await taskStore.setStatus(command.threadId, "interrupted");
         await flushRemoteDeltas();
         await publish({
@@ -2525,6 +2983,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       ]);
       finishLocalActivity(command.threadId, "interrupted");
       activeTurnByThread.delete(command.threadId);
+      turnStartingByThread.delete(command.threadId);
       await flushRemoteDeltas();
       await publish({ type: "turn.completed", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: command.turnId, status: "interrupted" }, true, "completed");
       return;
@@ -2576,7 +3035,16 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       }, false);
     }
   } catch (error) {
-    if (localThreadId) finishLocalActivity(localThreadId, "failed");
+    if (localThreadId) {
+      finishLocalActivity(localThreadId, "failed");
+      activeTurnByThread.delete(localThreadId);
+      turnStartingByThread.delete(localThreadId);
+    }
+    if (command.type === "turn.start") {
+      turnStartingByThread.delete(command.threadId);
+      // Failed start should still try the next durable queued prompt.
+      scheduleDrainTurnQueue(command.threadId);
+    }
     await publish({
       type: "error",
       eventId: crypto.randomUUID(),
@@ -2665,10 +3133,13 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     finishLocalActivity(threadId, String(params.turn.status));
     await flushRemoteDeltas();
     activeTurnByThread.delete(threadId);
+    turnStartingByThread.delete(threadId);
     await publish({ type: "turn.completed", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: params.threadId, turnId: params.turn.id, status: String(params.turn.status) }, true, "completed");
     // Refresh snapshot so final assistant text is complete even if some deltas were dropped.
     // Touch updatedAt so web/agent lists reorder by last activity (not create time).
     try { await publishThread(threadId, { touch: true }); } catch { /* ignore */ }
+    // Codex turn finished — drain durable follow-up prompts for this thread.
+    scheduleDrainTurnQueue(threadId);
   }
   if (message.method === "serverRequest/resolved") {
     pendingRequestTypes.delete(String(message.params.requestId));
@@ -2714,13 +3185,38 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   }
 }
 
-function publishAgentMeta(fields: { name?: string; codexVersion?: string; platform?: string; agentVersion?: string } = {}): void {
+function resolveReportedEngineVersion(engine: CliEngine): string {
+  if (engine === "codex") {
+    const fromEnv = publicState.environment.codexVersion || codexVersion;
+    if (fromEnv && fromEnv !== "unknown") return fromEnv;
+    const fromList = publicState.availableEngines.find((item) => item.engine === "codex");
+    if (fromList?.version?.trim()) return fromList.version.trim();
+    return publicState.environment.codexInstalled || publicState.environment.codexCompatible
+      ? "unknown"
+      : "not-installed";
+  }
+  const info = publicState.availableEngines.find((item) => item.engine === engine);
+  if (info?.version?.trim()) return info.version.trim();
+  if (info?.ready) return "unknown";
+  return "not-installed";
+}
+
+function publishAgentMeta(fields: {
+  name?: string;
+  codexVersion?: string;
+  claudeVersion?: string;
+  grokVersion?: string;
+  platform?: string;
+  agentVersion?: string;
+} = {}): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   try {
     socket.send(JSON.stringify({
       type: "agent.meta",
       name: fields.name ?? resolvedDisplayName(),
-      codexVersion: fields.codexVersion ?? codexVersion,
+      codexVersion: fields.codexVersion ?? resolveReportedEngineVersion("codex"),
+      claudeVersion: fields.claudeVersion ?? resolveReportedEngineVersion("claude"),
+      grokVersion: fields.grokVersion ?? resolveReportedEngineVersion("grok"),
       platform: fields.platform ?? `${process.platform} ${os.release()}`,
       agentVersion: fields.agentVersion ?? PRODUCT_VERSION
     }));
@@ -3141,11 +3637,18 @@ async function addWorkspace(): Promise<PublicState> {
 
 function handleError(error: unknown): void {
   const detail = error instanceof Error ? error.message : String(error);
-  console.error(error);
+  logError("操作失败", error instanceof Error ? error : detail);
   if (quitting || installingUpdate) return;
   const connected = socket?.readyState === WebSocket.OPEN;
+  // Never stick on "incompatible" just because a Codex-only op failed while Claude/Grok work.
+  // Only use incompatible when no coding engine is ready at all.
+  const status = connected
+    ? "online"
+    : anyCodingEngineReady()
+      ? (publicState.status === "connecting" ? "connecting" : "offline")
+      : "incompatible";
   updateState({
-    status: publicState.status === "incompatible" ? "incompatible" : connected ? "online" : "offline",
+    status,
     detail: connected ? `代理在线，但有一项操作失败：${detail}` : detail
   });
 }
@@ -3518,7 +4021,35 @@ function registerIpc(): void {
     await publishHostStatus();
     return publicState;
   });
-  ipcMain.handle("agent:reconnect", async () => { await connect(true); return publicState; });
+  // Do not await connect — hung TCP must never freeze the agent UI/IPC.
+  ipcMain.handle("agent:reconnect", async () => {
+    logInfo("用户触发重新连接");
+    updateState({ status: "connecting", detail: "正在重新连接加密中继…" });
+    void connect(true).catch(handleError);
+    return publicState;
+  });
+  ipcMain.handle("agent:get-logs", async () => agentLogs.slice());
+  ipcMain.handle("agent:clear-logs", async () => {
+    agentLogs.length = 0;
+    logInfo("用户清空了内存日志（磁盘 agent.log 仍保留历史）");
+    return agentLogs.slice();
+  });
+  ipcMain.handle("agent:open-log-file", async () => {
+    if (!agentLogFilePath) throw new Error("日志文件尚未初始化");
+    try {
+      await fs.mkdir(path.dirname(agentLogFilePath), { recursive: true });
+      await fs.appendFile(agentLogFilePath, "", "utf8");
+    } catch {
+      // ignore create failures — still try open
+    }
+    const result = await shell.openPath(agentLogFilePath);
+    if (result) {
+      // openPath returns empty string on success; non-empty is error message
+      await shell.showItemInFolder(agentLogFilePath);
+    }
+    logInfo("已打开日志文件", agentLogFilePath);
+    return { path: agentLogFilePath };
+  });
   ipcMain.handle("agent:check-environment", async () => {
     try {
       await applyLoginPathToProcess();
@@ -3531,7 +4062,7 @@ function registerIpc(): void {
       codexReady: environment.codexCompatible,
       codexVersion: environment.codexVersion || "unknown"
     });
-    const anyEngineReady = environment.codexCompatible || availableEngines.some((item) => item.ready);
+    const ready = anyCodingEngineReady(environment, availableEngines);
     const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
     const readyLabels = availableEngines
       .filter((item) => item.ready)
@@ -3541,17 +4072,17 @@ function registerIpc(): void {
       environment,
       availableEngines,
       codexVersion: environment.codexVersion || publicState.codexVersion,
-      status: !anyEngineReady
-        ? "incompatible"
-        : paired
-          ? (socket?.readyState === WebSocket.OPEN ? "online" : "offline")
-          : config.relayUrl
-            ? "waiting_pairing"
-            : "unconfigured",
-      detail: !anyEngineReady
-        ? "未检测到可用编码引擎。请安装 Codex / Claude Code / Grok Build 后重试。"
-        : `环境检测完成：${readyLabels || "就绪"}${paired ? "。主机引擎能力已同步到网页。" : "。"}`
+      status: statusForEngineAvailability({ environment, engines: availableEngines, paired }),
+      detail: !ready
+        ? "未检测到可用编码引擎。请安装 Codex / Claude Code / Grok Build 任意一种后重试。"
+        : `环境检测完成：${readyLabels || "就绪"}${paired ? "。主机引擎能力已同步到网页。" : "。"}${
+          !environment.codexCompatible ? "（未安装 Codex 也可连接中继）" : ""
+        }`
     });
+    // If paired but socket down, try reconnect after engines are known (Claude/Grok-only hosts).
+    if (paired && socket?.readyState !== WebSocket.OPEN && ready) {
+      void connect(true).catch(handleError);
+    }
     // Push engine icons/versions to the web host card when online.
     if (socket?.readyState === WebSocket.OPEN) {
       try {
@@ -3666,6 +4197,8 @@ if (process.platform === "win32") {
 app.whenReady().then(async () => {
   await loadConfig();
   await taskStore.load(app.getPath("userData"));
+  await loadTurnQueue(app.getPath("userData"));
+  await initAgentLogFile(app.getPath("userData"));
   updateState({ cliEngine: taskStore.getDefaultEngine() });
   registerIpc();
   if (process.platform === "darwin") {
@@ -3689,22 +4222,66 @@ app.whenReady().then(async () => {
     void checkForAgentUpdate().catch((error) => updateState({ update: { status: "error", message: error.message } }));
   }, 1500);
   setInterval(() => void checkForAgentUpdate().catch(() => undefined), 6 * 60 * 60 * 1000).unref();
-  try {
-    await findCodex();
-    const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
-    updateState({
-      codexVersion,
-      status: !config.relayUrl ? "unconfigured" : config.pairing ? "pairing" : paired ? "offline" : "waiting_pairing",
-      detail: !config.relayUrl ? "请先配置中继地址。" : config.pairing ? "等待 Web 端确认配对。" : paired ? "Codex 已就绪，正在连接中继。" : "Codex 已就绪，等待配对连接。"
-    });
-    // Local 接力: list Codex threads as soon as the app can talk to Codex.
-    void refreshLocalTasks().catch(() => undefined);
-    if (config.pairing) schedulePairingPoll();
-    // Connect without blocking startup forever.
-    if (config.hostId) void connect().catch(handleError);
-  } catch (error) {
-    handleError(error);
-  }
+
+  const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
+  updateState({
+    status: !config.relayUrl
+      ? "unconfigured"
+      : config.pairing
+        ? "pairing"
+        : paired
+          ? "offline"
+          : "waiting_pairing",
+    detail: !config.relayUrl
+      ? "请先配置中继地址。"
+      : config.pairing
+        ? "等待 Web 端确认配对。"
+        : paired
+          ? "正在连接中继…"
+          : "等待配对连接。"
+  });
+  if (config.pairing) schedulePairingPoll();
+  // Connect immediately when paired — never wait on Codex/env probes (those can hang PATH shells).
+  // Any of Codex / Claude / Grok is enough; missing Codex must not prevent relay.
+  if (config.hostId) void connect().catch(handleError);
+  // Background env detect (Codex optional; failures must not block relay).
+  void (async () => {
+    try {
+      await applyLoginPathToProcessBounded();
+      const environment = await detectEnvironment();
+      const availableEngines = await detectAvailableEngines({
+        codexReady: environment.codexCompatible,
+        codexVersion: environment.codexVersion || "unknown"
+      }).catch(() => publicState.availableEngines);
+      const ready = anyCodingEngineReady(environment, availableEngines);
+      const readyLabels = availableEngines
+        .filter((item) => item.ready)
+        .map((item) => `${item.engine}${item.version ? ` ${item.version}` : ""}`)
+        .join(" · ");
+      updateState({
+        environment,
+        availableEngines,
+        codexVersion: environment.codexVersion || codexVersion,
+        // Do not overwrite online/connecting with incompatible when engines not yet found on PATH.
+        ...(publicState.status === "online" || publicState.status === "connecting"
+          ? {}
+          : { status: statusForEngineAvailability({ environment, engines: availableEngines }) }),
+        detail: publicState.status === "online"
+          ? publicState.detail
+          : ready
+            ? (environment.codexCompatible
+              ? `环境已就绪（${readyLabels || "Codex"}），正在连接中继。`
+              : `环境已就绪（${readyLabels}），正在连接中继（无需 Codex）。`)
+            : "正在连接中继…安装任意编码引擎后即可下发任务。"
+      });
+      if (environment.codexCompatible) {
+        void ensureCodex().then(() => refreshLocalTasks()).catch(() => undefined);
+      }
+    } catch (error) {
+      // Env probe failures must never force offline/incompatible over a live socket.
+      logWarn("启动环境检测失败", error instanceof Error ? error.message : String(error));
+    }
+  })();
 });
 
 app.on("window-all-closed", () => undefined);

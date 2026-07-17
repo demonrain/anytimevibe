@@ -239,7 +239,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: AdminContext, ses
     if (!user) return reply.code(404).send({ error: "user_not_found" });
 
     const hosts = await sql<Array<Record<string, unknown>>>`
-      SELECT id, name, platform, codex_version, agent_version, created_at, last_seen_at, revoked_at
+      SELECT id, name, platform, codex_version, claude_version, grok_version, agent_version, created_at, last_seen_at, revoked_at
       FROM hosts WHERE user_id = ${userId}
       ORDER BY created_at DESC
     `;
@@ -388,12 +388,17 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: AdminContext, ses
 
     const hosts = await sql<Array<Record<string, unknown>>>`
       SELECT
-        h.id, h.name, h.platform, h.codex_version, h.agent_version, h.created_at, h.last_seen_at, h.revoked_at,
+        h.id, h.name, h.platform, h.codex_version, h.claude_version, h.grok_version, h.agent_version,
+        h.created_at, h.last_seen_at, h.revoked_at,
         u.id AS user_id, u.username,
         (SELECT count(*)::int FROM sync_events se WHERE se.host_id = h.id) AS event_count
       FROM hosts h
       JOIN users u ON u.id = h.user_id
-      WHERE (${pattern}::text IS NULL OR h.name ILIKE ${pattern} OR u.username ILIKE ${pattern} OR COALESCE(h.agent_version, '') ILIKE ${pattern})
+      WHERE (${pattern}::text IS NULL OR h.name ILIKE ${pattern} OR u.username ILIKE ${pattern}
+        OR COALESCE(h.agent_version, '') ILIKE ${pattern}
+        OR COALESCE(h.codex_version, '') ILIKE ${pattern}
+        OR COALESCE(h.claude_version, '') ILIKE ${pattern}
+        OR COALESCE(h.grok_version, '') ILIKE ${pattern})
         AND (
           ${query.status} = 'all'
           OR (${query.status} = 'active' AND h.revoked_at IS NULL)

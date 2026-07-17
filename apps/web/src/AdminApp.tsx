@@ -45,6 +45,8 @@ type AdminHost = {
   name: string;
   platform: string;
   codexVersion: string;
+  claudeVersion?: string | null;
+  grokVersion?: string | null;
   agentVersion?: string | null;
   eventCount?: number;
   createdAt: string;
@@ -54,6 +56,14 @@ type AdminHost = {
   username: string;
   online: boolean;
 };
+
+function formatEngineVersion(value: string | null | undefined): string {
+  const text = String(value ?? "").trim();
+  if (!text) return "—";
+  if (/^not[-_]?installed$/i.test(text)) return "未安装";
+  if (/^unknown$/i.test(text)) return "未知";
+  return text;
+}
 
 type AuditLog = {
   id: string;
@@ -369,7 +379,7 @@ export function AdminApp() {
               const result = await api<{ deleted: number }>("/api/admin/pairings/cleanup", { method: "POST", body: "{}" });
               window.alert(`已清理 ${result.deleted} 条配对记录`);
             })}>清理配对垃圾</button>
-            <button className="danger" disabled={busyId === "cleanup-revoked"} onClick={() => runAction("cleanup-revoked", async () => {
+            <button className="quiet" disabled={busyId === "cleanup-revoked"} onClick={() => runAction("cleanup-revoked", async () => {
               if (!window.confirm("永久删除全部「已撤销」主机及其密文事件？此操作不可恢复。")) return;
               const result = await api<{ deleted: number }>("/api/admin/hosts/cleanup-revoked", {
                 method: "POST",
@@ -381,7 +391,7 @@ export function AdminApp() {
           </div>
         </header>
         <p className="admin-hint" style={{ margin: "0 0 12px" }}>
-          「客户端」列为桌面 Agent 上报的版本（上线后自动同步）。「撤销」仅禁用配对；「删除」永久移除主机与同步密文，用于清理错误/测试数据。
+          「客户端」与「编码引擎」版本由桌面 Agent 上线后自动上报（Codex / Claude Code / Grok Build）。「撤销」仅禁用配对；「删除」永久移除主机与同步密文。
         </p>
         <div className="admin-table-wrap">
           <table className="admin-table">
@@ -392,7 +402,7 @@ export function AdminApp() {
                 <th>平台</th>
                 <th>状态</th>
                 <th>客户端</th>
-                <th>Codex</th>
+                <th>编码引擎</th>
                 <th>事件数</th>
                 <th>最近在线</th>
                 <th>操作</th>
@@ -416,7 +426,13 @@ export function AdminApp() {
                       ? <code>v{String(host.agentVersion).replace(/^v/i, "")}</code>
                       : <span className="admin-note">未上报</span>}
                   </td>
-                  <td>{host.codexVersion || "—"}</td>
+                  <td>
+                    <div className="admin-engine-versions">
+                      <div><span>Codex</span><code>{formatEngineVersion(host.codexVersion)}</code></div>
+                      <div><span>Claude</span><code>{formatEngineVersion(host.claudeVersion)}</code></div>
+                      <div><span>Grok</span><code>{formatEngineVersion(host.grokVersion)}</code></div>
+                    </div>
+                  </td>
                   <td>{host.eventCount ?? 0}</td>
                   <td>{formatTime(host.lastSeenAt)}</td>
                   <td className="admin-actions">

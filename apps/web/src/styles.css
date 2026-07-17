@@ -928,10 +928,14 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .admin-panel p, .settings-panel p { margin: 0; color: #5f6660; line-height: 1.55; font-size: 13px; }
 .admin-panel code, .admin-json { font: 11px/1.45 "Cascadia Code", monospace; word-break: break-all; }
 .admin-table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,250,240,.7); }
-.admin-table { width: 100%; border-collapse: collapse; min-width: 860px; }
+.admin-table { width: 100%; border-collapse: collapse; min-width: 960px; }
 .admin-table th, .admin-table td { padding: 12px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; }
 .admin-table th { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #6f756e; background: rgba(23,33,27,.04); }
 .admin-table tr:last-child td { border-bottom: 0; }
+.admin-engine-versions { display: grid; gap: 4px; min-width: 148px; }
+.admin-engine-versions > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12px; }
+.admin-engine-versions span { color: #6f756e; font-weight: 700; flex: 0 0 auto; }
+.admin-engine-versions code { font-size: 11px; color: #17211b; background: rgba(23,33,27,.05); padding: 1px 6px; border-radius: 6px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .admin-actions { display: flex; flex-wrap: wrap; gap: 6px; min-width: 280px; }
 .admin-actions button { border: 1px solid var(--line); background: white; border-radius: 8px; padding: 6px 8px; font-size: 11px; font-weight: 800; cursor: pointer; }
 .admin-actions button:disabled { opacity: .45; cursor: not-allowed; }

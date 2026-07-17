@@ -1408,12 +1408,15 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     if (!prompt.trim() || online !== true) return;
     const submittedPrompt = prompt.trim();
     stickToBottomRef.current = true;
-    if (running || pendingPrompt) setCommandQueue((current) => [...current, submittedPrompt]);
-    else {
+    // Always deliver to the agent. When a turn is already running the agent durable-queues
+    // the follow-up so closing the browser no longer drops queued prompts.
+    if (running || pendingPrompt) {
+      setCommandQueue((current) => [...current, submittedPrompt]);
+    } else {
       setPendingPrompt(submittedPrompt);
       setPendingMessageCount(task.messages.length);
-      onCommand(turnStartCommand(submittedPrompt));
     }
+    onCommand(turnStartCommand(submittedPrompt));
     setPrompt("");
     saveTaskDraft(task.threadId, "");
   }
@@ -1422,8 +1425,10 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
   function stopTurn() {
     setPendingPrompt("");
     setCommandQueue([]);
+    try { localStorage.removeItem(`command-queue:${task.threadId}`); } catch { /* ignore */ }
     saveTaskDraft(task.threadId, "");
     // Always send interrupt: headless kill is keyed by threadId; turnId is for event correlation.
+    // Agent also clears its durable queue for this thread.
     onCommand({
       type: "turn.interrupt",
       commandId: crypto.randomUUID(),
@@ -1459,15 +1464,21 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     localStorage.setItem(`command-queue:${task.threadId}`, JSON.stringify(commandQueue));
   }, [commandQueue, task.threadId]);
 
+  // Local queue is UI-only; the agent owns durable execution. When a new turn starts,
+  // drop the queue head if it matches the latest user message (agent accepted the follow-up).
+  const previousActiveTurnRef = useRef(task.activeTurnId);
   useEffect(() => {
-    if (running || pendingPrompt || online !== true || commandQueue.length === 0) return;
-    const nextPrompt = commandQueue[0]!;
-    setCommandQueue(commandQueue.slice(1));
-    setPendingPrompt(nextPrompt);
-    setPendingMessageCount(task.messages.length);
-    stickToBottomRef.current = true;
-    onCommand(turnStartCommand(nextPrompt));
-  }, [commandQueue, online, onCommand, pendingPrompt, permissionMode, running, task.threadId, model, reasoningEffort]);
+    const previous = previousActiveTurnRef.current;
+    previousActiveTurnRef.current = task.activeTurnId;
+    if (!task.activeTurnId || task.activeTurnId === previous) return;
+    const lastUser = [...task.messages].reverse().find((message) => message.role === "user");
+    if (!lastUser?.text) return;
+    setCommandQueue((current) => {
+      if (current.length === 0) return current;
+      if (current[0] === lastUser.text) return current.slice(1);
+      return current;
+    });
+  }, [task.activeTurnId, task.messages]);
 
   useEffect(() => {
     const latestMessage = task.messages.at(-1);

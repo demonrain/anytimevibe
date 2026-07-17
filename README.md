@@ -32,12 +32,12 @@
 
 ## 立即体验
 
-**演示地址：** [https://vibe.demonrain.top/](https://vibe.demonrain.top/)
+**体验地址：** [https://vibe.demonrain.top/](https://vibe.demonrain.top/)
 
 | 步骤 | 做什么 |
 | --- | --- |
 | 1 | [下载 Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest) 并安装，添加白名单工作区 |
-| 2 | 打开 [演示站](https://vibe.demonrain.top/) 或自建 Web PWA，登录并输入客户端配对码 |
+| 2 | 打开 [体验站](https://vibe.demonrain.top/) 或自建 Web PWA，登录并输入客户端配对码 |
 | 3 | 新建任务时选择 **Codex / Claude Code / Grok Build**，在手机上查看进度、继续对话与审批 |
 
 自建中继见下方 [Docker 部署](#docker-部署)。本地开发见 [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md)。
@@ -222,3 +222,9 @@ pnpm typecheck
 pnpm test
 pnpm build
 ```
+
+## 交流群
+
+加入 QQ 群「随码 AnytimeVibe 交流群」：
+
+<a target="_blank" href="https://qm.qq.com/cgi-bin/qm/qr?k=r-97SUcHdisn_wz-4voLVgmXo1rGDfJH&jump_from=webapi&authKey=4NAmjiuC7S5tGVdLDSz8JwDKQQoKkCJTn/oZZKKchOCIEh4PQGAgSWaQw3SyZAti"><img border="0" src="//pub.idqqimg.com/wpa/images/group.png" alt="随码AnytimeVibe交流群" title="随码AnytimeVibe交流群"></a>

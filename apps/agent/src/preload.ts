@@ -19,9 +19,17 @@ contextBridge.exposeInMainWorld("anytimeVibe", {
   windowMinimize: () => ipcRenderer.invoke("agent:window-minimize"),
   windowClose: () => ipcRenderer.invoke("agent:window-close"),
   openFeedback: () => ipcRenderer.invoke("agent:open-feedback"),
+  getLogs: () => ipcRenderer.invoke("agent:get-logs"),
+  clearLogs: () => ipcRenderer.invoke("agent:clear-logs"),
+  openLogFile: () => ipcRenderer.invoke("agent:open-log-file"),
   onState: (listener: (state: unknown) => void) => {
     const wrapped = (_event: unknown, state: unknown) => listener(state);
     ipcRenderer.on("agent:state", wrapped);
     return () => ipcRenderer.removeListener("agent:state", wrapped);
+  },
+  onLog: (listener: (entry: unknown) => void) => {
+    const wrapped = (_event: unknown, entry: unknown) => listener(entry);
+    ipcRenderer.on("agent:log", wrapped);
+    return () => ipcRenderer.removeListener("agent:log", wrapped);
   }
 });

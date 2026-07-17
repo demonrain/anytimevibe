@@ -657,17 +657,23 @@ async function main(): Promise<void> {
           const meta = z.object({
             name: z.string().trim().min(1).max(64).optional(),
             codexVersion: z.string().trim().min(1).max(80).optional(),
+            claudeVersion: z.string().trim().min(1).max(80).optional(),
+            grokVersion: z.string().trim().min(1).max(80).optional(),
             platform: z.string().trim().min(1).max(120).optional(),
             agentVersion: z.string().trim().min(1).max(40).optional()
           }).parse(parsed);
           const nextName = meta.name?.trim();
           const nextCodex = meta.codexVersion?.trim();
+          const nextClaude = meta.claudeVersion?.trim();
+          const nextGrok = meta.grokVersion?.trim();
           const nextPlatform = meta.platform?.trim();
           const nextAgentVersion = meta.agentVersion?.trim();
           await sql`
             UPDATE hosts SET
               name = COALESCE(${nextName ?? null}, name),
               codex_version = COALESCE(${nextCodex ?? null}, codex_version),
+              claude_version = COALESCE(${nextClaude ?? null}, claude_version),
+              grok_version = COALESCE(${nextGrok ?? null}, grok_version),
               platform = COALESCE(${nextPlatform ?? null}, platform),
               agent_version = COALESCE(${nextAgentVersion ?? null}, agent_version),
               last_seen_at = now()
@@ -677,6 +683,8 @@ async function main(): Promise<void> {
             hostId: host.id,
             ...(nextName ? { name: nextName } : {}),
             ...(nextCodex ? { codexVersion: nextCodex } : {}),
+            ...(nextClaude ? { claudeVersion: nextClaude } : {}),
+            ...(nextGrok ? { grokVersion: nextGrok } : {}),
             ...(nextPlatform ? { platform: nextPlatform } : {}),
             ...(nextAgentVersion ? { agentVersion: nextAgentVersion } : {})
           }));
