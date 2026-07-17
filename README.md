@@ -203,9 +203,9 @@ macOS 包需要在 macOS 或 GitHub Actions `macos-latest` 环境构建。当前
 
 <a href="https://www.star-history.com/?repos=demonrain%2Fanytimevibe&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&theme=dark&legend=top-left&sealed_token=r6dBJtMY8KMBwqyKA-zCxx131eL7QND6pUwcK3Sd0ghYr9_cmozQzGTE-WufadS5wnicAdz80SxVlJr87JYN6_xwkc60dmWBrdEwuaKCwgm2srBWTOsreQ" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&legend=top-left&sealed_token=r6dBJtMY8KMBwqyKA-zCxx131eL7QND6pUwcK3Sd0ghYr9_cmozQzGTE-WufadS5wnicAdz80SxVlJr87JYN6_xwkc60dmWBrdEwuaKCwgm2srBWTOsreQ" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&legend=top-left&sealed_token=r6dBJtMY8KMBwqyKA-zCxx131eL7QND6pUwcK3Sd0ghYr9_cmozQzGTE-WufadS5wnicAdz80SxVlJr87JYN6_xwkc60dmWBrdEwuaKCwgm2srBWTOsreQ" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&theme=dark&legend=top-left&sealed_token=fP5ilEUaMkQn14aKOspqXOZGuK1gM92PAAz5e0Qgz3Z8cYHG65NUTd_uAsQ1cm2Th0JFhEjoSa7dNNFZg4iq2IVo8RWPpMwYlkpo_dbfszrBe3qHuXwpXg" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&legend=top-left&sealed_token=fP5ilEUaMkQn14aKOspqXOZGuK1gM92PAAz5e0Qgz3Z8cYHG65NUTd_uAsQ1cm2Th0JFhEjoSa7dNNFZg4iq2IVo8RWPpMwYlkpo_dbfszrBe3qHuXwpXg" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=demonrain/anytimevibe&type=date&legend=top-left&sealed_token=fP5ilEUaMkQn14aKOspqXOZGuK1gM92PAAz5e0Qgz3Z8cYHG65NUTd_uAsQ1cm2Th0JFhEjoSa7dNNFZg4iq2IVo8RWPpMwYlkpo_dbfszrBe3qHuXwpXg" />
  </picture>
 </a>
 
@@ -227,4 +227,4 @@ pnpm build
 
 加入 QQ 群「随码 AnytimeVibe 交流群」：
 
-<a target="_blank" href="https://qm.qq.com/cgi-bin/qm/qr?k=r-97SUcHdisn_wz-4voLVgmXo1rGDfJH&jump_from=webapi&authKey=4NAmjiuC7S5tGVdLDSz8JwDKQQoKkCJTn/oZZKKchOCIEh4PQGAgSWaQw3SyZAti"><img border="0" src="//pub.idqqimg.com/wpa/images/group.png" alt="随码AnytimeVibe交流群" title="随码AnytimeVibe交流群"></a>
+<a target="_blank" href="https://qm.qq.com/cgi-bin/qm/qr?k=r-97SUcHdisn_wz-4voLVgmXo1rGDfJH&jump_from=webapi&authKey=4NAmjiuC7S5tGVdLDSz8JwDKQQoKkCJTn/oZZKKchOCIEh4PQGAgSWaQw3SyZAti"><img border="0" src="https://pub.idqqimg.com/wpa/images/group.png" alt="随码AnytimeVibe交流群" title="随码AnytimeVibe交流群"></a>
