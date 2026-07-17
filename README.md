@@ -223,6 +223,10 @@ pnpm test
 pnpm build
 ```
 
+## 友链 & 支持
+
+- **社区**：[LINUX DO](https://linux.do/) —— 真诚、友善、专业的技术交流社区
+
 ## 交流群
 
 加入 QQ 群「随码 AnytimeVibe 交流群」：
