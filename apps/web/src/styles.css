@@ -253,7 +253,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   max-height: calc(1.4em * 2);
   height: calc(1.4em * 2);
 }
-.task-foot code {
+.task-foot code,
+.task-foot .task-cwd {
   min-width: 0;
   flex: 1 1 auto;
   overflow: hidden;
@@ -261,6 +262,14 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   white-space: nowrap;
   font-size: 9px;
   color: #767c75;
+  /* Prefer showing the leaf of long absolute paths when the column is narrow. */
+  direction: rtl;
+  text-align: left;
+  unicode-bidi: plaintext;
+}
+.task-foot .task-cwd {
+  /* Restore LTR glyphs inside the truncated absolute path. */
+  direction: rtl;
 }
 .task-foot b {
   color: #a03b24;
@@ -559,7 +568,25 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .composer .stop { background: #efe0d8; color: #9b341e; }
 .command-queue { display: grid; gap: 6px; border: 1px solid rgba(226,88,50,.3); background: rgba(226,88,50,.06); border-radius: 14px; padding: 10px; min-width: 0; }.command-queue > div { display: flex; justify-content: space-between; align-items: center; color: var(--rust); font-size: 11px; }.command-queue > div span { font-size: 10px; font-weight: 800; }.command-queue article { display: flex; gap: 8px; align-items: flex-start; background: rgba(255,250,240,.75); border-radius: 9px; padding: 8px 9px; min-width: 0; }.command-queue article b { display: grid; place-items: center; flex: 0 0 auto; width: 18px; height: 18px; border-radius: 50%; background: var(--rust); color: white; font-size: 10px; }.command-queue article p { margin: 1px 0 0; font-size: 11px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; min-width: 0; }
 .composer { border-top: 1px solid var(--line); padding: 10px 14px max(10px, env(safe-area-inset-bottom)); background: rgba(242,234,219,.85); backdrop-filter: blur(18px); min-width: 0; flex: 0 0 auto; }.composer textarea { min-height: 56px; resize: vertical; background: var(--cream); font-size: 13px; padding: 10px 11px; }.composer > div { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 8px; flex-wrap: wrap; }.composer small { margin-right: auto; color: #737a72; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }.send-shortcut { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }.composer kbd { border: 1px solid rgba(23,33,27,.2); border-bottom-width: 2px; border-radius: 5px; background: var(--cream); padding: 1px 5px; font: 10px/1.4 "Cascadia Code", monospace; color: var(--ink); }.composer button { border: 0; border-radius: 8px; padding: 7px 12px; font-size: 12px; font-weight: 800; cursor: pointer; }.composer .send { background: var(--rust); color: white; }.composer .stop { background: #efe0d8; color: #9b341e; }
-.diff-view { min-width: 0; min-height: 0; overflow: auto; padding: 12px 0; font: 11px/1.5 "Cascadia Code", Consolas, monospace; background: #18201b; color: #d5d9d1; }.diff-view div { padding: 0 14px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%; }.diff-view .add { background: rgba(60,160,99,.2); color: #b9efca; }.diff-view .remove { background: rgba(210,70,54,.18); color: #ffc1b7; }.diff-view .hunk { color: #e8c46a; background: rgba(232,196,106,.08); }.diff-empty, .conversation-empty { display: grid; place-content: center; text-align: center; color: #747a73; padding: 24px; min-width: 0; }.conversation-empty { grid-row: 1 / -1; }.orbit { width: 72px; height: 72px; border: 2px solid var(--rust); border-radius: 50%; margin: auto; position: relative; }.orbit::after { content: ""; position: absolute; width: 11px; height: 11px; background: var(--moss); border-radius: 50%; top: 6px; right: 2px; }
+.diff-panel { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
+.diff-file-list { padding: 12px 14px; border-bottom: 1px solid var(--line); background: rgba(255,250,240,.9); min-width: 0; }
+.diff-file-list strong { display: block; font-size: 12px; margin-bottom: 8px; color: var(--ink); }
+.diff-file-list ul { margin: 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 6px; max-height: 96px; overflow: auto; }
+.diff-file-list li { margin: 0; }
+.diff-file-list code { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; padding: 3px 8px; border-radius: 8px; background: rgba(23,33,27,.06); color: #2a332c; }
+.diff-view { min-width: 0; min-height: 0; overflow: auto; padding: 12px 0; font: 11px/1.5 "Cascadia Code", Consolas, monospace; background: #18201b; color: #d5d9d1; }
+.diff-view div { padding: 0 14px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%; }
+.diff-view .add { background: rgba(60,160,99,.2); color: #b9efca; }
+.diff-view .remove { background: rgba(210,70,54,.18); color: #ffc1b7; }
+.diff-view .hunk { color: #e8c46a; background: rgba(232,196,106,.08); }
+.diff-view .meta { color: #9db0a4; background: rgba(255,255,255,.04); }
+.diff-empty { display: grid; place-content: center; gap: 8px; text-align: left; color: #747a73; padding: 28px 24px; min-width: 0; max-width: 420px; margin: 0 auto; }
+.diff-empty strong { color: var(--ink); font-size: 15px; }
+.diff-empty p, .diff-empty ul { margin: 0; font-size: 13px; line-height: 1.55; }
+.diff-empty ul { padding-left: 1.2em; }
+.conversation-empty { display: grid; place-content: center; text-align: center; color: #747a73; padding: 24px; min-width: 0; grid-row: 1 / -1; }
+.orbit { width: 72px; height: 72px; border: 2px solid var(--rust); border-radius: 50%; margin: auto; position: relative; }
+.orbit::after { content: ""; position: absolute; width: 11px; height: 11px; background: var(--moss); border-radius: 50%; top: 6px; right: 2px; }
 /*
  * Mobile new-task forms are taller than the viewport. Using only place-items:center
  * clips the sheet and prevents pan/scroll, so the submit button stays off-screen.
@@ -928,7 +955,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .admin-panel p, .settings-panel p { margin: 0; color: #5f6660; line-height: 1.55; font-size: 13px; }
 .admin-panel code, .admin-json { font: 11px/1.45 "Cascadia Code", monospace; word-break: break-all; }
 .admin-table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,250,240,.7); }
-.admin-table { width: 100%; border-collapse: collapse; min-width: 960px; }
+.admin-table { width: 100%; border-collapse: collapse; table-layout: auto; min-width: 1080px; }
 .admin-table th, .admin-table td { padding: 12px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; }
 .admin-table th { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #6f756e; background: rgba(23,33,27,.04); }
 .admin-table tr:last-child td { border-bottom: 0; }
@@ -936,8 +963,27 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .admin-engine-versions > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12px; }
 .admin-engine-versions span { color: #6f756e; font-weight: 700; flex: 0 0 auto; }
 .admin-engine-versions code { font-size: 11px; color: #17211b; background: rgba(23,33,27,.05); padding: 1px 6px; border-radius: 6px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.admin-actions { display: flex; flex-wrap: wrap; gap: 6px; min-width: 280px; }
-.admin-actions button { border: 1px solid var(--line); background: white; border-radius: 8px; padding: 6px 8px; font-size: 11px; font-weight: 800; cursor: pointer; }
+/* Keep <td> as table-cell so the 操作 column aligns with its header; flex only on the inner stack. */
+.admin-table th.admin-actions-col,
+.admin-table td.admin-actions-cell {
+  vertical-align: top;
+  text-align: left;
+  width: 220px;
+  min-width: 220px;
+  max-width: 280px;
+  box-sizing: border-box;
+}
+.admin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+}
+.admin-actions button { border: 1px solid var(--line); background: white; border-radius: 8px; padding: 6px 8px; font-size: 11px; font-weight: 800; cursor: pointer; line-height: 1.2; }
 .admin-actions button:disabled { opacity: .45; cursor: not-allowed; }
 .admin-actions button.danger, .admin-actions .danger { color: #9b341e; background: #f7e5df; border-color: transparent; }
 .admin-note { display: block; color: #7a8079; font-size: 11px; margin-top: 3px; }

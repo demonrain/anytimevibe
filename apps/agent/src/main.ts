@@ -40,13 +40,14 @@ import {
   PRODUCT_VERSION
 } from "@anytimevibe/protocol";
 import { CodexAdapter, normalizeUnixSeconds, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
-import { ensureClaudeWorkspaceTrusted } from "./cli/claude-trust";
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn } from "./cli/headless-runner";
 import { importLocalCliSessions } from "./cli/import-sessions";
 import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
+import { appendEngineDiffChunk, buildTurnDiff, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
 import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
+import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
@@ -529,7 +530,7 @@ function touchAgentTask(threadId: string, patch: Partial<AgentTask> = {}): void 
   const task: AgentTask = {
     threadId,
     title: patch.title || existing?.title || stored?.title || "远程任务",
-    cwd: patch.cwd || existing?.cwd || stored?.cwd || "",
+    cwd: preferTaskCwd(patch.cwd, existing?.cwd, stored?.cwd),
     status: patch.status || existing?.status || stored?.status || "active",
     updatedAt: now,
     ...(engine ? { engine } : {})
@@ -2497,6 +2498,21 @@ async function ensureCodex(): Promise<void> {
   await codex.start();
 }
 
+/** Write project trust, then restart app-server if config changed so the new trust is loaded. */
+async function ensureCodexTrustedAndReady(cwd: string): Promise<void> {
+  const trustChanged = await ensureWorkspaceTrusted("codex", cwd);
+  if (trustChanged && codex) {
+    logInfo("Codex 项目信任已更新，正在重载 app-server", cwd);
+    try {
+      codex.stop();
+    } catch {
+      // ignore
+    }
+    codex = null;
+  }
+  await ensureCodex();
+}
+
 async function handleRelayMessage(raw: string): Promise<void> {
   const parsed = JSON.parse(raw) as Record<string, any>;
   if (parsed.type === "relay.key_authorization") {
@@ -2540,6 +2556,28 @@ function isAllowedWorkspace(requestedPath: string): boolean {
   });
 }
 
+/** Always persist/publish absolute task working directories (subdir under a workspace stays the full path). */
+function resolveAbsoluteCwd(cwd: string | undefined | null, fallback = ""): string {
+  const raw = String(cwd ?? "").trim();
+  if (!raw) return fallback;
+  try {
+    return path.resolve(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/** Prefer the more specific absolute path when merging snapshot vs local store. */
+function preferTaskCwd(...candidates: Array<string | undefined | null>): string {
+  const resolved = candidates
+    .map((item) => resolveAbsoluteCwd(item))
+    .filter(Boolean);
+  if (!resolved.length) return "";
+  // Longer path wins when one is a parent of another (workspace root vs task subdir).
+  resolved.sort((left, right) => right.length - left.length);
+  return resolved[0]!;
+}
+
 async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void> {
   if (event.type === "delta") {
     const itemId = event.kind === "assistant"
@@ -2557,13 +2595,25 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
   }
   if (event.type === "turn.started") {
     activeTurnByThread.set(event.threadId, event.turnId);
+    clearEngineDiffChunks(event.threadId);
+    // Headless path already upserts the user message + snapshot before spawning the CLI.
+    // Omitting prompt here avoids the web adding a second YOU bubble for the same turn.
+    const stored = taskStore.get(event.threadId);
+    const lastUser = stored
+      ? [...stored.messages].reverse().find((message) => message.role === "user")
+      : undefined;
+    const promptAlreadyPersisted = Boolean(
+      event.prompt
+      && lastUser
+      && lastUser.text.trim() === event.prompt.trim()
+    );
     await publish({
       type: "turn.started",
       eventId: crypto.randomUUID(),
       occurredAt: new Date().toISOString(),
       threadId: event.threadId,
       turnId: event.turnId,
-      ...(event.prompt ? { prompt: event.prompt } : {})
+      ...(!promptAlreadyPersisted && event.prompt ? { prompt: event.prompt } : {})
     }, true);
     return;
   }
@@ -2613,7 +2663,13 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
       status: event.status,
       ...(event.contextUsage ? { contextUsage: event.contextUsage } : {})
     }, true, "completed");
-    // Push latest snapshot so web sees contextUsage / final status for multi-CLI tasks.
+    // Collect workspace / engine diffs for the Diff tab (Claude / Grok headless path).
+    try {
+      await publishTaskDiff(event.threadId, event.turnId);
+    } catch {
+      // ignore
+    }
+    // Push latest snapshot so web sees contextUsage / final status / lastDiff.
     try {
       await publishStoredTaskSnapshot(event.threadId);
     } catch {
@@ -2622,13 +2678,40 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
   }
 }
 
+/** Build + publish task Diff for the web Diff tab; persist on StoredTask. */
+async function publishTaskDiff(threadId: string, turnId: string): Promise<void> {
+  const stored = taskStore.get(threadId);
+  const listed = publicState.tasks.find((item) => item.threadId === threadId);
+  const cwd = preferTaskCwd(stored?.cwd, listed?.cwd);
+  const diff = await buildTurnDiff(threadId, cwd);
+  if (!diff.trim()) return;
+  if (stored) {
+    stored.lastDiff = diff;
+    stored.updatedAt = Date.now() / 1000;
+    await taskStore.upsert(stored);
+  }
+  await publish({
+    type: "diff.updated",
+    eventId: crypto.randomUUID(),
+    occurredAt: new Date().toISOString(),
+    threadId,
+    turnId,
+    diff
+  }, true);
+}
+
 async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
   const task = taskStore.get(threadId);
   if (!task) return;
+  const cwd = resolveAbsoluteCwd(task.cwd);
+  if (cwd && task.cwd !== cwd) {
+    task.cwd = cwd;
+    await taskStore.upsert(task);
+  }
   const agentTask: AgentTask = {
     threadId: task.threadId,
     title: task.title,
-    cwd: task.cwd,
+    cwd,
     status: task.status,
     updatedAt: task.updatedAt,
     engine: task.engine
@@ -2644,7 +2727,7 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     occurredAt: new Date().toISOString(),
     threadId: task.threadId,
     title: task.title,
-    cwd: task.cwd,
+    cwd,
     status: task.status,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
@@ -2653,6 +2736,7 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     ...(task.model ? { model: task.model } : {}),
     ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
+    ...(task.lastDiff ? { diff: task.lastDiff } : {}),
     messages: task.messages
   }, true);
 }
@@ -2671,12 +2755,13 @@ async function runHeadlessTaskTurn(options: {
   const turnId = crypto.randomUUID();
   const now = Date.now() / 1000;
   let stored = taskStore.get(options.threadId);
+  const absoluteCwd = resolveAbsoluteCwd(options.cwd);
   if (options.isNew || !stored) {
     stored = {
       threadId: options.threadId,
       engine: options.engine,
       providerSessionId: "",
-      cwd: options.cwd,
+      cwd: absoluteCwd,
       title: options.title || options.prompt.slice(0, 80),
       status: "active",
       createdAt: now,
@@ -2685,6 +2770,9 @@ async function runHeadlessTaskTurn(options: {
       ...(options.model ? { model: options.model } : {}),
       ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {})
     };
+  } else if (absoluteCwd) {
+    // Keep the real absolute working dir (subdir under a workspace root stays full path).
+    stored.cwd = preferTaskCwd(absoluteCwd, stored.cwd);
   }
   if (options.model) stored.model = options.model;
   if (options.reasoningEffort) stored.reasoningEffort = options.reasoningEffort;
@@ -2779,6 +2867,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       if (engine === "claude" || engine === "grok") {
         const threadId = crypto.randomUUID();
         localThreadId = threadId;
+        await ensureWorkspaceTrusted(engine, command.cwd);
         await runHeadlessTaskTurn({
           engine,
           threadId,
@@ -2792,8 +2881,11 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         });
         return;
       }
-      await ensureCodex();
-      const startParams: Record<string, unknown> = { ...threadStartParams(command.cwd, mode) };
+      // Pre-trust project root so Codex app-server does not hang on the interactive
+      // "Do you trust the contents of this directory?" prompt (no TTY in remote mode).
+      const absoluteCwd = resolveAbsoluteCwd(command.cwd);
+      await ensureCodexTrustedAndReady(absoluteCwd);
+      const startParams: Record<string, unknown> = { ...threadStartParams(absoluteCwd, mode) };
       if (command.model) startParams.model = command.model;
       if (command.reasoningEffort) {
         // Codex app-server / config use model_reasoning_effort style values.
@@ -2804,16 +2896,17 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         started = await codex!.request("thread/start", startParams);
       } catch {
         // Older app-server builds may reject model fields — retry bare params.
-        started = await codex!.request("thread/start", threadStartParams(command.cwd, mode));
+        started = await codex!.request("thread/start", threadStartParams(absoluteCwd, mode));
       }
       const thread = started.thread;
       localThreadId = thread.id;
       if (command.title) await codex!.request("thread/name/set", { threadId: thread.id, name: command.title });
+      const threadCwd = preferTaskCwd(thread?.cwd, absoluteCwd);
       await taskStore.upsert({
         threadId: thread.id,
         engine: "codex",
         providerSessionId: thread.id,
-        cwd: command.cwd,
+        cwd: threadCwd,
         title: command.title || command.prompt.slice(0, 80),
         status: "active",
         createdAt: Date.now() / 1000,
@@ -2852,7 +2945,8 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         await publishStoredTaskSnapshot(command.threadId);
         return;
       }
-      await ensureCodex();
+      if (stored?.cwd) await ensureCodexTrustedAndReady(stored.cwd);
+      else await ensureCodex();
       await codex!.request("thread/resume", { threadId: command.threadId });
       await publishThread(command.threadId);
       return;
@@ -2876,6 +2970,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
             if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
             await taskStore.upsert(stored);
           }
+          await ensureWorkspaceTrusted(stored.engine, stored.cwd);
           await runHeadlessTaskTurn({
             engine: stored.engine,
             threadId: command.threadId,
@@ -2891,7 +2986,9 @@ async function handleCommand(command: ClientCommand): Promise<void> {
           });
           return;
         }
-        await ensureCodex();
+        const codexCwd = stored?.cwd || "";
+        if (codexCwd) await ensureCodexTrustedAndReady(codexCwd);
+        else await ensureCodex();
         await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
         startLocalActivity(command.threadId, command.prompt, "继续远程任务", "codex");
         if (stored && (command.model || command.reasoningEffort)) {
@@ -3086,6 +3183,11 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
         queueRemoteDelta(threadId, `stage:${key}:done`, `\n✓ ${result}\n`);
       }
     }
+    // Capture file patches for the Diff tab as Codex applies them.
+    if (String(item.type ?? "") === "fileChange" && threadId) {
+      const patch = extractFileChangeDiff(item);
+      if (patch) appendEngineDiffChunk(threadId, patch);
+    }
   }
   if (message.method === "item/agentMessage/delta") {
     const threadId = String(message.params?.threadId ?? "");
@@ -3125,17 +3227,27 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const threadId = String(params.threadId ?? params.turn?.threadId ?? "");
     const turnId = String(params.turnId ?? params.turn?.id ?? "");
     if (threadId && turnId) activeTurnByThread.set(threadId, turnId);
-    if (threadId) touchAgentTask(threadId, { status: "active", engine: "codex" });
+    if (threadId) {
+      clearEngineDiffChunks(threadId);
+      touchAgentTask(threadId, { status: "active", engine: "codex" });
+    }
   }
   if (message.method === "turn/completed") {
     const params = message.params;
     const threadId = String(params.threadId);
+    const turnId = String(params.turn?.id ?? params.turnId ?? "");
     finishLocalActivity(threadId, String(params.turn.status));
     await flushRemoteDeltas();
     activeTurnByThread.delete(threadId);
     turnStartingByThread.delete(threadId);
     await publish({ type: "turn.completed", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: params.threadId, turnId: params.turn.id, status: String(params.turn.status) }, true, "completed");
-    // Refresh snapshot so final assistant text is complete even if some deltas were dropped.
+    // Workspace git diff + any fileChange patches → Diff tab.
+    try {
+      if (turnId) await publishTaskDiff(threadId, turnId);
+    } catch {
+      // ignore
+    }
+    // Refresh snapshot so final assistant text / lastDiff are complete.
     // Touch updatedAt so web/agent lists reorder by last activity (not create time).
     try { await publishThread(threadId, { touch: true }); } catch { /* ignore */ }
     // Codex turn finished — drain durable follow-up prompts for this thread.
@@ -3260,13 +3372,19 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
   const result = await codex!.request("thread/read", { threadId, includeTurns: true });
   const snapshot = threadToSnapshot(result.thread);
   const stored = taskStore.get(threadId);
+  const cwd = preferTaskCwd(snapshot.cwd, stored?.cwd);
+  if (stored && cwd && stored.cwd !== cwd) {
+    stored.cwd = cwd;
+    stored.updatedAt = Date.now() / 1000;
+    await taskStore.upsert(stored);
+  }
   const updatedAt = options.touch
     ? Math.max(normalizeUnixSeconds(snapshot.updatedAt), Date.now() / 1000)
     : normalizeUnixSeconds(snapshot.updatedAt);
   const task: AgentTask = {
     threadId: snapshot.threadId,
     title: snapshot.title,
-    cwd: snapshot.cwd,
+    cwd,
     status: snapshot.status,
     updatedAt,
     engine: "codex"
@@ -3282,10 +3400,12 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     eventId: crypto.randomUUID(),
     occurredAt: new Date().toISOString(),
     ...snapshot,
+    cwd,
     updatedAt,
     cliEngine: "codex",
     ...(stored?.model ? { model: stored.model } : {}),
     ...(stored?.reasoningEffort ? { reasoningEffort: stored.reasoningEffort } : {}),
+    ...(stored?.lastDiff ? { diff: stored.lastDiff } : {}),
     ...(stored?.providerSessionId ? { providerSessionId: stored.providerSessionId } : { providerSessionId: threadId })
   }, true);
 }
@@ -3302,7 +3422,7 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   const storedTasks: AgentTask[] = taskStore.list(listLimit).map((task) => ({
     threadId: task.threadId,
     title: task.title,
-    cwd: task.cwd,
+    cwd: resolveAbsoluteCwd(task.cwd),
     status: task.status,
     updatedAt: task.updatedAt,
     engine: task.engine
@@ -3316,7 +3436,7 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
     codexTasks = threads.map((thread) => ({
       threadId: String(thread.id),
       title: String(thread.name || thread.preview || "未命名任务"),
-      cwd: String(thread.cwd || ""),
+      cwd: resolveAbsoluteCwd(String(thread.cwd || "")),
       status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
       updatedAt: normalizeUnixSeconds(thread.updatedAt),
       engine: "codex" as const
@@ -3532,20 +3652,16 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   // Only resume with provider-native session ids (not our product thread UUID unless they match).
   const providerSessionId = (stored?.providerSessionId || "").trim();
 
+  // Pre-accept directory trust prompts before opening an interactive handoff terminal.
+  await ensureWorkspaceTrusted(engine === "claude" || engine === "grok" || engine === "codex" ? engine : "codex", cwd);
+
   if (engine === "claude") {
     const binary = await resolveEngineBinary("claude");
     if (!binary) throw new Error("未找到 Claude Code CLI，无法接力");
-    // Pre-trust cwd so "Do you trust this folder?" decline does not poison later web runs.
-    try {
-      await ensureClaudeWorkspaceTrusted(cwd);
-    } catch {
-      // ignore
-    }
     // Do not force --model (default "sonnet" often maps to offline proxy models and
     // drops the user into the interactive model picker). Only pass when explicitly set.
     const model = (stored?.model || process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "").trim();
     const args = [
-      // Skip trust prompt if this Claude build supports it via env; still pre-mark trust above.
       ...(model ? ["--model", model] : []),
       ...(providerSessionId ? ["--resume", providerSessionId] : [])
     ];
@@ -3630,6 +3746,8 @@ async function addWorkspace(): Promise<PublicState> {
     config.workspaces.push({ id: crypto.randomUUID(), name: path.basename(resolved), path: resolved });
     await saveConfig();
     updateState({ workspaces: config.workspaces });
+    // Pre-trust so first remote task in this folder is not blocked by CLI trust prompts.
+    await ensureWorkspaceTrustedForAllEngines(resolved);
     await publishHostStatus();
   }
   return publicState;

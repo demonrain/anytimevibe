@@ -408,6 +408,25 @@ function AssistantMessageCard({ label, text }: { label: string; text: string }) 
   );
 }
 
+/** Drop consecutive identical user bubbles (snapshot + turn.started race / queue drain). */
+function dedupeAdjacentUserMessages<T extends { id: string; role: string; text: string }>(messages: T[]): T[] {
+  if (messages.length < 2) return messages;
+  const out: T[] = [];
+  for (const message of messages) {
+    const prev = out[out.length - 1];
+    if (
+      prev
+      && prev.role === "user"
+      && message.role === "user"
+      && prev.text.trim() === message.text.trim()
+    ) {
+      continue;
+    }
+    out.push(message);
+  }
+  return out;
+}
+
 function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   const next = structuredClone(runtime);
   if (event.type === "host.status") {
@@ -438,17 +457,40 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       && /failed|error|interrupt|stop|cancel/i.test(existingStatus)
       && /completed|idle|unknown/i.test(incomingStatus);
     const status = preferExistingStatus ? existingStatus : (incomingStatus || existingStatus || "unknown");
+    const terminalStatus = /^(completed|failed|error|interrupted|cancelled|canceled|stopped|idle)$/i.test(status);
+    // Snapshots from agent often omit activeTurnId; do not clear a live turn mid-run
+    // (cleared activeTurnId also breaks queue UI cleanup and looks like a double YOU bubble).
+    const activeTurnId = terminalStatus
+      ? undefined
+      : (event.activeTurnId || existing?.activeTurnId);
+    const rawMessages = event.messages?.length ? event.messages : (existing?.messages ?? []);
+    // Prefer the more specific absolute cwd (task subdir over bare workspace root when both known).
+    const nextCwd = (() => {
+      const incoming = String(event.cwd || "").trim();
+      const prev = String(existing?.cwd || "").trim();
+      if (incoming && prev) {
+        const a = incoming.replace(/[\\/]+$/, "").toLowerCase();
+        const b = prev.replace(/[\\/]+$/, "").toLowerCase();
+        if (a.startsWith(b + "\\") || a.startsWith(b + "/") || b.startsWith(a + "\\") || b.startsWith(a + "/")) {
+          return incoming.length >= prev.length ? incoming : prev;
+        }
+      }
+      return incoming || prev || "";
+    })();
     next.tasks[event.threadId] = {
       threadId: event.threadId,
       title: event.title || existing?.title || "未命名任务",
-      cwd: event.cwd || existing?.cwd || "",
+      cwd: nextCwd,
       status,
       updatedAt: updatedAt || Date.now() / 1000,
-      diff: existing?.diff ?? "",
-      messages: event.messages?.length ? event.messages : (existing?.messages ?? []),
+      // Prefer snapshot-persisted diff (survives reconnect); keep existing if absent.
+      diff: ("diff" in event && typeof event.diff === "string" && event.diff)
+        ? event.diff
+        : (existing?.diff ?? ""),
+      messages: dedupeAdjacentUserMessages(rawMessages),
       approvals: existing?.approvals ?? [],
       ...(engine ? { cliEngine: engine } : {}),
-      ...(event.activeTurnId ? { activeTurnId: event.activeTurnId } : {}),
+      ...(activeTurnId ? { activeTurnId } : {}),
       ...(providerSessionId ? { providerSessionId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
@@ -527,14 +569,17 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   if (event.type === "turn.started") {
     task.status = "active";
     task.activeTurnId = event.turnId;
-    // Snapshot may already include the user turn (headless path). Avoid duplicate YOU bubbles.
+    // Snapshot / prior turn.started may already include the user turn. Avoid duplicate YOU bubbles
+    // (especially when a durable-queued follow-up starts right after the previous turn).
     if (event.prompt) {
       const prompt = event.prompt.trim();
-      const already = task.messages.some(
-        (item: Task["messages"][number]) => item.role === "user" && item.text.trim() === prompt
-      );
-      if (!already) {
-        task.messages.push({ id: event.eventId, role: "user", text: event.prompt });
+      if (prompt) {
+        const already = task.messages.some(
+          (item: Task["messages"][number]) => item.role === "user" && item.text.trim() === prompt
+        );
+        if (!already) {
+          task.messages.push({ id: event.eventId, role: "user", text: prompt });
+        }
       }
     }
   }
@@ -1263,7 +1308,10 @@ export function App() {
               </div>
               <h3 title={task.title}>{task.title}</h3>
               <p title={preview}>{preview}</p>
-              <div className="task-foot"><code title={task.cwd}>{shortPath(task.cwd)}</code>{task.approvals.length > 0 && <b>{task.approvals.length}</b>}</div>
+              <div className="task-foot">
+                <code className="task-cwd" title={formatTaskCwd(task.cwd)} dir="ltr">{formatTaskCwd(task.cwd)}</code>
+                {task.approvals.length > 0 && <b>{task.approvals.length}</b>}
+              </div>
             </button>;
           })}
           {!tasks.length && <div className="empty-state"><span>&gt;_</span><h3>{t("noTasks")}</h3><p>{t("noTasksHint")}</p></div>}
@@ -1464,21 +1512,40 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     localStorage.setItem(`command-queue:${task.threadId}`, JSON.stringify(commandQueue));
   }, [commandQueue, task.threadId]);
 
-  // Local queue is UI-only; the agent owns durable execution. When a new turn starts,
-  // drop the queue head if it matches the latest user message (agent accepted the follow-up).
+  // Local queue is UI-only; the agent owns durable execution.
+  // When a queued prompt lands as a user bubble (or a new turn starts for it), drop it from the queue
+  // so it is not shown both in the message stream and under「等待队列」.
   const previousActiveTurnRef = useRef(task.activeTurnId);
+  const previousUserCountRef = useRef(task.messages.filter((message) => message.role === "user").length);
+  const queueThreadRef = useRef(task.threadId);
   useEffect(() => {
-    const previous = previousActiveTurnRef.current;
+    if (queueThreadRef.current !== task.threadId) {
+      queueThreadRef.current = task.threadId;
+      previousActiveTurnRef.current = task.activeTurnId;
+      previousUserCountRef.current = task.messages.filter((message) => message.role === "user").length;
+      return;
+    }
+    const previousTurn = previousActiveTurnRef.current;
     previousActiveTurnRef.current = task.activeTurnId;
-    if (!task.activeTurnId || task.activeTurnId === previous) return;
-    const lastUser = [...task.messages].reverse().find((message) => message.role === "user");
+    const userMessages = task.messages.filter((message) => message.role === "user");
+    const userCount = userMessages.length;
+    const previousUserCount = previousUserCountRef.current;
+    previousUserCountRef.current = userCount;
+    const turnChanged = Boolean(task.activeTurnId && task.activeTurnId !== previousTurn);
+    const userGrew = userCount > previousUserCount;
+    if (!turnChanged && !userGrew) return;
+    const lastUser = userMessages[userMessages.length - 1];
     if (!lastUser?.text) return;
+    const lastText = lastUser.text.trim();
     setCommandQueue((current) => {
       if (current.length === 0) return current;
-      if (current[0] === lastUser.text) return current.slice(1);
-      return current;
+      // Prefer dropping the head (FIFO); fall back to first matching entry.
+      if (current[0]?.trim() === lastText) return current.slice(1);
+      const index = current.findIndex((item) => item.trim() === lastText);
+      if (index === -1) return current;
+      return [...current.slice(0, index), ...current.slice(index + 1)];
     });
-  }, [task.activeTurnId, task.messages]);
+  }, [task.threadId, task.activeTurnId, task.messages]);
 
   useEffect(() => {
     const latestMessage = task.messages.at(-1);
@@ -1657,9 +1724,80 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
   </>;
 }
 
+function listDiffPaths(diff: string): string[] {
+  const paths = new Set<string>();
+  let inStatus = false;
+  for (const raw of diff.split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    if (line === "# git status") {
+      inStatus = true;
+      continue;
+    }
+    if (inStatus) {
+      if (line.startsWith("# ") || line.startsWith("diff ")) {
+        inStatus = false;
+      } else {
+        const status = line.match(/^[ MADRCU?]{1,2}\s+(.+)$/);
+        if (status?.[1]) {
+          paths.add(status[1].replace(/^.* -> /, "").trim());
+          continue;
+        }
+        if (!line.trim()) {
+          inStatus = false;
+          continue;
+        }
+      }
+    }
+    const git = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    if (git?.[2]) {
+      paths.add(git[2]);
+      continue;
+    }
+    const plus = line.match(/^\+\+\+ b\/(.+)$/);
+    if (plus?.[1] && plus[1] !== "/dev/null") paths.add(plus[1]);
+  }
+  return [...paths].filter(Boolean);
+}
+
 function DiffView({ diff }: { diff: string }) {
-  if (!diff) return <div className="diff-empty">当前任务还没有产生代码变更。</div>;
-  return <div className="diff-view">{sanitizeDisplayText(diff).split("\n").map((line, index) => <div key={index} className={line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "remove" : line.startsWith("@@") ? "hunk" : ""}>{line || " "}</div>)}</div>;
+  if (!diff?.trim()) {
+    return (
+      <div className="diff-empty">
+        <strong>还没有可展示的代码变更</strong>
+        <p>任务回合结束后，客户端会汇总工作区的 git 变更（以及引擎上报的文件补丁）。</p>
+        <ul>
+          <li>工作目录需要是 git 仓库（或其子目录）</li>
+          <li>若引擎只改了未跟踪的新文件，会列出路径</li>
+          <li>完成一轮有文件写入的对话后，再打开本页查看</li>
+        </ul>
+      </div>
+    );
+  }
+  const files = listDiffPaths(diff);
+  return (
+    <div className="diff-panel">
+      {files.length > 0 && (
+        <div className="diff-file-list">
+          <strong>变更文件（{files.length}）</strong>
+          <ul>
+            {files.map((file) => (
+              <li key={file} title={file}><code>{file}</code></li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <div className="diff-view">
+        {sanitizeDisplayText(diff).split("\n").map((line, index) => {
+          let className = "";
+          if (line.startsWith("+") && !line.startsWith("+++")) className = "add";
+          else if (line.startsWith("-") && !line.startsWith("---")) className = "remove";
+          else if (line.startsWith("@@")) className = "hunk";
+          else if (line.startsWith("diff ") || line.startsWith("# ")) className = "meta";
+          return <div key={index} className={className}>{line || " "}</div>;
+        })}
+      </div>
+    </div>
+  );
 }
 
 function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): void }) {
@@ -1888,7 +2026,19 @@ async function subscribePush(vapidPublicKey: string | null): Promise<void> {
   await api("/api/push/subscriptions", { method: "POST", body: JSON.stringify(subscription.toJSON()) });
 }
 
-function shortPath(path: string): string {
-  const parts = path.split(/[\\/]/).filter(Boolean);
-  return parts.slice(-2).join("/") || path;
+/**
+ * Task list / foot: always show the task working directory as an absolute path.
+ * (Previously only the last two segments were shown, which hid parent folders and
+ * made workspace-root vs subdir tasks look the same.)
+ */
+function formatTaskCwd(raw: string | undefined | null): string {
+  const value = String(raw ?? "").trim();
+  if (!value) return "—";
+  // Keep platform separators; strip redundant trailing separators (except drive root).
+  const normalized = value.replace(/[\\/]+$/, (match, offset) => {
+    // Keep "C:\" / "/" roots
+    if (/^[A-Za-z]:\\?$/.test(value.slice(0, offset + 1)) || value === "/") return match.charAt(0) || "";
+    return "";
+  });
+  return normalized || value;
 }

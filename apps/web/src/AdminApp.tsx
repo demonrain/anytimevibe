@@ -306,7 +306,7 @@ export function AdminApp() {
                 <th>主机</th>
                 <th>会话</th>
                 <th>最近登录</th>
-                <th>操作</th>
+                <th className="admin-actions-col">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -321,37 +321,39 @@ export function AdminApp() {
                   <td>{item.hostCount}</td>
                   <td>{item.sessionCount}</td>
                   <td>{formatTime(item.lastLoginAt)}</td>
-                  <td className="admin-actions">
-                    <button disabled={busyId === item.id} onClick={() => runAction(item.id, async () => {
-                      const note = window.prompt("备注（可空）", item.note ?? "") ?? undefined;
-                      if (note === undefined) return;
-                      await api(`/api/admin/users/${item.id}`, { method: "PATCH", body: JSON.stringify({ note: note || null }) });
-                      await loadUsers();
-                    })}>备注</button>
-                    <button disabled={busyId === item.id} onClick={() => runAction(item.id, async () => {
-                      await api(`/api/admin/users/${item.id}`, { method: "PATCH", body: JSON.stringify({ isAdmin: !item.isAdmin }) });
-                      await loadUsers();
-                    })}>{item.isAdmin ? "取消管理员" : "设为管理员"}</button>
-                    <button disabled={busyId === item.id} onClick={() => runAction(item.id, async () => {
-                      await api(`/api/admin/users/${item.id}`, { method: "PATCH", body: JSON.stringify({ disabled: !item.disabledAt }) });
-                      await loadUsers();
-                    })}>{item.disabledAt ? "启用" : "停用"}</button>
-                    <button disabled={busyId === item.id} onClick={() => runAction(item.id, async () => {
-                      await api(`/api/admin/users/${item.id}/sessions/revoke`, { method: "POST" });
-                      await loadUsers();
-                    })}>强制下线</button>
-                    <button disabled={busyId === item.id} onClick={() => runAction(item.id, async () => {
-                      const password = window.prompt("输入新密码（至少 6 位）");
-                      if (!password) return;
-                      await api(`/api/admin/users/${item.id}`, { method: "PATCH", body: JSON.stringify({ password }) });
-                      window.alert("密码已重置，该用户所有会话已失效");
-                      await loadUsers();
-                    })}>重置密码</button>
-                    <button className="danger" disabled={busyId === item.id || item.id === user.id} onClick={() => runAction(item.id, async () => {
-                      if (!window.confirm(`确定删除用户 ${item.username}？其主机与同步密文将一并删除。`)) return;
-                      await api(`/api/admin/users/${item.id}`, { method: "DELETE" });
-                      await loadUsers();
-                    })}>删除</button>
+                  <td className="admin-actions-cell">
+                    <div className="admin-actions">
+                      <button disabled={busyId === item.id} onClick={() => runAction(item.id, async () => {
+                        const note = window.prompt("备注（可空）", item.note ?? "") ?? undefined;
+                        if (note === undefined) return;
+                        await api(`/api/admin/users/${item.id}`, { method: "PATCH", body: JSON.stringify({ note: note || null }) });
+                        await loadUsers();
+                      })}>备注</button>
+                      <button disabled={busyId === item.id} onClick={() => runAction(item.id, async () => {
+                        await api(`/api/admin/users/${item.id}`, { method: "PATCH", body: JSON.stringify({ isAdmin: !item.isAdmin }) });
+                        await loadUsers();
+                      })}>{item.isAdmin ? "取消管理员" : "设为管理员"}</button>
+                      <button disabled={busyId === item.id} onClick={() => runAction(item.id, async () => {
+                        await api(`/api/admin/users/${item.id}`, { method: "PATCH", body: JSON.stringify({ disabled: !item.disabledAt }) });
+                        await loadUsers();
+                      })}>{item.disabledAt ? "启用" : "停用"}</button>
+                      <button disabled={busyId === item.id} onClick={() => runAction(item.id, async () => {
+                        await api(`/api/admin/users/${item.id}/sessions/revoke`, { method: "POST" });
+                        await loadUsers();
+                      })}>强制下线</button>
+                      <button disabled={busyId === item.id} onClick={() => runAction(item.id, async () => {
+                        const password = window.prompt("输入新密码（至少 6 位）");
+                        if (!password) return;
+                        await api(`/api/admin/users/${item.id}`, { method: "PATCH", body: JSON.stringify({ password }) });
+                        window.alert("密码已重置，该用户所有会话已失效");
+                        await loadUsers();
+                      })}>重置密码</button>
+                      <button className="danger" disabled={busyId === item.id || item.id === user.id} onClick={() => runAction(item.id, async () => {
+                        if (!window.confirm(`确定删除用户 ${item.username}？其主机与同步密文将一并删除。`)) return;
+                        await api(`/api/admin/users/${item.id}`, { method: "DELETE" });
+                        await loadUsers();
+                      })}>删除</button>
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -405,7 +407,7 @@ export function AdminApp() {
                 <th>编码引擎</th>
                 <th>事件数</th>
                 <th>最近在线</th>
-                <th>操作</th>
+                <th className="admin-actions-col">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -435,27 +437,29 @@ export function AdminApp() {
                   </td>
                   <td>{host.eventCount ?? 0}</td>
                   <td>{formatTime(host.lastSeenAt)}</td>
-                  <td className="admin-actions">
-                    <button disabled={Boolean(host.revokedAt) || busyId === host.id} onClick={() => runAction(host.id, async () => {
-                      await api(`/api/admin/hosts/${host.id}/disconnect`, { method: "POST" });
-                      await loadHosts();
-                    })}>断开</button>
-                    <button disabled={busyId === host.id} onClick={() => runAction(host.id, async () => {
-                      if (!window.confirm(`清空主机「${host.name}」的全部同步密文事件？主机记录会保留。`)) return;
-                      const result = await api<{ deleted: number }>(`/api/admin/hosts/${host.id}/purge-events`, { method: "POST" });
-                      window.alert(`已删除 ${result.deleted} 条事件`);
-                      await loadHosts();
-                    })}>清空事件</button>
-                    <button className="danger" disabled={Boolean(host.revokedAt) || busyId === host.id} onClick={() => runAction(host.id, async () => {
-                      if (!window.confirm(`确定撤销主机「${host.name}」？用户将无法再连接该主机。`)) return;
-                      await api(`/api/admin/hosts/${host.id}/revoke`, { method: "POST" });
-                      await loadHosts();
-                    })}>撤销</button>
-                    <button className="danger" disabled={busyId === host.id} onClick={() => runAction(host.id, async () => {
-                      if (!window.confirm(`永久删除主机「${host.name}」及其密文事件？此操作不可恢复。`)) return;
-                      await api(`/api/admin/hosts/${host.id}`, { method: "DELETE" });
-                      await loadHosts();
-                    })}>删除</button>
+                  <td className="admin-actions-cell">
+                    <div className="admin-actions">
+                      <button disabled={Boolean(host.revokedAt) || busyId === host.id} onClick={() => runAction(host.id, async () => {
+                        await api(`/api/admin/hosts/${host.id}/disconnect`, { method: "POST" });
+                        await loadHosts();
+                      })}>断开</button>
+                      <button disabled={busyId === host.id} onClick={() => runAction(host.id, async () => {
+                        if (!window.confirm(`清空主机「${host.name}」的全部同步密文事件？主机记录会保留。`)) return;
+                        const result = await api<{ deleted: number }>(`/api/admin/hosts/${host.id}/purge-events`, { method: "POST" });
+                        window.alert(`已删除 ${result.deleted} 条事件`);
+                        await loadHosts();
+                      })}>清空事件</button>
+                      <button className="danger" disabled={Boolean(host.revokedAt) || busyId === host.id} onClick={() => runAction(host.id, async () => {
+                        if (!window.confirm(`确定撤销主机「${host.name}」？用户将无法再连接该主机。`)) return;
+                        await api(`/api/admin/hosts/${host.id}/revoke`, { method: "POST" });
+                        await loadHosts();
+                      })}>撤销</button>
+                      <button className="danger" disabled={busyId === host.id} onClick={() => runAction(host.id, async () => {
+                        if (!window.confirm(`永久删除主机「${host.name}」及其密文事件？此操作不可恢复。`)) return;
+                        await api(`/api/admin/hosts/${host.id}`, { method: "DELETE" });
+                        await loadHosts();
+                      })}>删除</button>
+                    </div>
                   </td>
                 </tr>
               ))}

@@ -3,9 +3,9 @@ import { createInterface } from "node:readline";
 import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/protocol";
 import { collectLocalProxyEnv, mergeProxyIntoEnv } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
-import { ensureClaudeWorkspaceTrusted } from "./claude-trust";
 import { resolveEngineBinary } from "./detect";
 import type { BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
+import { ensureWorkspaceTrusted } from "./workspace-trust";
 
 type ActiveRun = {
   child: ChildProcess;
@@ -365,13 +365,11 @@ export async function runHeadlessTurn(
     return { providerSessionId: options.providerSessionId || options.threadId, status: "failed", text: message };
   }
 
-  // Avoid interactive trust prompt fallout: pre-accept workspace for Claude.
-  if (engine === "claude") {
-    try {
-      await ensureClaudeWorkspaceTrusted(options.cwd);
-    } catch {
-      // ignore
-    }
+  // Avoid interactive trust prompt fallout (Claude folder trust; Codex dir trust for handoff parity).
+  try {
+    await ensureWorkspaceTrusted(engine, options.cwd);
+  } catch {
+    // ignore
   }
 
   const args = buildArgs(engine, options);

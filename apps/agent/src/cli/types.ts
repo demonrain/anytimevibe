@@ -22,6 +22,8 @@ export type StoredTask = {
   model?: string;
   reasoningEffort?: ReasoningEffort;
   contextUsage?: ContextUsage;
+  /** Last known unified diff / git status for the Diff tab (persisted across reconnect). */
+  lastDiff?: string;
   messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string }>;
 };
 

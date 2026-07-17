@@ -300,7 +300,9 @@ async function importGrokSessions(store: TaskStore, limit: number): Promise<numb
       threadId,
       engine: "grok",
       providerSessionId: hit.id,
-      cwd: meta.cwd || existing?.cwd || "",
+      cwd: (meta.cwd || existing?.cwd)
+        ? path.resolve(meta.cwd || existing?.cwd || "")
+        : (existing?.cwd || ""),
       title: existing?.title || meta.title || `Grok ${hit.id.slice(0, 8)}`,
       status: mergeImportStatus(existing),
       createdAt: existing?.createdAt ?? hit.mtime,
@@ -403,7 +405,9 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
       threadId,
       engine: "claude",
       providerSessionId: hit.id,
-      cwd: hit.cwd || existing?.cwd || "",
+      cwd: (hit.cwd || existing?.cwd)
+        ? path.resolve(hit.cwd || existing?.cwd || "")
+        : (existing?.cwd || ""),
       title: existing?.title || titleFromUser || `Claude ${hit.id.slice(0, 8)}`,
       status: mergeImportStatus(existing),
       createdAt: existing?.createdAt ?? hit.mtime,

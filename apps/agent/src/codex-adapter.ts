@@ -192,10 +192,12 @@ export function threadToSnapshot(thread: JsonObject) {
     lastActivity,
     createdAt
   );
+  // Prefer absolute working directory from app-server (subdir tasks keep full path).
+  const rawCwd = String(thread.cwd || thread.workingDirectory || thread.workdir || "").trim();
   return {
     threadId: String(thread.id),
     title: String(thread.name || thread.preview || "未命名任务"),
-    cwd: String(thread.cwd || ""),
+    cwd: rawCwd,
     status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
     ...(activeTurn ? { activeTurnId: String(activeTurn.id) } : {}),
     createdAt,
