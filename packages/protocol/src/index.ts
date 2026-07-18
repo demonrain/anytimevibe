@@ -154,7 +154,7 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
   }),
   commandBase.extend({
     type: z.literal("sync.request"),
-    /** Recent threads to fully load (default 20). Ignored when query is set. */
+    /** Recent threads to fully load per coding engine (default 10). Ignored when query is set. */
     limit: z.number().int().positive().max(100).optional(),
     /** Fuzzy search across titles/previews; may load more than limit to find matches. */
     query: z.string().trim().max(200).optional()

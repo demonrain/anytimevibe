@@ -472,7 +472,7 @@ export async function dedupeMultiCliTasks(store: TaskStore): Promise<number> {
 }
 
 /** Import local Claude/Grok CLI sessions into the agent task index for web sync. */
-export async function importLocalCliSessions(store: TaskStore, limit = 40): Promise<{ grok: number; claude: number }> {
+export async function importLocalCliSessions(store: TaskStore, limit = 10): Promise<{ grok: number; claude: number }> {
   const [grok, claude] = await Promise.all([
     importGrokSessions(store, limit),
     importClaudeSessions(store, limit)

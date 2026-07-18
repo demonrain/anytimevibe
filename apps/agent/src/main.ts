@@ -2844,10 +2844,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     await publishHostStatus();
     try {
       await importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT);
-      for (const task of taskStore.list(DEFAULT_SYNC_LIMIT)) {
-        if (task.engine === "codex") continue;
-        await publishStoredTaskSnapshot(task.threadId);
-      }
+      await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
     } catch {
       // optional
     }
@@ -3098,27 +3095,29 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     if (command.type === "sync.request") {
       // Refresh workspaces for the web new-task picker before streaming threads.
       await publishHostStatus();
-      // Import local Claude/Grok CLI sessions, then publish them to the web.
+      const syncLimit = command.limit ?? DEFAULT_SYNC_LIMIT;
+      // Import local Claude/Grok CLI sessions (up to syncLimit each), then publish them.
       try {
-        await importLocalCliSessions(taskStore, command.limit ?? DEFAULT_SYNC_LIMIT);
+        await importLocalCliSessions(taskStore, syncLimit);
       } catch {
         // ignore
       }
-      // Publish non-Codex tasks from local index first.
-      for (const task of taskStore.list(command.limit ?? DEFAULT_SYNC_LIMIT)) {
-        if (task.engine === "codex") continue;
-        if (command.query && !`${task.title}\n${task.cwd}\n${task.status}`.toLowerCase().includes(command.query.trim().toLowerCase())) continue;
-        await publishStoredTaskSnapshot(task.threadId);
+      // Up to syncLimit snapshots per multi-CLI engine (not a single shared pool).
+      let multiCliCount = 0;
+      try {
+        multiCliCount = await publishRecentMultiCliSnapshots(syncLimit, command.query);
+      } catch {
+        // ignore
       }
       let result = { threadCount: 0, partial: true };
       try {
         await ensureCodex();
         result = await syncAllThreads({
-          ...(command.limit !== undefined ? { limit: command.limit } : {}),
+          limit: syncLimit,
           ...(command.query !== undefined ? { query: command.query } : {})
         });
         // Keep local 接力 list aligned with what was just read from Codex.
-        await refreshLocalTasks(command.limit ?? DEFAULT_SYNC_LIMIT).catch(() => undefined);
+        await refreshLocalTasks(syncLimit).catch(() => undefined);
       } catch (error) {
         // Codex optional when only Claude/Grok tasks exist.
         handleError(error);
@@ -3127,7 +3126,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         type: "sync.completed",
         eventId: crypto.randomUUID(),
         occurredAt: new Date().toISOString(),
-        threadCount: result.threadCount,
+        threadCount: result.threadCount + multiCliCount,
         partial: result.partial,
         ...(command.query ? { query: command.query } : {})
       }, false);
@@ -3461,8 +3460,26 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   updateState({ tasks });
 }
 
-const DEFAULT_SYNC_LIMIT = 20;
+/** Recent tasks to fully sync per coding engine (Codex / Claude / Grok each). */
+const DEFAULT_SYNC_LIMIT = 10;
 const SEARCH_LIST_LIMIT = 100;
+
+/** Publish up to `limit` recent non-Codex tasks for each multi-CLI engine. */
+async function publishRecentMultiCliSnapshots(limit: number, query?: string): Promise<number> {
+  const q = query?.trim().toLowerCase() ?? "";
+  const counts: Record<"claude" | "grok", number> = { claude: 0, grok: 0 };
+  let published = 0;
+  // Pull a wider window so each engine can still fill its quota after filtering.
+  for (const task of taskStore.list(Math.max(limit * 8, 40))) {
+    if (task.engine !== "claude" && task.engine !== "grok") continue;
+    if (counts[task.engine] >= limit) continue;
+    if (q && !`${task.title}\n${task.cwd}\n${task.status}`.toLowerCase().includes(q)) continue;
+    await publishStoredTaskSnapshot(task.threadId);
+    counts[task.engine] += 1;
+    published += 1;
+  }
+  return published;
+}
 
 function threadMatchesQuery(thread: Record<string, any>, query: string): boolean {
   const hay = [
@@ -4260,10 +4277,7 @@ function registerIpc(): void {
     setTimeout(() => {
       void importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT)
         .then(async () => {
-          for (const task of taskStore.list(DEFAULT_SYNC_LIMIT)) {
-            if (task.engine === "codex") continue;
-            await publishStoredTaskSnapshot(task.threadId);
-          }
+          await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
         })
         .catch(() => undefined);
     }, 15_000);
@@ -4273,10 +4287,7 @@ function registerIpc(): void {
     await refreshLocalTasks();
     // Also push multi-CLI tasks to the web when the agent window refreshes.
     try {
-      for (const task of taskStore.list(DEFAULT_SYNC_LIMIT)) {
-        if (task.engine === "codex") continue;
-        await publishStoredTaskSnapshot(task.threadId);
-      }
+      await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
     } catch {
       // ignore
     }

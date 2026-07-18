@@ -1067,7 +1067,8 @@ export function App() {
       await sendCommand(hostId, {
         type: "sync.request",
         commandId: crypto.randomUUID(),
-        limit: options.limit ?? 20,
+        // Per-engine recent window (Codex / Claude / Grok each); keep low to limit bandwidth.
+        limit: options.limit ?? 10,
         ...(options.query ? { query: options.query } : {})
       });
     } catch (syncError) {
