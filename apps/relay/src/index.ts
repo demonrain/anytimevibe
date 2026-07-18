@@ -676,6 +676,7 @@ async function main(): Promise<void> {
             codexVersion: z.string().trim().min(1).max(80).optional(),
             claudeVersion: z.string().trim().min(1).max(80).optional(),
             grokVersion: z.string().trim().min(1).max(80).optional(),
+            cursorVersion: z.string().trim().min(1).max(80).optional(),
             platform: z.string().trim().min(1).max(120).optional(),
             agentVersion: z.string().trim().min(1).max(40).optional()
           }).parse(parsed);
@@ -683,6 +684,7 @@ async function main(): Promise<void> {
           const nextCodex = meta.codexVersion?.trim();
           const nextClaude = meta.claudeVersion?.trim();
           const nextGrok = meta.grokVersion?.trim();
+          const nextCursor = meta.cursorVersion?.trim();
           const nextPlatform = meta.platform?.trim();
           const nextAgentVersion = meta.agentVersion?.trim();
           await sql`
@@ -691,6 +693,7 @@ async function main(): Promise<void> {
               codex_version = COALESCE(${nextCodex ?? null}, codex_version),
               claude_version = COALESCE(${nextClaude ?? null}, claude_version),
               grok_version = COALESCE(${nextGrok ?? null}, grok_version),
+              cursor_version = COALESCE(${nextCursor ?? null}, cursor_version),
               platform = COALESCE(${nextPlatform ?? null}, platform),
               agent_version = COALESCE(${nextAgentVersion ?? null}, agent_version),
               last_seen_at = now()
@@ -702,6 +705,7 @@ async function main(): Promise<void> {
             ...(nextCodex ? { codexVersion: nextCodex } : {}),
             ...(nextClaude ? { claudeVersion: nextClaude } : {}),
             ...(nextGrok ? { grokVersion: nextGrok } : {}),
+            ...(nextCursor ? { cursorVersion: nextCursor } : {}),
             ...(nextPlatform ? { platform: nextPlatform } : {}),
             ...(nextAgentVersion ? { agentVersion: nextAgentVersion } : {})
           }));

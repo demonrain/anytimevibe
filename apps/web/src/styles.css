@@ -36,7 +36,10 @@ button { color: inherit; }
 .featured-engines-head { display: flex; align-items: baseline; justify-content: space-between; gap: 18px; margin-bottom: 11px; }
 .featured-engines-head span { color: rgba(242,234,219,.62); font-size: 11px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
 .featured-engines-head strong { color: rgba(242,234,219,.9); font-size: 12px; letter-spacing: .04em; }
-.featured-engine-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.featured-engine-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 900px) {
+  .featured-engine-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .featured-engine { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px; padding: 11px; border: 1px solid rgba(255,250,240,.18); border-radius: 16px; background: rgba(255,250,240,.94); color: var(--ink); box-shadow: 0 14px 35px rgba(0,0,0,.16); }
 .featured-engine-logo { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 12px; background: #f2eadb; overflow: hidden; }
 .featured-engine-logo img { width: 30px; height: 30px; object-fit: contain; }
@@ -88,7 +91,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .thread-engine-logo { flex: 0 0 auto; }
 .engine-picker { display: grid; gap: 8px; }
 .engine-picker-label { font-size: 13px; font-weight: 750; }
-.engine-picker-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.engine-picker-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 640px) {
+  .engine-picker-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .engine-card { border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.72); padding: 14px 10px; display: grid; justify-items: center; gap: 8px; cursor: pointer; text-align: center; color: inherit; transition: .15s ease; min-width: 0; }
 .engine-card:hover:not(:disabled) { border-color: rgba(45,118,83,.45); transform: translateY(-1px); }
 .engine-card.selected { border-color: var(--moss); background: rgba(45,118,83,.08); box-shadow: 0 0 0 2px rgba(45,118,83,.12); }

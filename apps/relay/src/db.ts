@@ -52,6 +52,7 @@ export async function ensureSchema(sql: Database): Promise<void> {
     ALTER TABLE hosts ADD COLUMN IF NOT EXISTS agent_version text;
     ALTER TABLE hosts ADD COLUMN IF NOT EXISTS claude_version text;
     ALTER TABLE hosts ADD COLUMN IF NOT EXISTS grok_version text;
+    ALTER TABLE hosts ADD COLUMN IF NOT EXISTS cursor_version text;
     CREATE UNIQUE INDEX IF NOT EXISTS hosts_user_agent_id_idx ON hosts(user_id, agent_id) WHERE agent_id IS NOT NULL AND revoked_at IS NULL;
 
     CREATE TABLE IF NOT EXISTS pairings (

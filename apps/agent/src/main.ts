@@ -3366,6 +3366,7 @@ function publishAgentMeta(fields: {
   codexVersion?: string;
   claudeVersion?: string;
   grokVersion?: string;
+  cursorVersion?: string;
   platform?: string;
   agentVersion?: string;
 } = {}): void {
@@ -3377,6 +3378,7 @@ function publishAgentMeta(fields: {
       codexVersion: fields.codexVersion ?? resolveReportedEngineVersion("codex"),
       claudeVersion: fields.claudeVersion ?? resolveReportedEngineVersion("claude"),
       grokVersion: fields.grokVersion ?? resolveReportedEngineVersion("grok"),
+      cursorVersion: fields.cursorVersion ?? resolveReportedEngineVersion("cursor"),
       platform: fields.platform ?? `${process.platform} ${os.release()}`,
       agentVersion: fields.agentVersion ?? PRODUCT_VERSION
     }));

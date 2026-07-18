@@ -47,6 +47,7 @@ type AdminHost = {
   codexVersion: string;
   claudeVersion?: string | null;
   grokVersion?: string | null;
+  cursorVersion?: string | null;
   agentVersion?: string | null;
   eventCount?: number;
   createdAt: string;
@@ -393,7 +394,7 @@ export function AdminApp() {
           </div>
         </header>
         <p className="admin-hint" style={{ margin: "0 0 12px" }}>
-          「客户端」与「编码引擎」版本由桌面 Agent 上线后自动上报（Codex / Claude Code / Grok Build）。「撤销」仅禁用配对；「删除」永久移除主机与同步密文。
+          「客户端」与「编码引擎」版本由桌面 Agent 上线后自动上报（Codex / Claude / Grok / Cursor）。「撤销」仅禁用配对；「删除」永久移除主机与同步密文。
         </p>
         <div className="admin-table-wrap">
           <table className="admin-table">
@@ -433,6 +434,7 @@ export function AdminApp() {
                       <div><span>Codex</span><code>{formatEngineVersion(host.codexVersion)}</code></div>
                       <div><span>Claude</span><code>{formatEngineVersion(host.claudeVersion)}</code></div>
                       <div><span>Grok</span><code>{formatEngineVersion(host.grokVersion)}</code></div>
+                      <div><span>Cursor</span><code>{formatEngineVersion(host.cursorVersion)}</code></div>
                     </div>
                   </td>
                   <td>{host.eventCount ?? 0}</td>

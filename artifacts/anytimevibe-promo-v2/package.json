@@ -1,0 +1,12 @@
+{
+  "name": "anytimevibe-promo-v2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bgm": "node scripts/generate-bgm.mjs",
+    "dev": "npx --yes hyperframes@0.7.54 preview",
+    "check": "npx --yes hyperframes@0.7.54 check",
+    "render": "npx --yes hyperframes@0.7.54 render",
+    "publish": "npx --yes hyperframes@0.7.54 publish"
+  }
+}
