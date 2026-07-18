@@ -36,10 +36,19 @@ import {
   type EncryptedEnvelope,
   type PermissionMode,
   type ReasoningEffort,
+  type EngineQuota,
   type Workspace,
   PRODUCT_VERSION
 } from "@anytimevibe/protocol";
-import { CodexAdapter, normalizeUnixSeconds, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
+import {
+  CodexAdapter,
+  extractCodexTurnError,
+  isTerminalTurnStatus,
+  normalizeUnixSeconds,
+  threadResumeParams,
+  threadStartParams,
+  threadToSnapshot
+} from "./codex-adapter";
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn } from "./cli/headless-runner";
 import { importLocalCliSessions } from "./cli/import-sessions";
@@ -2795,14 +2804,43 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
   }
   if (event.type === "error") {
     handleError(new Error(event.message));
+    const threadId = event.threadId;
+    if (threadId) {
+      const task = taskStore.get(threadId);
+      if (task) {
+        const text = event.message.trim();
+        const already = task.messages.some(
+          (message) => message.role === "system" && message.text.trim() === text
+        );
+        if (text && !already) {
+          task.messages.push({
+            id: crypto.randomUUID(),
+            role: "system",
+            text: text.startsWith("错误") || text.startsWith("Error") ? text : `错误：${text}`
+          });
+        }
+        if (!/failed|error|interrupt|stop|cancel/i.test(task.status)) {
+          task.status = "failed";
+        }
+        task.updatedAt = Date.now() / 1000;
+        await taskStore.upsert(task);
+      }
+    }
     // Also surface to web clients as a persisted error event when possible.
-    void publish({
+    await publish({
       type: "error",
       eventId: crypto.randomUUID(),
       occurredAt: new Date().toISOString(),
       message: event.message,
-      ...(event.threadId ? { threadId: event.threadId } : {})
+      ...(threadId ? { threadId } : {})
     }, true).catch(() => undefined);
+    if (threadId) {
+      try {
+        await publishStoredTaskSnapshot(threadId);
+      } catch {
+        // ignore
+      }
+    }
     return;
   }
   if (event.type === "turn.completed") {
@@ -2810,6 +2848,7 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     activeTurnByThread.delete(event.threadId);
     finishLocalActivity(event.threadId, event.status);
     await taskStore.setStatus(event.threadId, event.status);
+    const failed = isTerminalTurnStatus(event.status) && /error|fail/i.test(event.status);
     if (event.contextUsage) {
       const task = taskStore.get(event.threadId);
       if (task) {
@@ -2817,6 +2856,30 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
         await taskStore.upsert(task);
       }
     }
+    // Ensure a visible system error when the CLI only reported a failed status.
+    if (failed) {
+      const task = taskStore.get(event.threadId);
+      if (task) {
+        const hasSystem = task.messages.some((message) => message.role === "system" && message.text.trim());
+        if (!hasSystem) {
+          task.messages.push({
+            id: crypto.randomUUID(),
+            role: "system",
+            text: `任务失败（${event.status}）。请在电脑端打开「任务 → 接力」查看本机 CLI 输出，或重试。`
+          });
+          task.updatedAt = Date.now() / 1000;
+          await taskStore.upsert(task);
+        }
+      }
+    }
+    const failedSystemText = failed
+      ? taskStore.get(event.threadId)?.messages
+        .slice()
+        .reverse()
+        .find((message) => message.role === "system")
+        ?.text
+        ?.trim()
+      : undefined;
     await publish({
       type: "turn.completed",
       eventId: crypto.randomUUID(),
@@ -2824,7 +2887,8 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
       threadId: event.threadId,
       turnId: event.turnId,
       status: event.status,
-      ...(event.contextUsage ? { contextUsage: event.contextUsage } : {})
+      ...(event.contextUsage ? { contextUsage: event.contextUsage } : {}),
+      ...(failedSystemText ? { errorMessage: failedSystemText } : {})
     }, true, "completed");
     // Collect workspace / engine diffs for the Diff tab (Claude / Grok headless path).
     try {
@@ -2832,7 +2896,7 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     } catch {
       // ignore
     }
-    // Push latest snapshot so web sees contextUsage / final status / lastDiff.
+    // Push latest snapshot so web sees contextUsage / final status / lastDiff / system errors.
     try {
       await publishStoredTaskSnapshot(event.threadId);
     } catch {
@@ -3005,6 +3069,8 @@ async function runHeadlessTaskTurn(options: {
 async function handleCommand(command: ClientCommand): Promise<void> {
   // host.refresh: status + re-import local Claude/Grok sessions for web list.
   if (command.type === "host.refresh") {
+    // Always re-push agentVersion first so web update banners clear quickly after client upgrade.
+    publishAgentMeta({ agentVersion: PRODUCT_VERSION });
     await publishHostStatus();
     try {
       await importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT);
@@ -3014,8 +3080,25 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     }
     return;
   }
+  if (command.type === "host.quota.refresh") {
+    const quotas = await queryEngineQuotas(command.cliEngine);
+    lastEngineQuotas = quotas;
+    await publish({
+      type: "host.quota",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      engineQuotas: quotas,
+      detail: quotas.length
+        ? undefined
+        : "未能从本机 CLI 读取订阅额度（多数引擎需在官方客户端查看账单；仅部分 CLI 会暴露额度）。"
+    }, true);
+    // Also attach to host.status so reconnects keep the last sample briefly.
+    await publishHostStatus();
+    return;
+  }
   // host.set_cli_engine kept for protocol compatibility; engine is chosen per-task on web.
   if (command.type === "host.set_cli_engine") {
+    publishAgentMeta({ agentVersion: PRODUCT_VERSION });
     await publishHostStatus();
     return;
   }
@@ -3400,18 +3483,58 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const params = message.params;
     const threadId = String(params.threadId);
     const turnId = String(params.turn?.id ?? params.turnId ?? "");
-    finishLocalActivity(threadId, String(params.turn.status));
+    const turnStatus = String(params.turn?.status ?? params.status ?? "unknown");
+    const errorMessage = extractCodexTurnError(params.turn) || extractCodexTurnError(params);
+    finishLocalActivity(threadId, turnStatus);
     await flushRemoteDeltas();
     activeTurnByThread.delete(threadId);
     turnStartingByThread.delete(threadId);
-    await publish({ type: "turn.completed", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: params.threadId, turnId: params.turn.id, status: String(params.turn.status) }, true, "completed");
+    const failed = isTerminalTurnStatus(turnStatus) && /error|fail/i.test(turnStatus);
+    if (failed && errorMessage) {
+      // Persist into multi-cli store when present; always publish for web UI.
+      const stored = taskStore.get(threadId);
+      if (stored) {
+        const text = `任务失败（${turnStatus}）：${errorMessage}`;
+        const already = stored.messages.some((m) => m.role === "system" && m.text.includes(errorMessage));
+        if (!already) {
+          stored.messages.push({ id: crypto.randomUUID(), role: "system", text });
+        }
+        stored.status = turnStatus;
+        stored.updatedAt = Date.now() / 1000;
+        await taskStore.upsert(stored);
+      }
+      await publish({
+        type: "error",
+        eventId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(),
+        threadId,
+        message: `任务失败（${turnStatus}）：${errorMessage}`
+      }, true);
+    } else if (failed) {
+      await publish({
+        type: "error",
+        eventId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(),
+        threadId,
+        message: `任务失败（${turnStatus}）。本机 Codex 未返回详细错误信息，请在客户端「任务 → 接力」查看终端输出。`
+      }, true);
+    }
+    await publish({
+      type: "turn.completed",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadId: params.threadId,
+      turnId: params.turn?.id ?? turnId,
+      status: turnStatus,
+      ...(errorMessage ? { errorMessage } : {})
+    }, true, "completed");
     // Workspace git diff + any fileChange patches → Diff tab.
     try {
       if (turnId) await publishTaskDiff(threadId, turnId);
     } catch {
       // ignore
     }
-    // Refresh snapshot so final assistant text / lastDiff are complete.
+    // Refresh snapshot so final assistant text / lastDiff / system errors are complete.
     // Touch updatedAt so web/agent lists reorder by last activity (not create time).
     try { await publishThread(threadId, { touch: true }); } catch { /* ignore */ }
     // Codex turn finished — drain durable follow-up prompts for this thread.
@@ -3519,10 +3642,160 @@ async function refreshAvailableEngines(): Promise<void> {
   });
 }
 
+/** Last quota sample from host.quota.refresh (attached to subsequent host.status). */
+let lastEngineQuotas: EngineQuota[] = [];
+
+async function runCliText(command: string, args: string[], timeoutMs = 20_000): Promise<string> {
+  try {
+    const isWindows = process.platform === "win32";
+    const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
+    const finalArgs = isWindows ? windowsCmdArguments(command, args) : args;
+    const { stdout, stderr } = await execFileAsync(executable, finalArgs, {
+      timeout: timeoutMs,
+      windowsHide: true,
+      windowsVerbatimArguments: isWindows,
+      env: process.env,
+      maxBuffer: 512_000
+    });
+    return `${stdout || ""}\n${stderr || ""}`.trim();
+  } catch (error) {
+    const err = error as { stdout?: string; stderr?: string; message?: string };
+    const text = `${err.stdout || ""}\n${err.stderr || ""}\n${err.message || ""}`.trim();
+    return text;
+  }
+}
+
+function parseQuotaFromText(engine: CliEngine, raw: string): EngineQuota | null {
+  if (!raw.trim()) return null;
+  const text = raw.replace(/\r/g, "\n");
+  const checkedAt = new Date().toISOString();
+  // Money: $12.34 remaining / ¥ / €
+  const money = text.match(/(?:remaining|left|余额|剩余)[^\n$¥€£]*([$¥€£])\s*([0-9]+(?:\.[0-9]+)?)/i)
+    || text.match(/([$¥€£])\s*([0-9]+(?:\.[0-9]+)?)\s*(?:remaining|left|余额|剩余)/i);
+  if (money) {
+    const symbol = money[1] === "$" ? "USD" : money[1] === "¥" ? "CNY" : money[1] === "€" ? "EUR" : money[1] === "£" ? "GBP" : money[1];
+    return {
+      engine,
+      label: "Credits",
+      amountRemaining: Number(money[2]),
+      currency: symbol,
+      detail: text.slice(0, 200),
+      checkedAt
+    };
+  }
+  // Percent remaining / used
+  const remainingPct = text.match(/(?:remaining|left|剩余)[^\n%]*?(\d{1,3}(?:\.\d+)?)\s*%/i)
+    || text.match(/(\d{1,3}(?:\.\d+)?)\s*%\s*(?:remaining|left|剩余)/i);
+  const usedPct = text.match(/(?:used|usage|已用)[^\n%]*?(\d{1,3}(?:\.\d+)?)\s*%/i)
+    || text.match(/(\d{1,3}(?:\.\d+)?)\s*%\s*(?:used|usage|已用)/i);
+  if (remainingPct || usedPct) {
+    const remainingPercent = remainingPct
+      ? Math.max(0, Math.min(100, Number(remainingPct[1])))
+      : (usedPct ? Math.max(0, Math.min(100, 100 - Number(usedPct[1]))) : undefined);
+    const usedPercent = usedPct
+      ? Math.max(0, Math.min(100, Number(usedPct[1])))
+      : (remainingPercent != null ? 100 - remainingPercent : undefined);
+    return {
+      engine,
+      label: "Plan",
+      ...(remainingPercent != null ? { remainingPercent } : {}),
+      ...(usedPercent != null ? { usedPercent } : {}),
+      detail: text.slice(0, 200),
+      checkedAt
+    };
+  }
+  // Absolute remaining / limit pairs
+  const pair = text.match(/(?:remaining|left|剩余)\s*[:=]?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*\/\s*([0-9][0-9,]*(?:\.[0-9]+)?)/i);
+  if (pair?.[1] && pair[2]) {
+    const remaining = Number(pair[1].replace(/,/g, ""));
+    const limit = Number(pair[2].replace(/,/g, ""));
+    if (Number.isFinite(remaining) && Number.isFinite(limit) && limit > 0) {
+      return {
+        engine,
+        remaining,
+        limit,
+        remainingPercent: Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))),
+        detail: text.slice(0, 200),
+        checkedAt
+      };
+    }
+  }
+  // Recognizable but unstructured account blurbs
+  if (/plan|subscription|usage|quota|rate.?limit|额度|订阅|余额|billing/i.test(text)) {
+    return {
+      engine,
+      detail: text.split(/\n/).map((line) => line.trim()).filter(Boolean).slice(0, 4).join(" · ").slice(0, 200),
+      checkedAt
+    };
+  }
+  return null;
+}
+
+async function queryEngineQuotas(filter?: CliEngine): Promise<EngineQuota[]> {
+  const engines: CliEngine[] = filter
+    ? [filter]
+    : ["codex", "claude", "grok", "cursor"];
+  const results: EngineQuota[] = [];
+  for (const engine of engines) {
+    try {
+      if (engine === "codex") {
+        if (!publicState.environment.codexInstalled && !publicState.environment.codexCompatible) continue;
+        // Codex app-server has no stable billing CLI — surface a clear guidance row.
+        results.push({
+          engine: "codex",
+          label: "Codex",
+          detail: "Codex CLI 未提供稳定的订阅额度查询接口，请在 ChatGPT / Codex 账号页查看用量。",
+          checkedAt: new Date().toISOString()
+        });
+        continue;
+      }
+      const binary = await resolveEngineBinary(engine);
+      if (!binary) continue;
+      const attempts: string[][] =
+        engine === "cursor"
+          ? [["about"], ["status"], ["whoami"], ["--help"]]
+          : engine === "claude"
+            ? [["auth", "status"], ["status"], ["--version"]]
+            : [["status"], ["about"], ["--version"]];
+      let parsed: EngineQuota | null = null;
+      for (const args of attempts) {
+        const text = await runCliText(binary, args);
+        parsed = parseQuotaFromText(engine, text);
+        if (parsed && (parsed.remainingPercent != null || parsed.amountRemaining != null || parsed.remaining != null)) {
+          break;
+        }
+        // Keep first informative detail even without numbers.
+        if (parsed?.detail && !results.some((item) => item.engine === engine)) {
+          // continue trying for structured numbers
+        } else if (!parsed) {
+          continue;
+        }
+      }
+      if (parsed) {
+        results.push(parsed);
+      } else {
+        results.push({
+          engine,
+          detail: engine === "cursor"
+            ? "未解析到 Cursor 订阅额度。请确认 agent 已登录；也可在 cursor.com/dashboard 查看。"
+            : engine === "claude"
+              ? "Claude CLI 通常不暴露订阅额度，请在 console.anthropic.com 查看。"
+              : "未能读取该引擎的订阅额度。",
+          checkedAt: new Date().toISOString()
+        });
+      }
+    } catch {
+      // skip engine
+    }
+  }
+  return results;
+}
+
 async function publishHostStatus(): Promise<void> {
   // Keep encrypted host.status for workspaces/online UX; version/name also go via agent.meta for DB.
   await refreshAvailableEngines().catch(() => undefined);
-  publishAgentMeta();
+  // Always stamp the running build version so web banners update without waiting for a full re-pair.
+  publishAgentMeta({ agentVersion: PRODUCT_VERSION });
   await publish({
     type: "host.status", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), online: true,
     name: resolvedDisplayName(), platform: `${process.platform} ${os.release()}`, codexVersion,
@@ -3530,7 +3803,8 @@ async function publishHostStatus(): Promise<void> {
     cliEngine: taskStore.getDefaultEngine(),
     availableEngines: publicState.availableEngines,
     engineCapabilities: publicState.engineCapabilities,
-    agentVersion: PRODUCT_VERSION
+    agentVersion: PRODUCT_VERSION,
+    ...(lastEngineQuotas.length ? { engineQuotas: lastEngineQuotas } : {})
   }, true);
 }
 

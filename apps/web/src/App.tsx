@@ -20,6 +20,7 @@ import {
   type EncryptedEnvelope,
   type EngineCapability,
   type EngineModelOption,
+  type EngineQuota,
   type PairingPublicInfo,
   type PermissionMode,
   type ReasoningEffort,
@@ -292,8 +293,12 @@ type HostRuntime = {
   tasks: Record<string, Task>;
   availableEngines?: CliEngineInfo[];
   engineCapabilities?: EngineCapability[];
-  /** Desktop agent version reported by host.status.agentVersion */
+  /** Desktop agent version reported by host.status.agentVersion / relay.host_meta */
   agentVersion?: string;
+  /** Last subscription / plan quota sample from host.quota.refresh */
+  engineQuotas?: EngineQuota[];
+  quotaDetail?: string;
+  quotaLoading?: boolean;
 };
 
 function taskStatusMeta(status: string): { label: string; tone: string } {
@@ -307,12 +312,23 @@ function taskStatusMeta(status: string): { label: string; tone: string } {
   const normalized = statusType.toLowerCase().replace(/[\s_-]/g, "");
   if (["active", "running", "inprogress", "processing"].includes(normalized)) return { label: "进行中", tone: "active" };
   if (["completed", "complete", "success", "succeeded"].includes(normalized)) return { label: "已完成", tone: "completed" };
-  if (["failed", "error"].includes(normalized)) return { label: "失败", tone: "failed" };
+  // systemerror / rate_limit_error / failed etc.
+  if (normalized.includes("fail") || normalized.includes("error")) return { label: "失败", tone: "failed" };
   if (["interrupted", "cancelled", "canceled", "stopped"].includes(normalized)) return { label: "已停止", tone: "stopped" };
   if (normalized === "idle") return { label: "空闲", tone: "idle" };
   if (normalized === "notloaded") return { label: "未加载", tone: "not-loaded" };
   if (["pending", "queued", "notstarted"].includes(normalized)) return { label: "待处理", tone: "pending" };
   return { label: statusType || "未知状态", tone: "unknown" };
+}
+
+function isFailedTaskStatus(status: string | undefined): boolean {
+  const normalized = String(status || "").toLowerCase().replace(/[\s_-]/g, "");
+  if (!normalized) return false;
+  return (
+    normalized.includes("fail")
+    || normalized.includes("error")
+    || ["interrupted", "cancelled", "canceled", "stopped"].includes(normalized)
+  );
 }
 
 function emptyRuntime(online: boolean | null = null): HostRuntime {
@@ -561,6 +577,17 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     if (event.availableEngines) next.availableEngines = event.availableEngines;
     if (event.engineCapabilities) next.engineCapabilities = event.engineCapabilities;
     if (event.agentVersion) next.agentVersion = event.agentVersion;
+    if (event.engineQuotas?.length) {
+      next.engineQuotas = event.engineQuotas;
+      next.quotaLoading = false;
+    }
+    return next;
+  }
+  if (event.type === "host.quota") {
+    next.engineQuotas = event.engineQuotas;
+    if (event.detail) next.quotaDetail = event.detail;
+    else delete next.quotaDetail;
+    next.quotaLoading = false;
     return next;
   }
   if (event.type === "sync.completed" || event.type === "sync.progress") return next;
@@ -583,7 +610,8 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       && /failed|error|interrupt|stop|cancel/i.test(existingStatus)
       && /completed|idle|unknown/i.test(incomingStatus);
     const status = preferExistingStatus ? existingStatus : (incomingStatus || existingStatus || "unknown");
-    const terminalStatus = /^(completed|failed|error|interrupted|cancelled|canceled|stopped|idle)$/i.test(status);
+    const terminalStatus = isFailedTaskStatus(status)
+      || /^(completed|complete|success|succeeded|idle)$/i.test(status);
     // Snapshots from agent often omit activeTurnId; do not clear a live turn mid-run
     // (cleared activeTurnId also breaks queue UI cleanup and looks like a double YOU bubble).
     const activeTurnId = terminalStatus
@@ -657,14 +685,21 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   }
   if (event.type === "error") {
     if (event.threadId && next.tasks[event.threadId]) {
-      next.tasks[event.threadId]!.status = "failed";
-      delete next.tasks[event.threadId]!.activeTurnId;
+      const task = next.tasks[event.threadId]!;
+      if (!isFailedTaskStatus(task.status)) task.status = "failed";
+      delete task.activeTurnId;
       if (event.message) {
-        next.tasks[event.threadId]!.messages.push({
-          id: event.eventId,
-          role: "system",
-          text: event.message
-        });
+        const text = event.message.trim();
+        const already = task.messages.some(
+          (message) => message.role === "system" && message.text.trim() === text
+        );
+        if (text && !already) {
+          task.messages.push({
+            id: event.eventId,
+            role: "system",
+            text
+          });
+        }
       }
     }
     return next;
@@ -719,6 +754,28 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     task.status = event.status;
     delete task.activeTurnId;
     if (event.contextUsage) task.contextUsage = event.contextUsage;
+    const errText = event.errorMessage?.trim();
+    if (errText) {
+      const already = task.messages.some(
+        (message) => message.role === "system" && message.text.includes(errText)
+      );
+      if (!already) {
+        task.messages.push({
+          id: event.eventId,
+          role: "system",
+          text: errText.startsWith("错误") || errText.startsWith("任务失败") ? errText : `错误：${errText}`
+        });
+      }
+    } else if (isFailedTaskStatus(event.status)) {
+      const hasSystem = task.messages.some((message) => message.role === "system" && message.text.trim());
+      if (!hasSystem) {
+        task.messages.push({
+          id: event.eventId,
+          role: "system",
+          text: `任务失败（${event.status}）。请查看下方错误说明，或在电脑端客户端「任务 → 接力」查看 CLI 输出。`
+        });
+      }
+    }
   }
   if (event.type === "diff.updated") task.diff = event.diff;
   if (event.type === "approval.requested") task.approvals.push(event);
@@ -1101,12 +1158,25 @@ export function App() {
           }
           if (parsed.type === "relay.host_meta") {
             const hostId = String(parsed.hostId);
+            const agentVersion = typeof parsed.agentVersion === "string" ? parsed.agentVersion.trim().replace(/^v/i, "") : "";
             setHosts((current) => current.map((host) => host.id !== hostId ? host : {
               ...host,
               ...(typeof parsed.name === "string" && parsed.name.trim() ? { name: parsed.name.trim() } : {}),
               ...(typeof parsed.codexVersion === "string" && parsed.codexVersion.trim() ? { codexVersion: parsed.codexVersion.trim() } : {}),
               ...(typeof parsed.platform === "string" && parsed.platform.trim() ? { platform: parsed.platform.trim() } : {})
             }));
+            // agent.meta arrives unencrypted and often sooner/more often than host.status —
+            // update runtime.agentVersion immediately so update banners clear after client upgrade.
+            if (agentVersion) {
+              setRuntime((current) => {
+                const prev = current[hostId] ?? emptyRuntime(true);
+                if (prev.agentVersion === agentVersion) return current;
+                return {
+                  ...current,
+                  [hostId]: { ...prev, agentVersion, online: prev.online ?? true }
+                };
+              });
+            }
             return;
           }
           if (parsed.type === "relay.error") {
@@ -1458,7 +1528,25 @@ export function App() {
       </section>
 
       <section className="conversation-column">
-        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} replyDetail={replyDetail} engineCapabilities={activeRuntime.engineCapabilities ?? []} onPermissionModeChange={(mode) => { const next = normalizePermissionMode(mode); setPermissionMode(next); localStorage.setItem("permission-mode", next); }} onReplyDetailChange={(detail) => { const next = normalizeReplyDetail(detail); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} /> : <div className="conversation-empty"><div className="orbit" /><h2>{t("pickTask")}</h2><p>{t("pickTaskHint")}</p></div>}
+        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} replyDetail={replyDetail} engineCapabilities={activeRuntime.engineCapabilities ?? []} engineQuotas={activeRuntime.engineQuotas ?? []} {...(activeRuntime.quotaDetail ? { quotaDetail: activeRuntime.quotaDetail } : {})} quotaLoading={Boolean(activeRuntime.quotaLoading)} onPermissionModeChange={(mode) => { const next = normalizePermissionMode(mode); setPermissionMode(next); localStorage.setItem("permission-mode", next); }} onReplyDetailChange={(detail) => { const next = normalizeReplyDetail(detail); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} onQuotaRefresh={() => {
+          setRuntime((current) => {
+            const hostId = activeHost!.id;
+            const prev = current[hostId] ?? emptyRuntime(true);
+            return { ...current, [hostId]: { ...prev, quotaLoading: true } };
+          });
+          return sendCommand(activeHost!.id, {
+            type: "host.quota.refresh",
+            commandId: crypto.randomUUID(),
+            cliEngine: normalizeCliEngine(activeTask.cliEngine)
+          }).catch((sendError) => {
+            setError(sendError.message);
+            setRuntime((current) => {
+              const hostId = activeHost!.id;
+              const prev = current[hostId] ?? emptyRuntime();
+              return { ...current, [hostId]: { ...prev, quotaLoading: false } };
+            });
+          });
+        }} /> : <div className="conversation-empty"><div className="orbit" /><h2>{t("pickTask")}</h2><p>{t("pickTaskHint")}</p></div>}
       </section>
     </main>
 
@@ -1499,7 +1587,59 @@ export function App() {
   </div>;
 }
 
-function TaskConversation({ task, online, visible, permissionMode, replyDetail, engineCapabilities, onPermissionModeChange, onReplyDetailChange, onBack, onCommand }: { task: Task; online: boolean | null; visible: boolean; permissionMode: PermissionMode; replyDetail: ReplyDetail; engineCapabilities: EngineCapability[]; onPermissionModeChange(mode: PermissionMode): void; onReplyDetailChange(detail: ReplyDetail): void; onBack(): void; onCommand(command: ClientCommand): void }) {
+function formatEngineQuotaChip(quota: EngineQuota): string {
+  if (quota.amountRemaining != null) {
+    const cur = quota.currency || "";
+    const amount = Number.isFinite(quota.amountRemaining)
+      ? (Math.abs(quota.amountRemaining) >= 100
+        ? String(Math.round(quota.amountRemaining))
+        : quota.amountRemaining.toFixed(2).replace(/\.?0+$/, ""))
+      : "—";
+    if (cur === "USD" || cur === "$") return `$${amount}`;
+    if (cur === "CNY" || cur === "¥") return `¥${amount}`;
+    if (cur === "EUR" || cur === "€") return `€${amount}`;
+    return cur ? `${amount} ${cur}` : amount;
+  }
+  if (quota.remainingPercent != null) return `${Math.round(quota.remainingPercent)}%`;
+  if (quota.usedPercent != null) return `余 ${Math.max(0, 100 - Math.round(quota.usedPercent))}%`;
+  if (quota.remaining != null && quota.limit != null) {
+    return `${compactTokenCount(quota.remaining)}/${compactTokenCount(quota.limit)}`;
+  }
+  if (quota.remaining != null) return compactTokenCount(quota.remaining);
+  return "—";
+}
+
+function TaskConversation({
+  task,
+  online,
+  visible,
+  permissionMode,
+  replyDetail,
+  engineCapabilities,
+  engineQuotas,
+  quotaDetail,
+  quotaLoading,
+  onPermissionModeChange,
+  onReplyDetailChange,
+  onBack,
+  onCommand,
+  onQuotaRefresh
+}: {
+  task: Task;
+  online: boolean | null;
+  visible: boolean;
+  permissionMode: PermissionMode;
+  replyDetail: ReplyDetail;
+  engineCapabilities: EngineCapability[];
+  engineQuotas: EngineQuota[];
+  quotaDetail?: string;
+  quotaLoading: boolean;
+  onPermissionModeChange(mode: PermissionMode): void;
+  onReplyDetailChange(detail: ReplyDetail): void;
+  onBack(): void;
+  onCommand(command: ClientCommand): void;
+  onQuotaRefresh(): void;
+}) {
   const { t, locale } = useI18n();
   const [prompt, setPrompt] = useState(() => loadTaskDraft(task.threadId));
   const [pendingPrompt, setPendingPrompt] = useState("");
@@ -1549,8 +1689,7 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
   const running = Boolean(task.activeTurnId);
   const permissionOptions = permissionOptionsForEngine(taskEngine, locale);
   const contextView = parseContextUsageView(task.contextUsage);
-  const modelLabel = (task.model || model || "").split("[")[0] || task.model || model || "未知";
-  const effortLabel = task.reasoningEffort || reasoningEffort || "";
+  const taskQuota = engineQuotas.find((item) => item.engine === taskEngine);
   const isMac = isMacPlatform();
   const visibleMessages = replyDetail === "detailed"
     ? task.messages
@@ -1669,18 +1808,16 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
 
   /** Last user message eligible for resend after failure / stop. */
   const lastUserPrompt = [...task.messages].reverse().find((message) => message.role === "user")?.text?.trim() || "";
-  const lastMessage = task.messages.at(-1);
-  const statusFailed = ["failed", "error", "interrupted", "cancelled", "canceled", "stopped"].includes(
-    String(task.status || "").toLowerCase()
-  );
-  const endedWithSystemError = lastMessage?.role === "system" && Boolean(lastMessage.text?.trim());
+  const lastSystemError = [...task.messages].reverse().find((message) => message.role === "system" && message.text.trim())?.text?.trim() || "";
+  const statusFailed = isFailedTaskStatus(task.status);
   const canResend = Boolean(
     lastUserPrompt
     && online === true
     && !running
     && !pendingPrompt
-    && (statusFailed || endedWithSystemError)
+    && (statusFailed || Boolean(lastSystemError))
   );
+  const showFailureBanner = !running && !pendingPrompt && (statusFailed || Boolean(lastSystemError));
 
   function resendLastPrompt() {
     if (!canResend || !lastUserPrompt) return;
@@ -1737,8 +1874,7 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
   // Clear optimistic "sending" when the turn ends in failure before a user bubble lands.
   useEffect(() => {
     if (!pendingPrompt) return;
-    const status = String(task.status || "").toLowerCase();
-    if (["failed", "error", "interrupted", "cancelled", "canceled", "stopped"].includes(status) && !task.activeTurnId) {
+    if (isFailedTaskStatus(task.status) && !task.activeTurnId) {
       setPendingPrompt("");
     }
   }, [pendingPrompt, task.status, task.activeTurnId]);
@@ -1778,18 +1914,22 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
         <code title={task.cwd}>{task.cwd}</code>
         <div
           className="thread-meta-chips"
-          title={contextView ? contextUsageTitle(contextView) : "当前任务模型 / 推理 / 上下文"}
+          title={contextView ? contextUsageTitle(contextView) : "上下文用量"}
         >
-          <span className="meta-chip meta-chip-model" title={modelLabel}>
-            <em>模型</em>
-            <strong>{modelLabel}</strong>
-          </span>
-          {effortLabel ? (
-            <span className="meta-chip" title={`推理 ${effortLabel}`}>
-              <em>推理</em>
-              <strong>{effortLabel}</strong>
+          {contextView?.totalTokens != null ? (
+            <span className="meta-chip meta-chip-context" title={contextUsageTitle(contextView)}>
+              <em>Token</em>
+              <strong>
+                {compactTokenCount(contextView.totalTokens)}
+                {contextView.contextWindow != null ? ` / ${compactTokenCount(contextView.contextWindow)}` : ""}
+              </strong>
             </span>
-          ) : null}
+          ) : (
+            <span className="meta-chip meta-chip-context muted" title="本轮尚未上报 token 用量">
+              <em>Token</em>
+              <strong>—</strong>
+            </span>
+          )}
           {contextView?.usedPercent != null ? (
             <span
               className={`meta-chip meta-chip-context${contextView.usedPercent >= 85 ? " hot" : contextView.usedPercent >= 60 ? " warm" : ""}`}
@@ -1801,34 +1941,39 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
               </span>
               <strong>{contextView.usedPercent}%</strong>
             </span>
-          ) : contextView?.totalTokens != null ? (
+          ) : contextView?.remainingTokens != null && contextView.contextWindow != null ? (
             <span className="meta-chip meta-chip-context" title={contextUsageTitle(contextView)}>
-              <em>已用</em>
-              <strong>{compactTokenCount(contextView.totalTokens)} tok</strong>
-            </span>
-          ) : null}
-          {contextView?.remainingTokens != null && contextView.contextWindow != null ? (
-            <span className="meta-chip" title={`上下文剩余 ${contextView.remainingTokens.toLocaleString()} / ${contextView.contextWindow.toLocaleString()}`}>
               <em>余窗</em>
-              <strong>{compactTokenCount(contextView.remainingTokens)}</strong>
-            </span>
-          ) : null}
-          {(contextView?.planLabel || contextView?.planRemaining != null) ? (
-            <span
-              className="meta-chip meta-chip-quota"
-              title={contextUsageTitle(contextView!)}
-            >
-              <em>{contextView?.planLabel || "额度"}</em>
               <strong>
-                {contextView?.planRemaining != null
-                  ? (contextView.planLimit != null
-                    ? `${compactTokenCount(contextView.planRemaining)}/${compactTokenCount(contextView.planLimit)}`
-                    : compactTokenCount(contextView.planRemaining))
-                  : "—"}
-                {contextView?.planUsedPercent != null ? ` · ${contextView.planUsedPercent}%` : ""}
+                {Math.max(0, Math.min(100, Math.round((contextView.remainingTokens / contextView.contextWindow) * 100)))}%
               </strong>
             </span>
+          ) : (
+            <span className="meta-chip meta-chip-context muted" title="上下文窗口占比未知">
+              <em>上下文</em>
+              <strong>—</strong>
+            </span>
+          )}
+          {taskQuota ? (
+            <span
+              className="meta-chip meta-chip-quota"
+              title={taskQuota.detail || taskQuota.label || "订阅额度"}
+            >
+              <em>{taskQuota.label || "额度"}</em>
+              <strong>{formatEngineQuotaChip(taskQuota)}</strong>
+            </span>
           ) : null}
+          <button
+            type="button"
+            className="meta-chip meta-chip-action"
+            disabled={online !== true || quotaLoading}
+            onClick={onQuotaRefresh}
+            title={quotaDetail || (locale === "en" ? "Query subscription remaining for this engine" : "查询当前引擎订阅剩余用量")}
+          >
+            {quotaLoading
+              ? (locale === "en" ? "Checking…" : "查询中…")
+              : (locale === "en" ? "Quota" : "查额度")}
+          </button>
         </div>
       </div>
       <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>{t("chat")}</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>{t("diff")}</button></div>
@@ -1860,6 +2005,16 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
       })}
       {pendingPrompt && <article className="message user pending"><span>YOU · 发送中</span><pre>{sanitizeDisplayText(pendingPrompt)}</pre></article>}
       {(running || pendingPrompt) && <article className="processing-card"><span className="processing-spinner" /><div><strong>{t("processing")}</strong><p>{t("processingHint")}</p></div></article>}
+      {showFailureBanner && (
+        <article className="failure-card" role="alert">
+          <div>
+            <strong>{locale === "en" ? "Task failed" : "任务执行失败"}</strong>
+            <p>{sanitizeDisplayText(lastSystemError || (locale === "en"
+              ? `Status: ${task.status}. Open desktop handoff for CLI details if this is empty.`
+              : `状态：${task.status}。若此处无详情，请在电脑端客户端「任务 → 接力」查看 CLI 输出。`))}</p>
+          </div>
+        </article>
+      )}
       {canResend && (
         <article className="resend-card">
           <div>

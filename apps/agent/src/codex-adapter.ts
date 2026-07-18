@@ -149,14 +149,65 @@ export function normalizeUnixSeconds(value: unknown, fallback = Date.now() / 100
   return n;
 }
 
+/** Pull a human-readable error from a Codex turn / item payload. */
+export function extractCodexTurnError(turn: JsonObject | undefined | null): string | undefined {
+  if (!turn || typeof turn !== "object") return undefined;
+  const direct = turn.error ?? turn.errorMessage ?? turn.message ?? turn.failureReason ?? turn.reason;
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  if (direct && typeof direct === "object") {
+    const nested = (direct as JsonObject).message ?? (direct as JsonObject).detail ?? (direct as JsonObject).text;
+    if (typeof nested === "string" && nested.trim()) return nested.trim();
+  }
+  for (const item of turn.items ?? []) {
+    const type = String(item?.type ?? "").toLowerCase();
+    if (type === "error" || type === "systemerror" || type === "systemmessage" || type === "system") {
+      const text = String(item.text ?? item.message ?? item.detail ?? "").trim();
+      if (text) return text;
+    }
+    if (item?.error) {
+      if (typeof item.error === "string" && item.error.trim()) return item.error.trim();
+      if (typeof item.error === "object" && item.error) {
+        const msg = String((item.error as JsonObject).message ?? (item.error as JsonObject).detail ?? "").trim();
+        if (msg) return msg;
+      }
+    }
+  }
+  return undefined;
+}
+
+export function isTerminalTurnStatus(status: string): boolean {
+  const normalized = status.toLowerCase().replace(/[\s_-]/g, "");
+  return (
+    normalized === "completed"
+    || normalized === "complete"
+    || normalized === "success"
+    || normalized === "succeeded"
+    || normalized === "failed"
+    || normalized === "error"
+    || normalized === "systemerror"
+    || normalized.includes("error")
+    || normalized.includes("fail")
+    || normalized === "interrupted"
+    || normalized === "cancelled"
+    || normalized === "canceled"
+    || normalized === "stopped"
+  );
+}
+
 export function threadToSnapshot(thread: JsonObject) {
   const messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string; createdAt?: number }> = [];
   const turns = thread.turns ?? [];
   let lastActivity = 0;
+  let lastTurnStatus = "";
+  let lastTurnError: string | undefined;
   for (const turn of turns) {
     const started = normalizeUnixSeconds(turn.startedAt, 0);
     const completed = normalizeUnixSeconds(turn.completedAt, 0);
     lastActivity = Math.max(lastActivity, started, completed);
+    const turnStatus = String(turn.status ?? "");
+    if (turnStatus) lastTurnStatus = turnStatus;
+    const turnError = extractCodexTurnError(turn);
+    if (turnError) lastTurnError = turnError;
     for (const item of turn.items ?? []) {
       if (item.type === "userMessage") {
         const text = (item.content ?? []).filter((content: JsonObject) => content.type === "text").map((content: JsonObject) => content.text).join("\n");
@@ -178,12 +229,35 @@ export function threadToSnapshot(thread: JsonObject) {
         });
       }
       if (item.type === "plan" && item.text) messages.push({ id: item.id, role: "system", text: item.text });
+      const itemType = String(item.type ?? "").toLowerCase();
+      if (itemType === "error" || itemType === "systemerror" || itemType === "systemmessage") {
+        const text = String(item.text ?? item.message ?? item.detail ?? "").trim();
+        if (text) {
+          messages.push({
+            id: String(item.id || `error:${messages.length}`),
+            role: "system",
+            text: text.startsWith("错误") || text.startsWith("Error") ? text : `错误：${text}`,
+            ...(completed || started ? { createdAt: completed || started } : {})
+          });
+        }
+      }
+    }
+    // Surface terminal failure when Codex only sets turn.status without an error item.
+    if (isTerminalTurnStatus(turnStatus) && /error|fail/i.test(turnStatus) && turnError) {
+      const already = messages.some((m) => m.role === "system" && m.text.includes(turnError));
+      if (!already) {
+        messages.push({
+          id: `turn-error:${String(turn.id || completed || messages.length)}`,
+          role: "system",
+          text: `任务失败（${turnStatus}）：${turnError}`,
+          ...(completed || started ? { createdAt: completed || started } : {})
+        });
+      }
     }
   }
-  const terminalStatuses = new Set(["completed", "failed", "cancelled", "canceled", "interrupted"]);
   const activeTurn = [...turns].reverse().find((turn: JsonObject) => {
     const status = String(turn.status ?? "").toLowerCase();
-    return turn.id && !turn.completedAt && !terminalStatuses.has(status);
+    return turn.id && !turn.completedAt && !isTerminalTurnStatus(status);
   });
   const createdAt = normalizeUnixSeconds(thread.createdAt);
   // Prefer explicit thread.updatedAt, else last turn activity, else createdAt — never invent "now" for idle history.
@@ -194,11 +268,29 @@ export function threadToSnapshot(thread: JsonObject) {
   );
   // Prefer absolute working directory from app-server (subdir tasks keep full path).
   const rawCwd = String(thread.cwd || thread.workingDirectory || thread.workdir || "").trim();
+  const rawStatus = typeof thread.status === "string"
+    ? thread.status
+    : JSON.stringify(thread.status ?? "unknown");
+  // Prefer last turn status when thread-level status is vague but the turn ended in systemerror/failed.
+  const status = (/unknown|active|running/i.test(rawStatus) && lastTurnStatus && isTerminalTurnStatus(lastTurnStatus))
+    ? lastTurnStatus
+    : rawStatus;
+  // If still no system error bubble but we know the failure reason, append one.
+  if (isTerminalTurnStatus(status) && /error|fail/i.test(status) && lastTurnError) {
+    const already = messages.some((m) => m.role === "system" && m.text.includes(lastTurnError));
+    if (!already) {
+      messages.push({
+        id: `thread-error:${String(thread.id)}`,
+        role: "system",
+        text: `任务失败（${status}）：${lastTurnError}`
+      });
+    }
+  }
   return {
     threadId: String(thread.id),
     title: String(thread.name || thread.preview || "未命名任务"),
     cwd: rawCwd,
-    status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
+    status,
     ...(activeTurn ? { activeTurnId: String(activeTurn.id) } : {}),
     createdAt,
     updatedAt,

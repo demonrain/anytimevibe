@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.41";
+export const PRODUCT_VERSION = "0.4.42";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -127,6 +127,32 @@ export const contextUsageSchema = z.object({
 });
 export type ContextUsage = z.infer<typeof contextUsageSchema>;
 
+/**
+ * Host-level subscription / plan usage for one coding engine (queried on demand).
+ * Prefer percent remaining; if monetary, use amountRemaining + currency.
+ */
+export const engineQuotaSchema = z.object({
+  engine: cliEngineSchema,
+  /** Short display label, e.g. "Pro plan" / "API credits". */
+  label: z.string().trim().min(1).max(80).optional(),
+  /** Remaining share of the pool, 0–100. */
+  remainingPercent: z.number().min(0).max(100).optional(),
+  /** Used share of the pool, 0–100. */
+  usedPercent: z.number().min(0).max(100).optional(),
+  /** Remaining absolute units (requests, tokens, etc.). */
+  remaining: z.number().nonnegative().optional(),
+  limit: z.number().positive().optional(),
+  /** Remaining money when the plan is prepaid / credits-based. */
+  amountRemaining: z.number().optional(),
+  amountLimit: z.number().optional(),
+  currency: z.string().trim().min(1).max(8).optional(),
+  /** Free-form summary when structured fields are incomplete. */
+  detail: z.string().trim().min(1).max(240).optional(),
+  /** ISO timestamp of this sample. */
+  checkedAt: z.string().datetime().optional()
+});
+export type EngineQuota = z.infer<typeof engineQuotaSchema>;
+
 export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
     type: z.literal("task.create"),
@@ -180,6 +206,14 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
     type: z.literal("host.refresh")
   }),
+  /**
+   * Ask the agent to query local CLI account / subscription remaining usage.
+   * Optional engine filter; omit to refresh all detected engines.
+   */
+  commandBase.extend({
+    type: z.literal("host.quota.refresh"),
+    cliEngine: cliEngineSchema.optional()
+  }),
   /** Set the host default coding CLI engine (persisted on the agent). */
   commandBase.extend({
     type: z.literal("host.set_cli_engine"),
@@ -210,7 +244,15 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     /** Per-engine model/effort catalogs from the host machine. */
     engineCapabilities: z.array(engineCapabilitySchema).optional(),
     /** Desktop agent app version (AnytimeVibe client). */
-    agentVersion: z.string().optional()
+    agentVersion: z.string().optional(),
+    /** Latest subscription / plan quotas from local CLIs (if available). */
+    engineQuotas: z.array(engineQuotaSchema).optional()
+  }),
+  eventBase.extend({
+    type: z.literal("host.quota"),
+    engineQuotas: z.array(engineQuotaSchema),
+    /** Optional human-readable summary when a query partially fails. */
+    detail: z.string().optional()
   }),
   eventBase.extend({
     type: z.literal("sync.completed"),
@@ -268,7 +310,9 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     threadId: z.string(),
     turnId: z.string(),
     status: z.string(),
-    contextUsage: contextUsageSchema.optional()
+    contextUsage: contextUsageSchema.optional(),
+    /** Failure reason when status is failed / systemerror / error. */
+    errorMessage: z.string().max(4000).optional()
   }),
   eventBase.extend({
     type: z.literal("diff.updated"),
