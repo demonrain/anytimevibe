@@ -178,13 +178,27 @@ function usageFromUnknown(raw: unknown, contextWindow?: number): ContextUsage | 
   const output = Number(u.output_tokens ?? u.outputTokens ?? u.completion_tokens ?? 0) || 0;
   const total = Number(u.total_tokens ?? u.totalTokens ?? input + output) || input + output;
   const window = contextWindow || Number(u.context_window ?? u.contextWindow ?? 0) || undefined;
-  if (!input && !output && !total) return undefined;
+  // Optional subscription / rate-limit pool when CLI surfaces it.
+  const planRemaining = Number(
+    u.plan_remaining ?? u.planRemaining ?? u.rate_limit_remaining ?? u.rateLimitRemaining ?? 0
+  ) || undefined;
+  const planLimit = Number(
+    u.plan_limit ?? u.planLimit ?? u.rate_limit_limit ?? u.rateLimitLimit ?? 0
+  ) || undefined;
+  const planLabelRaw = u.plan_label ?? u.planLabel ?? u.rate_limit_label ?? u.subscription;
+  const planLabel = typeof planLabelRaw === "string" && planLabelRaw.trim()
+    ? planLabelRaw.trim().slice(0, 80)
+    : undefined;
+  if (!input && !output && !total && planRemaining == null && !planLabel) return undefined;
   return {
     ...(input ? { inputTokens: input } : {}),
     ...(output ? { outputTokens: output } : {}),
     ...(total ? { totalTokens: total } : {}),
     ...(window ? { contextWindow: window } : {}),
-    ...(window && total ? { remainingTokens: Math.max(0, window - total) } : {})
+    ...(window && total ? { remainingTokens: Math.max(0, window - total) } : {}),
+    ...(planRemaining != null ? { planRemaining } : {}),
+    ...(planLimit ? { planLimit } : {}),
+    ...(planLabel ? { planLabel } : {})
   };
 }
 

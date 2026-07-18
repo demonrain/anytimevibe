@@ -836,13 +836,29 @@ function rendererHtml(): string {
   .titlebar h1{font:700 16px Rockwell,serif;margin:0;line-height:1.1}
   .titlebar p{margin:2px 0 0;color:#6b726b;font-size:9px;letter-spacing:.12em}
   .card{background:rgba(255,250,240,.96);border:1px solid rgba(23,33,27,.12);border-radius:12px;padding:10px 11px;box-shadow:0 8px 18px rgba(34,39,31,.05)}
-  .card.grow{display:flex;flex-direction:column}
+  .card.grow{display:flex;flex-direction:column;min-height:0}
   .status{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
   .status b{text-transform:uppercase;font-size:10px;letter-spacing:.1em}
   .dot{width:8px;height:8px;border-radius:50%;background:#999;flex:0 0 auto}
   .dot.online{background:#3bab70;box-shadow:0 0 0 4px rgba(59,171,112,.14)}
   .detail{color:#6b726b;font-size:11px;line-height:1.4;margin:6px 0 0;white-space:pre-wrap}
   .meta{font:10px/1.4 "Cascadia Code",monospace;color:#687068;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .nav-tabs{display:flex;gap:4px;padding:2px;background:rgba(23,33,27,.07);border-radius:11px;flex:0 0 auto;-webkit-app-region:no-drag;app-region:no-drag}
+  .nav-tabs button{flex:1 1 0;min-width:0;border:0;border-radius:9px;padding:7px 4px;background:transparent;color:#5c645c;font-size:10px;font-weight:850;cursor:pointer;white-space:nowrap}
+  .nav-tabs button.active{background:#17211b;color:#fff;box-shadow:0 4px 10px rgba(23,33,27,.16)}
+  .tab-panel{display:none;flex-direction:column;gap:8px;min-height:0}
+  .tab-panel.active{display:flex}
+  .guide-steps{display:grid;gap:7px;margin-top:8px}
+  .guide-step{display:grid;grid-template-columns:22px minmax(0,1fr) auto;gap:8px;align-items:start;padding:8px 9px;background:#eee6d8;border-radius:10px;min-width:0}
+  .guide-step .n{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#d9d0c0;color:#17211b;font-size:10px;font-weight:900;flex:0 0 auto}
+  .guide-step.done .n{background:#3bab70;color:#fff}
+  .guide-step.current .n{background:#e25832;color:#fff}
+  .guide-step .body{min-width:0}
+  .guide-step strong{display:block;font-size:11px;font-weight:850;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .guide-step small{display:block;margin-top:2px;color:#6b726b;font-size:10px;line-height:1.35;word-break:break-word}
+  .guide-step button{padding:5px 8px;font-size:10px}
+  .guide-tip{margin:0;padding:8px 10px;border-radius:10px;background:rgba(45,118,83,.08);border:1px solid rgba(45,118,83,.18);color:#2d4a3a;font-size:11px;line-height:1.45}
+  .hint{margin:6px 0 0;color:#7a827a;font-size:10px;line-height:1.4}
   h2{font:700 12px Rockwell,serif;margin:0}
   .row{display:flex;gap:6px;align-items:center;min-width:0}
   .row.wrap{flex-wrap:wrap}
@@ -896,13 +912,35 @@ function rendererHtml(): string {
   .footer .lang-switch button.active{background:#17211b;color:#fff}
   </style></head><body><div class="frame"><main class="shell">
   <div class="titlebar">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1 id="brandTitle">随码</h1><p id="brandTag">随时续上你的代码 · ${platformLabel}</p></div><div class="win-actions"><button type="button" id="openLogs" class="logs-btn" title="运行日志">日志</button><button type="button" id="winMin" title="最小化">–</button><button type="button" id="winClose" class="close" title="关闭">×</button></div></div>
+  <section class="card" style="flex:0 0 auto"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
+  <nav class="nav-tabs" role="tablist" aria-label="客户端功能">
+    <button type="button" role="tab" data-tab="guide" class="active" id="tabGuide">指引</button>
+    <button type="button" role="tab" data-tab="env" id="tabEnv">环境</button>
+    <button type="button" role="tab" data-tab="pair" id="tabPair">配对</button>
+    <button type="button" role="tab" data-tab="ws" id="tabWs">工作区</button>
+    <button type="button" role="tab" data-tab="tasks" id="tabTasks">任务</button>
+  </nav>
   <div class="scroll">
-  <section class="card"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
-  <section class="card"><div class="status"><h2>本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><div id="environment" class="checks"></div><div id="updateBox" class="update-row"></div></section>
-  <section class="card"><h2>中继与配对</h2><div class="stack"><div class="label">中继服务器</div><div class="row"><input id="relay" placeholder="https://vibe.demonrain.top"><button id="startPair" class="secondary">生成配对码</button><button id="saveRelay">保存</button></div><div id="pairBox"></div><div class="label">客户端名称</div><div class="row"><input id="displayName" placeholder="例如：公司电脑" maxlength="64"><button id="saveName" class="secondary">保存名称</button></div></div></section>
-  <section class="card grow"><div class="status"><h2>允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><div id="workspaces" class="workspaces"></div></section>
-  <section class="card" id="activityBox" style="display:none"></section>
-  <section class="card" id="taskBox"></section>
+  <div class="tab-panel active" data-panel="guide" id="panelGuide">
+    <section class="card">
+      <h2 id="guideTitle">快速上手</h2>
+      <p class="guide-tip" id="guideTip">按下面步骤完成后，即可在网页端远程下发任务到本机编码引擎。</p>
+      <div id="guideSteps" class="guide-steps"></div>
+    </section>
+  </div>
+  <div class="tab-panel" data-panel="env" id="panelEnv">
+    <section class="card"><div class="status"><h2 id="envTitle">本机环境</h2><button id="recheck" class="secondary">重新检测</button></div><p class="hint" id="envHint">先安装 Node（Codex 需要）与至少一个编码引擎 CLI，再去做配对。</p><div id="environment" class="checks"></div><div id="updateBox" class="update-row"></div></section>
+  </div>
+  <div class="tab-panel" data-panel="pair" id="panelPair">
+    <section class="card"><h2 id="pairTitle">中继与配对</h2><p class="hint" id="pairHint">保存中继地址后生成配对码，在 Web 端输入即可绑定本机。</p><div class="stack"><div class="label" id="relayLabel">中继服务器</div><div class="row"><input id="relay" placeholder="https://vibe.demonrain.top"><button id="saveRelay" class="secondary">保存</button></div><div class="row"><button id="startPair">生成配对码</button></div><div id="pairBox"></div><div class="label" id="nameLabel">客户端名称</div><div class="row"><input id="displayName" placeholder="例如：公司电脑" maxlength="64"><button id="saveName" class="secondary">保存名称</button></div></div></section>
+  </div>
+  <div class="tab-panel" data-panel="ws" id="panelWs">
+    <section class="card grow"><div class="status"><h2 id="wsTitle">允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><p class="hint" id="wsHint">只有白名单目录可被远程任务读写。至少添加一个项目路径。</p><div id="workspaces" class="workspaces"></div></section>
+  </div>
+  <div class="tab-panel" data-panel="tasks" id="panelTasks">
+    <section class="card" id="activityBox" style="display:none"></section>
+    <section class="card" id="taskBox"></section>
+  </div>
   </div>
   <footer class="footer"><div class="author"><strong id="authorStrong">随码 AnytimeVibe</strong><br><span id="authorLine">作者 · demonrain · 开源项目</span></div><div class="footer-actions"><div class="lang-switch"><button type="button" id="langZh" class="active">中文</button><button type="button" id="langEn">EN</button></div><button type="button" id="feedback" class="feedback">反馈问题</button></div></footer>
   </main></div>
@@ -942,11 +980,22 @@ function rendererHtml(): string {
     return 'codex';
   }
   var I18N={
-    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',logs:'日志',logTitle:'运行日志',logRefresh:'刷新',logCopy:'复制',logClear:'清空',logOpenFile:'打开文件',logClose:'关闭',logEmpty:'暂无日志',logFooter:'最近运行记录 · 便于排查连接与任务问题',logCopied:'已复制到剪贴板',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',expand:'展开',collapse:'收起',open:'接力'},
-    en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',logs:'Logs',logTitle:'Runtime logs',logRefresh:'Refresh',logCopy:'Copy',logClear:'Clear',logOpenFile:'Open file',logClose:'Close',logEmpty:'No logs yet',logFooter:'Recent runtime events for troubleshooting',logCopied:'Copied to clipboard',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',expand:'Expand',collapse:'Collapse',open:'Open'}
+    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',logs:'日志',logTitle:'运行日志',logRefresh:'刷新',logCopy:'复制',logClear:'清空',logOpenFile:'打开文件',logClose:'关闭',logEmpty:'暂无日志',logFooter:'最近运行记录 · 便于排查连接与任务问题',logCopied:'已复制到剪贴板',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',expand:'展开',collapse:'收起',open:'接力',tabGuide:'指引',tabEnv:'环境',tabPair:'配对',tabWs:'工作区',tabTasks:'任务',guideTitle:'快速上手',guideTip:'按下面步骤完成后，即可在网页端远程下发任务到本机编码引擎。',envTitle:'本机环境',envHint:'先安装 Node（Codex 需要）与至少一个编码引擎 CLI，再去做配对。',pairTitle:'中继与配对',pairHint:'保存中继地址后生成配对码，在 Web 端输入即可绑定本机。',relayLabel:'中继服务器',nameLabel:'客户端名称',wsTitle:'允许的工作区',wsHint:'只有白名单目录可被远程任务读写。至少添加一个项目路径。',stepEnv:'安装前置环境',stepEnvDesc:'安装 Node.js（Codex 需要）以及 Codex / Claude / Grok / Cursor 中至少一个 CLI 并登录。',stepRelay:'配置中继服务器',stepRelayDesc:'确认中继地址正确并保存（默认体验站可用）。',stepPair:'生成配对码并绑定',stepPairDesc:'点击生成配对码，在网页「添加主机」中输入。码约 10 分钟有效。',stepWs:'添加工作区目录',stepWsDesc:'允许至少一个本机项目目录，远程任务才能在该路径执行。',stepReady:'开始使用',stepReadyDesc:'网页端在线后即可新建任务。本页「任务」可接力到本机终端。',goEnv:'去环境',goPair:'去配对',goWs:'去工作区',goTasks:'看任务',done:'完成',todo:'待办',onlineReady:'已在线，可在网页下发任务。'},
+    en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',logs:'Logs',logTitle:'Runtime logs',logRefresh:'Refresh',logCopy:'Copy',logClear:'Clear',logOpenFile:'Open file',logClose:'Close',logEmpty:'No logs yet',logFooter:'Recent runtime events for troubleshooting',logCopied:'Copied to clipboard',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',expand:'Expand',collapse:'Collapse',open:'Open',tabGuide:'Guide',tabEnv:'Setup',tabPair:'Pair',tabWs:'Folders',tabTasks:'Tasks',guideTitle:'Get started',guideTip:'Finish the steps below so the web app can send coding tasks to this machine.',envTitle:'Local environment',envHint:'Install Node (for Codex) and at least one coding CLI, then pair.',pairTitle:'Relay & pairing',pairHint:'Save the relay URL, generate a code, and enter it on the web.',relayLabel:'Relay server',nameLabel:'Client name',wsTitle:'Allowed workspaces',wsHint:'Only allowlisted folders can be used by remote tasks. Add at least one project path.',stepEnv:'Install prerequisites',stepEnvDesc:'Install Node.js (needed for Codex) and at least one of Codex / Claude / Grok / Cursor CLI, then sign in.',stepRelay:'Configure relay',stepRelayDesc:'Confirm and save the relay URL (public demo works by default).',stepPair:'Pair with the web app',stepPairDesc:'Generate a pairing code and enter it under Add host on the web. Codes expire in ~10 minutes.',stepWs:'Allow a workspace folder',stepWsDesc:'Add at least one local project directory for remote tasks to run in.',stepReady:'You are ready',stepReadyDesc:'When online, create tasks from the web. Use Tasks here to hand off to a local terminal.',goEnv:'Setup',goPair:'Pair',goWs:'Folders',goTasks:'Tasks',done:'Done',todo:'Todo',onlineReady:'Online — send tasks from the web.'}
   };
   var locale=(function(){try{return localStorage.getItem('anytimevibe-locale')==='en'?'en':'zh-CN';}catch(e){return 'zh-CN';}})();
   function t(key){return (I18N[locale]&&I18N[locale][key])||I18N.en[key]||key}
+  var activeTab=(function(){try{return localStorage.getItem('anytimevibe-tab')||'guide';}catch(e){return 'guide';}})();
+  function setActiveTab(name){
+    activeTab=name||'guide';
+    try{localStorage.setItem('anytimevibe-tab',activeTab);}catch(e){}
+    document.querySelectorAll('.nav-tabs [data-tab]').forEach(function(btn){
+      btn.classList.toggle('active',btn.getAttribute('data-tab')===activeTab);
+    });
+    document.querySelectorAll('.tab-panel').forEach(function(panel){
+      panel.classList.toggle('active',panel.getAttribute('data-panel')===activeTab);
+    });
+  }
   function applyLocale(){
     var el;
     if(el=document.querySelector('#brandTitle')) el.textContent=t('brand');
@@ -962,6 +1011,21 @@ function rendererHtml(): string {
     if(el=document.querySelector('#logOpenFile')) el.textContent=t('logOpenFile');
     if(el=document.querySelector('#logClose')) el.textContent=t('logClose');
     if(el=document.querySelector('#logFooter')) el.textContent=t('logFooter');
+    if(el=document.querySelector('#tabGuide')) el.textContent=t('tabGuide');
+    if(el=document.querySelector('#tabEnv')) el.textContent=t('tabEnv');
+    if(el=document.querySelector('#tabPair')) el.textContent=t('tabPair');
+    if(el=document.querySelector('#tabWs')) el.textContent=t('tabWs');
+    if(el=document.querySelector('#tabTasks')) el.textContent=t('tabTasks');
+    if(el=document.querySelector('#guideTitle')) el.textContent=t('guideTitle');
+    if(el=document.querySelector('#guideTip')) el.textContent=t('guideTip');
+    if(el=document.querySelector('#envTitle')) el.textContent=t('envTitle');
+    if(el=document.querySelector('#envHint')) el.textContent=t('envHint');
+    if(el=document.querySelector('#pairTitle')) el.textContent=t('pairTitle');
+    if(el=document.querySelector('#pairHint')) el.textContent=t('pairHint');
+    if(el=document.querySelector('#relayLabel')) el.textContent=t('relayLabel');
+    if(el=document.querySelector('#nameLabel')) el.textContent=t('nameLabel');
+    if(el=document.querySelector('#wsTitle')) el.textContent=t('wsTitle');
+    if(el=document.querySelector('#wsHint')) el.textContent=t('wsHint');
     if(el=document.querySelector('#langZh')) el.classList.toggle('active',locale==='zh-CN');
     if(el=document.querySelector('#langEn')) el.classList.toggle('active',locale==='en');
   }
@@ -984,7 +1048,53 @@ function rendererHtml(): string {
   var engineFilter=null;
   var lastActivities=[];
   var selectedActivityId=null;
+  var lastPaintState=null;
+  var guidedOnce=false;
   function escapeHtml(value){return String(value||'').replace(/[&<>"']/g,function(char){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[char];});}
+  function renderGuide(state){
+    var box=document.querySelector('#guideSteps');
+    if(!box) return;
+    state=state||{};
+    var env=state.environment||{};
+    var engines=state.availableEngines||[];
+    var anyEngine=!!env.codexCompatible||engines.some(function(item){return item&&item.ready;});
+    var hasRelay=!!(state.relayUrl&&String(state.relayUrl).trim());
+    var paired=!!state.hostId||state.status==='online'||state.status==='connecting';
+    var online=state.status==='online';
+    var hasWs=!!(state.workspaces&&state.workspaces.length);
+    var steps=[
+      {id:'env',done:anyEngine,title:t('stepEnv'),desc:t('stepEnvDesc'),action:'env',actionLabel:t('goEnv')},
+      {id:'relay',done:hasRelay,title:t('stepRelay'),desc:t('stepRelayDesc'),action:'pair',actionLabel:t('goPair')},
+      {id:'pair',done:paired,title:t('stepPair'),desc:t('stepPairDesc'),action:'pair',actionLabel:t('goPair')},
+      {id:'ws',done:hasWs,title:t('stepWs'),desc:t('stepWsDesc'),action:'ws',actionLabel:t('goWs')},
+      {id:'ready',done:online&&hasWs&&anyEngine,title:t('stepReady'),desc:online?t('onlineReady'):t('stepReadyDesc'),action:'tasks',actionLabel:t('goTasks')}
+    ];
+    var currentIdx=steps.findIndex(function(s){return !s.done;});
+    if(currentIdx<0) currentIdx=steps.length-1;
+    box.innerHTML=steps.map(function(step,idx){
+      var cls='guide-step'+(step.done?' done':'')+(idx===currentIdx&&!step.done?' current':'');
+      var badge=step.done?t('done'):String(idx+1);
+      var btn=(!step.done||step.id==='ready')
+        ? '<button type="button" class="secondary" data-goto="'+escapeHtml(step.action)+'">'+escapeHtml(step.actionLabel)+'</button>'
+        : '<span class="label">'+escapeHtml(t('done'))+'</span>';
+      return '<div class="'+cls+'"><span class="n">'+escapeHtml(badge)+'</span><div class="body"><strong>'+escapeHtml(step.title)+'</strong><small>'+escapeHtml(step.desc)+'</small></div>'+btn+'</div>';
+    }).join('');
+    box.querySelectorAll('[data-goto]').forEach(function(btn){
+      btn.addEventListener('click',function(){ setActiveTab(btn.getAttribute('data-goto')||'guide'); });
+    });
+    // First successful paint: jump to first incomplete step's tab if still on default guide.
+    if(!guidedOnce){
+      guidedOnce=true;
+      try{
+        var stored=localStorage.getItem('anytimevibe-tab');
+        if(!stored){
+          var first=steps.find(function(s){return !s.done;});
+          if(first&&first.action) setActiveTab(first.action==='env'||first.action==='pair'||first.action==='ws'||first.action==='tasks'?first.action:'guide');
+          else setActiveTab('guide');
+        }
+      }catch(e){}
+    }
+  }
   function formatActivityTime(ts){
     var n=Number(ts)||0;
     if(!n) return '';
@@ -996,6 +1106,7 @@ function rendererHtml(): string {
   function paint(state){
     try{
       if(!state) return;
+      lastPaintState=state;
       if(status) status.textContent=state.status||'';
       if(dot) dot.className='dot '+(state.status==='online'?'online':'');
       if(detail) detail.textContent=state.detail||'';
@@ -1025,9 +1136,9 @@ function rendererHtml(): string {
       }
       var anyEngineReady=env.codexCompatible||engines.some(function(item){return item.ready;});
       if(startPair) startPair.disabled=!anyEngineReady||!state.relayUrl;
-      if(pairBox) pairBox.innerHTML=state.pairingCode?'<div class="pair">'+escapeHtml(state.pairingCode)+'</div><p class="detail">在 Web 端输入配对码，约 10 分钟后失效。</p>':'';
+      if(pairBox) pairBox.innerHTML=state.pairingCode?'<div class="pair">'+escapeHtml(state.pairingCode)+'</div><p class="detail">'+(locale==='en'?'Enter this code on the web. Expires in ~10 minutes.':'在 Web 端输入配对码，约 10 分钟后失效。')+'</p>':'';
       if(workspaces){
-        workspaces.innerHTML=(state.workspaces&&state.workspaces.length)?state.workspaces.map(function(w){return '<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button class="ghost" data-id="'+escapeHtml(w.id)+'">移除</button></div>';}).join(''):'<div class="empty">尚未允许任何目录</div>';
+        workspaces.innerHTML=(state.workspaces&&state.workspaces.length)?state.workspaces.map(function(w){return '<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button class="ghost" data-id="'+escapeHtml(w.id)+'">'+(locale==='en'?'Remove':'移除')+'</button></div>';}).join(''):'<div class="empty">'+(locale==='en'?'No folders allowed yet':'尚未允许任何目录')+'</div>';
         workspaces.querySelectorAll('button[data-id]').forEach(function(button){
           button.addEventListener('click',function(){ if(api) api.removeWorkspace(button.getAttribute('data-id')); });
         });
@@ -1037,6 +1148,7 @@ function rendererHtml(): string {
       selectedActivityId=state.selectedActivityThreadId||(lastActivities[0]&&lastActivities[0].threadId)||null;
       renderActivity(lastActivities, selectedActivityId);
       renderTasks(state.tasks||[]);
+      renderGuide(state);
     }catch(err){
       if(detail) detail.textContent='界面渲染异常：'+(err&&err.message?err.message:String(err));
       console.error(err);
@@ -1202,13 +1314,17 @@ function rendererHtml(): string {
   }
   function bindUi(){
     var el;
+    document.querySelectorAll('.nav-tabs [data-tab]').forEach(function(btn){
+      btn.addEventListener('click',function(){ setActiveTab(btn.getAttribute('data-tab')||'guide'); });
+    });
+    setActiveTab(activeTab);
     if((el=document.querySelector('#saveRelay'))&&api) el.addEventListener('click',function(){api.setRelayUrl(relay.value);});
     if((el=document.querySelector('#saveName'))&&api) el.addEventListener('click',function(){api.setDisplayName(displayName.value);});
     if(startPair&&api) startPair.addEventListener('click',function(){api.startPairing();});
     if((el=document.querySelector('#addWorkspace'))&&api) el.addEventListener('click',function(){api.addWorkspace();});
     if((el=document.querySelector('#recheck'))&&api) el.addEventListener('click',function(){
       el.disabled=true;
-      if(detail) detail.textContent='正在检测 Node / Codex / Claude / Grok…';
+      if(detail) detail.textContent=locale==='en'?'Detecting Node / Codex / Claude / Grok / Cursor…':'正在检测 Node / Codex / Claude / Grok / Cursor…';
       Promise.resolve(api.checkEnvironment()).then(function(state){
         if(state) paint(state);
       }).catch(function(error){
@@ -1242,8 +1358,8 @@ function rendererHtml(): string {
     if((el=document.querySelector('#logOpenFile'))&&api) el.addEventListener('click',function(){
       api.openLogFile().catch(function(error){ alert(error&&error.message?error.message:String(error)); });
     });
-    if(el=document.querySelector('#langZh')) el.addEventListener('click',function(){locale='zh-CN';try{localStorage.setItem('anytimevibe-locale',locale);}catch(e){} applyLocale(); paint(initialState); refresh();});
-    if(el=document.querySelector('#langEn')) el.addEventListener('click',function(){locale='en';try{localStorage.setItem('anytimevibe-locale',locale);}catch(e){} applyLocale(); paint(initialState); refresh();});
+    if(el=document.querySelector('#langZh')) el.addEventListener('click',function(){locale='zh-CN';try{localStorage.setItem('anytimevibe-locale',locale);}catch(e){} applyLocale(); paint(lastPaintState||initialState); refresh();});
+    if(el=document.querySelector('#langEn')) el.addEventListener('click',function(){locale='en';try{localStorage.setItem('anytimevibe-locale',locale);}catch(e){} applyLocale(); paint(lastPaintState||initialState); refresh();});
   }
   function refresh(){
     if(!api||!api.getState) return;

@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.40";
+export const PRODUCT_VERSION = "0.4.41";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -116,7 +116,14 @@ export const contextUsageSchema = z.object({
   totalTokens: z.number().nonnegative().optional(),
   /** Model context window size when known. */
   contextWindow: z.number().positive().optional(),
-  remainingTokens: z.number().nonnegative().optional()
+  remainingTokens: z.number().nonnegative().optional(),
+  /**
+   * Optional subscription / plan quota (when the local CLI reports it).
+   * Display-only: engines rarely expose full billing pools.
+   */
+  planRemaining: z.number().nonnegative().optional(),
+  planLimit: z.number().positive().optional(),
+  planLabel: z.string().trim().min(1).max(80).optional()
 });
 export type ContextUsage = z.infer<typeof contextUsageSchema>;
 

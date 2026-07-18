@@ -211,17 +211,80 @@ function saveTaskUiPrefs(threadId: string, prefs: TaskUiPrefs): void {
   }
 }
 
-function formatContextUsage(usage?: ContextUsage): string | null {
+function compactTokenCount(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "—";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(Math.round(n));
+}
+
+type ContextUsageView = {
+  usedPercent: number | null;
+  remainingTokens: number | null;
+  contextWindow: number | null;
+  totalTokens: number | null;
+  planLabel: string | null;
+  planRemaining: number | null;
+  planLimit: number | null;
+  planUsedPercent: number | null;
+};
+
+function parseContextUsageView(usage?: ContextUsage): ContextUsageView | null {
   if (!usage) return null;
-  const total = usage.totalTokens ?? ((usage.inputTokens || 0) + (usage.outputTokens || 0));
-  const window = usage.contextWindow;
-  if (window && (usage.remainingTokens != null || total)) {
-    const remaining = usage.remainingTokens ?? Math.max(0, window - total);
-    const pct = Math.max(0, Math.min(100, Math.round((remaining / window) * 100)));
-    return `上下文剩余 ${remaining.toLocaleString()} / ${window.toLocaleString()}（${pct}%）`;
+  const total = usage.totalTokens
+    ?? (((usage.inputTokens || 0) + (usage.outputTokens || 0)) || 0);
+  const window = usage.contextWindow ?? null;
+  const remaining = usage.remainingTokens
+    ?? (window != null ? Math.max(0, window - total) : null);
+  const usedPercent = window && window > 0
+    ? Math.max(0, Math.min(100, Math.round((total / window) * 100)))
+    : null;
+  const planRemaining = usage.planRemaining ?? null;
+  const planLimit = usage.planLimit ?? null;
+  const planUsedPercent = planLimit && planLimit > 0 && planRemaining != null
+    ? Math.max(0, Math.min(100, Math.round(((planLimit - planRemaining) / planLimit) * 100)))
+    : null;
+  const planLabel = usage.planLabel?.trim() || null;
+  if (usedPercent == null && remaining == null && !total && !planLabel && planRemaining == null) {
+    return null;
   }
-  if (total) return `已用约 ${total.toLocaleString()} tokens`;
-  return null;
+  return {
+    usedPercent,
+    remainingTokens: remaining,
+    contextWindow: window,
+    totalTokens: total || null,
+    planLabel,
+    planRemaining,
+    planLimit,
+    planUsedPercent
+  };
+}
+
+/** Compact title/tooltip for context chips. */
+function contextUsageTitle(view: ContextUsageView): string {
+  const parts: string[] = [];
+  if (view.usedPercent != null && view.contextWindow != null) {
+    parts.push(
+      `上下文已用 ${view.usedPercent}%（${compactTokenCount(view.totalTokens || 0)} / ${compactTokenCount(view.contextWindow)}）`
+    );
+  } else if (view.totalTokens != null) {
+    parts.push(`已用约 ${compactTokenCount(view.totalTokens)} tokens`);
+  }
+  if (view.remainingTokens != null && view.contextWindow != null) {
+    parts.push(`上下文剩余 ${compactTokenCount(view.remainingTokens)}`);
+  }
+  if (view.planLabel || view.planRemaining != null) {
+    const plan = view.planLabel || "订阅额度";
+    if (view.planRemaining != null && view.planLimit != null) {
+      parts.push(`${plan} 剩余 ${compactTokenCount(view.planRemaining)} / ${compactTokenCount(view.planLimit)}`);
+    } else if (view.planRemaining != null) {
+      parts.push(`${plan} 剩余 ${compactTokenCount(view.planRemaining)}`);
+    } else {
+      parts.push(plan);
+    }
+  }
+  return parts.join(" · ");
 }
 type HostRuntime = {
   online: boolean | null;
@@ -1485,7 +1548,9 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
   const previousThreadRef = useRef(task.threadId);
   const running = Boolean(task.activeTurnId);
   const permissionOptions = permissionOptionsForEngine(taskEngine, locale);
-  const contextLabel = formatContextUsage(task.contextUsage);
+  const contextView = parseContextUsageView(task.contextUsage);
+  const modelLabel = (task.model || model || "").split("[")[0] || task.model || model || "未知";
+  const effortLabel = task.reasoningEffort || reasoningEffort || "";
   const isMac = isMacPlatform();
   const visibleMessages = replyDetail === "detailed"
     ? task.messages
@@ -1711,13 +1776,60 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
           <span>{task.title}</span>
         </h2>
         <code title={task.cwd}>{task.cwd}</code>
-        <p className="thread-meta-line" title="当前任务模型 / 推理强度 / 上下文">
-          {[
-            `模型 ${task.model || model || "未知"}`,
-            `推理 ${task.reasoningEffort || reasoningEffort || "未知"}`,
-            contextLabel
-          ].filter(Boolean).join(" · ")}
-        </p>
+        <div
+          className="thread-meta-chips"
+          title={contextView ? contextUsageTitle(contextView) : "当前任务模型 / 推理 / 上下文"}
+        >
+          <span className="meta-chip meta-chip-model" title={modelLabel}>
+            <em>模型</em>
+            <strong>{modelLabel}</strong>
+          </span>
+          {effortLabel ? (
+            <span className="meta-chip" title={`推理 ${effortLabel}`}>
+              <em>推理</em>
+              <strong>{effortLabel}</strong>
+            </span>
+          ) : null}
+          {contextView?.usedPercent != null ? (
+            <span
+              className={`meta-chip meta-chip-context${contextView.usedPercent >= 85 ? " hot" : contextView.usedPercent >= 60 ? " warm" : ""}`}
+              title={contextUsageTitle(contextView)}
+            >
+              <em>上下文</em>
+              <span className="ctx-bar" aria-hidden="true">
+                <span style={{ width: `${contextView.usedPercent}%` }} />
+              </span>
+              <strong>{contextView.usedPercent}%</strong>
+            </span>
+          ) : contextView?.totalTokens != null ? (
+            <span className="meta-chip meta-chip-context" title={contextUsageTitle(contextView)}>
+              <em>已用</em>
+              <strong>{compactTokenCount(contextView.totalTokens)} tok</strong>
+            </span>
+          ) : null}
+          {contextView?.remainingTokens != null && contextView.contextWindow != null ? (
+            <span className="meta-chip" title={`上下文剩余 ${contextView.remainingTokens.toLocaleString()} / ${contextView.contextWindow.toLocaleString()}`}>
+              <em>余窗</em>
+              <strong>{compactTokenCount(contextView.remainingTokens)}</strong>
+            </span>
+          ) : null}
+          {(contextView?.planLabel || contextView?.planRemaining != null) ? (
+            <span
+              className="meta-chip meta-chip-quota"
+              title={contextUsageTitle(contextView!)}
+            >
+              <em>{contextView?.planLabel || "额度"}</em>
+              <strong>
+                {contextView?.planRemaining != null
+                  ? (contextView.planLimit != null
+                    ? `${compactTokenCount(contextView.planRemaining)}/${compactTokenCount(contextView.planLimit)}`
+                    : compactTokenCount(contextView.planRemaining))
+                  : "—"}
+                {contextView?.planUsedPercent != null ? ` · ${contextView.planUsedPercent}%` : ""}
+              </strong>
+            </span>
+          ) : null}
+        </div>
       </div>
       <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>{t("chat")}</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>{t("diff")}</button></div>
     </div>
