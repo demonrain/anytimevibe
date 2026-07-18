@@ -799,7 +799,8 @@ function rendererHtml(): string {
   const logoMapJson = JSON.stringify({
     codex: vendorLogo("codex"),
     claude: vendorLogo("claude"),
-    grok: vendorLogo("grok")
+    grok: vendorLogo("grok"),
+    cursor: vendorLogo("cursor")
   }).replace(/</g, "\\u003c");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>随码</title><style>
   :root{font-family:"Bahnschrift","Aptos","Segoe UI",sans-serif;color:#17211b}
@@ -937,6 +938,7 @@ function rendererHtml(): string {
     var title=String(task&&task.title||'');
     if(/^\\[claude\\]/i.test(title)) return 'claude';
     if(/^\\[grok\\]/i.test(title)) return 'grok';
+    if(/^\\[cursor\\]/i.test(title)) return 'cursor';
     return 'codex';
   }
   var I18N={
@@ -1007,7 +1009,7 @@ function rendererHtml(): string {
       var codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">'+(env.codexInstalled?'安装兼容版':'一键安装')+'</button>':'';
       if(environment){
         var engineExtra=engines.filter(function(item){return item.engine!=='codex';}).map(function(item){
-          var label=item.engine==='claude'?'Claude Code':'Grok Build';
+          var label=item.engine==='claude'?'Claude Code':(item.engine==='cursor'?'Cursor Agent':'Grok Build');
           var action=!item.ready?'<button data-install="'+escapeHtml(item.engine)+'" class="secondary">一键安装</button>':'';
           return '<div class="check '+(item.ready?'ok':'')+'"><b>'+escapeHtml(label)+'</b><span>'+escapeHtml(item.version||item.detail||(item.ready?'就绪':'未安装'))+'</span>'+action+'</div>';
         }).join('');
@@ -1100,10 +1102,10 @@ function rendererHtml(): string {
       var hay=((task.title||'')+' '+(task.cwd||'')+' '+(task.status||'')+' '+(eng||'')).toLowerCase();
       return hay.indexOf(q)>=0;
     });
-    var counts={codex:0,claude:0,grok:0};
+    var counts={codex:0,claude:0,grok:0,cursor:0};
     lastTasks.forEach(function(task){ var e=detectEngine(task); if(counts[e]!=null) counts[e]+=1; });
     var filterBar='<div class="engine-filter" role="toolbar" aria-label="engine filter">'
-      +['codex','claude','grok'].map(function(eng){
+      +['codex','claude','grok','cursor'].map(function(eng){
         return '<button type="button" class="engine-filter-btn'+(engineFilter===eng?' active':'')+'" data-engine-filter="'+eng+'" title="'+eng+' · '+counts[eng]+'">'
           +engineLogo(eng)+'<span>'+counts[eng]+'</span></button>';
       }).join('')
@@ -2082,7 +2084,47 @@ fi
   updateState({ detail: "已打开 Terminal 安装 Node.js。完成后请重启随码并点击「重新检测」。" });
 }
 
-async function installEnvironment(target: "node" | "codex" | "claude" | "grok"): Promise<void> {
+async function installCursorAgent(): Promise<void> {
+  updateState({ detail: "正在打开 Cursor Agent CLI 安装窗口…" });
+  if (process.platform === "win32") {
+    const proxyLines = await proxyShellLines("win32");
+    await openWindowsVisibleConsole([
+      "echo ============================================",
+      "echo   AnytimeVibe - install Cursor Agent CLI",
+      "echo ============================================",
+      "echo.",
+      ...proxyLines,
+      "echo [1] Official installer (cursor.com/install) ...",
+      "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"irm 'https://cursor.com/install?win32=true' | iex\"",
+      "echo.",
+      "set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\"",
+      "where agent 2>nul",
+      "where cursor-agent 2>nul",
+      "agent --version 2>nul",
+      "echo.",
+      "echo If agent is Cursor CLI: run  agent login",
+      "echo Note: do not confuse with Grok's agent.exe under %%USERPROFILE%%\\.grok\\bin",
+      "echo.",
+      "echo Done. Close this window and click 重新检测 in AnytimeVibe."
+    ]);
+    updateState({ detail: "已打开 Cursor Agent 安装窗口。完成后请登录（agent login）并点「重新检测」。" });
+    return;
+  }
+  if (process.platform === "darwin") {
+    await openMacTerminalScript(`
+echo "Installing Cursor Agent CLI…"
+curl -fsS https://cursor.com/install | bash
+export PATH="$HOME/.local/bin:$PATH"
+agent --version || true
+echo "Install finished. Run: agent login"
+`);
+    updateState({ detail: "已打开 Terminal 安装 Cursor Agent。完成后请执行 agent login 并点「重新检测」。" });
+    return;
+  }
+  throw new Error("当前系统暂不支持一键安装 Cursor Agent CLI。");
+}
+
+async function installEnvironment(target: "node" | "codex" | "claude" | "grok" | "cursor"): Promise<void> {
   if (target === "node") {
     if (process.platform === "win32") {
       await installNodeOnWindows();
@@ -2115,6 +2157,10 @@ async function installEnvironment(target: "node" | "codex" | "claude" | "grok"):
       return;
     }
     throw new Error("当前系统暂不支持一键安装 Grok Build。");
+  }
+  if (target === "cursor") {
+    await installCursorAgent();
+    return;
   }
   // Strict platform split: do not share install implementation across OS.
   if (process.platform === "win32") {
@@ -2829,7 +2875,9 @@ async function runHeadlessTaskTurn(options: {
       role: "system",
       text: options.engine === "claude"
         ? "Claude 任务失败。请确认本机已安装 Claude Code 并登录；若提示模型已下线，请设置环境变量 CLAUDE_MODEL（例如 claude-opus-4-7）或在 Claude CLI 中切换模型。"
-        : "Grok 任务失败。请确认本机已安装 Grok Build 并已登录。"
+        : options.engine === "cursor"
+          ? "Cursor 任务失败。请确认已安装 Cursor Agent CLI（agent）并登录（agent login 或设置 CURSOR_API_KEY）；勿与 Grok 的 agent 命令混淆。"
+          : "Grok 任务失败。请确认本机已安装 Grok Build 并已登录。"
     });
   }
   await taskStore.upsert(latest);
@@ -2862,7 +2910,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       const mode = command.permissionMode ?? "ask-for-approval";
       if (!command.cliEngine) throw new Error("请在网页端选择编码引擎后再下发任务");
       const engine = normalizeCliEngine(command.cliEngine);
-      if (engine === "claude" || engine === "grok") {
+      if (engine === "claude" || engine === "grok" || engine === "cursor") {
         const threadId = crypto.randomUUID();
         localThreadId = threadId;
         await ensureWorkspaceTrusted(engine, command.cwd);
@@ -2961,7 +3009,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         logInfo("开始执行 turn.start", `thread=${command.threadId.slice(0, 8)} prompt=${command.prompt.slice(0, 80)}`);
         const mode = command.permissionMode ?? "ask-for-approval";
         const stored = taskStore.get(command.threadId);
-        if (stored && (stored.engine === "claude" || stored.engine === "grok")) {
+        if (stored && (stored.engine === "claude" || stored.engine === "grok" || stored.engine === "cursor")) {
           // Persist UI-selected model/effort before the turn so refresh/import keep them.
           if (command.model || command.reasoningEffort) {
             if (command.model) stored.model = command.model;
@@ -3467,11 +3515,11 @@ const SEARCH_LIST_LIMIT = 100;
 /** Publish up to `limit` recent non-Codex tasks for each multi-CLI engine. */
 async function publishRecentMultiCliSnapshots(limit: number, query?: string): Promise<number> {
   const q = query?.trim().toLowerCase() ?? "";
-  const counts: Record<"claude" | "grok", number> = { claude: 0, grok: 0 };
+  const counts: Record<"claude" | "grok" | "cursor", number> = { claude: 0, grok: 0, cursor: 0 };
   let published = 0;
   // Pull a wider window so each engine can still fill its quota after filtering.
-  for (const task of taskStore.list(Math.max(limit * 8, 40))) {
-    if (task.engine !== "claude" && task.engine !== "grok") continue;
+  for (const task of taskStore.list(Math.max(limit * 10, 50))) {
+    if (task.engine !== "claude" && task.engine !== "grok" && task.engine !== "cursor") continue;
     if (counts[task.engine] >= limit) continue;
     if (q && !`${task.title}\n${task.cwd}\n${task.status}`.toLowerCase().includes(q)) continue;
     await publishStoredTaskSnapshot(task.threadId);
@@ -3671,7 +3719,12 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   const providerSessionId = (stored?.providerSessionId || "").trim();
 
   // Pre-accept directory trust prompts before opening an interactive handoff terminal.
-  await ensureWorkspaceTrusted(engine === "claude" || engine === "grok" || engine === "codex" ? engine : "codex", cwd);
+  await ensureWorkspaceTrusted(
+    engine === "claude" || engine === "grok" || engine === "codex" || engine === "cursor"
+      ? engine
+      : "codex",
+    cwd
+  );
 
   if (engine === "claude") {
     const binary = await resolveEngineBinary("claude");
@@ -3713,6 +3766,31 @@ async function relayTaskToCli(threadId: string): Promise<void> {
           ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : []),
           ...(model ? ["--model", shellQuote(model)] : []),
           "--cwd", shellQuote(cwd)
+        ].join(" ")
+      );
+    }
+    return;
+  }
+
+  if (engine === "cursor") {
+    const binary = await resolveEngineBinary("cursor");
+    if (!binary) throw new Error("未找到 Cursor Agent CLI，无法接力");
+    const model = (stored?.model || process.env.CURSOR_MODEL || "").trim();
+    const args = [
+      ...(providerSessionId ? ["--resume", providerSessionId] : []),
+      ...(model ? ["--model", model] : []),
+      "--workspace", cwd
+    ];
+    if (process.platform === "win32") {
+      await openExternalTerminal(cwd, formatWinCliCommand(binary, args));
+    } else {
+      await openExternalTerminal(
+        cwd,
+        [
+          shellQuote(binary),
+          ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : []),
+          ...(model ? ["--model", shellQuote(model)] : []),
+          "--workspace", shellQuote(cwd)
         ].join(" ")
       );
     }
@@ -4229,8 +4307,8 @@ function registerIpc(): void {
     }
     return publicState;
   });
-  ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex" | "claude" | "grok") => {
-    if (target !== "node" && target !== "codex" && target !== "claude" && target !== "grok") {
+  ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex" | "claude" | "grok" | "cursor") => {
+    if (target !== "node" && target !== "codex" && target !== "claude" && target !== "grok" && target !== "cursor") {
       throw new Error("未知的安装目标");
     }
     try {

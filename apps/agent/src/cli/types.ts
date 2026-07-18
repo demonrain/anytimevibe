@@ -51,6 +51,6 @@ export type HeadlessRunResult = {
 };
 
 export function normalizeCliEngine(value: string | null | undefined): CliEngine {
-  if (value === "claude" || value === "grok" || value === "codex") return value;
+  if (value === "claude" || value === "grok" || value === "codex" || value === "cursor") return value;
   return "codex";
 }

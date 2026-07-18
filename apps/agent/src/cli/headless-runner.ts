@@ -68,6 +68,14 @@ function permissionArgs(engine: CliEngine, mode: PermissionMode): string[] {
     // acceptEdits still needs non-interactive safety for untrusted-folder edge cases
     return ["--permission-mode", "acceptEdits", "--dangerously-skip-permissions"];
   }
+  if (engine === "cursor") {
+    // Cursor print mode needs --force/--yolo to apply file edits without TTY approval.
+    if (mode === "read-only") return [];
+    if (mode === "full-access" || mode === "approve-for-me" || mode === "ask-for-approval") {
+      return ["--force"];
+    }
+    return ["--force"];
+  }
   // grok: always-approve so headless never blocks on TTY
   if (mode === "read-only") {
     return ["--permission-mode", "dontAsk", "--tools", "read_file,grep,list_dir"];
@@ -90,6 +98,20 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
     if (options.reasoningEffort) args.push("--effort", options.reasoningEffort);
     // Only use --bare when API key is present (bare skips keychain/OAuth).
     if (process.env.ANTHROPIC_API_KEY) args.push("--bare");
+    if (options.providerSessionId) args.push("--resume", options.providerSessionId);
+    args.push(...permissionArgs(engine, options.permissionMode));
+    return args;
+  }
+  if (engine === "cursor") {
+    const model = (options.model || process.env.CURSOR_MODEL || "").trim();
+    // Official headless: agent -p --force --output-format stream-json --stream-partial-output
+    args.push(
+      "-p", options.prompt,
+      "--output-format", "stream-json",
+      "--stream-partial-output",
+      "--workspace", options.cwd
+    );
+    if (model) args.push("--model", model);
     if (options.providerSessionId) args.push("--resume", options.providerSessionId);
     args.push(...permissionArgs(engine, options.permissionMode));
     return args;
@@ -262,6 +284,97 @@ function handleClaudeLine(
   }
 }
 
+/**
+ * Cursor Agent CLI stream-json events (print mode).
+ * See https://cursor.com/docs/cli/reference/output-format
+ */
+function handleCursorLine(
+  line: string,
+  options: HeadlessRunOptions,
+  state: ParseState,
+  onEvent: (event: BackendStreamEvent) => void
+): void {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    emitDelta(onEvent, options, "cli-log", "cli-log", `${line}\n`);
+    return;
+  }
+  const type = String(parsed.type || "");
+  if (parsed.session_id) state.sessionId = String(parsed.session_id);
+
+  if (type === "system") {
+    const subtype = String(parsed.subtype || "");
+    if (subtype === "init") {
+      if (parsed.model) state.model = String(parsed.model);
+      const model = state.model ? `（模型 ${state.model}）` : "";
+      emitDelta(onEvent, options, "stage:init", "stage", `\n▶ Cursor 会话初始化${model}\n`);
+    }
+    return;
+  }
+
+  if (type === "assistant") {
+    // Skip buffered duplicate flushes when stream-partial-output is enabled.
+    const hasTs = Object.prototype.hasOwnProperty.call(parsed, "timestamp_ms");
+    const hasMc = Object.prototype.hasOwnProperty.call(parsed, "model_call_id");
+    if (hasTs && hasMc) return; // pre-tool flush (duplicate)
+    if (!hasTs && !hasMc && state.sawAssistant) return; // final flush (duplicate)
+    const content = parsed.message?.content;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        const text = block?.type === "text" ? String(block.text || "") : "";
+        if (!text) continue;
+        state.text += text;
+        state.sawAssistant = true;
+        emitDelta(onEvent, options, "assistant", "assistant", text);
+      }
+    }
+    return;
+  }
+
+  if (type === "tool_call") {
+    const subtype = String(parsed.subtype || "");
+    const call = parsed.tool_call || {};
+    let label = "工具调用";
+    if (call.writeToolCall?.args?.path) {
+      label = subtype === "started"
+        ? `写入 ${call.writeToolCall.args.path}`
+        : `已写入 ${call.writeToolCall.args.path}`;
+    } else if (call.readToolCall?.args?.path) {
+      label = subtype === "started"
+        ? `读取 ${call.readToolCall.args.path}`
+        : `已读取 ${call.readToolCall.args.path}`;
+    } else if (call.function?.name) {
+      label = `调用 ${call.function.name}`;
+    }
+    emitDelta(
+      onEvent,
+      options,
+      `stage:tool:${parsed.call_id || label}`,
+      "stage",
+      subtype === "started" ? `\n▶ ${label}\n` : `\n✓ ${label}\n`
+    );
+    return;
+  }
+
+  if (type === "result") {
+    if (parsed.session_id) state.sessionId = String(parsed.session_id);
+    if (parsed.is_error) {
+      state.failed = true;
+      state.errorMessage = String(parsed.result || parsed.error || "Cursor 运行失败");
+      onEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+      emitDelta(onEvent, options, "stage:error", "stage", `\n✗ ${state.errorMessage}\n`);
+      return;
+    }
+    if (typeof parsed.result === "string" && parsed.result && !state.sawAssistant) {
+      state.text = parsed.result;
+      state.sawAssistant = true;
+      emitDelta(onEvent, options, "assistant", "assistant", parsed.result);
+    }
+  }
+}
+
 function handleGrokLine(
   line: string,
   options: HeadlessRunOptions,
@@ -357,7 +470,9 @@ export async function runHeadlessTurn(
   if (!command) {
     const message = engine === "claude"
       ? "未找到 Claude Code CLI，请安装并确保 claude 在 PATH 中"
-      : "未找到 Grok Build CLI，请安装并确保 grok 在 PATH 中";
+      : engine === "cursor"
+        ? "未找到 Cursor Agent CLI（agent / cursor-agent）。请执行官方安装脚本并登录：irm https://cursor.com/install?win32=true | iex"
+        : "未找到 Grok Build CLI，请安装并确保 grok 在 PATH 中";
     safeOnEvent({ type: "error", threadId: options.threadId, message });
     safeOnEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
     safeOnEvent({ type: "turn.completed", threadId: options.threadId, turnId: options.turnId, status: "failed" });
@@ -392,12 +507,17 @@ export async function runHeadlessTurn(
   );
 
   safeOnEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
+  const engineLabel = engine === "claude"
+    ? "Claude Code"
+    : engine === "cursor"
+      ? "Cursor Agent"
+      : "Grok Build";
   emitDelta(
     safeOnEvent,
     options,
     `stage:${engine}`,
     "stage",
-    `\n▶ 使用 ${engine === "claude" ? "Claude Code" : "Grok Build"} 执行\n`
+    `\n▶ 使用 ${engineLabel} 执行\n`
   );
   if (Object.keys(proxy).length) {
     emitDelta(safeOnEvent, options, "stage:proxy", "stage", "\n… 已注入本机代理环境\n");
@@ -449,7 +569,7 @@ export async function runHeadlessTurn(
 
     const timeout = setTimeout(() => {
       state.failed = true;
-      state.errorMessage = `${engine === "claude" ? "Claude" : "Grok"} 执行超时（${Math.round(HEADLESS_TIMEOUT_MS / 1000)}s），已终止`;
+      state.errorMessage = `${engineLabel} 执行超时（${Math.round(HEADLESS_TIMEOUT_MS / 1000)}s），已终止`;
       safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
       emitDelta(safeOnEvent, options, "stage:timeout", "stage", `\n✗ ${state.errorMessage}\n`);
       killChildTree(child);
@@ -464,13 +584,14 @@ export async function runHeadlessTurn(
         options,
         "stage:heartbeat",
         "stage",
-        `\n… ${engine === "claude" ? "Claude" : "Grok"} 仍在执行…\n`
+        `\n… ${engineLabel} 仍在执行…\n`
       );
     }, 20_000);
 
     if (child.stdout) {
       createInterface({ input: child.stdout }).on("line", (line) => {
         if (engine === "claude") handleClaudeLine(line, options, state, safeOnEvent);
+        else if (engine === "cursor") handleCursorLine(line, options, state, safeOnEvent);
         else handleGrokLine(line, options, state, safeOnEvent);
         if (state.sessionId && state.sessionId !== options.providerSessionId) {
           safeOnEvent({ type: "session", threadId: options.threadId, providerSessionId: state.sessionId });
@@ -503,7 +624,9 @@ export async function runHeadlessTurn(
         if (!state.errorMessage) {
           state.errorMessage = engine === "claude"
             ? `Claude 退出码 ${code ?? "unknown"}（模型不可用时请设置 CLAUDE_MODEL，或在 Claude CLI 中切换模型；未登录请执行 claude auth login）`
-            : `Grok 退出码 ${code ?? "unknown"}`;
+            : engine === "cursor"
+              ? `Cursor 退出码 ${code ?? "unknown"}（请确认 agent 已登录或设置 CURSOR_API_KEY；勿与 Grok 的 agent 混淆）`
+              : `Grok 退出码 ${code ?? "unknown"}`;
           safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
           emitDelta(safeOnEvent, options, "stage:error", "stage", `\n✗ ${state.errorMessage}\n`);
         }

@@ -67,7 +67,7 @@ export const permissionModeSchema = z.enum([
 export type PermissionMode = z.infer<typeof permissionModeSchema>;
 
 /** Local coding CLI backend used by the desktop agent. */
-export const cliEngineSchema = z.enum(["codex", "claude", "grok"]);
+export const cliEngineSchema = z.enum(["codex", "claude", "grok", "cursor"]);
 export type CliEngine = z.infer<typeof cliEngineSchema>;
 
 export const cliEngineInfoSchema = z.object({

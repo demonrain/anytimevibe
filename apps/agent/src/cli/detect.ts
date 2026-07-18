@@ -77,6 +77,8 @@ function enrichedPathEnv(): NodeJS.ProcessEnv {
     ? [
         path.join(home, ".grok", "bin"),
         path.join(home, ".local", "bin"),
+        path.join(home, ".cursor", "bin"),
+        path.join(process.env.LOCALAPPDATA || "", "cursor-agent"),
         path.join(process.env.LOCALAPPDATA || "", "Programs", "claude"),
         path.join(process.env.LOCALAPPDATA || "", "Microsoft", "WinGet", "Links"),
         path.join(process.env.APPDATA || "", "npm"),
@@ -85,6 +87,7 @@ function enrichedPathEnv(): NodeJS.ProcessEnv {
     : [
         path.join(home, ".grok", "bin"),
         path.join(home, ".local", "bin"),
+        path.join(home, ".cursor", "bin"),
         path.join(home, ".claude", "local"),
         "/opt/homebrew/bin",
         "/usr/local/bin"
@@ -246,6 +249,29 @@ function parseGrokVersion(raw: string | null): string | undefined {
   return match?.[1] ?? raw.slice(0, 80);
 }
 
+function parseCursorVersion(raw: string | null): string | undefined {
+  if (!raw) return undefined;
+  // Avoid treating Grok's `agent` binary as Cursor (common PATH name collision).
+  if (/grok/i.test(raw) && !/cursor/i.test(raw)) return undefined;
+  const match = raw.match(/(\d{4}\.\d{2}\.\d{2}[-\w]*)/i)
+    || raw.match(/(\d+\.\d+\.\d+[-\w]*)/)
+    || raw.match(/cursor[^\d]*([0-9][^\s]*)/i);
+  return match?.[1] ?? (raw.length < 80 ? raw : raw.slice(0, 80));
+}
+
+/** True when this executable looks like Cursor Agent CLI (not Grok `agent`). */
+async function looksLikeCursorAgent(command: string): Promise<boolean> {
+  const help = await runVersion(command, ["--help"]);
+  const version = await runVersion(command, ["--version"]);
+  const text = `${help || ""}\n${version || ""}`;
+  if (!text.trim()) return false;
+  if (/grok\s+build|Grok Build/i.test(text) && !/cursor/i.test(text)) return false;
+  // Cursor agent help typically mentions print/output-format/resume.
+  if (/--print|--output-format|stream-json|cursor/i.test(text)) return true;
+  if (parseCursorVersion(version) && !/grok/i.test(text)) return true;
+  return false;
+}
+
 export async function detectAvailableEngines(options: {
   codexReady: boolean;
   codexVersion: string;
@@ -253,10 +279,13 @@ export async function detectAvailableEngines(options: {
   clearEngineBinaryCache();
   const claudePath = await resolveEngineBinary("claude");
   const grokPath = await resolveEngineBinary("grok");
+  const cursorPath = await resolveEngineBinary("cursor");
   const claudeRaw = claudePath ? await runVersion(claudePath, ["--version"]) : null;
   const grokRaw = grokPath ? await runVersion(grokPath, ["--version"]) : null;
+  const cursorRaw = cursorPath ? await runVersion(cursorPath, ["--version"]) : null;
   const claudeVersion = parseClaudeVersion(claudeRaw);
   const grokVersion = parseGrokVersion(grokRaw);
+  const cursorVersion = parseCursorVersion(cursorRaw);
 
   return [
     {
@@ -274,6 +303,17 @@ export async function detectAvailableEngines(options: {
       engine: "grok",
       ready: Boolean(grokPath && grokVersion),
       ...(grokVersion ? { version: grokVersion } : { detail: grokPath ? "grok 已找到但无法读取版本" : "未检测到 grok 命令，请安装 Grok Build CLI" })
+    },
+    {
+      engine: "cursor",
+      ready: Boolean(cursorPath && (cursorVersion || cursorRaw)),
+      ...(cursorVersion || cursorRaw
+        ? { version: cursorVersion || String(cursorRaw).slice(0, 40) }
+        : {
+          detail: cursorPath
+            ? "cursor agent 已找到但无法读取版本"
+            : "未检测到 Cursor Agent CLI（agent / cursor-agent），请安装并登录"
+        })
     }
   ];
 }
@@ -285,6 +325,38 @@ export async function resolveEngineBinary(engine: Exclude<CliEngine, "codex">): 
       || (await resolveCommandPath("claude.exe"))
       || (await resolveCommandPath("claude.cmd"));
   }
+  if (engine === "cursor") {
+    if (process.env.CURSOR_COMMAND) return resolveCommandPath(process.env.CURSOR_COMMAND);
+    if (process.env.CURSOR_AGENT_COMMAND) return resolveCommandPath(process.env.CURSOR_AGENT_COMMAND);
+    // Prefer unambiguous names first — bare `agent` collides with Grok on Windows.
+    const named = (await resolveCommandPath("cursor-agent"))
+      || (await resolveCommandPath("cursor-agent.exe"))
+      || (await resolveCommandPath("cursor-agent.cmd"));
+    if (named) return named;
+    const home = os.homedir();
+    const localCandidates = process.platform === "win32"
+      ? [
+          path.join(home, ".local", "bin", "agent.exe"),
+          path.join(home, ".local", "bin", "agent.cmd"),
+          path.join(home, ".local", "bin", "agent"),
+          path.join(home, ".cursor", "bin", "agent.exe"),
+          path.join(process.env.LOCALAPPDATA || "", "cursor-agent", "agent.exe")
+        ]
+      : [
+          path.join(home, ".local", "bin", "agent"),
+          path.join(home, ".cursor", "bin", "agent")
+        ];
+    for (const candidate of localCandidates) {
+      if (!candidate || !(await pathExists(candidate))) continue;
+      if (await looksLikeCursorAgent(candidate)) return candidate;
+    }
+    // Last resort: PATH `agent`, but only if it is not Grok.
+    for (const name of process.platform === "win32" ? ["agent.exe", "agent.cmd", "agent"] : ["agent"]) {
+      const hit = await resolveCommandPath(name);
+      if (hit && await looksLikeCursorAgent(hit)) return hit;
+    }
+    return null;
+  }
   if (process.env.GROK_COMMAND) return resolveCommandPath(process.env.GROK_COMMAND);
   return (await resolveCommandPath("grok"))
     || (await resolveCommandPath("grok.exe"))
@@ -295,6 +367,11 @@ export async function resolveEngineBinary(engine: Exclude<CliEngine, "codex">): 
 export function resolveEngineCommand(engine: Exclude<CliEngine, "codex">): string {
   if (engine === "claude") {
     return process.env.CLAUDE_COMMAND || (process.platform === "win32" ? "claude.exe" : "claude");
+  }
+  if (engine === "cursor") {
+    return process.env.CURSOR_COMMAND
+      || process.env.CURSOR_AGENT_COMMAND
+      || (process.platform === "win32" ? "cursor-agent.exe" : "cursor-agent");
   }
   return process.env.GROK_COMMAND || (process.platform === "win32" ? "grok.exe" : "grok");
 }

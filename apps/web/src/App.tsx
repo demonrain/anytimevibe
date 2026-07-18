@@ -108,7 +108,9 @@ function effortOptionsFromHost(
       ? (["low", "medium", "high", "xhigh", "max"] as ReasoningEffort[])
       : engine === "grok"
         ? (["low", "medium", "high"] as ReasoningEffort[])
-        : (["low", "medium", "high", "xhigh"] as ReasoningEffort[]);
+        : engine === "cursor"
+          ? ([] as ReasoningEffort[])
+          : (["low", "medium", "high", "xhigh"] as ReasoningEffort[]);
   if (currentEffort && !base.includes(currentEffort)) base.unshift(currentEffort);
   return base;
 }
@@ -209,13 +211,14 @@ function emptyRuntime(online: boolean | null = null): HostRuntime {
 }
 
 function normalizeCliEngine(value: string | null | undefined): CliEngine {
-  if (value === "claude" || value === "grok" || value === "codex") return value;
+  if (value === "claude" || value === "grok" || value === "codex" || value === "cursor") return value;
   return "codex";
 }
 
 function cliEngineLabel(engine: CliEngine): string {
   if (engine === "claude") return "Claude Code";
   if (engine === "grok") return "Grok Build";
+  if (engine === "cursor") return "Cursor";
   return "Codex";
 }
 
@@ -223,6 +226,7 @@ function cliEngineLabel(engine: CliEngine): string {
 function assistantEngineBadge(engine: CliEngine): string {
   if (engine === "claude") return "CLAUDE";
   if (engine === "grok") return "GROK";
+  if (engine === "cursor") return "CURSOR";
   return "CODEX";
 }
 
@@ -271,6 +275,19 @@ function permissionOptionsForEngine(engine: CliEngine, locale: "zh-CN" | "en"): 
           { value: "read-only", label: "只读工具" },
           { value: "ask-for-approval", label: "接受文件编辑" },
           { value: "full-access", label: "全自动批准" }
+        ];
+  }
+  if (engine === "cursor") {
+    return locale === "en"
+      ? [
+          { value: "read-only", label: "Propose only (no --force)" },
+          { value: "ask-for-approval", label: "Apply changes (--force)" },
+          { value: "full-access", label: "Full auto (--force)" }
+        ]
+      : [
+          { value: "read-only", label: "仅提议（不写盘）" },
+          { value: "ask-for-approval", label: "允许改文件 (--force)" },
+          { value: "full-access", label: "全自动写盘 (--force)" }
         ];
   }
   // codex
@@ -619,7 +636,8 @@ function ClientDownloads({ downloads }: { downloads: Health["clientDownloads"] }
 const featuredEngines: Array<{ engine: CliEngine; vendor: string; product: string }> = [
   { engine: "codex", vendor: "OpenAI", product: "Codex" },
   { engine: "claude", vendor: "Anthropic", product: "Claude Code" },
-  { engine: "grok", vendor: "xAI", product: "Grok Build" }
+  { engine: "grok", vendor: "xAI", product: "Grok Build" },
+  { engine: "cursor", vendor: "Cursor", product: "Cursor Agent" }
 ];
 
 function FeaturedEngines() {
@@ -1264,7 +1282,7 @@ export function App() {
           <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? t("hostOnline") : activeRuntime.online === false ? t("hostOffline") : t("hostChecking")}</div>
           {activeHost && keyAuthorizationStatus[activeHost.id] && <div className="key-authorization-note"><div><strong>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "正在授权此浏览器" : "此浏览器尚未取得主机密钥"}</strong><span>{activeRuntime.online === true ? "电脑端会自动完成端到端密钥授权。" : "请先让电脑端客户端上线，再重新授权。"}</span></div><button disabled={keyAuthorizationStatus[activeHost.id] === "authorizing" || activeRuntime.online !== true} onClick={() => authorizeExistingHost(activeHost.id).catch((authorizationError) => setError(authorizationError.message))}>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "授权中…" : "授权此浏览器"}</button></div>}
           <div className="engine-filter" role="toolbar" aria-label="按编码引擎筛选任务">
-            {(["codex", "claude", "grok"] as CliEngine[]).map((engine) => {
+            {(["codex", "claude", "grok", "cursor"] as CliEngine[]).map((engine) => {
               const count = tasks.filter((task) => normalizeCliEngine(task.cliEngine) === engine).length;
               const active = engineFilter === engine;
               return (
@@ -1967,7 +1985,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
     <div className="engine-picker">
       <span className="engine-picker-label">编码引擎</span>
       <div className="engine-picker-grid" role="radiogroup" aria-label="编码引擎">
-        {(["codex", "claude", "grok"] as CliEngine[]).map((item) => {
+        {(["codex", "claude", "grok", "cursor"] as CliEngine[]).map((item) => {
           const info = availableEngines.find((entry) => entry.engine === item);
           const isReady = Boolean(info?.ready);
           const selected = engine === item;

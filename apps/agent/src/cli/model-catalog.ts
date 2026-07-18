@@ -210,12 +210,32 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
   };
 }
 
+async function discoverCursorCapability(): Promise<EngineCapability> {
+  // Cursor Agent selects models server-side; expose common aliases for the web picker.
+  // Users can leave empty to use CLI default (Composer / account plan).
+  const models: EngineModelOption[] = [
+    { id: "auto", label: "Auto (CLI default)" },
+    { id: "composer-2", label: "Composer 2" },
+    { id: "sonnet-4", label: "Claude Sonnet 4" },
+    { id: "gpt-5", label: "GPT-5" },
+    { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" }
+  ];
+  const currentModel = process.env.CURSOR_MODEL?.trim() || "auto";
+  return {
+    engine: "cursor",
+    models,
+    reasoningEfforts: [],
+    currentModel
+  };
+}
+
 /** Collect model + effort options from local CLI configs/caches on this machine. */
 export async function discoverEngineCapabilities(): Promise<EngineCapability[]> {
-  const [codex, claude, grok] = await Promise.all([
+  const [codex, claude, grok, cursor] = await Promise.all([
     discoverCodexCapability(),
     discoverClaudeCapability(),
-    discoverGrokCapability()
+    discoverGrokCapability(),
+    discoverCursorCapability()
   ]);
-  return [codex, claude, grok];
+  return [codex, claude, grok, cursor];
 }
