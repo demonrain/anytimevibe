@@ -1,13 +1,9 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { CliEngine, ReasoningEffort } from "@anytimevibe/protocol";
+import type { CliEngine, EngineModelOption, ReasoningEffort } from "@anytimevibe/protocol";
 
-export type EngineModelOption = {
-  id: string;
-  label: string;
-  contextWindow?: number;
-};
+export type { EngineModelOption };
 
 export type EngineCapability = {
   engine: CliEngine;
@@ -210,23 +206,244 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
   };
 }
 
+/**
+ * Cursor Agent CLI models (see https://cursor.com/docs/cli + https://cursor.com/docs/models).
+ * IDs are CLI `--model` slugs; Fast/effort are composed as `id[fast=…,effort=…]` at spawn time.
+ * Prefer live `agent models` / `--list-models` when the binary is installed.
+ */
+const CURSOR_FALLBACK_MODELS: EngineModelOption[] = [
+  { id: "auto", label: "Auto" },
+  {
+    id: "composer-2.5",
+    label: "Composer 2.5",
+    supportsFast: true
+  },
+  {
+    id: "claude-opus-4-8",
+    label: "Claude Opus 4.8",
+    supportsFast: true,
+    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+  },
+  {
+    id: "claude-fable-5",
+    label: "Claude Fable 5",
+    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+  },
+  {
+    id: "gpt-5.6-sol",
+    label: "GPT-5.6 Sol",
+    supportsFast: true,
+    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+  },
+  {
+    id: "gpt-5.6-terra",
+    label: "GPT-5.6 Terra",
+    supportsFast: true,
+    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+  },
+  {
+    id: "gpt-5.6-luna",
+    label: "GPT-5.6 Luna",
+    supportsFast: true,
+    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+  },
+  { id: "grok-4.5", label: "Grok 4.5" },
+  { id: "gemini-3.1-pro", label: "Gemini 3.1 Pro" },
+  {
+    id: "claude-sonnet-5",
+    label: "Claude Sonnet 5",
+    supportsFast: true,
+    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+  }
+];
+
+function looksLikeCursorModelLine(line: string): boolean {
+  const t = line.trim();
+  if (!t || t.length > 120) return false;
+  if (/^(Available|Models|NAME|ID|Usage|\$|──|==)/i.test(t)) return false;
+  // Skip Grok Build help noise if wrong binary ever leaks in.
+  if (/grok\s+build|Grok Build/i.test(t)) return false;
+  return true;
+}
+
+function parseCursorModelsCliOutput(raw: string): EngineModelOption[] {
+  const models: EngineModelOption[] = [];
+  const seen = new Set<string>();
+  for (const line of raw.split(/\r?\n/)) {
+    if (!looksLikeCursorModelLine(line)) continue;
+    // Formats seen: "composer-2.5", "composer-2.5  Composer 2.5", "- composer-2.5 (Composer 2.5)"
+    const cleaned = line.replace(/^[-*•]\s*/, "").trim();
+    const m =
+      cleaned.match(/^([a-z0-9][\w./+-]*(?:\[[^\]]+\])?)\s{2,}(.+)$/i)
+      || cleaned.match(/^([a-z0-9][\w./+-]*)\s+\(([^)]+)\)\s*$/i)
+      || cleaned.match(/^([a-z0-9][\w./+-]+)\s*$/i);
+    if (!m?.[1]) continue;
+    const id = m[1].trim();
+    if (!id || seen.has(id) || id.includes(" ")) continue;
+    // Drop param-only variants from listing; we compose params ourselves.
+    if (id.includes("[")) continue;
+    seen.add(id);
+    const label = (m[2] || id).trim();
+    const lower = `${id} ${label}`.toLowerCase();
+    const supportsFast =
+      /composer|opus|sonnet|gpt|gemini/i.test(lower) && !/auto|grok/i.test(id);
+    const reasoningEfforts: ReasoningEffort[] | undefined =
+      /gpt|opus|fable|sonnet|claude/i.test(lower) && !/composer|auto|grok/i.test(id)
+        ? ["low", "medium", "high", "xhigh"]
+        : undefined;
+    models.push({
+      id,
+      label,
+      ...(supportsFast ? { supportsFast: true } : {}),
+      ...(reasoningEfforts ? { reasoningEfforts } : {})
+    });
+  }
+  return models;
+}
+
+async function runCursorModelsList(command: string): Promise<string | null> {
+  try {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+    const isWindows = process.platform === "win32";
+    const { windowsCmdArguments } = await import("../windows-command");
+    const attempts: string[][] = [["models"], ["--list-models"], ["models", "--json"]];
+    for (const args of attempts) {
+      try {
+        const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
+        const finalArgs = isWindows ? windowsCmdArguments(command, args) : args;
+        const { stdout, stderr } = await execFileAsync(executable, finalArgs, {
+          timeout: 20_000,
+          windowsHide: true,
+          windowsVerbatimArguments: isWindows,
+          env: process.env,
+          maxBuffer: 512_000
+        });
+        const text = `${stdout || ""}\n${stderr || ""}`.trim();
+        if (text && !/unknown command|unrecognized|error:/i.test(text.slice(0, 200))) {
+          return text;
+        }
+      } catch {
+        // try next
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
 async function discoverCursorCapability(): Promise<EngineCapability> {
-  // Cursor Agent selects models server-side; expose common aliases for the web picker.
-  // Users can leave empty to use CLI default (Composer / account plan).
-  const models: EngineModelOption[] = [
-    { id: "auto", label: "Auto (CLI default)" },
-    { id: "composer-2", label: "Composer 2" },
-    { id: "sonnet-4", label: "Claude Sonnet 4" },
-    { id: "gpt-5", label: "GPT-5" },
-    { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" }
-  ];
-  const currentModel = process.env.CURSOR_MODEL?.trim() || "auto";
+  const models: EngineModelOption[] = [];
+  const seen = new Set<string>();
+
+  // Live list from Cursor Agent CLI when installed (never Grok's `agent`).
+  try {
+    const { resolveEngineBinary } = await import("./detect");
+    const binary = await resolveEngineBinary("cursor");
+    if (binary) {
+      const raw = await runCursorModelsList(binary);
+      if (raw) {
+        for (const row of parseCursorModelsCliOutput(raw)) {
+          if (seen.has(row.id)) continue;
+          seen.add(row.id);
+          models.push(row);
+        }
+      }
+    }
+  } catch {
+    // fall through to static catalog
+  }
+
+  // Ensure curated first-party / popular models exist even if CLI list is sparse.
+  for (const row of CURSOR_FALLBACK_MODELS) {
+    if (seen.has(row.id)) {
+      // Merge metadata onto live row when CLI omitted flags.
+      const existing = models.find((m) => m.id === row.id);
+      if (existing) {
+        if (row.supportsFast && existing.supportsFast === undefined) existing.supportsFast = true;
+        if (row.reasoningEfforts?.length && !existing.reasoningEfforts?.length) {
+          existing.reasoningEfforts = row.reasoningEfforts;
+        }
+        if (row.label && existing.label === existing.id) existing.label = row.label;
+      }
+      continue;
+    }
+    seen.add(row.id);
+    models.push({ ...row });
+  }
+
+  // Prefer Composer 2.5 first in the picker (after optional Auto).
+  models.sort((a, b) => {
+    const rank = (id: string) => {
+      if (id === "composer-2.5") return 0;
+      if (id === "auto") return 1;
+      if (id.startsWith("claude-opus")) return 2;
+      if (id.includes("fable")) return 3;
+      if (id.startsWith("gpt-")) return 4;
+      if (id.startsWith("grok")) return 5;
+      return 10;
+    };
+    return rank(a.id) - rank(b.id) || a.label.localeCompare(b.label);
+  });
+
+  const envModel = process.env.CURSOR_MODEL?.trim();
+  const currentModel = envModel || "composer-2.5";
+  if (currentModel && !seen.has(currentModel.split("[")[0]!)) {
+    models.unshift({ id: currentModel, label: currentModel });
+  }
+
+  // Engine-level efforts are a union used as fallback when a model has none.
+  const reasoningEfforts: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
+
   return {
     engine: "cursor",
     models,
-    reasoningEfforts: [],
+    reasoningEfforts,
     currentModel
   };
+}
+
+/**
+ * Build Cursor CLI `--model` value from base id + effort + optional fast flag.
+ * Docs/community use forms like `composer-2.5[fast=false]` and effort-bearing GPT names.
+ */
+export function formatCursorModelArg(
+  model: string | undefined,
+  options?: { reasoningEffort?: ReasoningEffort; fast?: boolean }
+): string {
+  const raw = (model || process.env.CURSOR_MODEL || "composer-2.5").trim() || "composer-2.5";
+  // Already parameterized by web/UI — pass through.
+  if (raw.includes("[")) return raw;
+  if (raw === "auto") return "auto";
+
+  const base = raw;
+  const params: string[] = [];
+  const lower = base.toLowerCase();
+  const catalog = CURSOR_FALLBACK_MODELS.find((m) => m.id === base);
+  const supportsFast = catalog?.supportsFast ?? /composer|opus|sonnet|gpt/i.test(lower);
+  const supportsEffort =
+    Boolean(catalog?.reasoningEfforts?.length)
+    || /gpt|opus|fable|sonnet|claude/i.test(lower);
+
+  if (supportsFast && options?.fast !== undefined) {
+    params.push(`fast=${options.fast ? "true" : "false"}`);
+  }
+
+  if (supportsEffort && options?.reasoningEffort) {
+    const effortMap: Record<ReasoningEffort, string> = {
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "extra_high",
+      max: "extra_high"
+    };
+    params.push(`effort=${effortMap[options.reasoningEffort]}`);
+  }
+
+  if (!params.length) return base;
+  return `${base}[${params.join(",")}]`;
 }
 
 /** Collect model + effort options from local CLI configs/caches on this machine. */

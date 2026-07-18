@@ -3776,8 +3776,11 @@ async function relayTaskToCli(threadId: string): Promise<void> {
 
   if (engine === "cursor") {
     const binary = await resolveEngineBinary("cursor");
-    if (!binary) throw new Error("未找到 Cursor Agent CLI，无法接力");
-    const model = (stored?.model || process.env.CURSOR_MODEL || "").trim();
+    if (!binary) throw new Error("未找到 Cursor Agent CLI（cursor-agent / agent），无法接力。请安装 https://cursor.com/cn/cli 并登录（agent login）");
+    const { formatCursorModelArg } = await import("./cli/model-catalog");
+    const model = formatCursorModelArg(stored?.model, {
+      ...(stored?.reasoningEffort ? { reasoningEffort: stored.reasoningEffort } : {})
+    });
     const args = [
       ...(providerSessionId ? ["--resume", providerSessionId] : []),
       ...(model ? ["--model", model] : []),

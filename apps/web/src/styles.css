@@ -13,7 +13,7 @@
   --shadow: 0 24px 70px rgba(32, 38, 30, 0.13);
   --topbar-h: 56px;
   --rail-w: 300px;
-  --task-col-w: 300px;
+  --task-col-w: 360px;
   --msg-font: 12.5px;
   --msg-lh: 1.55;
 }
@@ -287,12 +287,18 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .mobile-back { display: none; }
 .mobile-level-back { display: none; }
 .permission-select, .reply-detail-select { grid-template-columns: auto minmax(120px, 180px); align-items: center; margin: -6px 0 12px; color: #697068; font-size: 12px; }.permission-select select, .reply-detail-select select { padding: 7px 9px; font-size: 12px; }
-.engine-filter { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; min-width: 0; }
+.engine-filter { display: flex; align-items: center; gap: 6px; margin: 0 0 12px; min-width: 0; flex-wrap: wrap; }
 .engine-filter-btn {
-  display: inline-flex; align-items: center; gap: 6px;
+  display: inline-flex; align-items: center; gap: 5px;
   border: 1px solid var(--line); background: rgba(255,250,240,.72); color: var(--ink);
-  border-radius: 12px; padding: 7px 10px; cursor: pointer; font-weight: 800; font-size: 11px;
-  transition: .15s ease;
+  border-radius: 12px; padding: 6px 8px; cursor: pointer; font-weight: 800; font-size: 11px;
+  transition: .15s ease; flex: 0 0 auto;
+}
+.composer-fast-toggle {
+  display: inline-flex; align-items: center; gap: 6px; font-weight: 750;
+}
+.composer-fast-toggle input[type="checkbox"] {
+  width: 15px; height: 15px; accent-color: var(--moss); cursor: pointer;
 }
 .engine-filter-btn:hover { border-color: rgba(226,88,50,.45); transform: translateY(-1px); }
 .engine-filter-btn.active { background: var(--ink); color: #f8f1e5; border-color: var(--ink); box-shadow: 0 8px 16px rgba(23,33,27,.14); }
@@ -672,17 +678,17 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } } @keyframes pulse { 50% { transform: scale(.72); opacity: .45; } } @keyframes spin { to { transform: rotate(360deg); } }
 /* Large / high-DPI desktop (4K @ 150% ≈ 2560 CSS px): denser chrome, more content */
 @media (min-width: 1280px) {
-  :root { --topbar-h: 52px; --rail-w: 300px; --task-col-w: 280px; --msg-font: 12px; }
+  :root { --topbar-h: 52px; --rail-w: 300px; --task-col-w: 380px; --msg-font: 12px; }
   .quiet { padding: 7px 10px; font-size: 12px; }
   .top-actions { gap: 8px; }
 }
 @media (min-width: 1600px) {
-  :root { --rail-w: 320px; --task-col-w: 320px; }
+  :root { --rail-w: 320px; --task-col-w: 400px; }
   .message { max-width: min(78%, 920px); }
   .message-stream { padding: 16px 22px; }
 }
 @media (min-width: 2200px) {
-  :root { --rail-w: 340px; --task-col-w: 360px; --msg-font: 12.5px; }
+  :root { --rail-w: 340px; --task-col-w: 440px; --msg-font: 12.5px; }
   .message { max-width: min(70%, 980px); }
 }
 /* Scaled displays (125%–150%): keep UI compact without relying on device-pixel-ratio alone */
@@ -691,7 +697,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   .composer textarea { min-height: 52px; }
 }
 @media (min-resolution: 1.5dppx) and (min-width: 1100px) {
-  :root { font-size: 13px; --task-col-w: 260px; }
+  :root { font-size: 13px; --task-col-w: 340px; }
 }
 
 @media (max-width: 980px) {

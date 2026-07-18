@@ -4,6 +4,7 @@ import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/proto
 import { collectLocalProxyEnv, mergeProxyIntoEnv } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveEngineBinary } from "./detect";
+import { formatCursorModelArg } from "./model-catalog";
 import type { BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
 import { ensureWorkspaceTrusted } from "./workspace-trust";
 
@@ -69,18 +70,45 @@ function permissionArgs(engine: CliEngine, mode: PermissionMode): string[] {
     return ["--permission-mode", "acceptEdits", "--dangerously-skip-permissions"];
   }
   if (engine === "cursor") {
-    // Cursor print mode needs --force/--yolo to apply file edits without TTY approval.
-    if (mode === "read-only") return [];
-    if (mode === "full-access" || mode === "approve-for-me" || mode === "ask-for-approval") {
-      return ["--force"];
+    // Cursor Agent CLI (https://cursor.com/docs/cli/reference/parameters):
+    // --mode ask|plan, --force/--yolo, --trust (headless workspace), --sandbox
+    if (mode === "read-only") {
+      return ["--mode", "ask", "--trust"];
     }
-    return ["--force"];
+    if (mode === "full-access" || mode === "approve-for-me") {
+      return ["--force", "--trust", "--sandbox", "disabled"];
+    }
+    // accept edits / ask-for-approval: write with force so remote turns are non-interactive
+    return ["--force", "--trust"];
   }
   // grok: always-approve so headless never blocks on TTY
   if (mode === "read-only") {
     return ["--permission-mode", "dontAsk", "--tools", "read_file,grep,list_dir"];
   }
   return ["--always-approve"];
+}
+
+/**
+ * Parse optional fast flag encoded by the web as model id suffix:
+ *   composer-2.5[fast=true,effort=high]  → already complete
+ *   or bare id + separate reasoningEffort field
+ */
+function parseCursorModelHints(model: string | undefined): {
+  model: string;
+  fast?: boolean;
+} {
+  const raw = (model || "").trim();
+  if (!raw) return { model: "composer-2.5" };
+  const m = raw.match(/^([^[\]]+)\[([^\]]+)\]\s*$/);
+  if (!m) return { model: raw };
+  const base = (m[1] || raw).trim() || "composer-2.5";
+  let fast: boolean | undefined;
+  for (const part of (m[2] || "").split(",")) {
+    const [k, v] = part.split("=").map((s) => s.trim());
+    if (!k) continue;
+    if (k === "fast") fast = v === "true" || v === "1";
+  }
+  return fast === undefined ? { model: base } : { model: base, fast };
 }
 
 function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
@@ -103,19 +131,28 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
     return args;
   }
   if (engine === "cursor") {
-    const model = (options.model || process.env.CURSOR_MODEL || "").trim();
-    // Official headless: agent -p --force --output-format stream-json --stream-partial-output
+    // Cursor Agent CLI only — never Grok flags (--cwd, streaming-json, --always-approve).
+    // Docs: agent -p --force --output-format stream-json --stream-partial-output --workspace
+    // https://cursor.com/docs/cli/headless
+    const hints = parseCursorModelHints(options.model);
+    const modelArg = options.model?.includes("[")
+      ? options.model.trim()
+      : formatCursorModelArg(hints.model, {
+          ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+          ...(hints.fast !== undefined ? { fast: hints.fast } : {})
+        });
     args.push(
       "-p", options.prompt,
       "--output-format", "stream-json",
       "--stream-partial-output",
       "--workspace", options.cwd
     );
-    if (model) args.push("--model", model);
+    if (modelArg) args.push("--model", modelArg);
     if (options.providerSessionId) args.push("--resume", options.providerSessionId);
     args.push(...permissionArgs(engine, options.permissionMode));
     return args;
   }
+  // Grok Build CLI (distinct binary: grok, not agent)
   const model = (options.model || process.env.GROK_MODEL || process.env.XAI_MODEL || "").trim();
   args.push(
     "-p", options.prompt,
@@ -315,21 +352,23 @@ function handleCursorLine(
   }
 
   if (type === "assistant") {
-    // Skip buffered duplicate flushes when stream-partial-output is enabled.
+    // Cursor stream-json + --stream-partial-output (docs):
+    // - timestamp_ms present, model_call_id absent → streaming delta (use)
+    // - both present → pre-tool buffered flush (skip)
+    // - both absent → final flush at end of turn (skip if already streamed)
+    // Without partial mode, complete messages have neither field — accept each segment.
     const hasTs = Object.prototype.hasOwnProperty.call(parsed, "timestamp_ms");
     const hasMc = Object.prototype.hasOwnProperty.call(parsed, "model_call_id");
-    if (hasTs && hasMc) return; // pre-tool flush (duplicate)
-    if (!hasTs && !hasMc && state.sawAssistant) return; // final flush (duplicate)
+    if (hasTs && hasMc) return;
     const content = parsed.message?.content;
-    if (Array.isArray(content)) {
-      for (const block of content) {
-        const text = block?.type === "text" ? String(block.text || "") : "";
-        if (!text) continue;
-        state.text += text;
-        state.sawAssistant = true;
-        emitDelta(onEvent, options, "assistant", "assistant", text);
-      }
-    }
+    const text = Array.isArray(content)
+      ? content.map((block: any) => (block?.type === "text" ? String(block.text || "") : "")).join("")
+      : "";
+    if (!text) return;
+    if (!hasTs && !hasMc && state.sawAssistant && state.text.includes(text)) return;
+    state.text += text;
+    state.sawAssistant = true;
+    emitDelta(onEvent, options, "assistant", "assistant", text);
     return;
   }
 

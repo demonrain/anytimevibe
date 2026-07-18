@@ -99,20 +99,63 @@ function modelOptionsFromHost(
 function effortOptionsFromHost(
   capabilities: EngineCapability[] | undefined,
   engine: CliEngine,
-  currentEffort?: ReasoningEffort
+  currentEffort?: ReasoningEffort,
+  modelId?: string
 ): ReasoningEffort[] {
   const cap = capabilityForEngine(capabilities, engine);
+  const baseId = (modelId || "").split("[")[0]?.trim();
+  const modelMeta = baseId
+    ? cap?.models.find((item) => item.id === baseId)
+    : undefined;
+  // Cursor (and engines with per-model catalogs): prefer model-specific efforts.
+  if (modelMeta?.reasoningEfforts?.length) {
+    const base = [...modelMeta.reasoningEfforts];
+    if (currentEffort && !base.includes(currentEffort)) base.unshift(currentEffort);
+    return base;
+  }
+  // Cursor models without effort (Composer / Auto / Grok) → no dropdown.
+  if (engine === "cursor") {
+    if (currentEffort) return [currentEffort];
+    return [];
+  }
   const base = cap?.reasoningEfforts?.length
     ? [...cap.reasoningEfforts]
     : engine === "claude"
       ? (["low", "medium", "high", "xhigh", "max"] as ReasoningEffort[])
       : engine === "grok"
         ? (["low", "medium", "high"] as ReasoningEffort[])
-        : engine === "cursor"
-          ? ([] as ReasoningEffort[])
-          : (["low", "medium", "high", "xhigh"] as ReasoningEffort[]);
+        : (["low", "medium", "high", "xhigh"] as ReasoningEffort[]);
   if (currentEffort && !base.includes(currentEffort)) base.unshift(currentEffort);
   return base;
+}
+
+function modelOptionMeta(
+  capabilities: EngineCapability[] | undefined,
+  engine: CliEngine,
+  modelId?: string
+): EngineModelOption | undefined {
+  const baseId = (modelId || "").split("[")[0]?.trim();
+  if (!baseId) return undefined;
+  return capabilityForEngine(capabilities, engine)?.models.find((item) => item.id === baseId);
+}
+
+/** Encode Cursor Fast / strip prior params so agent can compose CLI --model. */
+function composeCursorModelId(baseModel: string, fast: boolean | undefined, supportsFast: boolean): string {
+  const base = (baseModel || "composer-2.5").split("[")[0]!.trim() || "composer-2.5";
+  if (!supportsFast || fast === undefined) return base;
+  return `${base}[fast=${fast ? "true" : "false"}]`;
+}
+
+function parseFastFromModelId(modelId?: string): boolean | undefined {
+  if (!modelId?.includes("[")) return undefined;
+  const m = modelId.match(/\[([^\]]+)\]/);
+  const body = m?.[1];
+  if (!body) return undefined;
+  for (const part of body.split(",")) {
+    const [k, v] = part.split("=").map((s) => s.trim());
+    if (k === "fast") return v === "true" || v === "1";
+  }
+  return undefined;
 }
 
 function draftStorageKey(threadId: string): string {
@@ -141,7 +184,7 @@ function taskPrefsKey(threadId: string): string {
   return `task-prefs:${threadId}`;
 }
 
-type TaskUiPrefs = { model?: string; reasoningEffort?: ReasoningEffort };
+type TaskUiPrefs = { model?: string; reasoningEffort?: ReasoningEffort; fast?: boolean };
 
 function loadTaskUiPrefs(threadId: string): TaskUiPrefs {
   try {
@@ -158,8 +201,11 @@ function saveTaskUiPrefs(threadId: string, prefs: TaskUiPrefs): void {
   try {
     const current = loadTaskUiPrefs(threadId);
     const next: TaskUiPrefs = { ...current, ...prefs };
-    if (!next.model && !next.reasoningEffort) localStorage.removeItem(taskPrefsKey(threadId));
-    else localStorage.setItem(taskPrefsKey(threadId), JSON.stringify(next));
+    if (!next.model && !next.reasoningEffort && next.fast === undefined) {
+      localStorage.removeItem(taskPrefsKey(threadId));
+    } else {
+      localStorage.setItem(taskPrefsKey(threadId), JSON.stringify(next));
+    }
   } catch {
     // ignore quota / private mode
   }
@@ -1408,17 +1454,30 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     taskEngine,
     task.model || uiPrefs.model || cap?.currentModel
   );
+  const [model, setModel] = useState(
+    () => {
+      const raw = task.model || uiPrefs.model || cap?.currentModel || modelOptions[0]?.id || "";
+      return raw.split("[")[0] || raw;
+    }
+  );
+  const modelMeta = modelOptionMeta(engineCapabilities, taskEngine, model);
   const effortOptions = effortOptionsFromHost(
     engineCapabilities,
     taskEngine,
-    task.reasoningEffort || uiPrefs.reasoningEffort || cap?.currentReasoningEffort
-  );
-  const [model, setModel] = useState(
-    () => task.model || uiPrefs.model || cap?.currentModel || modelOptions[0]?.id || ""
+    task.reasoningEffort || uiPrefs.reasoningEffort || cap?.currentReasoningEffort,
+    model
   );
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(
     () => task.reasoningEffort || uiPrefs.reasoningEffort || cap?.currentReasoningEffort || effortOptions[0] || ""
   );
+  const [fastMode, setFastMode] = useState<boolean>(() => {
+    const fromModel = parseFastFromModelId(task.model || uiPrefs.model);
+    if (fromModel !== undefined) return fromModel;
+    if (uiPrefs.fast !== undefined) return uiPrefs.fast;
+    // Composer defaults to Fast on Cursor CLI; other models default off.
+    const base = (task.model || uiPrefs.model || cap?.currentModel || "").split("[")[0] || "";
+    return /composer/i.test(base);
+  });
   const messageStreamRef = useRef<HTMLDivElement | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1443,10 +1502,14 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
   useEffect(() => {
     const prefs = loadTaskUiPrefs(task.threadId);
     if (task.model) {
-      setModel(task.model);
-      saveTaskUiPrefs(task.threadId, { model: task.model });
+      const base = task.model.split("[")[0] || task.model;
+      setModel(base);
+      saveTaskUiPrefs(task.threadId, { model: base });
+      const parsedFast = parseFastFromModelId(task.model);
+      if (parsedFast !== undefined) setFastMode(parsedFast);
     } else if (prefs.model) {
-      setModel(prefs.model);
+      setModel(prefs.model.split("[")[0] || prefs.model);
+      if (prefs.fast !== undefined) setFastMode(prefs.fast);
     } else {
       setModel((current) => current || cap?.currentModel || modelOptions[0]?.id || "");
     }
@@ -1464,20 +1527,45 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.threadId, task.model, task.reasoningEffort]);
 
+  // When model changes on Cursor, reset effort to first option for that model (or clear).
+  useEffect(() => {
+    if (taskEngine !== "cursor") return;
+    const nextEfforts = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, model);
+    setReasoningEffort((current) => {
+      if (current && nextEfforts.includes(current as ReasoningEffort)) return current;
+      return nextEfforts[0] || "";
+    });
+    const meta = modelOptionMeta(engineCapabilities, taskEngine, model);
+    if (meta?.supportsFast && /composer/i.test(model) && uiPrefs.fast === undefined) {
+      setFastMode(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [model, taskEngine]);
+
   // Persist in-progress edits so switching tasks and back restores the draft.
   useEffect(() => {
     saveTaskDraft(task.threadId, prompt);
   }, [task.threadId, prompt]);
 
+  function resolveOutboundModel(): string | undefined {
+    if (!model) return undefined;
+    if (taskEngine === "cursor") {
+      return composeCursorModelId(model, modelMeta?.supportsFast ? fastMode : undefined, Boolean(modelMeta?.supportsFast));
+    }
+    return model;
+  }
+
   function turnStartCommand(text: string): ClientCommand {
+    const outboundModel = resolveOutboundModel();
+    const effort = effortOptions.length ? reasoningEffort : "";
     return {
       type: "turn.start",
       commandId: crypto.randomUUID(),
       threadId: task.threadId,
       prompt: text,
       permissionMode,
-      ...(model ? { model } : {}),
-      ...(reasoningEffort ? { reasoningEffort } : {})
+      ...(outboundModel ? { model: outboundModel } : {}),
+      ...(effort ? { reasoningEffort: effort as ReasoningEffort } : {})
     };
   }
 
@@ -1694,7 +1782,7 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
             <select
               value={model}
               onChange={(event) => {
-                const next = event.target.value;
+                const next = event.target.value.split("[")[0] || event.target.value;
                 setModel(next);
                 if (next) saveTaskUiPrefs(task.threadId, { model: next });
               }}
@@ -1704,8 +1792,22 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
               {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
             </select>
           </label>
+          {taskEngine === "cursor" && modelMeta?.supportsFast && (
+            <label className="composer-permission composer-fast-toggle">
+              Fast
+              <input
+                type="checkbox"
+                checked={fastMode}
+                onChange={(event) => {
+                  const next = event.target.checked;
+                  setFastMode(next);
+                  saveTaskUiPrefs(task.threadId, { fast: next });
+                }}
+              />
+            </label>
+          )}
           <label className="composer-permission">
-            推理强度
+            {taskEngine === "cursor" ? "Effort" : "推理强度"}
             <select
               value={reasoningEffort}
               onChange={(event) => {
@@ -1714,6 +1816,7 @@ function TaskConversation({ task, online, visible, permissionMode, replyDetail, 
                 if (next) saveTaskUiPrefs(task.threadId, { reasoningEffort: next });
               }}
               disabled={!effortOptions.length}
+              title={taskEngine === "cursor" && !effortOptions.length ? "当前模型不支持 effort" : undefined}
             >
               {!effortOptions.length && <option value="">—</option>}
               {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
@@ -1898,9 +2001,21 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
   const [taskPermission, setTaskPermission] = useState<PermissionMode>(permissionOptions[0]?.value ?? "ask-for-approval");
   const cap = capabilityForEngine(engineCapabilities, engineId);
   const modelOptions = modelOptionsFromHost(engineCapabilities, engineId, cap?.currentModel);
-  const effortOptions = effortOptionsFromHost(engineCapabilities, engineId, cap?.currentReasoningEffort);
-  const [model, setModel] = useState(cap?.currentModel || modelOptions[0]?.id || "");
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(cap?.currentReasoningEffort || effortOptions[0] || "");
+  const [model, setModel] = useState(() => {
+    const raw = cap?.currentModel || modelOptions[0]?.id || "";
+    return raw.split("[")[0] || raw;
+  });
+  const modelMeta = modelOptionMeta(engineCapabilities, engineId, model);
+  const effortOptions = effortOptionsFromHost(
+    engineCapabilities,
+    engineId,
+    cap?.currentReasoningEffort,
+    model
+  );
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(
+    cap?.currentReasoningEffort || effortOptions[0] || ""
+  );
+  const [fastMode, setFastMode] = useState(() => /composer/i.test(cap?.currentModel || modelOptions[0]?.id || ""));
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
@@ -1928,16 +2043,24 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
   useEffect(() => {
     const nextCap = capabilityForEngine(engineCapabilities, engineId);
     const nextModels = modelOptionsFromHost(engineCapabilities, engineId, nextCap?.currentModel);
-    const nextEfforts = effortOptionsFromHost(engineCapabilities, engineId, nextCap?.currentReasoningEffort);
     setModel((current) => {
-      if (current && nextModels.some((item) => item.id === current)) return current;
-      return nextCap?.currentModel || nextModels[0]?.id || "";
-    });
-    setReasoningEffort((current) => {
-      if (current && nextEfforts.includes(current as ReasoningEffort)) return current;
-      return nextCap?.currentReasoningEffort || nextEfforts[0] || "";
+      const base = (current || "").split("[")[0] || current;
+      if (base && nextModels.some((item) => item.id === base)) return base;
+      const fallback = nextCap?.currentModel || nextModels[0]?.id || "";
+      return fallback.split("[")[0] || fallback;
     });
   }, [engine, engineCapabilities]);
+
+  useEffect(() => {
+    const nextEfforts = effortOptionsFromHost(engineCapabilities, engineId, undefined, model);
+    setReasoningEffort((current) => {
+      if (current && nextEfforts.includes(current as ReasoningEffort)) return current;
+      return nextEfforts[0] || "";
+    });
+    if (engineId === "cursor") {
+      setFastMode(/composer/i.test(model));
+    }
+  }, [model, engineId, engineCapabilities]);
 
   // Pull latest whitelist from the agent once when the dialog opens (avoid dep on unstable callback identity).
   const refreshRef = useRef(onRefreshWorkspaces);
@@ -1965,14 +2088,18 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
     setLoading(true);
     setError("");
     try {
+      const outboundModel = engineId === "cursor" && model
+        ? composeCursorModelId(model, modelMeta?.supportsFast ? fastMode : undefined, Boolean(modelMeta?.supportsFast))
+        : (model || undefined);
+      const effort = effortOptions.length ? (reasoningEffort || undefined) : undefined;
       await onCreate(
         cwd,
         prompt,
         title,
         engine,
         taskPermission,
-        model || undefined,
-        reasoningEffort || undefined
+        outboundModel,
+        effort
       );
     } catch (createError) {
       setError(createError instanceof Error ? createError.message : "任务创建失败");
@@ -2009,14 +2136,21 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
       </div>
     </div>
     <label>模型
-      <select value={model} onChange={(event) => setModel(event.target.value)} disabled={!engine || !modelOptions.length}>
+      <select value={model} onChange={(event) => setModel(event.target.value.split("[")[0] || event.target.value)} disabled={!engine || !modelOptions.length}>
         {!modelOptions.length && <option value="">主机未上报模型列表</option>}
         {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
       </select>
     </label>
-    <label>推理强度
+    {engineId === "cursor" && modelMeta?.supportsFast && (
+      <label className="composer-fast-toggle" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span>Fast 模式</span>
+        <input type="checkbox" checked={fastMode} onChange={(event) => setFastMode(event.target.checked)} />
+        <small style={{ color: "#6f756e" }}>部分模型（如 Composer / GPT）支持更快但更浅的推理</small>
+      </label>
+    )}
+    <label>{engineId === "cursor" ? "Effort（按模型）" : "推理强度"}
       <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)} disabled={!engine || !effortOptions.length}>
-        {!effortOptions.length && <option value="">—</option>}
+        {!effortOptions.length && <option value="">{engineId === "cursor" ? "当前模型无 effort" : "—"}</option>}
         {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
       </select>
     </label>

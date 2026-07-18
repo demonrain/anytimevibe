@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.39";
+export const PRODUCT_VERSION = "0.4.40";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -86,7 +86,17 @@ export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
 export const engineModelOptionSchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
-  contextWindow: z.number().positive().optional()
+  contextWindow: z.number().positive().optional(),
+  /**
+   * Cursor (and similar): model supports a Fast variant.
+   * Web/agent encode as `--model id[fast=true|false]` when set.
+   */
+  supportsFast: z.boolean().optional(),
+  /**
+   * Per-model reasoning/effort levels. When set, UI should prefer these over
+   * the engine-level `reasoningEfforts` list for this model only.
+   */
+  reasoningEfforts: z.array(reasoningEffortSchema).optional()
 });
 export type EngineModelOption = z.infer<typeof engineModelOptionSchema>;
 
