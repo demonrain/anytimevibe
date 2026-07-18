@@ -38,6 +38,14 @@ import {
 } from "./i18n/locales";
 import { getHostKey, removeHostKey, saveHostKey } from "./key-store";
 
+/**
+ * Subscription quota query is temporarily disabled:
+ * - CLI usage probes (e.g. `claude -p /usage`) can create real remote task records
+ * - returned numbers are often session-cost only, not plan remaining
+ * Flip to true when a reliable per-engine quota API is ready.
+ */
+const QUOTA_QUERY_ENABLED = false;
+
 type Health = {
   ok: boolean;
   needsSetup: boolean;
@@ -1553,7 +1561,7 @@ export function App() {
       </section>
 
       <section className="conversation-column">
-        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} replyDetail={replyDetail} engineCapabilities={activeRuntime.engineCapabilities ?? []} engineQuotas={activeRuntime.engineQuotas ?? []} {...(activeRuntime.quotaDetail ? { quotaDetail: activeRuntime.quotaDetail } : {})} quotaLoading={Boolean(activeRuntime.quotaLoading)} onPermissionModeChange={(mode) => { const next = normalizePermissionMode(mode); setPermissionMode(next); localStorage.setItem("permission-mode", next); }} onReplyDetailChange={(detail) => { const next = normalizeReplyDetail(detail); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} onQuotaRefresh={() => {
+        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} replyDetail={replyDetail} engineCapabilities={activeRuntime.engineCapabilities ?? []} engineQuotas={QUOTA_QUERY_ENABLED ? (activeRuntime.engineQuotas ?? []) : []} {...(QUOTA_QUERY_ENABLED && activeRuntime.quotaDetail ? { quotaDetail: activeRuntime.quotaDetail } : {})} quotaLoading={QUOTA_QUERY_ENABLED && Boolean(activeRuntime.quotaLoading)} onPermissionModeChange={(mode) => { const next = normalizePermissionMode(mode); setPermissionMode(next); localStorage.setItem("permission-mode", next); }} onReplyDetailChange={(detail) => { const next = normalizeReplyDetail(detail); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} onQuotaRefresh={QUOTA_QUERY_ENABLED ? () => {
           setRuntime((current) => {
             const hostId = activeHost!.id;
             const prev = current[hostId] ?? emptyRuntime(true);
@@ -1571,7 +1579,7 @@ export function App() {
               return { ...current, [hostId]: { ...prev, quotaLoading: false } };
             });
           });
-        }} /> : <div className="conversation-empty"><div className="orbit" /><h2>{t("pickTask")}</h2><p>{t("pickTaskHint")}</p></div>}
+        } : () => undefined} /> : <div className="conversation-empty"><div className="orbit" /><h2>{t("pickTask")}</h2><p>{t("pickTaskHint")}</p></div>}
       </section>
     </main>
 
@@ -1994,7 +2002,7 @@ function TaskConversation({
               <strong>—</strong>
             </span>
           )}
-          {taskQuota ? (
+          {QUOTA_QUERY_ENABLED && taskQuota ? (
             <span
               className="meta-chip meta-chip-quota"
               title={taskQuota.detail || taskQuota.label || "订阅额度"}
@@ -2003,19 +2011,21 @@ function TaskConversation({
               <strong>{formatEngineQuotaChip(taskQuota)}</strong>
             </span>
           ) : null}
-          <button
-            type="button"
-            className="meta-chip meta-chip-action"
-            disabled={online !== true || quotaLoading}
-            onClick={onQuotaRefresh}
-            title={quotaDetail || (locale === "en" ? "Query subscription remaining for this engine" : "查询当前引擎订阅剩余用量")}
-          >
-            {quotaLoading
-              ? (locale === "en" ? "Checking…" : "查询中…")
-              : (locale === "en" ? "Quota" : "查额度")}
-          </button>
+          {QUOTA_QUERY_ENABLED && (
+            <button
+              type="button"
+              className="meta-chip meta-chip-action"
+              disabled={online !== true || quotaLoading}
+              onClick={onQuotaRefresh}
+              title={quotaDetail || (locale === "en" ? "Query subscription remaining for this engine" : "查询当前引擎订阅剩余用量")}
+            >
+              {quotaLoading
+                ? (locale === "en" ? "Checking…" : "查询中…")
+                : (locale === "en" ? "Quota" : "查额度")}
+            </button>
+          )}
         </div>
-        {(taskQuota?.detail || quotaDetail) && (
+        {QUOTA_QUERY_ENABLED && (taskQuota?.detail || quotaDetail) && (
           <details className="quota-detail-panel" open={Boolean(taskQuota || quotaDetail)}>
             <summary>
               {locale === "en" ? "Quota details" : "额度详情"}
