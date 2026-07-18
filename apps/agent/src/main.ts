@@ -50,7 +50,7 @@ import {
   threadToSnapshot
 } from "./codex-adapter";
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
-import { queryEngineQuotas } from "./cli/engine-quota";
+import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn } from "./cli/headless-runner";
 import { importLocalCliSessions } from "./cli/import-sessions";
 import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
@@ -3106,8 +3106,8 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     return;
   }
   if (command.type === "host.quota.refresh") {
-    const quotas = await refreshEngineQuotas(command.cliEngine);
-    const summary = quotas
+    const quotas = (await refreshEngineQuotas(command.cliEngine)).map(sanitizeEngineQuota);
+    const summaryRaw = quotas
       .map((item) => {
         const head = item.label || item.engine;
         if (item.amountRemaining != null) {
@@ -3118,14 +3118,15 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         return `${head}: ${item.detail?.split("\n")[0] || "见详情"}`;
       })
       .join(" · ");
+    const summary = summaryRaw.length > 4000 ? `${summaryRaw.slice(0, 3999)}…` : summaryRaw;
     await publish({
       type: "host.quota",
       eventId: crypto.randomUUID(),
       occurredAt: new Date().toISOString(),
       engineQuotas: quotas,
-      detail: quotas.length
-        ? summary
-        : "未能从本机 CLI 读取订阅额度。请确认对应引擎已安装并登录。"
+      ...(quotas.length
+        ? (summary ? { detail: summary } : {})
+        : { detail: "未能从本机 CLI 读取订阅额度。请确认对应引擎已安装并登录。" })
     }, true);
     // Also attach to host.status so reconnects keep the last sample briefly.
     await publishHostStatus();

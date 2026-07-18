@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.43";
+export const PRODUCT_VERSION = "0.4.44";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -127,6 +127,9 @@ export const contextUsageSchema = z.object({
 });
 export type ContextUsage = z.infer<typeof contextUsageSchema>;
 
+/** Max length for engine quota free-form detail (CLI raw / API JSON snippets). */
+export const ENGINE_QUOTA_DETAIL_MAX = 4000;
+
 /**
  * Host-level subscription / plan usage for one coding engine (queried on demand).
  * Prefer percent remaining; if monetary, use amountRemaining + currency.
@@ -146,8 +149,8 @@ export const engineQuotaSchema = z.object({
   amountRemaining: z.number().optional(),
   amountLimit: z.number().optional(),
   currency: z.string().trim().min(1).max(8).optional(),
-  /** Free-form summary when structured fields are incomplete. */
-  detail: z.string().trim().min(1).max(240).optional(),
+  /** Free-form summary / CLI raw output (capped for envelope validation). */
+  detail: z.string().trim().min(1).max(ENGINE_QUOTA_DETAIL_MAX).optional(),
   /** ISO timestamp of this sample. */
   checkedAt: z.string().datetime().optional()
 });
@@ -252,7 +255,7 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     type: z.literal("host.quota"),
     engineQuotas: z.array(engineQuotaSchema),
     /** Optional human-readable summary when a query partially fails. */
-    detail: z.string().optional()
+    detail: z.string().trim().max(ENGINE_QUOTA_DETAIL_MAX).optional()
   }),
   eventBase.extend({
     type: z.literal("sync.completed"),

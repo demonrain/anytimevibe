@@ -7,11 +7,12 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { CliEngine, EngineQuota } from "@anytimevibe/protocol";
+import { ENGINE_QUOTA_DETAIL_MAX, type CliEngine, type EngineQuota } from "@anytimevibe/protocol";
 import { windowsCmdArguments } from "../windows-command";
 import { resolveEngineBinary } from "./detect";
 
 const execFileAsync = promisify(execFile);
+const DETAIL_MAX = ENGINE_QUOTA_DETAIL_MAX;
 
 async function pathExists(filePath: string): Promise<boolean> {
   try {
@@ -56,13 +57,28 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function compactDetail(text: string, max = 600): string {
-  return text
+function compactDetail(text: string, max = DETAIL_MAX): string {
+  const cleaned = text
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .join("\n")
-    .slice(0, max);
+    .trim();
+  if (cleaned.length <= max) return cleaned;
+  return `${cleaned.slice(0, Math.max(0, max - 1))}…`;
+}
+
+/** Ensure quota objects always pass protocol validation before publish. */
+export function sanitizeEngineQuota(quota: EngineQuota): EngineQuota {
+  const label = quota.label?.trim().slice(0, 80);
+  const currency = quota.currency?.trim().slice(0, 8);
+  const detail = quota.detail ? compactDetail(quota.detail, DETAIL_MAX) : undefined;
+  return {
+    ...quota,
+    ...(label ? { label } : {}),
+    ...(currency ? { currency } : {}),
+    ...(detail ? { detail } : {})
+  };
 }
 
 /** Parse free-form CLI text into structured quota fields when possible. */
@@ -544,29 +560,29 @@ export async function queryEngineQuotas(
     try {
       if (engine === "codex") {
         if (options?.codexInstalled === false) continue;
-        results.push(await queryCodexQuota());
+        results.push(sanitizeEngineQuota(await queryCodexQuota()));
         continue;
       }
       const binary = await resolveEngineBinary(engine);
       if (!binary) {
-        results.push({
+        results.push(sanitizeEngineQuota({
           engine,
           label: engine,
           detail: `未找到 ${engine} CLI，无法查询额度。`,
           checkedAt: nowIso()
-        });
+        }));
         continue;
       }
-      if (engine === "cursor") results.push(await queryCursorQuota(binary));
-      else if (engine === "claude") results.push(await queryClaudeQuota(binary));
-      else if (engine === "grok") results.push(await queryGrokQuota(binary));
+      if (engine === "cursor") results.push(sanitizeEngineQuota(await queryCursorQuota(binary)));
+      else if (engine === "claude") results.push(sanitizeEngineQuota(await queryClaudeQuota(binary)));
+      else if (engine === "grok") results.push(sanitizeEngineQuota(await queryGrokQuota(binary)));
     } catch (error) {
-      results.push({
+      results.push(sanitizeEngineQuota({
         engine,
         label: engine,
         detail: `查询失败：${error instanceof Error ? error.message : String(error)}`,
         checkedAt: nowIso()
-      });
+      }));
     }
   }
   return results;
