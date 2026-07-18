@@ -50,6 +50,7 @@ import {
   threadToSnapshot
 } from "./codex-adapter";
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
+import { queryEngineQuotas } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn } from "./cli/headless-runner";
 import { importLocalCliSessions } from "./cli/import-sessions";
 import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
@@ -3044,20 +3045,44 @@ async function runHeadlessTaskTurn(options: {
   latest.status = result.status;
   latest.updatedAt = Date.now() / 1000;
   if (result.text.trim()) {
-    latest.messages.push({
-      id: crypto.randomUUID(),
-      role: result.status === "failed" ? "system" : "assistant",
-      text: result.text
-    });
+    // Never dump long model replies into role=system — false failure banner on web (Grok non-zero exit).
+    const text = result.text.trim();
+    const looksLikeErrorOnly = result.status === "failed"
+      && text.length < 600
+      && /失败|错误|exit|退出码|未找到|无法|not found|error|failed|login|auth/i.test(text);
+    if (result.status === "failed" && looksLikeErrorOnly) {
+      latest.messages.push({
+        id: crypto.randomUUID(),
+        role: "system",
+        text: text.startsWith("错误") || text.startsWith("任务失败") ? text : ("错误：" + text)
+      });
+    } else {
+      latest.messages.push({
+        id: crypto.randomUUID(),
+        role: "assistant",
+        text
+      });
+      if (result.status === "failed") {
+        latest.messages.push({
+          id: crypto.randomUUID(),
+          role: "system",
+          text: options.engine === "claude"
+            ? "错误：Claude 任务失败（已保留上方模型输出）。请检查登录与模型配置。"
+            : options.engine === "cursor"
+              ? "错误：Cursor 任务失败（已保留上方模型输出）。请确认 agent 登录 / CURSOR_API_KEY。"
+              : "错误：Grok 任务失败（已保留上方模型输出）。请检查本机 Grok CLI 状态。"
+        });
+      }
+    }
   } else if (result.status === "failed") {
     latest.messages.push({
       id: crypto.randomUUID(),
       role: "system",
       text: options.engine === "claude"
-        ? "Claude 任务失败。请确认本机已安装 Claude Code 并登录；若提示模型已下线，请设置环境变量 CLAUDE_MODEL（例如 claude-opus-4-7）或在 Claude CLI 中切换模型。"
+        ? "错误：Claude 任务失败。请确认本机已安装 Claude Code 并登录；若提示模型已下线，请设置环境变量 CLAUDE_MODEL（例如 claude-opus-4-7）或在 Claude CLI 中切换模型。"
         : options.engine === "cursor"
-          ? "Cursor 任务失败。请确认已安装 Cursor Agent CLI（agent）并登录（agent login 或设置 CURSOR_API_KEY）；勿与 Grok 的 agent 命令混淆。"
-          : "Grok 任务失败。请确认本机已安装 Grok Build 并已登录。"
+          ? "错误：Cursor 任务失败。请确认已安装 Cursor Agent CLI（agent）并登录（agent login 或设置 CURSOR_API_KEY）；勿与 Grok 的 agent 命令混淆。"
+          : "错误：Grok 任务失败。请确认本机已安装 Grok Build 并已登录。"
     });
   }
   await taskStore.upsert(latest);
@@ -3081,16 +3106,26 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     return;
   }
   if (command.type === "host.quota.refresh") {
-    const quotas = await queryEngineQuotas(command.cliEngine);
-    lastEngineQuotas = quotas;
+    const quotas = await refreshEngineQuotas(command.cliEngine);
+    const summary = quotas
+      .map((item) => {
+        const head = item.label || item.engine;
+        if (item.amountRemaining != null) {
+          return `${head}: 剩余 ${item.currency === "USD" || !item.currency ? "$" : item.currency}${item.amountRemaining}${item.amountLimit != null ? ` / ${item.amountLimit}` : ""}`;
+        }
+        if (item.remainingPercent != null) return `${head}: 剩余 ${Math.round(item.remainingPercent)}%`;
+        if (item.remaining != null && item.limit != null) return `${head}: ${item.remaining}/${item.limit}`;
+        return `${head}: ${item.detail?.split("\n")[0] || "见详情"}`;
+      })
+      .join(" · ");
     await publish({
       type: "host.quota",
       eventId: crypto.randomUUID(),
       occurredAt: new Date().toISOString(),
       engineQuotas: quotas,
       detail: quotas.length
-        ? undefined
-        : "未能从本机 CLI 读取订阅额度（多数引擎需在官方客户端查看账单；仅部分 CLI 会暴露额度）。"
+        ? summary
+        : "未能从本机 CLI 读取订阅额度。请确认对应引擎已安装并登录。"
     }, true);
     // Also attach to host.status so reconnects keep the last sample briefly.
     await publishHostStatus();
@@ -3645,150 +3680,14 @@ async function refreshAvailableEngines(): Promise<void> {
 /** Last quota sample from host.quota.refresh (attached to subsequent host.status). */
 let lastEngineQuotas: EngineQuota[] = [];
 
-async function runCliText(command: string, args: string[], timeoutMs = 20_000): Promise<string> {
-  try {
-    const isWindows = process.platform === "win32";
-    const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
-    const finalArgs = isWindows ? windowsCmdArguments(command, args) : args;
-    const { stdout, stderr } = await execFileAsync(executable, finalArgs, {
-      timeout: timeoutMs,
-      windowsHide: true,
-      windowsVerbatimArguments: isWindows,
-      env: process.env,
-      maxBuffer: 512_000
-    });
-    return `${stdout || ""}\n${stderr || ""}`.trim();
-  } catch (error) {
-    const err = error as { stdout?: string; stderr?: string; message?: string };
-    const text = `${err.stdout || ""}\n${err.stderr || ""}\n${err.message || ""}`.trim();
-    return text;
-  }
-}
-
-function parseQuotaFromText(engine: CliEngine, raw: string): EngineQuota | null {
-  if (!raw.trim()) return null;
-  const text = raw.replace(/\r/g, "\n");
-  const checkedAt = new Date().toISOString();
-  // Money: $12.34 remaining / ¥ / €
-  const money = text.match(/(?:remaining|left|余额|剩余)[^\n$¥€£]*([$¥€£])\s*([0-9]+(?:\.[0-9]+)?)/i)
-    || text.match(/([$¥€£])\s*([0-9]+(?:\.[0-9]+)?)\s*(?:remaining|left|余额|剩余)/i);
-  if (money) {
-    const symbol = money[1] === "$" ? "USD" : money[1] === "¥" ? "CNY" : money[1] === "€" ? "EUR" : money[1] === "£" ? "GBP" : money[1];
-    return {
-      engine,
-      label: "Credits",
-      amountRemaining: Number(money[2]),
-      currency: symbol,
-      detail: text.slice(0, 200),
-      checkedAt
-    };
-  }
-  // Percent remaining / used
-  const remainingPct = text.match(/(?:remaining|left|剩余)[^\n%]*?(\d{1,3}(?:\.\d+)?)\s*%/i)
-    || text.match(/(\d{1,3}(?:\.\d+)?)\s*%\s*(?:remaining|left|剩余)/i);
-  const usedPct = text.match(/(?:used|usage|已用)[^\n%]*?(\d{1,3}(?:\.\d+)?)\s*%/i)
-    || text.match(/(\d{1,3}(?:\.\d+)?)\s*%\s*(?:used|usage|已用)/i);
-  if (remainingPct || usedPct) {
-    const remainingPercent = remainingPct
-      ? Math.max(0, Math.min(100, Number(remainingPct[1])))
-      : (usedPct ? Math.max(0, Math.min(100, 100 - Number(usedPct[1]))) : undefined);
-    const usedPercent = usedPct
-      ? Math.max(0, Math.min(100, Number(usedPct[1])))
-      : (remainingPercent != null ? 100 - remainingPercent : undefined);
-    return {
-      engine,
-      label: "Plan",
-      ...(remainingPercent != null ? { remainingPercent } : {}),
-      ...(usedPercent != null ? { usedPercent } : {}),
-      detail: text.slice(0, 200),
-      checkedAt
-    };
-  }
-  // Absolute remaining / limit pairs
-  const pair = text.match(/(?:remaining|left|剩余)\s*[:=]?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*\/\s*([0-9][0-9,]*(?:\.[0-9]+)?)/i);
-  if (pair?.[1] && pair[2]) {
-    const remaining = Number(pair[1].replace(/,/g, ""));
-    const limit = Number(pair[2].replace(/,/g, ""));
-    if (Number.isFinite(remaining) && Number.isFinite(limit) && limit > 0) {
-      return {
-        engine,
-        remaining,
-        limit,
-        remainingPercent: Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))),
-        detail: text.slice(0, 200),
-        checkedAt
-      };
-    }
-  }
-  // Recognizable but unstructured account blurbs
-  if (/plan|subscription|usage|quota|rate.?limit|额度|订阅|余额|billing/i.test(text)) {
-    return {
-      engine,
-      detail: text.split(/\n/).map((line) => line.trim()).filter(Boolean).slice(0, 4).join(" · ").slice(0, 200),
-      checkedAt
-    };
-  }
-  return null;
-}
-
-async function queryEngineQuotas(filter?: CliEngine): Promise<EngineQuota[]> {
-  const engines: CliEngine[] = filter
-    ? [filter]
-    : ["codex", "claude", "grok", "cursor"];
-  const results: EngineQuota[] = [];
-  for (const engine of engines) {
-    try {
-      if (engine === "codex") {
-        if (!publicState.environment.codexInstalled && !publicState.environment.codexCompatible) continue;
-        // Codex app-server has no stable billing CLI — surface a clear guidance row.
-        results.push({
-          engine: "codex",
-          label: "Codex",
-          detail: "Codex CLI 未提供稳定的订阅额度查询接口，请在 ChatGPT / Codex 账号页查看用量。",
-          checkedAt: new Date().toISOString()
-        });
-        continue;
-      }
-      const binary = await resolveEngineBinary(engine);
-      if (!binary) continue;
-      const attempts: string[][] =
-        engine === "cursor"
-          ? [["about"], ["status"], ["whoami"], ["--help"]]
-          : engine === "claude"
-            ? [["auth", "status"], ["status"], ["--version"]]
-            : [["status"], ["about"], ["--version"]];
-      let parsed: EngineQuota | null = null;
-      for (const args of attempts) {
-        const text = await runCliText(binary, args);
-        parsed = parseQuotaFromText(engine, text);
-        if (parsed && (parsed.remainingPercent != null || parsed.amountRemaining != null || parsed.remaining != null)) {
-          break;
-        }
-        // Keep first informative detail even without numbers.
-        if (parsed?.detail && !results.some((item) => item.engine === engine)) {
-          // continue trying for structured numbers
-        } else if (!parsed) {
-          continue;
-        }
-      }
-      if (parsed) {
-        results.push(parsed);
-      } else {
-        results.push({
-          engine,
-          detail: engine === "cursor"
-            ? "未解析到 Cursor 订阅额度。请确认 agent 已登录；也可在 cursor.com/dashboard 查看。"
-            : engine === "claude"
-              ? "Claude CLI 通常不暴露订阅额度，请在 console.anthropic.com 查看。"
-              : "未能读取该引擎的订阅额度。",
-          checkedAt: new Date().toISOString()
-        });
-      }
-    } catch {
-      // skip engine
-    }
-  }
-  return results;
+async function refreshEngineQuotas(filter?: CliEngine): Promise<EngineQuota[]> {
+  const quotas = await queryEngineQuotas(filter, {
+    codexInstalled: Boolean(
+      publicState.environment.codexInstalled || publicState.environment.codexCompatible
+    )
+  });
+  lastEngineQuotas = quotas;
+  return quotas;
 }
 
 async function publishHostStatus(): Promise<void> {

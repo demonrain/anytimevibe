@@ -673,7 +673,29 @@ export async function runHeadlessTurn(
         finish("interrupted");
         return;
       }
-      if (state.failed || (code !== 0 && code !== null)) {
+      // Explicit parse/runtime failure always wins.
+      if (state.failed) {
+        if (!state.errorMessage) {
+          state.errorMessage = `${engineLabel} 运行失败`;
+          safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+        }
+        finish("failed");
+        return;
+      }
+      // Some CLIs (notably Grok) exit non-zero even after a full successful reply.
+      // If we already streamed assistant text, treat as completed rather than poisoning the web UI.
+      if (code !== 0 && code !== null) {
+        if (state.sawAssistant && state.text.trim()) {
+          emitDelta(
+            safeOnEvent,
+            options,
+            "stage:exit",
+            "stage",
+            `\n… ${engineLabel} 退出码 ${code}（已收到完整回复，仍标记为成功）\n`
+          );
+          finish("completed");
+          return;
+        }
         if (!state.errorMessage) {
           state.errorMessage = engine === "claude"
             ? `Claude 退出码 ${code ?? "unknown"}（模型不可用时请设置 CLAUDE_MODEL，或在 Claude CLI 中切换模型；未登录请执行 claude auth login）`

@@ -143,6 +143,34 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 }
 .meta-chip-action:hover:not(:disabled) { border-color: rgba(45, 118, 83, 0.5); transform: translateY(-1px); }
 .meta-chip-action:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+.quota-detail-panel {
+  margin: 6px 0 0;
+  max-width: 100%;
+  min-width: 0;
+  border-radius: 10px;
+  border: 1px solid rgba(45, 118, 83, 0.2);
+  background: rgba(45, 118, 83, 0.06);
+  padding: 6px 10px 8px;
+}
+.quota-detail-panel summary {
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 850;
+  color: #2d5a42;
+  list-style: none;
+  user-select: none;
+}
+.quota-detail-panel summary::-webkit-details-marker { display: none; }
+.quota-detail-panel pre {
+  margin: 6px 0 0;
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  font: 10px/1.4 "Cascadia Code", Consolas, monospace;
+  color: #3a463e;
+}
 .message.system pre {
   white-space: pre-wrap;
   word-break: break-word;

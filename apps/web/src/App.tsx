@@ -324,11 +324,36 @@ function taskStatusMeta(status: string): { label: string; tone: string } {
 function isFailedTaskStatus(status: string | undefined): boolean {
   const normalized = String(status || "").toLowerCase().replace(/[\s_-]/g, "");
   if (!normalized) return false;
+  // Successful completions must never match (e.g. avoid false positives).
+  if (["completed", "complete", "success", "succeeded", "idle", "active", "running", "processing", "inprogress"].includes(normalized)) {
+    return false;
+  }
   return (
     normalized.includes("fail")
     || normalized.includes("error")
     || ["interrupted", "cancelled", "canceled", "stopped"].includes(normalized)
   );
+}
+
+/** Only treat short, explicit failure notes as error text — not long assistant dumps mis-tagged as system. */
+function isErrorSystemMessage(text: string | undefined): boolean {
+  const value = String(text || "").trim();
+  if (!value) return false;
+  // Long narratives are almost never the structured error we emit.
+  if (value.length > 800 || value.split(/\n/).length > 12) return false;
+  return /^(错误|任务失败|Error|Failed|失败)[:：\s（(]/i.test(value)
+    || /任务失败（/.test(value)
+    || /退出码|systemerror|未找到.*CLI|无法连接|not logged in|auth/i.test(value);
+}
+
+function findLastSystemErrorText(messages: Array<{ role: string; text: string }>): string {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message?.role === "system" && isErrorSystemMessage(message.text)) {
+      return message.text.trim();
+    }
+  }
+  return "";
 }
 
 function emptyRuntime(online: boolean | null = null): HostRuntime {
@@ -1595,18 +1620,23 @@ function formatEngineQuotaChip(quota: EngineQuota): string {
         ? String(Math.round(quota.amountRemaining))
         : quota.amountRemaining.toFixed(2).replace(/\.?0+$/, ""))
       : "—";
-    if (cur === "USD" || cur === "$") return `$${amount}`;
-    if (cur === "CNY" || cur === "¥") return `¥${amount}`;
-    if (cur === "EUR" || cur === "€") return `€${amount}`;
-    return cur ? `${amount} ${cur}` : amount;
+    const limitPart = quota.amountLimit != null
+      ? `/${Math.abs(quota.amountLimit) >= 100 ? Math.round(quota.amountLimit) : quota.amountLimit.toFixed(2).replace(/\.?0+$/, "")}`
+      : "";
+    if (cur === "USD" || cur === "$" || !cur) return `$${amount}${limitPart}`;
+    if (cur === "CNY" || cur === "¥") return `¥${amount}${limitPart}`;
+    if (cur === "EUR" || cur === "€") return `€${amount}${limitPart}`;
+    return `${amount}${limitPart} ${cur}`;
   }
-  if (quota.remainingPercent != null) return `${Math.round(quota.remainingPercent)}%`;
+  if (quota.remainingPercent != null) return `余 ${Math.round(quota.remainingPercent)}%`;
   if (quota.usedPercent != null) return `余 ${Math.max(0, 100 - Math.round(quota.usedPercent))}%`;
   if (quota.remaining != null && quota.limit != null) {
     return `${compactTokenCount(quota.remaining)}/${compactTokenCount(quota.limit)}`;
   }
   if (quota.remaining != null) return compactTokenCount(quota.remaining);
-  return "—";
+  // Fall back to first non-empty detail line so users always see CLI output
+  const line = (quota.detail || "").split(/\n/).map((item) => item.trim()).find(Boolean);
+  return line ? (line.length > 28 ? `${line.slice(0, 26)}…` : line) : "—";
 }
 
 function TaskConversation({
@@ -1808,16 +1838,26 @@ function TaskConversation({
 
   /** Last user message eligible for resend after failure / stop. */
   const lastUserPrompt = [...task.messages].reverse().find((message) => message.role === "user")?.text?.trim() || "";
-  const lastSystemError = [...task.messages].reverse().find((message) => message.role === "system" && message.text.trim())?.text?.trim() || "";
+  const lastSystemError = findLastSystemErrorText(task.messages);
   const statusFailed = isFailedTaskStatus(task.status);
+  const statusCompleted = /^(completed|complete|success|succeeded)$/i.test(String(task.status || "").trim());
   const canResend = Boolean(
     lastUserPrompt
     && online === true
     && !running
     && !pendingPrompt
-    && (statusFailed || Boolean(lastSystemError))
+    && statusFailed
   );
-  const showFailureBanner = !running && !pendingPrompt && (statusFailed || Boolean(lastSystemError));
+  // Only when status is actually failed/stopped — never because a system/plan message exists.
+  // Also hide for legacy bad data: status=failed but the only system blob is a long non-error transcript.
+  const hasLongNonErrorSystem = task.messages.some(
+    (message) => message.role === "system" && message.text.trim().length > 400 && !isErrorSystemMessage(message.text)
+  );
+  const showFailureBanner = !running
+    && !pendingPrompt
+    && statusFailed
+    && !statusCompleted
+    && (Boolean(lastSystemError) || !hasLongNonErrorSystem);
 
   function resendLastPrompt() {
     if (!canResend || !lastUserPrompt) return;
@@ -1975,6 +2015,15 @@ function TaskConversation({
               : (locale === "en" ? "Quota" : "查额度")}
           </button>
         </div>
+        {(taskQuota?.detail || quotaDetail) && (
+          <details className="quota-detail-panel" open={Boolean(taskQuota || quotaDetail)}>
+            <summary>
+              {locale === "en" ? "Quota details" : "额度详情"}
+              {taskQuota?.checkedAt ? ` · ${new Date(taskQuota.checkedAt).toLocaleString()}` : ""}
+            </summary>
+            <pre>{sanitizeDisplayText(taskQuota?.detail || quotaDetail || "")}</pre>
+          </details>
+        )}
       </div>
       <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>{t("chat")}</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>{t("diff")}</button></div>
     </div>
