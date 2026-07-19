@@ -7,7 +7,7 @@
 ![Latest tag](https://img.shields.io/github/v/tag/demonrain/anytimevibe?sort=semver&style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-22%2B-3c873a?style=flat-square)
 
-**在自己的电脑上跑 Codex / Claude Code / Grok Build，用手机随时续上任务——不是远程桌面，也不把源码和凭据交给云端。**
+**在自己的电脑上跑 Codex / Claude Code / Grok Build / Cursor Agent，用手机随时续上任务——不是远程桌面，也不把源码和凭据交给云端。**
 
 ## 20 秒看懂
 
@@ -38,7 +38,7 @@
 | --- | --- |
 | 1 | [下载 Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest) 并安装，添加白名单工作区 |
 | 2 | 打开 [体验站](https://vibe.demonrain.top/) 或自建 Web PWA，登录并输入客户端配对码 |
-| 3 | 新建任务时选择 **Codex / Claude Code / Grok Build**，在手机上查看进度、继续对话与审批 |
+| 3 | 新建任务时选择 **Codex / Claude Code / Grok Build / Cursor Agent**，在手机上查看进度、继续对话与审批 |
 
 自建中继见下方 [Docker 部署](#docker-部署)。本地开发见 [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md)。
 
@@ -46,7 +46,7 @@
 
 1. **任务式远程，而不是整机远控** — 只同步任务状态、流式回复、审批与 Diff，不必盯着桌面画面。
 2. **引擎在你自己的电脑上** — Agent 本机调用已安装的 CLI；源码、API Key、会话文件不上传中继。
-3. **三引擎同一工作台** — 每个任务绑定引擎与原生会话，可筛选、接力，刷新浏览器也不丢上下文。
+3. **四引擎同一工作台** — 每个任务绑定引擎与原生会话，可筛选、接力，刷新浏览器也不丢上下文。
 
 ## 为什么不用 SSH、远程桌面或 Tailscale？
 
@@ -54,7 +54,7 @@
 | --- | --- | --- | --- | --- |
 | 手机上的体验 | 任务卡片、流式回复、审批按钮 | 小屏敲终端 | 看整屏桌面、点鼠标 | 只解决网络连通 |
 | 代码与凭据 | 留在本机；中继只存密文事件 | 取决于你怎么用 | 画面在远端，风险面更大 | 不负责任务与审批 |
-| 多 CLI | Codex / Claude / Grok 统一列表 | 自己切工具 | 自己开窗口 | 无 |
+| 多 CLI | Codex / Claude / Grok / Cursor 统一列表 | 自己切工具 | 自己开窗口 | 无 |
 | 典型场景 | 通勤续任务、审批、看进度 | 运维与脚本 | 需要完整 GUI 时 | 需要安全组网时 |
 
 随码**不替代** SSH 或 RDP：当你需要完整终端或桌面时，用「电脑接力」回到本机原生 CLI。它补的是「离开工位后仍能驱动本机 AI 编程任务」这一段。
@@ -63,23 +63,23 @@
 
 | 多引擎任务选择 | 原生 CLI 接力 |
 | --- | --- |
-| ![选择 Codex、Claude Code 或 Grok Build 下发任务](docs/media/remote-command.png) | ![任务按所属引擎接力到原生 CLI](docs/media/cli-handoff.png) |
+| ![选择 Codex、Claude Code、Grok Build 或 Cursor Agent 下发任务](docs/media/remote-command.png) | ![任务按所属引擎接力到原生 CLI](docs/media/cli-handoff.png) |
 
 | 多引擎任务流 | 引擎权限映射 |
 | --- | --- |
-| ![Codex、Claude 和 Grok 的统一任务流](docs/media/task-stream.png) | ![不同编码引擎的权限映射](docs/media/permissions.png) |
+| ![Codex、Claude、Grok 和 Cursor 的统一任务流](docs/media/task-stream.png) | ![不同编码引擎的权限映射](docs/media/permissions.png) |
 
 ## 核心工作流
 
 1. 在手机或桌面浏览器登录 Web PWA，选择已配对的电脑和白名单工作区。
-2. 新建任务时选择 Codex、Claude Code 或 Grok Build，并使用该引擎对应的权限模式。
+2. 新建任务时选择 Codex、Claude Code、Grok Build 或 Cursor Agent，并使用该引擎对应的权限模式。
 3. Windows / macOS Agent 在本机启动选定 CLI，实时同步阶段日志、回复和任务状态。
 4. 需要完整终端体验时，点击「电脑接力」，Agent 使用对应引擎的原生会话 ID 恢复任务。
 
 ## 能做什么（摘要）
 
 - 多用户隔离、多主机配对、工作区白名单。
-- 三引擎创建任务、流式输出、权限映射、原生会话接力。
+- 四引擎创建任务、流式输出、权限映射、原生会话接力。
 - 任务列表按最后活动时间排序；可按引擎筛选。
 - Web Push 审批 / 完成通知；多浏览器授权同一主机密钥。
 - 客户端环境检测、引擎安装指引、自动更新。
@@ -93,8 +93,9 @@
 | Codex | `codex app-server --stdio` | Read Only、Ask for approval、Approve for me、Full Access | 读取 Codex thread，并通过 `codex resume` 接力 |
 | Claude Code | `claude -p --output-format stream-json` | 只读工具、接受文件编辑、跳过权限确认 | 导入 `~/.claude/projects` 会话，并通过 `claude --resume` 接力 |
 | Grok Build | `grok -p --output-format streaming-json` | 只读工具、接受文件编辑、全自动批准 | 导入 Grok sessions，并通过 `grok --resume` 接力 |
+| Cursor Agent | `agent -p --output-format stream-json --stream-partial-output` | 仅提议、允许改文件、全自动写盘 | 通过 `--workspace` 绑定工作区，并通过 `agent --resume` 接力 |
 
-任务创建页只允许选择当前主机已检测为可用的引擎。Claude / Grok 可以通过 `CLAUDE_MODEL`、`ANTHROPIC_MODEL`、`GROK_MODEL` 或 `XAI_MODEL` 指定模型；未设置时使用对应 CLI 的本机默认配置。
+任务创建页只允许选择当前主机已检测为可用的引擎。Claude / Grok / Cursor 可以通过 `CLAUDE_MODEL`、`ANTHROPIC_MODEL`、`GROK_MODEL`、`XAI_MODEL` 或 `CURSOR_MODEL` 指定模型；未设置时使用对应 CLI 的本机默认配置（Cursor 默认为 Composer 2.5）。Cursor 还支持按模型选择 Effort，以及部分模型的 Fast 模式；二进制可通过 `CURSOR_COMMAND` / `CURSOR_AGENT_COMMAND` 覆盖（需为 Cursor Agent CLI，而非 Grok 的同名 `agent`）。
 
 ## 系统架构
 
@@ -106,9 +107,11 @@ flowchart LR
     Router <-->|JSONL stdio| Codex[Codex app-server]
     Router <-->|stream-json| Claude[Claude Code]
     Router <-->|streaming-json| Grok[Grok Build]
+    Router <-->|stream-json| Cursor[Cursor Agent]
     Codex --> Workspace[白名单工作区]
     Claude --> Workspace
     Grok --> Workspace
+    Cursor --> Workspace
     Relay --> DB[(PostgreSQL)]
     Relay --> Push[Web Push]
 ```
@@ -120,8 +123,8 @@ flowchart LR
 | Web PWA | React 19、TypeScript、Vite 6、Service Worker、IndexedDB | 登录、主机、任务、会话、审批、Diff 和移动端布局 |
 | Relay 服务 | Node.js、Fastify 5、WebSocket、Zod、Argon2id、Web Push | 认证、用户隔离、在线路由、加密事件存储和通知 |
 | 数据库 | PostgreSQL 16 | 账号、会话、主机、配对、Push 订阅和加密事件元数据 |
-| 桌面 Agent | Electron 36、WebSocket、electron-updater | 托盘常驻、配对、三引擎检测、本地会话导入、自动更新和进程管理 |
-| 多引擎适配 | Codex app-server、Claude stream-json、Grok streaming-json | 引擎选择、权限映射、流式事件、会话恢复、停止任务和原生 CLI 接力 |
+| 桌面 Agent | Electron 36、WebSocket、electron-updater | 托盘常驻、配对、四引擎检测、本地会话导入、自动更新和进程管理 |
+| 多引擎适配 | Codex app-server、Claude stream-json、Grok streaming-json、Cursor stream-json | 引擎选择、权限映射、流式事件、会话恢复、停止任务和原生 CLI 接力 |
 | 部署 | Docker Compose、Caddy 2.8 | Relay、Web、PostgreSQL、HTTPS 和证书自动续期 |
 
 ## 安全模型
@@ -135,7 +138,7 @@ flowchart LR
 
 ## 快速开始
 
-环境要求：Node.js 22+、pnpm 10+、Git；运行服务端还需要 Docker Engine 和 Docker Compose。执行远程任务至少需要在 Agent 主机上安装并登录 Codex CLI `0.144.x`、Claude Code CLI 或 Grok Build CLI 中的一种。
+环境要求：Node.js 22+、pnpm 10+、Git；运行服务端还需要 Docker Engine 和 Docker Compose。执行远程任务至少需要在 Agent 主机上安装并登录 Codex CLI `0.144.x`、Claude Code CLI、Grok Build CLI 或 Cursor Agent CLI（`agent` / `cursor-agent`，可用 `agent login` 登录）中的一种。
 
 ```bash
 git clone https://github.com/demonrain/anytimevibe.git

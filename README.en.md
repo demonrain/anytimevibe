@@ -7,7 +7,7 @@
 ![Latest tag](https://img.shields.io/github/v/tag/demonrain/anytimevibe?sort=semver&style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-22%2B-3c873a?style=flat-square)
 
-**Run Codex, Claude Code, or Grok Build on your own machine—and keep the task moving from your phone. Not a remote desktop. Not a cloud that holds your source or API keys.**
+**Run Codex, Claude Code, Grok Build, or Cursor Agent on your own machine—and keep the task moving from your phone. Not a remote desktop. Not a cloud that holds your source or API keys.**
 
 ## 20-second overview
 
@@ -38,7 +38,7 @@
 | --- | --- |
 | 1 | [Download the Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest), install it, and add allow-listed workspaces |
 | 2 | Open the [demo site](https://vibe.demonrain.top/) or your self-hosted Web PWA, sign in, and enter the pairing code from the agent |
-| 3 | Create a task with **Codex / Claude Code / Grok Build**, then follow progress, continue the chat, and approve from your phone |
+| 3 | Create a task with **Codex / Claude Code / Grok Build / Cursor Agent**, then follow progress, continue the chat, and approve from your phone |
 
 Self-host the relay via [Docker deployment](#docker-deployment). Local development: [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md).
 
@@ -46,7 +46,7 @@ Self-host the relay via [Docker deployment](#docker-deployment). Local developme
 
 1. **Task-native remote, not full desktop control** — stream replies, status, approvals, and diffs without babysitting a remote screen.
 2. **Engines stay on your PC** — the Agent runs installed CLIs locally; source, keys, and session files never go to the relay as plaintext.
-3. **One workbench for three engines** — each task keeps its engine and native session; filter, hand off, and resume across browsers.
+3. **One workbench for four engines** — each task keeps its engine and native session; filter, hand off, and resume across browsers.
 
 ## Why not just SSH, remote desktop, or Tailscale?
 
@@ -54,7 +54,7 @@ Self-host the relay via [Docker deployment](#docker-deployment). Local developme
 | --- | --- | --- | --- | --- |
 | Phone UX | Task cards, streaming, approval buttons | Tiny terminal | Full desktop | Connectivity only |
 | Code & secrets | Stay local; relay stores encrypted envelopes | Depends on you | Larger GUI attack surface | No task/approval layer |
-| Multi-CLI | Codex / Claude / Grok in one list | You switch tools | You open windows | N/A |
+| Multi-CLI | Codex / Claude / Grok / Cursor in one list | You switch tools | You open windows | N/A |
 | Best for | Continue coding tasks away from the desk | Ops & scripts | Full GUI work | Secure networking |
 
 AnytimeVibe does **not** replace SSH or RDP. Use “Handoff to computer” when you need a full native CLI. It fills the gap between leaving your desk and still driving local AI coding agents.
@@ -63,23 +63,23 @@ AnytimeVibe does **not** replace SSH or RDP. Use “Handoff to computer” when 
 
 | Multi-engine task selection | Native CLI handoff |
 | --- | --- |
-| ![Choose Codex, Claude Code, or Grok Build for a task](docs/media/remote-command.png) | ![Resume a task with its provider-native CLI](docs/media/cli-handoff.png) |
+| ![Choose Codex, Claude Code, Grok Build, or Cursor Agent for a task](docs/media/remote-command.png) | ![Resume a task with its provider-native CLI](docs/media/cli-handoff.png) |
 
 | Unified multi-engine task stream | Engine permission mapping |
 | --- | --- |
-| ![Codex, Claude, and Grok tasks in one stream](docs/media/task-stream.png) | ![Permission mapping for each coding engine](docs/media/permissions.png) |
+| ![Codex, Claude, Grok, and Cursor tasks in one stream](docs/media/task-stream.png) | ![Permission mapping for each coding engine](docs/media/permissions.png) |
 
 ## Core workflow
 
 1. Sign in to the Web PWA and choose a paired computer plus an allow-listed workspace.
-2. Create a task with Codex, Claude Code, or Grok Build and a matching permission mode.
+2. Create a task with Codex, Claude Code, Grok Build, or Cursor Agent and a matching permission mode.
 3. The Agent starts the selected local CLI and streams stages, replies, and status.
 4. For a full terminal, hand off to the provider-native session on the computer.
 
 ## Features (summary)
 
 - Multi-user isolation, multi-host pairing, workspace allow-lists.
-- Three engines, streaming output, permission mapping, native session handoff.
+- Four engines, streaming output, permission mapping, native session handoff.
 - Task list ordered by last activity; filter by engine.
 - Web Push for approvals/completion; multi-browser host-key authorization.
 - Client environment detection, install helpers, auto-update.
@@ -93,8 +93,9 @@ Boundary: CLI capabilities differ and are mapped into one UX. No arbitrary termi
 | Codex | `codex app-server --stdio` | Read Only, Ask for approval, Approve for me, Full Access | Reads Codex threads and hands off with `codex resume` |
 | Claude Code | `claude -p --output-format stream-json` | Read-only tools, Accept edits, Bypass permissions | Imports `~/.claude/projects` and hands off with `claude --resume` |
 | Grok Build | `grok -p --output-format streaming-json` | Read-only tools, Accept edits, Always approve | Imports Grok sessions and hands off with `grok --resume` |
+| Cursor Agent | `agent -p --output-format stream-json --stream-partial-output` | Propose only, Apply changes, Full auto | Binds `--workspace` and hands off with `agent --resume` |
 
-The task dialog only enables engines detected as ready on the selected host. Claude and Grok models can be overridden with `CLAUDE_MODEL`, `ANTHROPIC_MODEL`, `GROK_MODEL`, or `XAI_MODEL`; otherwise each CLI keeps its local default.
+The task dialog only enables engines detected as ready on the selected host. Claude, Grok, and Cursor models can be overridden with `CLAUDE_MODEL`, `ANTHROPIC_MODEL`, `GROK_MODEL`, `XAI_MODEL`, or `CURSOR_MODEL`; otherwise each CLI keeps its local default (Cursor defaults to Composer 2.5). Cursor also supports per-model Effort and Fast mode where available; override the binary with `CURSOR_COMMAND` / `CURSOR_AGENT_COMMAND` (must be Cursor Agent CLI, not Grok’s similarly named `agent`).
 
 ## Architecture
 
@@ -106,9 +107,11 @@ flowchart LR
     Router <-->|JSONL stdio| Codex[Codex app-server]
     Router <-->|stream-json| Claude[Claude Code]
     Router <-->|streaming-json| Grok[Grok Build]
+    Router <-->|stream-json| Cursor[Cursor Agent]
     Codex --> Workspace[Allow-listed workspace]
     Claude --> Workspace
     Grok --> Workspace
+    Cursor --> Workspace
     Relay --> DB[(PostgreSQL)]
     Relay --> Push[Web Push]
 ```
@@ -120,8 +123,8 @@ flowchart LR
 | Web PWA | React 19, TypeScript, Vite 6, Service Worker, IndexedDB | Authentication, hosts, tasks, conversations, approvals, diffs, and mobile layout |
 | Relay | Node.js, Fastify 5, WebSocket, Zod, Argon2id, Web Push | Authentication, isolation, online routing, encrypted event storage, and notifications |
 | Database | PostgreSQL 16 | Accounts, sessions, hosts, pairing records, Push subscriptions, and encrypted event metadata |
-| Desktop Agent | Electron 36, WebSocket, electron-updater | Tray app, pairing, three-engine detection, local session import, updates, and process management |
-| Multi-engine adapters | Codex app-server, Claude stream-json, Grok streaming-json | Engine selection, permission mapping, streaming events, session resume, interruption, and native CLI handoff |
+| Desktop Agent | Electron 36, WebSocket, electron-updater | Tray app, pairing, four-engine detection, local session import, updates, and process management |
+| Multi-engine adapters | Codex app-server, Claude stream-json, Grok streaming-json, Cursor stream-json | Engine selection, permission mapping, streaming events, session resume, interruption, and native CLI handoff |
 | Operations | Docker Compose, Caddy 2.8 | Relay, Web, PostgreSQL, HTTPS, and automatic certificate renewal |
 
 ## Security Model
@@ -135,7 +138,7 @@ flowchart LR
 
 ## Quick Start
 
-Requirements: Node.js 22+, pnpm 10+, and Git. Docker Engine and Docker Compose are required for the production stack. The Agent host needs at least one authenticated engine: Codex CLI `0.144.x`, Claude Code CLI, or Grok Build CLI.
+Requirements: Node.js 22+, pnpm 10+, and Git. Docker Engine and Docker Compose are required for the production stack. The Agent host needs at least one authenticated engine: Codex CLI `0.144.x`, Claude Code CLI, Grok Build CLI, or Cursor Agent CLI (`agent` / `cursor-agent`, sign in with `agent login`).
 
 ```bash
 git clone https://github.com/demonrain/anytimevibe.git
