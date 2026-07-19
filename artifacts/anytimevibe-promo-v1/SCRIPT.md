@@ -2,7 +2,7 @@
 
 ## 0–5 秒
 
-一个入口，接住三种 AI 编程引擎。Codex、Claude Code、Grok Build，离开电脑也能继续。
+一个入口，接住四种 AI 编程引擎。Codex、Claude Code、Grok Build、Cursor Agent，离开电脑也能继续。
 
 ## 5–10 秒
 
@@ -14,15 +14,15 @@
 
 ## 15–20 秒
 
-Codex、Claude 和 Grok 的任务进入同一任务流，状态、阶段日志和回复统一同步。
+Codex、Claude、Grok 和 Cursor 的任务进入同一任务流，状态、阶段日志和回复统一同步。
 
 ## 20–25 秒
 
-权限按引擎准确映射：Codex Full Access、Claude Bypass permissions、Grok Always approve；源码和凭据仍留在本机。
+权限按引擎准确映射：Codex Full Access、Claude Bypass permissions、Grok Always approve、Cursor Force；源码和凭据仍留在本机。
 
 ## 25–30 秒
 
-随码。三种引擎，一个远程工作台。随时续上你的代码。
+随码。四种引擎，一个远程工作台。随时续上你的代码。
 
 ## 音乐
 

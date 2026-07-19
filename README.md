@@ -9,10 +9,10 @@
 
 **在自己的电脑上跑 Codex / Claude Code / Grok Build / Cursor Agent，用手机随时续上任务——不是远程桌面，也不把源码和凭据交给云端。**
 
-## 20 秒看懂
+## 35 秒看懂
 
 <p align="center">
-  <img src="docs/media/anytimevibe-promo.gif" alt="随码 20 秒产品预览" width="100%" />
+  <img src="docs/media/anytimevibe-promo.gif" alt="随码 35 秒产品预览" width="100%" />
 </p>
 
 <p align="center">

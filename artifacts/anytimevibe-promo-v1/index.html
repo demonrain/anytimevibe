@@ -25,7 +25,7 @@
     .wipe { position: absolute; inset: -4%; z-index: 20; background: #e25832; transform-origin: left; }
 
     .intro { position: relative; display: flex; flex-direction: column; justify-content: center; height: 100%; }
-    .hero { max-width: 1700px; margin: 34px 0 0; font-size: 105px; font-weight: 900; line-height: 1.04; letter-spacing: -.065em; }
+    .hero { max-width: 1700px; margin: 34px 0 0; font-size: 105px; font-weight: 900; line-height: 1.04; letter-spacing: 0; }
     .intro-sub { margin: 30px 0 0; font-size: 31px; color: #cbd5cc; }
     .intro-engines { display: flex; gap: 18px; margin-top: 48px; }
     .intro-engine { display: flex; align-items: center; gap: 13px; min-width: 240px; padding: 15px 18px; border: 1px solid rgba(242,234,219,.22); border-radius: 18px; background: rgba(255,255,255,.045); font: 700 19px "Cascadia Code", monospace; }
@@ -33,15 +33,15 @@
     .intro-prompt i { width: 14px; height: 14px; border-radius: 50%; background: #4db77d; box-shadow: 0 0 0 10px rgba(77,183,125,.13); }
 
     .scene-heading { display: flex; align-items: end; justify-content: space-between; gap: 40px; height: 104px; }
-    .scene-heading h2 { margin: 14px 0 0; font-size: 64px; line-height: 1; letter-spacing: -.045em; }
+    .scene-heading h2 { margin: 14px 0 0; font-size: 64px; line-height: 1; letter-spacing: 0; }
     .scene-note { max-width: 520px; color: #5f6b63; font-size: 22px; line-height: 1.45; text-align: right; }
     .engine-layout { display: grid; grid-template-columns: .94fr 1.06fr; gap: 64px; align-items: center; height: 780px; }
     .task-form { padding: 28px; height: 650px; }
     .form-top { display: flex; justify-content: space-between; align-items: center; padding-bottom: 18px; border-bottom: 1px solid rgba(23,33,27,.13); }
     .form-top strong { font-size: 24px; }
     .engine-label { margin: 22px 0 12px; font-size: 18px; font-weight: 900; }
-    .engine-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-    .engine-card { display: grid; place-items: center; gap: 8px; min-height: 118px; border: 1px solid rgba(23,33,27,.15); border-radius: 17px; background: #fffdf7; font-size: 16px; font-weight: 900; }
+    .engine-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .engine-card { display: grid; place-items: center; gap: 8px; min-height: 118px; border: 1px solid rgba(23,33,27,.15); border-radius: 17px; background: #fffdf7; font-size: 15px; font-weight: 900; text-align: center; }
     .engine-card small { color: #6d756e; font: 13px "Cascadia Code", monospace; }
     .engine-card.selected { border: 3px solid #2d7653; background: #edf5ef; box-shadow: 0 0 0 5px rgba(45,118,83,.08); }
     .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 17px; }
@@ -54,7 +54,7 @@
     .host-top { display: flex; align-items: center; justify-content: space-between; padding-bottom: 18px; border-bottom: 1px solid rgba(23,33,27,.13); }
     .host-top strong { font-size: 23px; }
     .ready-strip { display: flex; gap: 12px; margin-top: 20px; }
-    .ready-item { display: flex; align-items: center; gap: 8px; flex: 1; padding: 10px; border-radius: 13px; background: rgba(45,118,83,.08); font: 13px "Cascadia Code", monospace; }
+    .ready-item { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; padding: 9px; border-radius: 13px; background: rgba(45,118,83,.08); font: 12px "Cascadia Code", monospace; }
     .terminal { margin-top: 20px; height: 450px; padding: 25px; border-radius: 19px; background: #17211b; color: #dce7dd; font: 19px/1.67 "Cascadia Code", monospace; }
     .terminal-label { color: #eaa186; letter-spacing: .12em; font-size: 15px; }
     .terminal-task { margin: 15px 0; padding: 15px; border-left: 4px solid #e25832; background: rgba(226,88,50,.1); font-family: "Microsoft YaHei"; line-height: 1.45; }
@@ -81,7 +81,7 @@
     .cursor { display: inline-block; width: 11px; height: 22px; background: #e25832; vertical-align: -4px; }
 
     .queue-layout { display: grid; grid-template-columns: .78fr 1.22fr; gap: 70px; align-items: center; height: 100%; }
-    .queue-copy h2, .permission-copy h2 { margin: 27px 0; font-size: 86px; line-height: 1.06; letter-spacing: -.055em; }
+    .queue-copy h2, .permission-copy h2 { margin: 27px 0; font-size: 86px; line-height: 1.06; letter-spacing: 0; }
     .queue-copy p, .permission-copy p { color: #657069; font-size: 27px; line-height: 1.5; }
     .queue { padding: 28px; }
     .queue-row { display: grid; grid-template-columns: 54px 1fr auto; gap: 17px; align-items: center; padding: 18px 8px; border-bottom: 1px solid rgba(23,33,27,.12); }
@@ -95,8 +95,8 @@
     .spinner { width: 31px; height: 31px; border: 5px solid rgba(45,118,83,.2); border-top-color: #2d7653; border-radius: 50%; }
 
     .permission-layout { display: grid; grid-template-columns: .74fr 1.26fr; gap: 70px; align-items: center; height: 100%; }
-    .permission-stack { display: grid; gap: 15px; }
-    .permission-card { display: grid; grid-template-columns: 56px 1fr auto; gap: 16px; align-items: center; padding: 21px 23px; }
+    .permission-stack { display: grid; gap: 12px; }
+    .permission-card { display: grid; grid-template-columns: 56px 1fr auto; gap: 16px; align-items: center; padding: 17px 21px; }
     .permission-card h3 { margin: 0; font-size: 22px; }
     .permission-card small { display: block; margin-top: 6px; color: #707870; font: 13px "Cascadia Code", monospace; }
     .permission-mode { padding: 10px 14px; border: 2px solid #2d7653; border-radius: 12px; background: #edf5ef; color: #17633f; font-size: 16px; font-weight: 900; }
@@ -105,7 +105,7 @@
 
     .final { display: grid; place-items: center; align-content: center; height: 100%; text-align: center; }
     .final > img { width: 158px; height: 158px; }
-    .final h2 { margin: 23px 0 10px; font-size: 108px; letter-spacing: -.065em; }
+    .final h2 { margin: 23px 0 10px; font-size: 108px; letter-spacing: 0; }
     .final p { margin: 0; color: #cbd5cc; font-size: 32px; }
     .final-engines { display: flex; gap: 18px; margin-top: 34px; }
     .final-engine { display: flex; align-items: center; gap: 10px; min-width: 205px; padding: 13px 16px; border: 1px solid rgba(242,234,219,.23); border-radius: 16px; font: 700 16px "Cascadia Code", monospace; }
@@ -115,17 +115,18 @@
 <body>
   <div id="root" data-composition-id="main" data-start="0" data-duration="30" data-width="1920" data-height="1080">
     <section id="scene1" class="clip" data-start="0" data-duration="5" data-track-index="1">
-      <div class="scene ink"><div class="grid"></div><div class="grain"></div><div class="ghost">3×</div>
+      <div class="scene ink"><div class="grid"></div><div class="grain"></div><div class="ghost">4×</div>
         <div class="intro">
           <div class="eyebrow s1-e">MULTI-ENGINE REMOTE CODING</div>
-          <h1 class="hero s1-h">一个入口，接住三种 AI 编程引擎。</h1>
-          <p class="intro-sub s1-s">Codex、Claude Code、Grok Build，离开电脑也能继续。</p>
+          <h1 class="hero s1-h">一个入口，接住四种 AI 编程引擎。</h1>
+          <p class="intro-sub s1-s">Codex、Claude Code、Grok Build、Cursor Agent，离开电脑也能继续。</p>
           <div class="intro-engines">
             <div class="intro-engine s1-engine"><img class="vendor-logo" src="assets/codex.png" width="42" height="42" />Codex</div>
             <div class="intro-engine s1-engine"><img class="vendor-logo" src="assets/claude.png" width="42" height="42" />Claude Code</div>
             <div class="intro-engine s1-engine"><img class="vendor-logo" src="assets/grok.png" width="42" height="42" />Grok Build</div>
+            <div class="intro-engine s1-engine"><img class="vendor-logo" src="assets/cursor.png" width="42" height="42" />Cursor Agent</div>
           </div>
-          <div class="intro-prompt s1-p"><i></i>3 ENGINES · 1 REMOTE WORKSPACE</div>
+          <div class="intro-prompt s1-p"><i></i>4 ENGINES · 1 REMOTE WORKSPACE</div>
         </div>
       </div>
     </section>
@@ -139,24 +140,26 @@
             <div class="engine-label">编码引擎</div>
             <div class="engine-grid">
               <div class="engine-card s2-engine"><img class="vendor-logo" src="assets/codex.png" width="38" height="38" /><b>Codex</b><small>0.144.1</small></div>
-              <div class="engine-card selected s2-engine selected-engine"><img class="vendor-logo" src="assets/claude.png" width="38" height="38" /><b>Claude Code</b><small>2.1.12</small></div>
+              <div class="engine-card s2-engine"><img class="vendor-logo" src="assets/claude.png" width="38" height="38" /><b>Claude Code</b><small>2.1.12</small></div>
               <div class="engine-card s2-engine"><img class="vendor-logo" src="assets/grok.png" width="38" height="38" /><b>Grok Build</b><small>0.8.3</small></div>
+              <div class="engine-card selected s2-engine selected-engine"><img class="vendor-logo" src="assets/cursor.png" width="38" height="38" /><b>Cursor Agent</b><small>2026.07</small></div>
             </div>
-            <div class="form-row"><div class="field"><span>权限模式</span><strong>接受文件编辑</strong></div><div class="field"><span>工作区</span><strong>anytimevibe</strong></div></div>
+            <div class="form-row"><div class="field"><span>权限模式</span><strong>全自动写盘</strong></div><div class="field"><span>工作区</span><strong>anytimevibe</strong></div></div>
             <div class="task-prompt">更新移动端任务切换，并运行完整测试。</div>
-            <div class="start-button">开始 Claude Code 任务</div>
+            <div class="start-button">开始 Cursor Agent 任务</div>
           </div>
           <div class="host-panel panel s2-host">
-            <div class="host-top"><strong>开发主机 · Windows</strong><span class="badge"><i></i>3 个引擎可用</span></div>
+            <div class="host-top"><strong>开发主机 · Windows</strong><span class="badge"><i></i>4 个引擎可用</span></div>
             <div class="ready-strip">
               <div class="ready-item"><img class="vendor-logo" src="assets/codex.png" width="27" height="27" />READY</div>
               <div class="ready-item"><img class="vendor-logo" src="assets/claude.png" width="27" height="27" />READY</div>
               <div class="ready-item"><img class="vendor-logo" src="assets/grok.png" width="27" height="27" />READY</div>
+              <div class="ready-item"><img class="vendor-logo" src="assets/cursor.png" width="27" height="27" />READY</div>
             </div>
-            <div class="terminal"><div class="terminal-label">REMOTE HOST · CLAUDE CODE</div><div><span class="orange">›</span> 收到 Web 任务</div><div class="terminal-task">更新移动端任务切换，并运行完整测试。</div><div class="green">✓ 权限映射 · acceptEdits</div><div>▶ Claude 会话初始化</div><div>… 正在读取项目结构</div></div>
+            <div class="terminal"><div class="terminal-label">REMOTE HOST · CURSOR AGENT</div><div><span class="orange">›</span> 收到 Web 任务</div><div class="terminal-task">更新移动端任务切换，并运行完整测试。</div><div class="green">✓ 权限映射 · --force --trust</div><div>▶ Cursor 会话初始化</div><div>… 正在读取项目结构</div></div>
           </div>
         </div>
-        <div class="dispatch-pill s2-dispatch">选中 Claude Code<br />电脑立即执行</div>
+        <div class="dispatch-pill s2-dispatch">选中 Cursor Agent<br />电脑立即执行</div>
       </div>
     </section>
 
@@ -164,19 +167,19 @@
       <div class="scene paper">
         <div class="scene-heading s3-heading"><div><div class="eyebrow">NATIVE CLI HANDOFF</div><h2>同一引擎，原生 CLI 接力。</h2></div><p class="scene-note">任务所属引擎、权限和 provider session 全部保留。</p></div>
         <div class="relay-layout">
-          <div class="relay-task s3-task"><div class="relay-task-head"><div class="relay-engine"><img class="vendor-logo" src="assets/claude.png" width="34" height="34" />Claude Code</div><span class="badge"><i></i>进行中</span></div><div class="relay-card"><h3>更新移动端任务切换</h3><code>session_7f2 · acceptEdits</code><div class="relay-step"><i>✓</i>Web 已下发到远程电脑</div><div class="relay-step"><i>✓</i>流式回复正在同步</div><div class="relay-step"><i>→</i>准备在桌面继续</div></div><div class="handoff-button">在电脑上接力</div></div>
+          <div class="relay-task s3-task"><div class="relay-task-head"><div class="relay-engine"><img class="vendor-logo" src="assets/cursor.png" width="34" height="34" />Cursor Agent</div><span class="badge"><i></i>进行中</span></div><div class="relay-card"><h3>更新移动端任务切换</h3><code>session_7f2 · --force</code><div class="relay-step"><i>✓</i>Web 已下发到远程电脑</div><div class="relay-step"><i>✓</i>流式回复正在同步</div><div class="relay-step"><i>→</i>准备在桌面继续</div></div><div class="handoff-button">在电脑上接力</div></div>
           <div class="handoff-arrow s3-arrow"><b>→</b><span>PROVIDER<br />SESSION</span></div>
-          <div class="relay-cli s3-cli"><div class="cli-head"><span>CLAUDE CODE · DESKTOP</span><span class="green">acceptEdits</span></div><div><span class="orange">›</span> claude --resume session_7f2</div><div class="green">✓ 原生会话上下文已恢复</div><div class="green">✓ 权限模式已继承</div><div>继续修改并运行测试…</div><div>$ pnpm test <span class="cursor"></span></div><div class="sync-back s3-sync">← 阶段日志、回复与结果继续同步到 Web</div></div>
+          <div class="relay-cli s3-cli"><div class="cli-head"><span>CURSOR AGENT · DESKTOP</span><span class="green">--force</span></div><div><span class="orange">›</span> agent --resume session_7f2</div><div class="green">✓ 原生会话上下文已恢复</div><div class="green">✓ 权限模式已继承</div><div>继续修改并运行测试…</div><div>$ pnpm test <span class="cursor"></span></div><div class="sync-back s3-sync">← 阶段日志、回复与结果继续同步到 Web</div></div>
         </div>
       </div>
     </section>
 
     <section id="scene4" class="clip" data-start="15" data-duration="5" data-track-index="1">
-      <div class="scene paper"><div class="queue-layout"><div class="queue-copy"><div class="eyebrow s4-e">UNIFIED TASK STREAM</div><h2 class="s4-h">三种引擎，一条任务流。</h2><p class="s4-p">不同 CLI 的任务、状态和回复，在同一个 Web 工作台统一查看。</p></div><div class="queue panel s4-queue">
+      <div class="scene paper"><div class="queue-layout"><div class="queue-copy"><div class="eyebrow s4-e">UNIFIED TASK STREAM</div><h2 class="s4-h">四种引擎，一条任务流。</h2><p class="s4-p">不同 CLI 的任务、状态和回复，在同一个 Web 工作台统一查看。</p></div><div class="queue panel s4-queue">
         <div class="queue-row"><img class="vendor-logo" src="assets/claude.png" width="42" height="42" /><div><strong>修复移动端返回逻辑</strong><small>CLAUDE · session_7f2</small></div><span class="status run">进行中</span></div>
         <div class="queue-row"><img class="vendor-logo" src="assets/codex.png" width="42" height="42" /><div><strong>审查加密授权流程</strong><small>CODEX · thread_8f2</small></div><span class="status wait">队列中</span></div>
         <div class="queue-row"><img class="vendor-logo" src="assets/grok.png" width="42" height="42" /><div><strong>重构客户端更新逻辑</strong><small>GROK · session_b91</small></div><span class="status wait">队列中</span></div>
-        <div class="queue-row"><img class="vendor-logo" src="assets/codex.png" width="42" height="42" /><div><strong>构建 Windows 安装包</strong><small>CODEX · thread_3ad</small></div><span class="status done">已完成</span></div>
+        <div class="queue-row"><img class="vendor-logo" src="assets/cursor.png" width="42" height="42" /><div><strong>构建 Windows 安装包</strong><small>CURSOR · session_3ad</small></div><span class="status done">已完成</span></div>
         <div class="processing"><div class="spinner"></div><div><strong>多引擎状态实时同步</strong><div>简洁模式可隐藏阶段日志，只保留回复与结果</div></div></div>
       </div></div></div>
     </section>
@@ -186,11 +189,12 @@
         <div class="permission-card panel"><img class="vendor-logo" src="assets/codex.png" width="46" height="46" /><div><h3>Codex</h3><small>approvalPolicy: never · danger-full-access</small></div><span class="permission-mode">Full Access</span></div>
         <div class="permission-card panel"><img class="vendor-logo" src="assets/claude.png" width="46" height="46" /><div><h3>Claude Code</h3><small>--permission-mode bypassPermissions</small></div><span class="permission-mode">跳过权限确认</span></div>
         <div class="permission-card panel"><img class="vendor-logo" src="assets/grok.png" width="46" height="46" /><div><h3>Grok Build</h3><small>--always-approve</small></div><span class="permission-mode">全自动批准</span></div>
+        <div class="permission-card panel"><img class="vendor-logo" src="assets/cursor.png" width="46" height="46" /><div><h3>Cursor Agent</h3><small>--force --trust</small></div><span class="permission-mode">全自动写盘</span></div>
       </div><div class="security-boundary s5-security"><span>源码与引擎凭据</span><b>始终留在本机</b><span>Relay</span><b>只转发密文</b></div></div></div></div>
     </section>
 
     <section id="scene6" class="clip" data-start="25" data-duration="5" data-track-index="1">
-      <div class="scene ink"><div class="grid"></div><div class="grain"></div><div class="final"><img class="s6-logo" src="assets/icon-final.svg" /><h2 class="s6-title">随码</h2><p class="s6-sub">三种引擎，一个远程工作台。随时续上你的代码。</p><div class="final-engines"><div class="final-engine s6-engine"><img class="vendor-logo" src="assets/codex.png" width="36" height="36" />Codex</div><div class="final-engine s6-engine"><img class="vendor-logo" src="assets/claude.png" width="36" height="36" />Claude Code</div><div class="final-engine s6-engine"><img class="vendor-logo" src="assets/grok.png" width="36" height="36" />Grok Build</div></div><div class="cta s6-cta">3 ENGINES · ONE REMOTE WORKSPACE</div></div></div>
+      <div class="scene ink"><div class="grid"></div><div class="grain"></div><div class="final"><img class="s6-logo" src="assets/icon-final.svg" /><h2 class="s6-title">随码</h2><p class="s6-sub">四种引擎，一个远程工作台。随时续上你的代码。</p><div class="final-engines"><div class="final-engine s6-engine"><img class="vendor-logo" src="assets/codex.png" width="36" height="36" />Codex</div><div class="final-engine s6-engine"><img class="vendor-logo" src="assets/claude.png" width="36" height="36" />Claude Code</div><div class="final-engine s6-engine"><img class="vendor-logo" src="assets/grok.png" width="36" height="36" />Grok Build</div><div class="final-engine s6-engine"><img class="vendor-logo" src="assets/cursor.png" width="36" height="36" />Cursor Agent</div></div><div class="cta s6-cta">4 ENGINES · ONE REMOTE WORKSPACE</div></div></div>
     </section>
 
     <div id="wipe1" class="clip wipe" data-start="4.55" data-duration=".9" data-track-index="8"></div>
