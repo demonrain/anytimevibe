@@ -886,8 +886,8 @@ function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticat
   return <main className="auth-shell">
     <section className="auth-story">
       <p className="eyebrow">随码 · 随时续码</p>
-      <h1><span>离开电脑，</span><span>任务不用停。</span></h1>
-      <p>连接自己的 Windows 或 macOS 主机，远程使用 OpenAI Codex、Anthropic Claude Code 与 xAI Grok Build。云端只负责转发密文，源码与密钥留在本机。</p>
+      <h1><span>随时随地，</span><span>灵感不断。</span></h1>
+      <p>随时从手机发起或继续电脑上的 AI 编程任务。Codex、Claude Code、Grok Build 与 Cursor Agent 在你的 Windows 或 macOS 主机上运行；云端仅转发加密消息，源码、凭据与工作区始终留在本机。</p>
       <FeaturedEngines />
       <div className="signal-line"><span />端到端加密 · 本机执行</div>
       <ClientDownloads downloads={health.clientDownloads} />
