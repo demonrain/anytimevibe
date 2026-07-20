@@ -843,7 +843,7 @@ const featuredEngines: Array<{ engine: CliEngine; vendor: string; product: strin
 function FeaturedEngines() {
   return <section className="featured-engines" aria-label="支持的 AI 编程引擎">
     <div className="featured-engines-head">
-      <span>三大主流模型厂商</span>
+      <span>主流模型厂商</span>
       <strong>四款均已支持 · 一台主机自由选择</strong>
     </div>
     <div className="featured-engine-grid" role="list">
