@@ -170,14 +170,19 @@ async function main(): Promise<void> {
     }
   }
 
-  async function sendPush(userId: string, hint: "approval" | "completed"): Promise<void> {
-    if (!config.VAPID_PUBLIC_KEY || !config.VAPID_PRIVATE_KEY) return;
+  type PushKind = "approval" | "completed" | "test";
+  type PushDelivery = { subscriptions: number; delivered: number; expired: number; failed: number };
+
+  async function sendPush(userId: string, hint: PushKind): Promise<PushDelivery> {
+    const delivery: PushDelivery = { subscriptions: 0, delivered: 0, expired: 0, failed: 0 };
+    if (!config.VAPID_PUBLIC_KEY || !config.VAPID_PRIVATE_KEY) return delivery;
     const subscriptions = await sql<Array<{ endpoint: string; p256dh: string; auth: string }>>`
       SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ${userId}
     `;
+    delivery.subscriptions = subscriptions.length;
     const payload = JSON.stringify({
-      title: hint === "approval" ? "远程任务需要处理" : "远程任务已完成",
-      body: hint === "approval" ? "打开随码查看审批请求。" : "打开随码查看结果。",
+      title: hint === "approval" ? "远程任务需要处理" : hint === "completed" ? "远程任务已完成" : "随码通知已开启",
+      body: hint === "approval" ? "打开随码查看审批请求。" : hint === "completed" ? "打开随码查看结果。" : "任务完成后会在此提醒你。",
       url: "/"
     });
     await Promise.all(subscriptions.map(async (subscription) => {
@@ -185,16 +190,21 @@ async function main(): Promise<void> {
         await webPush.sendNotification({
           endpoint: subscription.endpoint,
           keys: { p256dh: subscription.p256dh, auth: subscription.auth }
-        }, payload, { TTL: 120 });
+        }, payload, { TTL: 24 * 60 * 60, urgency: "high" });
+        delivery.delivered += 1;
       } catch (error) {
         const statusCode = (error as { statusCode?: number }).statusCode;
         if (statusCode === 404 || statusCode === 410) {
           await sql`DELETE FROM push_subscriptions WHERE endpoint = ${subscription.endpoint}`;
+          delivery.expired += 1;
         } else {
+          delivery.failed += 1;
           app.log.warn({ error, endpoint: subscription.endpoint }, "push delivery failed");
         }
       }
     }));
+    app.log.info({ userId, hint, ...delivery }, "push delivery complete");
+    return delivery;
   }
 
   app.get("/api/health", async () => {
@@ -581,6 +591,12 @@ async function main(): Promise<void> {
       ON CONFLICT (endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth
     `;
     return { ok: true };
+  });
+
+  app.post("/api/push/test", async (request, reply) => {
+    const user = await requireUser(sql, request, reply);
+    if (!user) return;
+    return sendPush(user.id, "test");
   });
 
   app.delete("/api/push/subscriptions", async (request, reply) => {

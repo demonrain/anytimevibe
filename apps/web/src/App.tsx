@@ -37,6 +37,7 @@ import {
   type ReplyDetail
 } from "./i18n/locales";
 import { getHostKey, removeHostKey, saveHostKey } from "./key-store";
+import { syncPushSubscription } from "./push";
 
 /**
  * Subscription quota query is temporarily disabled:
@@ -931,6 +932,7 @@ export function App() {
   const [pairingOpen, setPairingOpen] = useState(false);
   const [composerOpen, setComposerOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
+  const [pushStatus, setPushStatus] = useState<"idle" | "syncing" | "enabled">("idle");
   const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
   const { locale, setLocale, t } = useI18n();
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => normalizePermissionMode(localStorage.getItem("permission-mode")));
@@ -1005,6 +1007,20 @@ export function App() {
       }
     }).catch((loadError) => setError(loadError.message));
   }, []);
+
+  useEffect(() => {
+    if (!user || !health?.vapidPublicKey) {
+      setPushStatus("idle");
+      return;
+    }
+    let active = true;
+    syncPushSubscription(health.vapidPublicKey).then((status) => {
+      if (active) setPushStatus(status === "enabled" ? "enabled" : "idle");
+    }).catch(() => {
+      if (active) setPushStatus("idle");
+    });
+    return () => { active = false; };
+  }, [user, health?.vapidPublicKey]);
 
   const handleEnvelope = useEffectEvent(async (envelope: EncryptedEnvelope) => {
     const key = await getHostKey(envelope.hostId);
@@ -1257,6 +1273,21 @@ export function App() {
     location.reload();
   }
 
+  async function enablePush(): Promise<void> {
+    if (!health?.vapidPublicKey || pushStatus !== "idle") return;
+    setPushStatus("syncing");
+    try {
+      const status = await syncPushSubscription(health.vapidPublicKey, { requestPermission: true });
+      if (status !== "enabled") throw new Error("通知订阅未能启用。");
+      const delivery = await api<{ delivered: number }>("/api/push/test", { method: "POST" });
+      if (delivery.delivered < 1) throw new Error("通知订阅已保存，但测试消息未能发送，请稍后重试。");
+      setPushStatus("enabled");
+    } catch (pushError) {
+      setPushStatus("idle");
+      throw pushError;
+    }
+  }
+
   async function deleteHost(host: Host) {
     if (!window.confirm(`确定删除设备“${host.name}”吗？该设备的云端加密同步记录也会被删除。`)) return;
     await api(`/api/hosts/${host.id}`, { method: "DELETE" });
@@ -1401,12 +1432,21 @@ export function App() {
           <button type="button" className={locale === "zh-CN" ? "active" : ""} onClick={() => setLocale("zh-CN")}>中文</button>
           <button type="button" className={locale === "en" ? "active" : ""} onClick={() => setLocale("en")}>EN</button>
         </div>
-        <button className="quiet" onClick={() => subscribePush(health.vapidPublicKey).catch((pushError) => setError(pushError.message))}>{t("notify")}</button>
+        <button
+          className={`quiet push-toggle${pushStatus === "enabled" ? " enabled" : ""}`}
+          disabled={pushStatus !== "idle"}
+          onClick={() => enablePush().catch((pushError) => setError(pushError.message))}
+        >{pushStatus === "syncing" ? t("notifyEnabling") : pushStatus === "enabled" ? t("notifyEnabled") : t("notify")}</button>
         <div className="account-menu">
           <button className="avatar" title={user.username} aria-expanded={accountOpen} onClick={() => setAccountOpen((open) => !open)}>{user.username.slice(0, 1).toUpperCase()}</button>
           {accountOpen && <div className="account-popover">
             <div><strong>{user.username}</strong><small>{user.isAdmin ? t("administrator") : t("personalSpace")}</small></div>
             {user.isAdmin && <a className="account-link" href="/admin">{t("admin")}</a>}
+            <button
+              className={`account-push${pushStatus === "enabled" ? " enabled" : ""}`}
+              disabled={pushStatus !== "idle"}
+              onClick={() => enablePush().catch((pushError) => setError(pushError.message))}
+            >{pushStatus === "syncing" ? t("notifyEnabling") : pushStatus === "enabled" ? t("notifyEnabled") : t("notify")}</button>
             <button onClick={() => logout().catch((logoutError) => setError(logoutError.message))}>{t("logout")}</button>
           </div>}
         </div>
@@ -2497,22 +2537,6 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
     {error && <p className="form-error">{error}</p>}
     <button className="primary" disabled={loading || !cwd || !prompt.trim() || !engine}>{loading ? "正在发送…" : "开始任务"}</button>
   </form></div>;
-}
-
-async function subscribePush(vapidPublicKey: string | null): Promise<void> {
-  if (!vapidPublicKey) throw new Error("服务端尚未配置 Web Push 密钥。");
-  if (!("serviceWorker" in navigator) || !("PushManager" in window)) throw new Error("当前浏览器不支持 Web Push。");
-  const permission = await Notification.requestPermission();
-  if (permission !== "granted") throw new Error("通知权限未授予。");
-  const registration = await navigator.serviceWorker.ready;
-  const subscription = await registration.pushManager.subscribe({
-    userVisibleOnly: true,
-    applicationServerKey: (() => {
-      const bytes = base64ToBytes(vapidPublicKey);
-      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-    })()
-  });
-  await api("/api/push/subscriptions", { method: "POST", body: JSON.stringify(subscription.toJSON()) });
 }
 
 /**
