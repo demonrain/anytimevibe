@@ -289,6 +289,31 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   flex: 0 0 auto;
   margin: 0;
 }
+.task-row {
+  position: relative;
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
+  border-radius: 14px;
+  overflow: hidden;
+}
+.task-row-delete {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 72px;
+  border: 0;
+  border-radius: 0 14px 14px 0;
+  background: #c23a22;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 850;
+  cursor: pointer;
+  z-index: 0;
+  display: none;
+}
+.task-row.swiping .task-row-delete { display: flex; align-items: center; justify-content: center; }
 .task-card {
   /* Reset <button> defaults that break card layout (esp. mobile Safari). */
   appearance: none;
@@ -302,7 +327,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   background: rgba(255,250,240,.63);
   padding: 10px 12px;
   cursor: pointer;
-  transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease, background .18s ease;
+  transition: border-color .18s ease, box-shadow .18s ease, background .18s ease;
   min-width: 0;
   max-width: 100%;
   width: 100%;
@@ -316,13 +341,72 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   flex-direction: column;
   gap: 6px;
   box-sizing: border-box;
+  position: relative;
+  z-index: 1;
+  will-change: transform;
+  touch-action: pan-y;
 }
 .task-card:hover, .task-card.active {
-  transform: translateY(-1px);
   border-color: rgba(226,88,50,.6);
   box-shadow: 0 10px 24px rgba(42,45,37,.08);
 }
 .task-card.active { background: var(--cream); }
+.task-meta-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+.task-delete-desktop {
+  display: none;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #9a9f98;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  flex: 0 0 auto;
+}
+.task-delete-desktop:hover {
+  background: rgba(226, 88, 50, 0.16);
+  color: #c23a22;
+}
+@media (hover: hover) and (pointer: fine) {
+  .task-delete-desktop { display: inline-flex; align-items: center; justify-content: center; opacity: 0; }
+  .task-card:hover .task-delete-desktop,
+  .task-card.active .task-delete-desktop,
+  .task-delete-desktop:focus-visible { opacity: 1; }
+  .task-row-delete { display: none !important; }
+}
+.command-queue article {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: start;
+}
+.command-queue .queue-cancel,
+.command-queue .queue-clear {
+  border: 0;
+  border-radius: 8px;
+  background: rgba(226, 88, 50, 0.12);
+  color: #a63b28;
+  font-size: 10px;
+  font-weight: 850;
+  padding: 4px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.command-queue .queue-clear { margin-left: auto; }
+.command-queue > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .task-meta,
 .task-foot {
   display: flex;

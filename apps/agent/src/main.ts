@@ -399,6 +399,17 @@ async function loadTurnQueue(userDataDir: string): Promise<void> {
   }
 }
 
+async function publishTurnQueueUpdated(threadId: string): Promise<void> {
+  const list = turnQueueByThread.get(threadId) ?? [];
+  await publish({
+    type: "turn.queue.updated",
+    eventId: crypto.randomUUID(),
+    occurredAt: new Date().toISOString(),
+    threadId,
+    items: list.map((item) => ({ commandId: item.commandId, prompt: item.prompt }))
+  }, true).catch(() => undefined);
+}
+
 async function enqueueTurnStart(command: Extract<ClientCommand, { type: "turn.start" }>): Promise<void> {
   const list = turnQueueByThread.get(command.threadId) ?? [];
   const entry: QueuedTurnStart = {
@@ -415,12 +426,104 @@ async function enqueueTurnStart(command: Extract<ClientCommand, { type: "turn.st
   updateState({
     detail: `任务「${command.threadId.slice(0, 8)}…」当前忙碌，已排队第 ${list.length} 条后续指令（关闭浏览器后仍会执行）。`
   });
+  await publishTurnQueueUpdated(command.threadId);
 }
 
 async function clearTurnQueue(threadId: string): Promise<void> {
   if (!turnQueueByThread.has(threadId)) return;
   turnQueueByThread.delete(threadId);
   await persistTurnQueue();
+  await publishTurnQueueUpdated(threadId);
+}
+
+/** Cancel one pending queue item (by commandId) or the entire waiting queue. */
+async function cancelTurnQueue(
+  threadId: string,
+  commandId?: string
+): Promise<{ removed: number; remaining: number }> {
+  const list = turnQueueByThread.get(threadId) ?? [];
+  if (!list.length) return { removed: 0, remaining: 0 };
+  let removed = 0;
+  if (commandId) {
+    const next = list.filter((item) => {
+      if (item.commandId === commandId) {
+        removed += 1;
+        return false;
+      }
+      return true;
+    });
+    if (next.length === 0) turnQueueByThread.delete(threadId);
+    else turnQueueByThread.set(threadId, next);
+  } else {
+    removed = list.length;
+    turnQueueByThread.delete(threadId);
+  }
+  if (removed > 0) {
+    await persistTurnQueue();
+    await publishTurnQueueUpdated(threadId);
+    logInfo(`已取消排队指令`, `thread=${threadId.slice(0, 8)} removed=${removed}`);
+  }
+  const remaining = turnQueueByThread.get(threadId)?.length ?? 0;
+  return { removed, remaining };
+}
+
+// ── Deleted task tombstones (skip on future sync/import) ─────────────────
+let deletedThreadsFilePath = "";
+const deletedThreadIds = new Set<string>();
+
+async function loadDeletedThreads(userDataDir: string): Promise<void> {
+  deletedThreadsFilePath = path.join(userDataDir, "deleted-threads.json");
+  deletedThreadIds.clear();
+  try {
+    const raw = JSON.parse(await fs.readFile(deletedThreadsFilePath, "utf8")) as { ids?: string[] };
+    for (const id of raw.ids || []) {
+      if (typeof id === "string" && id.trim()) deletedThreadIds.add(id.trim());
+    }
+  } catch {
+    // missing
+  }
+}
+
+async function persistDeletedThreads(): Promise<void> {
+  if (!deletedThreadsFilePath) return;
+  try {
+    await fs.mkdir(path.dirname(deletedThreadsFilePath), { recursive: true });
+    // Cap tombstone list to avoid unbounded growth.
+    const ids = [...deletedThreadIds].slice(-2_000);
+    deletedThreadIds.clear();
+    for (const id of ids) deletedThreadIds.add(id);
+    await fs.writeFile(deletedThreadsFilePath, JSON.stringify({ ids }, null, 2), "utf8");
+  } catch {
+    // ignore
+  }
+}
+
+function isThreadDeleted(threadId: string): boolean {
+  return deletedThreadIds.has(threadId);
+}
+
+async function deleteLocalThread(threadId: string): Promise<void> {
+  deletedThreadIds.add(threadId);
+  // Also tombstone provider session id so re-import of the same native session is blocked.
+  const stored = taskStore.get(threadId);
+  if (stored?.providerSessionId) deletedThreadIds.add(stored.providerSessionId);
+  await persistDeletedThreads();
+  await clearTurnQueue(threadId);
+  await taskStore.remove(threadId);
+  updateState({
+    tasks: publicState.tasks.filter((item) => item.threadId !== threadId)
+  });
+  activityOutputBuffers.delete(threadId);
+  activityItemsByThread.delete(threadId);
+  activeTurnByThread.delete(threadId);
+  turnStartingByThread.delete(threadId);
+  await publish({
+    type: "thread.deleted",
+    eventId: crypto.randomUUID(),
+    occurredAt: new Date().toISOString(),
+    threadId
+  }, true);
+  logInfo(`已删除本地任务`, threadId.slice(0, 8));
 }
 
 function scheduleDrainTurnQueue(threadId: string): void {
@@ -431,12 +534,17 @@ function scheduleDrainTurnQueue(threadId: string): void {
 
 async function drainTurnQueue(threadId: string): Promise<void> {
   if (isThreadTurnBusy(threadId)) return;
+  if (isThreadDeleted(threadId)) {
+    await clearTurnQueue(threadId);
+    return;
+  }
   const list = turnQueueByThread.get(threadId);
   if (!list?.length) return;
   const next = list.shift()!;
   if (list.length === 0) turnQueueByThread.delete(threadId);
   else turnQueueByThread.set(threadId, list);
   await persistTurnQueue();
+  await publishTurnQueueUpdated(threadId);
   logInfo(`执行排队指令`, `thread=${threadId.slice(0, 8)} remaining=${list.length}`);
   await handleCommand({
     type: "turn.start",
@@ -452,6 +560,15 @@ async function drainTurnQueue(threadId: string): Promise<void> {
 function scheduleDrainAllTurnQueues(): void {
   for (const threadId of turnQueueByThread.keys()) {
     scheduleDrainTurnQueue(threadId);
+  }
+}
+
+/** Re-broadcast durable queue snapshots so web clients that missed updates (e.g. switched
+ * conversations / reconnected) do not keep showing finished waiting items. */
+async function publishAllTurnQueues(): Promise<void> {
+  const threadIds = [...turnQueueByThread.keys()];
+  for (const threadId of threadIds) {
+    await publishTurnQueueUpdated(threadId);
   }
 }
 
@@ -2540,6 +2657,8 @@ async function connect(force = false): Promise<void> {
       updateState({ status: "online", detail: "代理在线。凭据和项目文件均保留在本机。" });
       // Resume any durable follow-up prompts queued while a prior turn was running.
       scheduleDrainAllTurnQueues();
+      // Push current queue state so browsers that missed turn.queue.updated while away stay in sync.
+      void publishAllTurnQueues().catch(() => undefined);
       // Always push workspaces/online status — must not depend on Codex being ready.
       try {
         if (generation === connectGeneration && socket === connection) await publishHostStatus();
@@ -2929,8 +3048,10 @@ async function publishTaskDiff(threadId: string, turnId: string): Promise<void> 
 }
 
 async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
+  if (isThreadDeleted(threadId)) return;
   const task = taskStore.get(threadId);
   if (!task) return;
+  if (task.providerSessionId && isThreadDeleted(task.providerSessionId)) return;
   const cwd = resolveAbsoluteCwd(task.cwd);
   if (cwd && task.cwd !== cwd) {
     task.cwd = cwd;
@@ -3103,6 +3224,32 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     } catch {
       // optional
     }
+    // Refresh durable waiting queues for open browser sessions.
+    await publishAllTurnQueues().catch(() => undefined);
+    return;
+  }
+  if (command.type === "turn.queue.cancel") {
+    const result = await cancelTurnQueue(command.threadId, command.queueCommandId);
+    updateState({
+      detail: result.removed
+        ? `已取消 ${result.removed} 条排队指令（剩余 ${result.remaining}）`
+        : "没有可取消的排队指令"
+    });
+    return;
+  }
+  if (command.type === "thread.delete") {
+    if (isThreadTurnBusy(command.threadId)) {
+      // Stop active work first so delete is clean.
+      try {
+        interruptHeadlessThread(command.threadId);
+      } catch {
+        // ignore
+      }
+      activeTurnByThread.delete(command.threadId);
+      turnStartingByThread.delete(command.threadId);
+      finishLocalActivity(command.threadId, "interrupted");
+    }
+    await deleteLocalThread(command.threadId);
     return;
   }
   if (command.type === "host.quota.refresh") {
@@ -3376,35 +3523,70 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "sync.request") {
-      // Refresh workspaces for the web new-task picker before streaming threads.
-      await publishHostStatus();
       const syncLimit = command.limit ?? DEFAULT_SYNC_LIMIT;
-      // Import local Claude/Grok CLI sessions (up to syncLimit each), then publish them.
-      try {
-        await importLocalCliSessions(taskStore, syncLimit);
-      } catch {
-        // ignore
-      }
-      // Up to syncLimit snapshots per multi-CLI engine (not a single shared pool).
+      // Lightweight status push (no full engine re-detect) — full detect is expensive on every sync.
+      void publish({
+        type: "host.status",
+        eventId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(),
+        online: true,
+        name: resolvedDisplayName(),
+        platform: `${process.platform} ${os.release()}`,
+        codexVersion,
+        workspaces: config.workspaces,
+        cliEngine: taskStore.getDefaultEngine(),
+        availableEngines: publicState.availableEngines,
+        engineCapabilities: publicState.engineCapabilities,
+        agentVersion: PRODUCT_VERSION,
+        ...(lastEngineQuotas.length ? { engineQuotas: lastEngineQuotas } : {})
+      }, true).catch(() => undefined);
+      publishAgentMeta({ agentVersion: PRODUCT_VERSION });
+
+      // Import multi-CLI sessions and publish snapshots in parallel with Codex path where possible.
       let multiCliCount = 0;
-      try {
-        multiCliCount = await publishRecentMultiCliSnapshots(syncLimit, command.query);
-      } catch {
-        // ignore
-      }
+      const multiCliPromise = (async () => {
+        try {
+          await importLocalCliSessions(taskStore, syncLimit);
+          // Drop any re-imported sessions the user already deleted.
+          for (const task of taskStore.list(Math.max(syncLimit * 20, 100))) {
+            if (
+              isThreadDeleted(task.threadId)
+              || (task.providerSessionId && isThreadDeleted(task.providerSessionId))
+            ) {
+              await taskStore.remove(task.threadId);
+            }
+          }
+        } catch {
+          // ignore
+        }
+        try {
+          return await publishRecentMultiCliSnapshots(syncLimit, command.query);
+        } catch {
+          return 0;
+        }
+      })();
+
       let result = { threadCount: 0, partial: true };
-      try {
-        await ensureCodex();
-        result = await syncAllThreads({
-          limit: syncLimit,
-          ...(command.query !== undefined ? { query: command.query } : {})
-        });
-        // Keep local 接力 list aligned with what was just read from Codex.
-        await refreshLocalTasks(syncLimit).catch(() => undefined);
-      } catch (error) {
-        // Codex optional when only Claude/Grok tasks exist.
-        handleError(error);
-      }
+      const codexPromise = (async () => {
+        try {
+          await ensureCodex();
+          const syncResult = await syncAllThreads({
+            limit: syncLimit,
+            ...(command.query !== undefined ? { query: command.query } : {})
+          });
+          // Keep local 接力 list aligned (non-blocking for web sync completion).
+          void refreshLocalTasks(syncLimit).catch(() => undefined);
+          return syncResult;
+        } catch (error) {
+          handleError(error);
+          return { threadCount: 0, partial: true as const };
+        }
+      })();
+
+      const [multi, codexResult] = await Promise.all([multiCliPromise, codexPromise]);
+      multiCliCount = multi;
+      result = codexResult;
+
       await publish({
         type: "sync.completed",
         eventId: crypto.randomUUID(),
@@ -3709,6 +3891,7 @@ async function publishHostStatus(): Promise<void> {
 }
 
 async function publishThread(threadId: string, options: { touch?: boolean } = {}): Promise<void> {
+  if (isThreadDeleted(threadId)) return;
   const result = await codex!.request("thread/read", { threadId, includeTurns: true });
   const snapshot = threadToSnapshot(result.thread);
   const stored = taskStore.get(threadId);
@@ -3804,21 +3987,50 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
 const DEFAULT_SYNC_LIMIT = 10;
 const SEARCH_LIST_LIMIT = 100;
 
+/** Run async work over items with a fixed concurrency limit. */
+async function mapPool<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  if (!items.length) return;
+  const limit = Math.max(1, Math.min(concurrency, items.length));
+  let next = 0;
+  async function run(): Promise<void> {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      await worker(items[index]!, index);
+    }
+  }
+  await Promise.all(Array.from({ length: limit }, () => run()));
+}
+
 /** Publish up to `limit` recent non-Codex tasks for each multi-CLI engine. */
 async function publishRecentMultiCliSnapshots(limit: number, query?: string): Promise<number> {
   const q = query?.trim().toLowerCase() ?? "";
   const counts: Record<"claude" | "grok" | "cursor", number> = { claude: 0, grok: 0, cursor: 0 };
-  let published = 0;
+  const toPublish: string[] = [];
   // Pull a wider window so each engine can still fill its quota after filtering.
   for (const task of taskStore.list(Math.max(limit * 10, 50))) {
     if (task.engine !== "claude" && task.engine !== "grok" && task.engine !== "cursor") continue;
+    if (isThreadDeleted(task.threadId) || (task.providerSessionId && isThreadDeleted(task.providerSessionId))) {
+      continue;
+    }
     if (counts[task.engine] >= limit) continue;
     if (q && !`${task.title}\n${task.cwd}\n${task.status}`.toLowerCase().includes(q)) continue;
-    await publishStoredTaskSnapshot(task.threadId);
     counts[task.engine] += 1;
-    published += 1;
+    toPublish.push(task.threadId);
   }
-  return published;
+  // Parallel snapshot publish (I/O bound on encrypt + WS send).
+  await mapPool(toPublish, 4, async (threadId) => {
+    try {
+      await publishStoredTaskSnapshot(threadId);
+    } catch {
+      // ignore single-task failures
+    }
+  });
+  return toPublish.length;
 }
 
 function threadMatchesQuery(thread: Record<string, any>, query: string): boolean {
@@ -3850,26 +4062,29 @@ async function syncAllThreads(options: { limit?: number; query?: string } = {}):
   } else {
     threads = threads.slice(0, limit);
   }
+  // Skip user-deleted threads so they do not reappear after sync.
+  threads = threads.filter((thread) => !isThreadDeleted(String(thread.id)));
   const total = threads.length;
-  let published = 0;
-  for (const thread of threads) {
+  const okFlags = new Array<boolean>(total).fill(false);
+  // Parallel Codex thread reads (app-server round-trips are the main cost).
+  await mapPool(threads, 3, async (thread, index) => {
     try {
       await publish({
         type: "sync.progress",
         eventId: crypto.randomUUID(),
         occurredAt: new Date().toISOString(),
-        current: published,
+        current: index,
         total,
         title: String(thread.name || thread.preview || thread.id || "")
       }, false);
       await publishThread(String(thread.id));
-      published += 1;
+      okFlags[index] = true;
     } catch (error) {
       handleError(error);
     }
-  }
+  });
   return {
-    threadCount: published,
+    threadCount: okFlags.filter(Boolean).length,
     // Without a search query we only load the recent window — mark partial for the UI.
     partial: !query
   };
@@ -4701,6 +4916,7 @@ app.whenReady().then(async () => {
   await loadConfig();
   await taskStore.load(app.getPath("userData"));
   await loadTurnQueue(app.getPath("userData"));
+  await loadDeletedThreads(app.getPath("userData"));
   await initAgentLogFile(app.getPath("userData"));
   updateState({ cliEngine: taskStore.getDefaultEngine() });
   registerIpc();

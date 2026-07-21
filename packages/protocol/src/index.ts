@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.44";
+export const PRODUCT_VERSION = "0.4.45";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -193,6 +193,21 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     threadId: z.string().min(1),
     turnId: z.string().min(1)
   }),
+  /**
+   * Cancel follow-up prompts that are still waiting (not yet started).
+   * With queueCommandId: drop that single queued item; without: clear the whole thread queue.
+   */
+  commandBase.extend({
+    type: z.literal("turn.queue.cancel"),
+    threadId: z.string().min(1),
+    /** Target queued turn's commandId (not the cancel command's own commandId). */
+    queueCommandId: z.string().uuid().optional()
+  }),
+  /** Delete a task from the agent index (local store + sync tombstone). */
+  commandBase.extend({
+    type: z.literal("thread.delete"),
+    threadId: z.string().min(1)
+  }),
   commandBase.extend({
     type: z.literal("approval.resolve"),
     requestId: z.union([z.string(), z.number()]),
@@ -316,6 +331,20 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     contextUsage: contextUsageSchema.optional(),
     /** Failure reason when status is failed / systemerror / error. */
     errorMessage: z.string().max(4000).optional()
+  }),
+  /** Durable follow-up queue on the agent for this thread (not yet started). */
+  eventBase.extend({
+    type: z.literal("turn.queue.updated"),
+    threadId: z.string(),
+    items: z.array(z.object({
+      commandId: z.string().min(1),
+      prompt: z.string()
+    }))
+  }),
+  /** Task removed from agent local index; web should drop it and not expect re-sync. */
+  eventBase.extend({
+    type: z.literal("thread.deleted"),
+    threadId: z.string()
   }),
   eventBase.extend({
     type: z.literal("diff.updated"),

@@ -1,4 +1,17 @@
-import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useEffectEvent,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MutableRefObject,
+  type ReactNode,
+  type RefObject,
+  type TouchEvent as ReactTouchEvent
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -66,6 +79,8 @@ type Host = {
   online: boolean;
 };
 type Approval = Extract<AgentEvent, { type: "approval.requested" }>;
+type QueuedTurnItem = { commandId: string; prompt: string };
+
 type Task = {
   threadId: string;
   title: string;
@@ -82,6 +97,8 @@ type Task = {
   model?: string;
   reasoningEffort?: ReasoningEffort;
   contextUsage?: ContextUsage;
+  /** Follow-up prompts waiting on the agent (not yet started). */
+  queuedTurns?: QueuedTurnItem[];
 };
 
 function capabilityForEngine(
@@ -532,10 +549,26 @@ function sanitizeDisplayText(text: string): string {
   return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u2028\u2029]/g, "");
 }
 
+/** Stable markdown config — recreating these every render forces ReactMarkdown to re-walk the tree. */
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- react-markdown Components typing is overly strict with exactOptionalPropertyTypes
+const MARKDOWN_COMPONENTS: any = {
+  a: ({ href, children }: { href?: string; children?: ReactNode }) => (
+    <a href={href} target="_blank" rel="noreferrer noopener">{children}</a>
+  ),
+  pre: ({ children }: { children?: ReactNode }) => <div className="md-pre">{children}</div>,
+  code: ({ className, children, ...props }: { className?: string; children?: ReactNode }) => {
+    const inline = !className;
+    if (inline) return <code className="md-code-inline" {...props}>{children}</code>;
+    return <pre className="md-code-block"><code className={className} {...props}>{children}</code></pre>;
+  }
+};
+
 /** Assistant reply: header (engine label + view toggle) and markdown/source body. */
-function AssistantMessageCard({ label, text }: { label: string; text: string }) {
+const AssistantMessageCard = memo(function AssistantMessageCard({ label, text }: { label: string; text: string }) {
   const { locale } = useI18n();
-  const clean = sanitizeDisplayText(text);
+  // Sanitize once per text change; memo keeps markdown parse off the composer keystroke path.
+  const clean = useMemo(() => sanitizeDisplayText(text), [text]);
   const [mode, setMode] = useState<"preview" | "source">("preview");
   return (
     <>
@@ -563,18 +596,8 @@ function AssistantMessageCard({ label, text }: { label: string; text: string }) 
       ) : (
         <div className="message-markdown">
           <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            components={{
-              a: ({ href, children }) => (
-                <a href={href} target="_blank" rel="noreferrer noopener">{children}</a>
-              ),
-              pre: ({ children }) => <div className="md-pre">{children}</div>,
-              code: ({ className, children, ...props }) => {
-                const inline = !className;
-                if (inline) return <code className="md-code-inline" {...props}>{children}</code>;
-                return <pre className="md-code-block"><code className={className} {...props}>{children}</code></pre>;
-              }
-            }}
+            remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+            components={MARKDOWN_COMPONENTS}
           >
             {clean}
           </ReactMarkdown>
@@ -582,25 +605,492 @@ function AssistantMessageCard({ label, text }: { label: string; text: string }) 
       )}
     </>
   );
-}
+});
+
+type ChatMessage = { id: string; role: "user" | "assistant" | "system"; text: string };
+
+/** One transcript bubble — memoized so long histories do not re-render on unrelated parent updates. */
+const ChatMessageRow = memo(function ChatMessageRow({
+  message,
+  processLabel,
+  assistantLabel
+}: {
+  message: ChatMessage;
+  processLabel: string;
+  assistantLabel: string;
+}) {
+  const process = isProcessStreamMessage(message);
+  const label = message.role === "user"
+    ? "YOU"
+    : message.role === "system"
+      ? "SYSTEM"
+      : process
+        ? processLabel
+        : assistantLabel;
+  const isAssistantReply = message.role === "assistant" && !process;
+  return (
+    <article className={`message ${message.role}${process ? " process" : ""}`}>
+      {isAssistantReply
+        ? <AssistantMessageCard label={label} text={message.text} />
+        : <>
+            <span>{label}</span>
+            <pre>{sanitizeDisplayText(message.text)}</pre>
+          </>}
+    </article>
+  );
+});
+
+/**
+ * Message list isolated from the composer. Typing must not re-render this tree —
+ * with long transcripts ReactMarkdown cost dominates keystroke latency.
+ */
+const ChatMessageStream = memo(function ChatMessageStream({
+  messages,
+  replyDetail,
+  taskEngine,
+  processLabel,
+  pendingPrompt,
+  showPendingBubble,
+  running,
+  processingLabel,
+  processingHint,
+  showFailureBanner,
+  failureTitle,
+  failureBody,
+  canResend,
+  resendTitle,
+  resendHint,
+  resendLabel,
+  onResend,
+  commandQueue,
+  queueLabel,
+  cancelQueueLabel,
+  cancelQueueAllLabel,
+  online,
+  onCancelQueuedItem,
+  onCancelAllQueued,
+  approvals,
+  actionRequiredLabel,
+  declineLabel,
+  allowOnceLabel,
+  onCommand,
+  stickToBottomRef,
+  messageStreamRef,
+  messageEndRef
+}: {
+  messages: ChatMessage[];
+  replyDetail: ReplyDetail;
+  taskEngine: CliEngine;
+  processLabel: string;
+  pendingPrompt: string;
+  showPendingBubble: boolean;
+  running: boolean;
+  processingLabel: string;
+  processingHint: string;
+  showFailureBanner: boolean;
+  failureTitle: string;
+  failureBody: string;
+  canResend: boolean;
+  resendTitle: string;
+  resendHint: string;
+  resendLabel: string;
+  onResend(): void;
+  commandQueue: QueuedTurnItem[];
+  queueLabel: string;
+  cancelQueueLabel: string;
+  cancelQueueAllLabel: string;
+  online: boolean | null;
+  onCancelQueuedItem(queueCommandId: string): void;
+  onCancelAllQueued(): void;
+  approvals: Approval[];
+  actionRequiredLabel: string;
+  declineLabel: string;
+  allowOnceLabel: string;
+  onCommand(command: ClientCommand): void;
+  stickToBottomRef: MutableRefObject<boolean>;
+  messageStreamRef: RefObject<HTMLDivElement | null>;
+  messageEndRef: RefObject<HTMLDivElement | null>;
+}) {
+  const visibleMessages = useMemo(
+    () => dedupeAdjacentUserMessages(
+      replyDetail === "detailed"
+        ? messages
+        : messages.filter((message) => !isProcessStreamMessage(message))
+    ),
+    [messages, replyDetail]
+  );
+  const assistantLabel = assistantEngineBadge(taskEngine);
+
+  return (
+    <div
+      className="message-stream"
+      ref={messageStreamRef}
+      onScroll={(event) => {
+        const stream = event.currentTarget;
+        stickToBottomRef.current = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 90;
+      }}
+    >
+      {visibleMessages.map((message) => (
+        <ChatMessageRow
+          key={message.id}
+          message={message}
+          processLabel={processLabel}
+          assistantLabel={assistantLabel}
+        />
+      ))}
+      {showPendingBubble && (
+        <article className="message user pending">
+          <span>YOU · 发送中</span>
+          <pre>{sanitizeDisplayText(pendingPrompt)}</pre>
+        </article>
+      )}
+      {(running || showPendingBubble) && (
+        <article className="processing-card">
+          <span className="processing-spinner" />
+          <div>
+            <strong>{processingLabel}</strong>
+            <p>{processingHint}</p>
+          </div>
+        </article>
+      )}
+      {showFailureBanner && (
+        <article className="failure-card" role="alert">
+          <div>
+            <strong>{failureTitle}</strong>
+            <p>{sanitizeDisplayText(failureBody)}</p>
+          </div>
+        </article>
+      )}
+      {canResend && (
+        <article className="resend-card">
+          <div>
+            <strong>{resendTitle}</strong>
+            <p>{resendHint}</p>
+          </div>
+          <button type="button" className="resend" onClick={onResend}>{resendLabel}</button>
+        </article>
+      )}
+      {commandQueue.length > 0 && (
+        <section className="command-queue">
+          <div>
+            <strong>{queueLabel}</strong>
+            <span>{commandQueue.length}</span>
+            {online === true && (
+              <button type="button" className="queue-clear" onClick={onCancelAllQueued}>{cancelQueueAllLabel}</button>
+            )}
+          </div>
+          {commandQueue.map((item, index) => (
+            <article key={item.commandId}>
+              <b>{index + 1}</b>
+              <p>{sanitizeDisplayText(item.prompt)}</p>
+              {online === true && (
+                <button
+                  type="button"
+                  className="queue-cancel"
+                  title={cancelQueueLabel}
+                  onClick={() => onCancelQueuedItem(item.commandId)}
+                >
+                  {cancelQueueLabel}
+                </button>
+              )}
+            </article>
+          ))}
+        </section>
+      )}
+      {approvals.map((approval) => (
+        <article className="approval-card" key={String(approval.requestId)}>
+          <div className="approval-label">{actionRequiredLabel}</div>
+          <h3>{approval.title}</h3>
+          <pre>{sanitizeDisplayText(approval.detail)}</pre>
+          <div className="approval-actions">
+            <button onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "decline" })}>{declineLabel}</button>
+            <button className="approve" onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "accept" })}>{allowOnceLabel}</button>
+          </div>
+        </article>
+      ))}
+      <div className="message-end" ref={messageEndRef} />
+    </div>
+  );
+});
+
+/**
+ * Composer owns the draft text so keystrokes do not re-render the message stream.
+ * draftClearNonce increments when the parent force-clears (stop / successful send path).
+ */
+const ConversationComposer = memo(function ConversationComposer({
+  threadId,
+  online,
+  running,
+  pendingPrompt,
+  draftClearNonce,
+  model,
+  modelOptions,
+  modelMeta,
+  taskEngine,
+  reasoningEffort,
+  effortOptions,
+  fastMode,
+  permissionMode,
+  permissionOptions,
+  replyDetail,
+  canResend,
+  isMac,
+  sendLabel,
+  stopLabel,
+  resendLabel,
+  currentPermissionLabel,
+  agentReplyDetailLabel,
+  replyConciseLabel,
+  replyDetailedLabel,
+  sendShortcutLabel,
+  onModelChange,
+  onReasoningEffortChange,
+  onFastModeChange,
+  onPermissionModeChange,
+  onReplyDetailChange,
+  onSubmitPrompt,
+  onStop,
+  onResend
+}: {
+  threadId: string;
+  online: boolean | null;
+  running: boolean;
+  pendingPrompt: string;
+  draftClearNonce: number;
+  model: string;
+  modelOptions: Array<{ id: string; label: string }>;
+  modelMeta: ReturnType<typeof modelOptionMeta>;
+  taskEngine: CliEngine;
+  reasoningEffort: ReasoningEffort | "";
+  effortOptions: ReasoningEffort[];
+  fastMode: boolean;
+  permissionMode: PermissionMode;
+  permissionOptions: Array<{ value: PermissionMode; label: string }>;
+  replyDetail: ReplyDetail;
+  canResend: boolean;
+  isMac: boolean;
+  sendLabel: string;
+  stopLabel: string;
+  resendLabel: string;
+  currentPermissionLabel: string;
+  agentReplyDetailLabel: string;
+  replyConciseLabel: string;
+  replyDetailedLabel: string;
+  sendShortcutLabel: string;
+  onModelChange(model: string): void;
+  onReasoningEffortChange(effort: ReasoningEffort): void;
+  onFastModeChange(fast: boolean): void;
+  onPermissionModeChange(mode: PermissionMode): void;
+  onReplyDetailChange(detail: ReplyDetail): void;
+  onSubmitPrompt(text: string): void;
+  onStop(): void;
+  onResend(): void;
+}) {
+  const [prompt, setPrompt] = useState(() => loadTaskDraft(threadId));
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const draftTimerRef = useRef<number | null>(null);
+
+  // Parent forces clear after stop / send handled outside (nonce bump).
+  useEffect(() => {
+    if (draftClearNonce === 0) return;
+    setPrompt("");
+    saveTaskDraft(threadId, "");
+  }, [draftClearNonce, threadId]);
+
+  // Debounced draft persist — avoid sessionStorage writes on every keypress.
+  useEffect(() => {
+    if (draftTimerRef.current) window.clearTimeout(draftTimerRef.current);
+    draftTimerRef.current = window.setTimeout(() => {
+      saveTaskDraft(threadId, prompt);
+      draftTimerRef.current = null;
+    }, 300);
+    return () => {
+      if (draftTimerRef.current) window.clearTimeout(draftTimerRef.current);
+    };
+  }, [threadId, prompt]);
+
+  useLayoutEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > 220 ? "auto" : "hidden";
+  }, [prompt]);
+
+  function submit() {
+    if (!prompt.trim() || online !== true) return;
+    const text = prompt.trim();
+    setPrompt("");
+    saveTaskDraft(threadId, "");
+    onSubmitPrompt(text);
+  }
+
+  return (
+    <form className="composer" onSubmit={(event) => {
+      event.preventDefault();
+      submit();
+    }}>
+      <textarea
+        ref={textareaRef}
+        value={prompt}
+        onChange={(event) => setPrompt(event.target.value)}
+        onKeyDown={(event) => {
+          const sendHotkey = isMac ? event.metaKey : event.ctrlKey;
+          if (sendHotkey && event.key === "Enter") {
+            event.preventDefault();
+            submit();
+          }
+        }}
+        placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"}
+      />
+      <div>
+        <small>
+          <label className="composer-permission">
+            模型
+            <select
+              value={model}
+              onChange={(event) => {
+                const next = event.target.value.split("[")[0] || event.target.value;
+                onModelChange(next);
+              }}
+              disabled={!modelOptions.length}
+            >
+              {!modelOptions.length && <option value="">主机未上报模型列表</option>}
+              {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+            </select>
+          </label>
+          {taskEngine === "cursor" && modelMeta?.supportsFast && (
+            <label className="composer-permission composer-fast-toggle">
+              Fast
+              <input
+                type="checkbox"
+                checked={fastMode}
+                onChange={(event) => onFastModeChange(event.target.checked)}
+              />
+            </label>
+          )}
+          <label className="composer-permission">
+            {taskEngine === "cursor" ? "Effort" : "推理强度"}
+            <select
+              value={reasoningEffort}
+              onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
+              disabled={!effortOptions.length}
+              title={taskEngine === "cursor" && !effortOptions.length ? "当前模型不支持 effort" : undefined}
+            >
+              {!effortOptions.length && <option value="">—</option>}
+              {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+            </select>
+          </label>
+          <label className="composer-permission">
+            {currentPermissionLabel}
+            <select value={permissionMode} onChange={(event) => onPermissionModeChange(normalizePermissionMode(event.target.value))}>
+              {permissionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          </label>
+          <label className="composer-reply-detail">
+            {agentReplyDetailLabel}
+            <select value={replyDetail} onChange={(event) => onReplyDetailChange(normalizeReplyDetail(event.target.value))}>
+              <option value="concise">{replyConciseLabel}</option>
+              <option value="detailed">{replyDetailedLabel}</option>
+            </select>
+          </label>
+          <span className="send-shortcut">
+            {isMac ? <><kbd>⌘</kbd> + <kbd>Enter</kbd></> : <><kbd>Ctrl</kbd> + <kbd>Enter</kbd></>}
+            {" "}{sendShortcutLabel}
+          </span>
+        </small>
+        {(running || pendingPrompt) && (
+          <button type="button" className="stop" onClick={onStop} disabled={online !== true}>
+            {stopLabel}
+          </button>
+        )}
+        {canResend && !running && !pendingPrompt && (
+          <button type="button" className="resend" onClick={onResend} disabled={online !== true}>
+            {resendLabel}
+          </button>
+        )}
+        <button className="send" disabled={online !== true || !prompt.trim()}>{sendLabel}</button>
+      </div>
+    </form>
+  );
+});
 
 /** Drop consecutive identical user bubbles (snapshot + turn.started race / queue drain). */
 function dedupeAdjacentUserMessages<T extends { id: string; role: string; text: string }>(messages: T[]): T[] {
   if (messages.length < 2) return messages;
   const out: T[] = [];
   for (const message of messages) {
-    const prev = out[out.length - 1];
-    if (
-      prev
-      && prev.role === "user"
-      && message.role === "user"
-      && prev.text.trim() === message.text.trim()
-    ) {
-      continue;
+    if (message.role === "user") {
+      const text = message.text.trim();
+      // Skip if the previous message is the same user text, or the last user bubble
+      // (process/stage lines may sit between two identical YOU entries after races).
+      const prev = out[out.length - 1];
+      if (prev?.role === "user" && prev.text.trim() === text) continue;
+      // indexOf(object) is reference-based; find last user by scanning instead.
+      let lastUserIndex = -1;
+      for (let i = out.length - 1; i >= 0; i -= 1) {
+        if (out[i]?.role === "user") {
+          lastUserIndex = i;
+          break;
+        }
+      }
+      if (lastUserIndex >= 0 && out[lastUserIndex]!.text.trim() === text) {
+        // Only collapse when nothing but process/system noise sits between the two YOU bubbles.
+        const between = out.slice(lastUserIndex + 1);
+        const onlyNoise = between.every(
+          (item) => item.role === "system" || isProcessStreamMessage(item)
+        );
+        if (onlyNoise && between.length > 0) continue;
+        if (between.length === 0) continue;
+      }
     }
     out.push(message);
   }
   return out;
+}
+
+/** Remove a waiting-queue item once the agent has actually started that prompt. */
+function dropQueuedPrompt(
+  queue: QueuedTurnItem[] | undefined,
+  prompt: string
+): QueuedTurnItem[] {
+  if (!queue?.length) return queue ?? [];
+  const text = prompt.trim();
+  if (!text) return queue;
+  const idx = queue.findIndex((item) => item.prompt.trim() === text);
+  if (idx < 0) return queue;
+  if (idx === 0) return queue.slice(1);
+  return [...queue.slice(0, idx), ...queue.slice(idx + 1)];
+}
+
+/**
+ * When the conversation was unmounted, localStorage / a missed empty queue event can leave
+ * ghost waiting items that already appear as YOU bubbles. Drop FIFO heads that match the latest
+ * YOU; if idle and every remaining item already appears in the transcript, clear the whole list.
+ */
+function pruneStaleQueueAgainstMessages(
+  queue: QueuedTurnItem[],
+  messages: Array<{ role: string; text: string }>,
+  options?: { idle?: boolean }
+): QueuedTurnItem[] {
+  if (!queue.length) return queue;
+  const userTexts = messages
+    .filter((message) => message.role === "user")
+    .map((message) => message.text.trim())
+    .filter(Boolean);
+  if (!userTexts.length) return queue;
+  let next = [...queue];
+  // Drop FIFO heads that already landed as the latest YOU (started while we were away).
+  const lastUser = userTexts[userTexts.length - 1]!;
+  while (next.length && next[0]!.prompt.trim() === lastUser) {
+    next = next.slice(1);
+  }
+  // Idle + every waiting prompt already exists as a YOU bubble ⇒ ghosts from a finished run
+  // (missed turn.queue.updated while unmounted). Keep queues that still have brand-new prompts.
+  if (options?.idle && next.length && next.every((item) => userTexts.includes(item.prompt.trim()))) {
+    return [];
+  }
+  return next;
 }
 
 function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
@@ -624,8 +1114,25 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     next.quotaLoading = false;
     return next;
   }
+  if (event.type === "thread.deleted") {
+    delete next.tasks[event.threadId];
+    return next;
+  }
+  if (event.type === "turn.queue.updated") {
+    const task = next.tasks[event.threadId];
+    if (task) {
+      task.queuedTurns = event.items.map((item) => ({
+        commandId: item.commandId,
+        prompt: item.prompt
+      }));
+      task.updatedAt = Date.now() / 1000;
+    }
+    return next;
+  }
   if (event.type === "sync.completed" || event.type === "sync.progress") return next;
   if (event.type === "thread.snapshot") {
+    // Never resurrect a task the user already deleted in this session if event races.
+    // (Agent also tombstones; this is a local guard.)
     const existing = next.tasks[event.threadId];
     const engine = event.cliEngine ?? existing?.cliEngine;
     const model = event.model ?? existing?.model;
@@ -682,7 +1189,10 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       ...(providerSessionId ? { providerSessionId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
-      ...(contextUsage ? { contextUsage } : {})
+      ...(contextUsage ? { contextUsage } : {}),
+      // Preserve agent queue state — snapshots do not carry it and must not wipe it.
+      // Use !== undefined so an empty [] (queue finished) is kept and not treated as "missing".
+      ...(existing?.queuedTurns !== undefined ? { queuedTurns: existing.queuedTurns } : {})
     };
     // Collapse Claude/Grok import clones: same engine + native session id → keep one task.
     if (engine && engine !== "codex" && providerSessionId) {
@@ -766,17 +1276,27 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     task.activeTurnId = event.turnId;
     // Snapshot / prior turn.started may already include the user turn. Avoid duplicate YOU bubbles
     // (especially when a durable-queued follow-up starts right after the previous turn).
-    if (event.prompt) {
-      const prompt = event.prompt.trim();
-      if (prompt) {
-        const already = task.messages.some(
-          (item: Task["messages"][number]) => item.role === "user" && item.text.trim() === prompt
-        );
-        if (!already) {
-          task.messages.push({ id: event.eventId, role: "user", text: prompt });
-        }
+    // Headless path often omits prompt when the user message was already snapshotted — still drop
+    // the matching waiting-queue item using the last YOU bubble.
+    const promptFromEvent = event.prompt?.trim() || "";
+    if (promptFromEvent) {
+      const already = task.messages.some(
+        (item: Task["messages"][number]) => item.role === "user" && item.text.trim() === promptFromEvent
+      );
+      if (!already) {
+        task.messages.push({ id: event.eventId, role: "user", text: promptFromEvent });
       }
     }
+    const lastUserText = [...task.messages]
+      .reverse()
+      .find((item: Task["messages"][number]) => item.role === "user")
+      ?.text
+      ?.trim() || "";
+    const queuePrompt = promptFromEvent || lastUserText;
+    if (queuePrompt && task.queuedTurns !== undefined) {
+      task.queuedTurns = dropQueuedPrompt(task.queuedTurns, queuePrompt);
+    }
+    task.messages = dedupeAdjacentUserMessages(task.messages);
   }
   if (event.type === "turn.delta") {
     const id = `assistant:${event.turnId}:${event.itemId}`;
@@ -787,6 +1307,20 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   if (event.type === "turn.completed") {
     task.status = event.status;
     delete task.activeTurnId;
+    // Finished turns should not linger in the waiting list (missed turn.queue.updated / headless
+    // turn.started without prompt while the conversation was unmounted).
+    const lastUserText = [...task.messages]
+      .reverse()
+      .find((item: Task["messages"][number]) => item.role === "user")
+      ?.text
+      ?.trim() || "";
+    if (lastUserText && task.queuedTurns?.length) {
+      task.queuedTurns = dropQueuedPrompt(task.queuedTurns, lastUserText);
+    }
+    // Materialize empty queue after completion so remount does not resurrect localStorage ghosts.
+    if (!task.queuedTurns?.length) {
+      task.queuedTurns = [];
+    }
     if (event.contextUsage) task.contextUsage = event.contextUsage;
     const errText = event.errorMessage?.trim();
     if (errText) {
@@ -1566,35 +2100,41 @@ export function App() {
           {(normalizedTaskQuery || engineFilter) && <small>{filteredTasks.length}/{tasks.length}</small>}
         </div>
         <div className="task-list">
-          {filteredTasks.map((task) => {
-            const status = taskStatusMeta(task.status);
-            const engine = task.cliEngine ? normalizeCliEngine(task.cliEngine) : undefined;
-            const updated = new Date(task.updatedAt * 1000);
-            const timeLabel = Number.isFinite(updated.getTime())
-              ? updated.toLocaleString(undefined, {
-                  month: "2-digit",
-                  day: "2-digit",
-                  hour: "2-digit",
-                  minute: "2-digit"
-                })
-              : "";
-            const preview = (task.messages.at(-1)?.text || task.cwd || "").replace(/\s+/g, " ").trim();
-            return <button key={task.threadId} type="button" className={`task-card ${activeTask?.threadId === task.threadId ? "active" : ""}`} onClick={() => selectTask(task.threadId)}>
-              <div className="task-meta">
-                <span className="task-meta-left">
-                  {engine && <EngineLogo engine={engine} size={14} className="task-engine-logo" />}
-                  <span className={`task-status ${status.tone}`}>{status.label}</span>
-                </span>
-                {timeLabel && <time dateTime={updated.toISOString()}>{timeLabel}</time>}
-              </div>
-              <h3 title={task.title}>{task.title}</h3>
-              <p title={preview}>{preview}</p>
-              <div className="task-foot">
-                <code className="task-cwd" title={formatTaskCwd(task.cwd)} dir="ltr">{formatTaskCwd(task.cwd)}</code>
-                {task.approvals.length > 0 && <b>{task.approvals.length}</b>}
-              </div>
-            </button>;
-          })}
+          {filteredTasks.map((task) => (
+            <TaskListRow
+              key={task.threadId}
+              task={task}
+              active={activeTask?.threadId === task.threadId}
+              online={activeRuntime.online}
+              onSelect={() => selectTask(task.threadId)}
+              onDelete={() => {
+                if (!activeHost) return;
+                const ok = window.confirm(t("deleteTaskConfirm"));
+                if (!ok) return;
+                // Optimistic local remove
+                setRuntime((current) => {
+                  const hostId = activeHost.id;
+                  const prev = current[hostId] ?? emptyRuntime();
+                  const nextTasks = { ...prev.tasks };
+                  delete nextTasks[task.threadId];
+                  return { ...current, [hostId]: { ...prev, tasks: nextTasks } };
+                });
+                if (selectedTaskId === task.threadId) {
+                  setSelectedTaskId(null);
+                  setMobilePane("tasks");
+                }
+                try { localStorage.removeItem(`command-queue:${task.threadId}`); } catch { /* ignore */ }
+                try { localStorage.removeItem(taskPrefsKey(task.threadId)); } catch { /* ignore */ }
+                if (activeRuntime.online === true) {
+                  void sendCommand(activeHost.id, {
+                    type: "thread.delete",
+                    commandId: crypto.randomUUID(),
+                    threadId: task.threadId
+                  }).catch((err) => setError(err.message));
+                }
+              }}
+            />
+          ))}
           {!tasks.length && <div className="empty-state"><span>&gt;_</span><h3>{t("noTasks")}</h3><p>{t("noTasksHint")}</p></div>}
           {Boolean(tasks.length && !filteredTasks.length) && <div className="empty-state"><span>?</span><h3>{t("noMatch")}</h3><p>{t("noMatchHint")}</p></div>}
         </div>
@@ -1660,6 +2200,124 @@ export function App() {
   </div>;
 }
 
+/** Task row with desktop hover-delete + mobile swipe-to-delete. */
+function TaskListRow({
+  task,
+  active,
+  onSelect,
+  onDelete
+}: {
+  task: Task;
+  active: boolean;
+  online: boolean | null;
+  onSelect(): void;
+  onDelete(): void;
+}) {
+  const { t } = useI18n();
+  const status = taskStatusMeta(task.status);
+  const engine = task.cliEngine ? normalizeCliEngine(task.cliEngine) : undefined;
+  const updated = new Date(task.updatedAt * 1000);
+  const timeLabel = Number.isFinite(updated.getTime())
+    ? updated.toLocaleString(undefined, {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit"
+      })
+    : "";
+  const preview = (task.messages.at(-1)?.text || task.cwd || "").replace(/\s+/g, " ").trim();
+  const [swipeX, setSwipeX] = useState(0);
+  const startX = useRef<number | null>(null);
+  const swiping = useRef(false);
+  const DELETE_REVEAL = 72;
+
+  function onTouchStart(event: ReactTouchEvent) {
+    startX.current = event.touches[0]?.clientX ?? null;
+    swiping.current = false;
+  }
+  function onTouchMove(event: ReactTouchEvent) {
+    if (startX.current == null) return;
+    const x = event.touches[0]?.clientX ?? startX.current;
+    const delta = x - startX.current;
+    if (delta < -8) swiping.current = true;
+    // Only left swipe reveals delete
+    setSwipeX(Math.max(-DELETE_REVEAL, Math.min(0, delta)));
+  }
+  function onTouchEnd() {
+    startX.current = null;
+    setSwipeX((current) => (current < -DELETE_REVEAL / 2 ? -DELETE_REVEAL : 0));
+  }
+
+  return (
+    <div className={`task-row ${active ? "active" : ""} ${swipeX < 0 ? "swiping" : ""}`}>
+      <button
+        type="button"
+        className="task-row-delete"
+        aria-label={t("deleteTask")}
+        title={t("deleteTask")}
+        onClick={(event) => {
+          event.stopPropagation();
+          onDelete();
+          setSwipeX(0);
+        }}
+      >
+        {t("deleteTask")}
+      </button>
+      <div
+        role="button"
+        tabIndex={0}
+        className={`task-card ${active ? "active" : ""}`}
+        style={{ transform: `translateX(${swipeX}px)` }}
+        onClick={() => {
+          if (swiping.current || swipeX < -8) {
+            setSwipeX(0);
+            return;
+          }
+          onSelect();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onSelect();
+          }
+        }}
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+        onTouchCancel={onTouchEnd}
+      >
+        <div className="task-meta">
+          <span className="task-meta-left">
+            {engine && <EngineLogo engine={engine} size={14} className="task-engine-logo" />}
+            <span className={`task-status ${status.tone}`}>{status.label}</span>
+          </span>
+          <span className="task-meta-right">
+            {timeLabel && <time dateTime={updated.toISOString()}>{timeLabel}</time>}
+            <button
+              type="button"
+              className="task-delete-desktop"
+              title={t("deleteTask")}
+              aria-label={t("deleteTask")}
+              onClick={(event) => {
+                event.stopPropagation();
+                onDelete();
+              }}
+            >
+              ×
+            </button>
+          </span>
+        </div>
+        <h3 title={task.title}>{task.title}</h3>
+        <p title={preview}>{preview}</p>
+        <div className="task-foot">
+          <code className="task-cwd" title={formatTaskCwd(task.cwd)} dir="ltr">{formatTaskCwd(task.cwd)}</code>
+          {task.approvals.length > 0 && <b>{task.approvals.length}</b>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function formatEngineQuotaChip(quota: EngineQuota): string {
   if (quota.amountRemaining != null) {
     const cur = quota.currency || "";
@@ -1719,21 +2377,57 @@ function TaskConversation({
   onQuotaRefresh(): void;
 }) {
   const { t, locale } = useI18n();
-  const [prompt, setPrompt] = useState(() => loadTaskDraft(task.threadId));
   const [pendingPrompt, setPendingPrompt] = useState("");
-  const [pendingMessageCount, setPendingMessageCount] = useState(0);
-  const [commandQueue, setCommandQueue] = useState<string[]>(() => {
-    try { return JSON.parse(localStorage.getItem(`command-queue:${task.threadId}`) ?? "[]") as string[]; }
-    catch { return []; }
+  const [draftClearNonce, setDraftClearNonce] = useState(0);
+  const submittingRef = useRef(false);
+  const [commandQueue, setCommandQueue] = useState<QueuedTurnItem[]>(() => {
+    // Agent-reported queue wins (including explicit []). Avoid restoring stale localStorage
+    // when the task is idle — the queue often finished while this conversation was unmounted.
+    const fromAgent = task.queuedTurns !== undefined
+      ? task.queuedTurns
+        .map((item) => ({ commandId: item.commandId, prompt: item.prompt }))
+        .filter((item) => item.prompt.trim())
+      : null;
+    let restored: QueuedTurnItem[] = fromAgent ?? [];
+    if (fromAgent === null) {
+      if (!task.activeTurnId) {
+        restored = [];
+      } else {
+        try {
+          const raw = JSON.parse(localStorage.getItem(`command-queue:${task.threadId}`) ?? "[]") as unknown;
+          if (Array.isArray(raw)) {
+            restored = raw.map((item) => {
+              if (typeof item === "string") {
+                return { commandId: crypto.randomUUID(), prompt: item };
+              }
+              const row = item as Partial<QueuedTurnItem>;
+              return {
+                commandId: String(row.commandId || crypto.randomUUID()),
+                prompt: String(row.prompt || "")
+              };
+            }).filter((item) => item.prompt.trim());
+          }
+        } catch {
+          restored = [];
+        }
+      }
+    }
+    return pruneStaleQueueAgainstMessages(restored, task.messages, {
+      idle: !task.activeTurnId
+    });
   });
   const [tab, setTab] = useState<"chat" | "diff">("chat");
   const taskEngine = normalizeCliEngine(task.cliEngine);
   const cap = capabilityForEngine(engineCapabilities, taskEngine);
-  const uiPrefs = loadTaskUiPrefs(task.threadId);
-  const modelOptions = modelOptionsFromHost(
-    engineCapabilities,
-    taskEngine,
-    task.model || uiPrefs.model || cap?.currentModel
+  // Avoid localStorage prefs reads on every parent re-render (streaming deltas).
+  const uiPrefs = useMemo(() => loadTaskUiPrefs(task.threadId), [task.threadId]);
+  const modelOptions = useMemo(
+    () => modelOptionsFromHost(
+      engineCapabilities,
+      taskEngine,
+      task.model || uiPrefs.model || cap?.currentModel
+    ),
+    [engineCapabilities, taskEngine, task.model, uiPrefs.model, cap?.currentModel]
   );
   const [model, setModel] = useState(
     () => {
@@ -1741,12 +2435,18 @@ function TaskConversation({
       return raw.split("[")[0] || raw;
     }
   );
-  const modelMeta = modelOptionMeta(engineCapabilities, taskEngine, model);
-  const effortOptions = effortOptionsFromHost(
-    engineCapabilities,
-    taskEngine,
-    task.reasoningEffort || uiPrefs.reasoningEffort || cap?.currentReasoningEffort,
-    model
+  const modelMeta = useMemo(
+    () => modelOptionMeta(engineCapabilities, taskEngine, model),
+    [engineCapabilities, taskEngine, model]
+  );
+  const effortOptions = useMemo(
+    () => effortOptionsFromHost(
+      engineCapabilities,
+      taskEngine,
+      task.reasoningEffort || uiPrefs.reasoningEffort || cap?.currentReasoningEffort,
+      model
+    ),
+    [engineCapabilities, taskEngine, task.reasoningEffort, uiPrefs.reasoningEffort, cap?.currentReasoningEffort, model]
   );
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(
     () => task.reasoningEffort || uiPrefs.reasoningEffort || cap?.currentReasoningEffort || effortOptions[0] || ""
@@ -1761,18 +2461,33 @@ function TaskConversation({
   });
   const messageStreamRef = useRef<HTMLDivElement | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
-  const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const stickToBottomRef = useRef(true);
   const previousThreadRef = useRef(task.threadId);
   const running = Boolean(task.activeTurnId);
-  const permissionOptions = permissionOptionsForEngine(taskEngine, locale);
-  const contextView = parseContextUsageView(task.contextUsage);
-  const taskQuota = engineQuotas.find((item) => item.engine === taskEngine);
+  const permissionOptions = useMemo(
+    () => permissionOptionsForEngine(taskEngine, locale),
+    [taskEngine, locale]
+  );
+  const contextView = useMemo(
+    () => parseContextUsageView(task.contextUsage),
+    [task.contextUsage]
+  );
+  const taskQuota = useMemo(
+    () => engineQuotas.find((item) => item.engine === taskEngine),
+    [engineQuotas, taskEngine]
+  );
   const isMac = isMacPlatform();
-  const visibleMessages = replyDetail === "detailed"
-    ? task.messages
-    : task.messages.filter((message) => !isProcessStreamMessage(message));
-  const lastMessageLength = visibleMessages.at(-1)?.text.length ?? 0;
+  // Cheap scroll metrics without re-filtering the full transcript on every parent render path.
+  const lastMessageLength = task.messages.at(-1)?.text.length ?? 0;
+  const messageCount = task.messages.length;
+  // Hide optimistic send bubble once the same text is already in the transcript (avoids double YOU).
+  const pendingAlreadyCommitted = Boolean(
+    pendingPrompt
+    && task.messages.some(
+      (message) => message.role === "user" && message.text.trim() === pendingPrompt.trim()
+    )
+  );
+  const showPendingBubble = Boolean(pendingPrompt && !pendingAlreadyCommitted);
 
   useEffect(() => {
     if (!permissionOptions.some((item) => item.value === permissionMode)) {
@@ -1824,11 +2539,6 @@ function TaskConversation({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model, taskEngine]);
 
-  // Persist in-progress edits so switching tasks and back restores the draft.
-  useEffect(() => {
-    saveTaskDraft(task.threadId, prompt);
-  }, [task.threadId, prompt]);
-
   function resolveOutboundModel(): string | undefined {
     if (!model) return undefined;
     if (taskEngine === "cursor") {
@@ -1837,12 +2547,12 @@ function TaskConversation({
     return model;
   }
 
-  function turnStartCommand(text: string): ClientCommand {
+  function turnStartCommand(text: string, commandId = crypto.randomUUID()): ClientCommand {
     const outboundModel = resolveOutboundModel();
     const effort = effortOptions.length ? reasoningEffort : "";
     return {
       type: "turn.start",
-      commandId: crypto.randomUUID(),
+      commandId,
       threadId: task.threadId,
       prompt: text,
       permissionMode,
@@ -1851,29 +2561,68 @@ function TaskConversation({
     };
   }
 
-  function submitPrompt() {
-    if (!prompt.trim() || online !== true) return;
-    const submittedPrompt = prompt.trim();
+  /** Composer owns the draft text; parent only receives the submitted string. */
+  const submitPromptText = useCallback((submittedPrompt: string) => {
+    if (!submittedPrompt.trim() || online !== true) return;
+    // Guard against double Enter / rapid re-clicks before React re-renders pending state.
+    if (!running && !pendingPrompt && submittingRef.current) return;
+    const text = submittedPrompt.trim();
+    const commandId = crypto.randomUUID();
     stickToBottomRef.current = true;
     // Always deliver to the agent. When a turn is already running the agent durable-queues
     // the follow-up so closing the browser no longer drops queued prompts.
     if (running || pendingPrompt) {
-      setCommandQueue((current) => [...current, submittedPrompt]);
+      setCommandQueue((current) => [...current, { commandId, prompt: text }]);
     } else {
-      setPendingPrompt(submittedPrompt);
-      setPendingMessageCount(task.messages.length);
+      submittingRef.current = true;
+      setPendingPrompt(text);
     }
-    onCommand(turnStartCommand(submittedPrompt));
-    setPrompt("");
-    saveTaskDraft(task.threadId, "");
-  }
+    onCommand(turnStartCommand(text, commandId));
+  }, [
+    online,
+    running,
+    pendingPrompt,
+    model,
+    modelMeta,
+    fastMode,
+    taskEngine,
+    effortOptions.length,
+    reasoningEffort,
+    permissionMode,
+    task.threadId,
+    onCommand
+  ]);
+
+  const cancelQueuedItem = useCallback((queueCommandId: string) => {
+    setCommandQueue((current) => current.filter((item) => item.commandId !== queueCommandId));
+    if (online === true) {
+      onCommand({
+        type: "turn.queue.cancel",
+        commandId: crypto.randomUUID(),
+        threadId: task.threadId,
+        queueCommandId
+      });
+    }
+  }, [online, onCommand, task.threadId]);
+
+  const cancelAllQueued = useCallback(() => {
+    setCommandQueue([]);
+    if (online === true) {
+      onCommand({
+        type: "turn.queue.cancel",
+        commandId: crypto.randomUUID(),
+        threadId: task.threadId
+      });
+    }
+  }, [online, onCommand, task.threadId]);
 
   /** Stop the active turn for real (agent kills CLI process tree). */
-  function stopTurn() {
+  const stopTurn = useCallback(() => {
+    submittingRef.current = false;
     setPendingPrompt("");
     setCommandQueue([]);
     try { localStorage.removeItem(`command-queue:${task.threadId}`); } catch { /* ignore */ }
-    saveTaskDraft(task.threadId, "");
+    setDraftClearNonce((value) => value + 1);
     // Always send interrupt: headless kill is keyed by threadId; turnId is for event correlation.
     // Agent also clears its durable queue for this thread.
     onCommand({
@@ -1882,11 +2631,14 @@ function TaskConversation({
       threadId: task.threadId,
       turnId: task.activeTurnId || crypto.randomUUID()
     });
-  }
+  }, [onCommand, task.threadId, task.activeTurnId]);
 
   /** Last user message eligible for resend after failure / stop. */
-  const lastUserPrompt = [...task.messages].reverse().find((message) => message.role === "user")?.text?.trim() || "";
-  const lastSystemError = findLastSystemErrorText(task.messages);
+  const lastUserPrompt = useMemo(
+    () => [...task.messages].reverse().find((message) => message.role === "user")?.text?.trim() || "",
+    [task.messages]
+  );
+  const lastSystemError = useMemo(() => findLastSystemErrorText(task.messages), [task.messages]);
   const statusFailed = isFailedTaskStatus(task.status);
   const statusCompleted = /^(completed|complete|success|succeeded)$/i.test(String(task.status || "").trim());
   const canResend = Boolean(
@@ -1898,8 +2650,11 @@ function TaskConversation({
   );
   // Only when status is actually failed/stopped — never because a system/plan message exists.
   // Also hide for legacy bad data: status=failed but the only system blob is a long non-error transcript.
-  const hasLongNonErrorSystem = task.messages.some(
-    (message) => message.role === "system" && message.text.trim().length > 400 && !isErrorSystemMessage(message.text)
+  const hasLongNonErrorSystem = useMemo(
+    () => task.messages.some(
+      (message) => message.role === "system" && message.text.trim().length > 400 && !isErrorSystemMessage(message.text)
+    ),
+    [task.messages]
   );
   const showFailureBanner = !running
     && !pendingPrompt
@@ -1907,21 +2662,62 @@ function TaskConversation({
     && !statusCompleted
     && (Boolean(lastSystemError) || !hasLongNonErrorSystem);
 
-  function resendLastPrompt() {
+  const resendLastPrompt = useCallback(() => {
     if (!canResend || !lastUserPrompt) return;
     stickToBottomRef.current = true;
+    submittingRef.current = true;
     setPendingPrompt(lastUserPrompt);
-    setPendingMessageCount(task.messages.length);
     onCommand(turnStartCommand(lastUserPrompt));
-  }
+  }, [canResend, lastUserPrompt, onCommand, model, modelMeta, fastMode, taskEngine, effortOptions.length, reasoningEffort, permissionMode, task.threadId]);
+
+  const handleModelChange = useCallback((next: string) => {
+    setModel(next);
+    if (next) saveTaskUiPrefs(task.threadId, { model: next });
+  }, [task.threadId]);
+
+  const handleReasoningEffortChange = useCallback((next: ReasoningEffort) => {
+    setReasoningEffort(next);
+    if (next) saveTaskUiPrefs(task.threadId, { reasoningEffort: next });
+  }, [task.threadId]);
+
+  const handleFastModeChange = useCallback((next: boolean) => {
+    setFastMode(next);
+    saveTaskUiPrefs(task.threadId, { fast: next });
+  }, [task.threadId]);
 
   useEffect(() => {
-    localStorage.setItem(`command-queue:${task.threadId}`, JSON.stringify(commandQueue));
+    if (commandQueue.length === 0) {
+      try { localStorage.removeItem(`command-queue:${task.threadId}`); } catch { /* ignore */ }
+    } else {
+      localStorage.setItem(`command-queue:${task.threadId}`, JSON.stringify(commandQueue));
+    }
   }, [commandQueue, task.threadId]);
 
-  // Local queue is UI-only; the agent owns durable execution.
-  // When a queued prompt lands as a user bubble (or a new turn starts for it), drop it from the queue
-  // so it is not shown both in the message stream and under「等待队列」.
+  // Agent durable queue is source of truth when it reports updates (including empty []).
+  // Do NOT re-run on every message delta — that would wipe an optimistic local enqueue
+  // before the matching turn.queue.updated arrives.
+  useEffect(() => {
+    if (task.queuedTurns !== undefined) {
+      const next = pruneStaleQueueAgainstMessages(
+        task.queuedTurns
+          .map((item) => ({ commandId: item.commandId, prompt: item.prompt }))
+          .filter((item) => item.prompt.trim()),
+        task.messages,
+        { idle: !task.activeTurnId }
+      );
+      setCommandQueue(next);
+      return;
+    }
+    // No agent queue payload yet: if the turn is idle, drop stale local cache from a previous visit.
+    if (!task.activeTurnId) {
+      setCommandQueue([]);
+      try { localStorage.removeItem(`command-queue:${task.threadId}`); } catch { /* ignore */ }
+    }
+  }, [task.threadId, task.queuedTurns, task.activeTurnId]);
+
+  // When a queued prompt lands as a YOU bubble (or a new turn starts for it), drop it from the
+  // local waiting list so it is not shown both in the stream and under「等待队列」.
+  // Also clears ghosts after switching back to a conversation whose queue finished unmounted.
   const previousActiveTurnRef = useRef(task.activeTurnId);
   const previousUserCountRef = useRef(task.messages.filter((message) => message.role === "user").length);
   const queueThreadRef = useRef(task.threadId);
@@ -1930,6 +2726,9 @@ function TaskConversation({
       queueThreadRef.current = task.threadId;
       previousActiveTurnRef.current = task.activeTurnId;
       previousUserCountRef.current = task.messages.filter((message) => message.role === "user").length;
+      setCommandQueue((current) =>
+        pruneStaleQueueAgainstMessages(current, task.messages, { idle: !task.activeTurnId })
+      );
       return;
     }
     const previousTurn = previousActiveTurnRef.current;
@@ -1940,40 +2739,52 @@ function TaskConversation({
     previousUserCountRef.current = userCount;
     const turnChanged = Boolean(task.activeTurnId && task.activeTurnId !== previousTurn);
     const userGrew = userCount > previousUserCount;
-    if (!turnChanged && !userGrew) return;
-    const lastUser = userMessages[userMessages.length - 1];
-    if (!lastUser?.text) return;
-    const lastText = lastUser.text.trim();
+    const becameIdle = Boolean(previousTurn && !task.activeTurnId);
+    if (!turnChanged && !userGrew && !becameIdle) return;
     setCommandQueue((current) => {
       if (current.length === 0) return current;
-      // Prefer dropping the head (FIFO); fall back to first matching entry.
-      if (current[0]?.trim() === lastText) return current.slice(1);
-      const index = current.findIndex((item) => item.trim() === lastText);
-      if (index === -1) return current;
-      return [...current.slice(0, index), ...current.slice(index + 1)];
+      const pruned = pruneStaleQueueAgainstMessages(current, task.messages, {
+        idle: !task.activeTurnId
+      });
+      if (
+        pruned.length === current.length
+        && pruned.every((item, index) => item.commandId === current[index]?.commandId)
+      ) {
+        return current;
+      }
+      return pruned;
     });
   }, [task.threadId, task.activeTurnId, task.messages]);
 
+  // Clear optimistic "sending" bubble once the real YOU message is in the transcript
+  // (last message may already be a stage/assistant delta — do not require it to be user).
   useEffect(() => {
-    const latestMessage = task.messages.at(-1);
-    if (pendingPrompt && task.messages.length > pendingMessageCount && latestMessage?.role === "user" && latestMessage.text === pendingPrompt) setPendingPrompt("");
-  }, [pendingMessageCount, pendingPrompt, task.messages]);
+    if (!pendingPrompt) return;
+    const pending = pendingPrompt.trim();
+    const matched = task.messages.some(
+      (message) => message.role === "user" && message.text.trim() === pending
+    );
+    if (matched) {
+      submittingRef.current = false;
+      setPendingPrompt("");
+    }
+  }, [pendingPrompt, task.messages]);
 
   // Clear optimistic "sending" when the turn ends in failure before a user bubble lands.
   useEffect(() => {
     if (!pendingPrompt) return;
     if (isFailedTaskStatus(task.status) && !task.activeTurnId) {
+      submittingRef.current = false;
       setPendingPrompt("");
     }
   }, [pendingPrompt, task.status, task.activeTurnId]);
 
-  useLayoutEffect(() => {
-    const textarea = composerTextareaRef.current;
-    if (!textarea) return;
-    textarea.style.height = "auto";
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
-    textarea.style.overflowY = textarea.scrollHeight > 220 ? "auto" : "hidden";
-  }, [prompt]);
+  // Release submit lock when a live turn is observed (or pending cleared elsewhere).
+  useEffect(() => {
+    if (task.activeTurnId || !pendingPrompt) {
+      submittingRef.current = false;
+    }
+  }, [task.activeTurnId, pendingPrompt]);
 
   useLayoutEffect(() => {
     const stream = messageStreamRef.current;
@@ -1988,7 +2799,7 @@ function TaskConversation({
       });
       return () => window.cancelAnimationFrame(frame);
     }
-  }, [task.threadId, visibleMessages.length, lastMessageLength, task.approvals.length, pendingPrompt, tab, visible, replyDetail]);
+  }, [task.threadId, messageCount, lastMessageLength, task.approvals.length, pendingPrompt, tab, visible, replyDetail]);
 
   return <>
     <div className="conversation-head">
@@ -2077,148 +2888,81 @@ function TaskConversation({
       </div>
       <div className="tabs"><button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>{t("chat")}</button><button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>{t("diff")}</button></div>
     </div>
-    {tab === "chat" ? <div className="message-stream" ref={messageStreamRef} onScroll={(event) => {
-      const stream = event.currentTarget;
-      stickToBottomRef.current = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 90;
-    }}>
-      {visibleMessages.map((message) => {
-        const process = isProcessStreamMessage(message);
-        const label = message.role === "user"
-          ? "YOU"
-          : message.role === "system"
-            ? "SYSTEM"
-            : process
-              ? t("replyProcess")
-              : assistantEngineBadge(taskEngine);
-        const isAssistantReply = message.role === "assistant" && !process;
-        return (
-          <article key={message.id} className={`message ${message.role}${process ? " process" : ""}`}>
-            {isAssistantReply
-              ? <AssistantMessageCard label={label} text={message.text} />
-              : <>
-                  <span>{label}</span>
-                  <pre>{sanitizeDisplayText(message.text)}</pre>
-                </>}
-          </article>
-        );
-      })}
-      {pendingPrompt && <article className="message user pending"><span>YOU · 发送中</span><pre>{sanitizeDisplayText(pendingPrompt)}</pre></article>}
-      {(running || pendingPrompt) && <article className="processing-card"><span className="processing-spinner" /><div><strong>{t("processing")}</strong><p>{t("processingHint")}</p></div></article>}
-      {showFailureBanner && (
-        <article className="failure-card" role="alert">
-          <div>
-            <strong>{locale === "en" ? "Task failed" : "任务执行失败"}</strong>
-            <p>{sanitizeDisplayText(lastSystemError || (locale === "en"
-              ? `Status: ${task.status}. Open desktop handoff for CLI details if this is empty.`
-              : `状态：${task.status}。若此处无详情，请在电脑端客户端「任务 → 接力」查看 CLI 输出。`))}</p>
-          </div>
-        </article>
-      )}
-      {canResend && (
-        <article className="resend-card">
-          <div>
-            <strong>{locale === "en" ? "Last turn failed or stopped" : "上次发送失败或已停止"}</strong>
-            <p>{locale === "en" ? "Resend the last user message to the host." : "可将上一条用户消息重新下发到主机。"}</p>
-          </div>
-          <button type="button" className="resend" onClick={resendLastPrompt}>{t("resend")}</button>
-        </article>
-      )}
-      {commandQueue.length > 0 && <section className="command-queue"><div><strong>{t("queue")}</strong><span>{commandQueue.length}</span></div>{commandQueue.map((queuedPrompt, index) => <article key={`${index}:${queuedPrompt}`}><b>{index + 1}</b><p>{sanitizeDisplayText(queuedPrompt)}</p></article>)}</section>}
-      {task.approvals.map((approval) => <article className="approval-card" key={String(approval.requestId)}>
-        <div className="approval-label">{t("actionRequired")}</div><h3>{approval.title}</h3><pre>{sanitizeDisplayText(approval.detail)}</pre>
-        <div className="approval-actions"><button onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "decline" })}>{t("decline")}</button><button className="approve" onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "accept" })}>{t("allowOnce")}</button></div>
-      </article>)}
-      <div className="message-end" ref={messageEndRef} />
-    </div> : <DiffView diff={task.diff} />}
-    <form className="composer" onSubmit={(event) => {
-      event.preventDefault();
-      submitPrompt();
-    }}>
-      <textarea ref={composerTextareaRef} value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => {
-        const sendHotkey = isMac ? event.metaKey : event.ctrlKey;
-        if (sendHotkey && event.key === "Enter") {
-          event.preventDefault();
-          submitPrompt();
-        }
-      }} placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"} />
-      <div>
-        <small>
-          <label className="composer-permission">
-            模型
-            <select
-              value={model}
-              onChange={(event) => {
-                const next = event.target.value.split("[")[0] || event.target.value;
-                setModel(next);
-                if (next) saveTaskUiPrefs(task.threadId, { model: next });
-              }}
-              disabled={!modelOptions.length}
-            >
-              {!modelOptions.length && <option value="">主机未上报模型列表</option>}
-              {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
-            </select>
-          </label>
-          {taskEngine === "cursor" && modelMeta?.supportsFast && (
-            <label className="composer-permission composer-fast-toggle">
-              Fast
-              <input
-                type="checkbox"
-                checked={fastMode}
-                onChange={(event) => {
-                  const next = event.target.checked;
-                  setFastMode(next);
-                  saveTaskUiPrefs(task.threadId, { fast: next });
-                }}
-              />
-            </label>
-          )}
-          <label className="composer-permission">
-            {taskEngine === "cursor" ? "Effort" : "推理强度"}
-            <select
-              value={reasoningEffort}
-              onChange={(event) => {
-                const next = event.target.value as ReasoningEffort;
-                setReasoningEffort(next);
-                if (next) saveTaskUiPrefs(task.threadId, { reasoningEffort: next });
-              }}
-              disabled={!effortOptions.length}
-              title={taskEngine === "cursor" && !effortOptions.length ? "当前模型不支持 effort" : undefined}
-            >
-              {!effortOptions.length && <option value="">—</option>}
-              {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
-            </select>
-          </label>
-          <label className="composer-permission">
-            {t("currentPermission")}
-            <select value={permissionMode} onChange={(event) => onPermissionModeChange(normalizePermissionMode(event.target.value))}>
-              {permissionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </select>
-          </label>
-          <label className="composer-reply-detail">
-            {t("agentReplyDetail")}
-            <select value={replyDetail} onChange={(event) => onReplyDetailChange(normalizeReplyDetail(event.target.value))}>
-              <option value="concise">{t("replyConcise")}</option>
-              <option value="detailed">{t("replyDetailed")}</option>
-            </select>
-          </label>
-          <span className="send-shortcut">
-            {isMac ? <><kbd>⌘</kbd> + <kbd>Enter</kbd></> : <><kbd>Ctrl</kbd> + <kbd>Enter</kbd></>}
-            {" "}{t("sendShortcut")}
-          </span>
-        </small>
-        {(running || pendingPrompt) && (
-          <button type="button" className="stop" onClick={stopTurn} disabled={online !== true}>
-            {t("stop")}
-          </button>
-        )}
-        {canResend && !running && !pendingPrompt && (
-          <button type="button" className="resend" onClick={resendLastPrompt} disabled={online !== true}>
-            {t("resend")}
-          </button>
-        )}
-        <button className="send" disabled={online !== true || !prompt.trim()}>{t("send")}</button>
-      </div>
-    </form>
+    {tab === "chat" ? (
+      <ChatMessageStream
+        messages={task.messages}
+        replyDetail={replyDetail}
+        taskEngine={taskEngine}
+        processLabel={t("replyProcess")}
+        pendingPrompt={pendingPrompt}
+        showPendingBubble={showPendingBubble}
+        running={running}
+        processingLabel={t("processing")}
+        processingHint={t("processingHint")}
+        showFailureBanner={showFailureBanner}
+        failureTitle={locale === "en" ? "Task failed" : "任务执行失败"}
+        failureBody={lastSystemError || (locale === "en"
+          ? `Status: ${task.status}. Open desktop handoff for CLI details if this is empty.`
+          : `状态：${task.status}。若此处无详情，请在电脑端客户端「任务 → 接力」查看 CLI 输出。`)}
+        canResend={canResend}
+        resendTitle={locale === "en" ? "Last turn failed or stopped" : "上次发送失败或已停止"}
+        resendHint={locale === "en" ? "Resend the last user message to the host." : "可将上一条用户消息重新下发到主机。"}
+        resendLabel={t("resend")}
+        onResend={resendLastPrompt}
+        commandQueue={commandQueue}
+        queueLabel={t("queue")}
+        cancelQueueLabel={t("cancelQueue")}
+        cancelQueueAllLabel={t("cancelQueueAll")}
+        online={online}
+        onCancelQueuedItem={cancelQueuedItem}
+        onCancelAllQueued={cancelAllQueued}
+        approvals={task.approvals}
+        actionRequiredLabel={t("actionRequired")}
+        declineLabel={t("decline")}
+        allowOnceLabel={t("allowOnce")}
+        onCommand={onCommand}
+        stickToBottomRef={stickToBottomRef}
+        messageStreamRef={messageStreamRef}
+        messageEndRef={messageEndRef}
+      />
+    ) : (
+      <DiffView diff={task.diff} />
+    )}
+    <ConversationComposer
+      threadId={task.threadId}
+      online={online}
+      running={running}
+      pendingPrompt={pendingPrompt}
+      draftClearNonce={draftClearNonce}
+      model={model}
+      modelOptions={modelOptions}
+      modelMeta={modelMeta}
+      taskEngine={taskEngine}
+      reasoningEffort={reasoningEffort}
+      effortOptions={effortOptions}
+      fastMode={fastMode}
+      permissionMode={permissionMode}
+      permissionOptions={permissionOptions}
+      replyDetail={replyDetail}
+      canResend={canResend}
+      isMac={isMac}
+      sendLabel={t("send")}
+      stopLabel={t("stop")}
+      resendLabel={t("resend")}
+      currentPermissionLabel={t("currentPermission")}
+      agentReplyDetailLabel={t("agentReplyDetail")}
+      replyConciseLabel={t("replyConcise")}
+      replyDetailedLabel={t("replyDetailed")}
+      sendShortcutLabel={t("sendShortcut")}
+      onModelChange={handleModelChange}
+      onReasoningEffortChange={handleReasoningEffortChange}
+      onFastModeChange={handleFastModeChange}
+      onPermissionModeChange={onPermissionModeChange}
+      onReplyDetailChange={onReplyDetailChange}
+      onSubmitPrompt={submitPromptText}
+      onStop={stopTurn}
+      onResend={resendLastPrompt}
+    />
   </>;
 }
 
