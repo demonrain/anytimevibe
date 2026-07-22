@@ -549,13 +549,78 @@ function sanitizeDisplayText(text: string): string {
   return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u2028\u2029]/g, "");
 }
 
+/**
+ * Local / host filesystem paths must not become <a href> on the web UI.
+ * Markdown often emits [text](H:/git/foo.md); browsers then treat `H:` as a URL scheme or
+ * resolve a bare `/git/...` against the site origin (e.g. https://vibe.demonrain.top/).
+ */
+function isLocalFilesystemHref(href: string | undefined | null): boolean {
+  const raw = String(href ?? "").trim();
+  if (!raw) return false;
+  // Windows drive: H:/path, H:\path, file:///H:/path
+  if (/^file:\/\//i.test(raw)) return true;
+  if (/^[A-Za-z]:[\\/]/.test(raw)) return true;
+  // UNC: \\server\share or //server/share
+  if (/^\\\\[^\\]/.test(raw) || /^\/\/[^/]/.test(raw)) return true;
+  // Single-letter "scheme" from drive letter (mdast may keep H:/foo as href)
+  if (/^[A-Za-z]:(\/|\\|$)/.test(raw)) return true;
+  // Absolute POSIX home/project paths that models link as markdown
+  if (/^\/(Users|home|var|tmp|opt|usr|etc|mnt|Volumes)\//i.test(raw)) return true;
+  return false;
+}
+
+function isSafeWebHref(href: string | undefined | null): boolean {
+  const raw = String(href ?? "").trim();
+  if (!raw || isLocalFilesystemHref(raw)) return false;
+  if (raw.startsWith("#")) return true;
+  if (raw.startsWith("mailto:") || raw.startsWith("tel:")) return true;
+  try {
+    // Absolute http(s) only — reject relative paths that would hit our SPA origin.
+    const parsed = new URL(raw);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function childrenToPlainText(children: ReactNode): string {
+  if (children == null || typeof children === "boolean") return "";
+  if (typeof children === "string" || typeof children === "number") return String(children);
+  if (Array.isArray(children)) return children.map(childrenToPlainText).join("");
+  return "";
+}
+
 /** Stable markdown config — recreating these every render forces ReactMarkdown to re-walk the tree. */
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- react-markdown Components typing is overly strict with exactOptionalPropertyTypes
 const MARKDOWN_COMPONENTS: any = {
-  a: ({ href, children }: { href?: string; children?: ReactNode }) => (
-    <a href={href} target="_blank" rel="noreferrer noopener">{children}</a>
-  ),
+  a: ({ href, children }: { href?: string; children?: ReactNode }) => {
+    const rawHref = String(href ?? "").trim();
+    const label = childrenToPlainText(children).trim();
+    // Local path as href, or link text that is clearly a filesystem path with a bad/relative href.
+    if (
+      isLocalFilesystemHref(rawHref)
+      || isLocalFilesystemHref(label)
+      || (!isSafeWebHref(rawHref) && /^[A-Za-z]:[\\/]/.test(label))
+    ) {
+      const display = label || rawHref;
+      const title = rawHref && rawHref !== display ? `${display}\n${rawHref}` : display;
+      return (
+        <code className="md-local-path" title={title || undefined}>
+          {children ?? rawHref}
+        </code>
+      );
+    }
+    if (!isSafeWebHref(rawHref)) {
+      // Relative markdown links (./x, /x) would open on vibe.demonrain.top — show as text.
+      return <span className="md-link-plain" title={rawHref || undefined}>{children}</span>;
+    }
+    return (
+      <a href={rawHref} target="_blank" rel="noreferrer noopener">
+        {children}
+      </a>
+    );
+  },
   pre: ({ children }: { children?: ReactNode }) => <div className="md-pre">{children}</div>,
   code: ({ className, children, ...props }: { className?: string; children?: ReactNode }) => {
     const inline = !className;

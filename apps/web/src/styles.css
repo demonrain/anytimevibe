@@ -751,6 +751,23 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   border-radius: 0 8px 8px 0;
 }
 .message-markdown a { color: var(--moss); font-weight: 700; text-decoration: underline; text-underline-offset: 2px; }
+/* Host filesystem paths (H:/…, /Users/…) — not navigable on the web origin. */
+.message-markdown .md-local-path {
+  font-family: "Cascadia Code", Consolas, "Segoe UI Mono", monospace;
+  font-size: .92em;
+  font-weight: 650;
+  color: var(--ink);
+  background: rgba(23, 33, 27, .06);
+  border: 1px solid rgba(23, 33, 27, .08);
+  border-radius: 5px;
+  padding: .05em .35em;
+  word-break: break-all;
+}
+.message-markdown .md-link-plain {
+  color: inherit;
+  font-weight: inherit;
+  text-decoration: none;
+}
 .message-markdown table {
   border-collapse: collapse;
   width: 100%;
