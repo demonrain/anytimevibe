@@ -319,6 +319,174 @@ async function importGrokSessions(store: TaskStore, limit: number): Promise<numb
   return added;
 }
 
+/**
+ * Claude Code stores projects as ~/.claude/projects/<encoded-path>/ where path
+ * separators become `-` and `C:\` becomes `C--`. That encoding is LOSSY when a
+ * real directory name already contains hyphens (py-cdp-bridge → py\cdp\bridge).
+ * Never use naive global replace alone — resolve against the filesystem / .claude.json.
+ */
+function naiveDecodeClaudeProjectDir(name: string): string {
+  if (/^[A-Za-z]--/.test(name)) {
+    return name.replace(/^([A-Za-z])--/, "$1:\\").replace(/-/g, "\\");
+  }
+  if (name.startsWith("-")) {
+    return name.replace(/-/g, "/");
+  }
+  return "";
+}
+
+/** Same rules Claude uses to name the projects/ folder (for reverse lookup). */
+function encodeClaudeProjectPath(absPath: string): string {
+  const resolved = path.resolve(absPath);
+  if (/^[A-Za-z]:[\\/]/.test(resolved)) {
+    return resolved
+      .replace(/^([A-Za-z]):[\\/]?/, "$1--")
+      .replace(/[\\/]+/g, "-");
+  }
+  // POSIX absolute: /Users/foo → -Users-foo
+  if (resolved.startsWith("/")) {
+    return resolved.replace(/\//g, "-");
+  }
+  return resolved.replace(/[\\/]+/g, "-");
+}
+
+async function pathIsDirectory(target: string): Promise<boolean> {
+  try {
+    return (await fs.stat(target)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Walk the real filesystem to reverse Claude's lossy encoding.
+ * Prefer longer directory names so `py-cdp-bridge` wins over `py` + `cdp` + `bridge`.
+ */
+async function matchClaudeEncodedRemainder(current: string, remainder: string): Promise<string | null> {
+  if (!remainder) {
+    return (await pathIsDirectory(current)) ? path.resolve(current) : null;
+  }
+  if (!(await pathIsDirectory(current))) return null;
+  let entries: string[] = [];
+  try {
+    entries = await fs.readdir(current);
+  } catch {
+    return null;
+  }
+  entries.sort((left, right) => right.length - left.length);
+  for (const name of entries) {
+    if (name.startsWith(".")) continue;
+    if (name === remainder) {
+      const full = path.join(current, name);
+      if (await pathIsDirectory(full)) return path.resolve(full);
+      continue;
+    }
+    if (remainder.startsWith(`${name}-`)) {
+      const nested = await matchClaudeEncodedRemainder(
+        path.join(current, name),
+        remainder.slice(name.length + 1)
+      );
+      if (nested) return nested;
+    }
+  }
+  return null;
+}
+
+/** Load absolute project paths known to Claude (~/.claude.json → projects). */
+async function loadClaudeJsonProjectPaths(): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const candidates = [
+    path.join(os.homedir(), ".claude.json"),
+    path.join(os.homedir(), ".claude", ".claude.json")
+  ];
+  for (const file of candidates) {
+    try {
+      const raw = JSON.parse(await fs.readFile(file, "utf8")) as {
+        projects?: Record<string, unknown>;
+      };
+      const projects = raw.projects;
+      if (!projects || typeof projects !== "object") continue;
+      for (const key of Object.keys(projects)) {
+        const abs = path.resolve(key);
+        out.set(encodeClaudeProjectPath(abs), abs);
+        // Also index basename-encoded form in case keys use mixed separators.
+        out.set(encodeClaudeProjectPath(key), abs);
+      }
+    } catch {
+      // optional
+    }
+  }
+  return out;
+}
+
+async function resolveClaudeProjectCwd(
+  encodedName: string,
+  claudeJsonPaths: Map<string, string>
+): Promise<string> {
+  const fromJson = claudeJsonPaths.get(encodedName);
+  if (fromJson && await pathIsDirectory(fromJson)) return path.resolve(fromJson);
+
+  // Filesystem-aware reverse of the lossy encoding (handles hyphens in folder names).
+  if (/^[A-Za-z]--/.test(encodedName)) {
+    const match = encodedName.match(/^([A-Za-z])--(.*)$/);
+    if (match) {
+      const root = `${match[1]!.toUpperCase()}:\\`;
+      const found = await matchClaudeEncodedRemainder(root, match[2] || "");
+      if (found) return found;
+    }
+  } else if (encodedName.startsWith("-")) {
+    const found = await matchClaudeEncodedRemainder(path.sep, encodedName.slice(1));
+    if (found) return found;
+  }
+
+  // Last resort: lossy decode (may be wrong when names contain `-`).
+  const naive = naiveDecodeClaudeProjectDir(encodedName);
+  if (naive && await pathIsDirectory(naive)) return path.resolve(naive);
+  return naive;
+}
+
+/** Prefer a path that still exists on disk; never let a broken import wipe a good existing cwd. */
+async function pickBestTaskCwd(...candidates: Array<string | undefined | null>): Promise<string> {
+  const resolved = candidates
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .map((item) => {
+      try {
+        return path.resolve(item);
+      } catch {
+        return item;
+      }
+    });
+  for (const candidate of resolved) {
+    if (await pathIsDirectory(candidate)) return candidate;
+  }
+  return resolved[0] || "";
+}
+
+/** Claude jsonl often embeds the real cwd; prefer it over lossy folder-name decode. */
+function extractCwdFromClaudeJsonl(raw: string): string {
+  // Scan a limited prefix — cwd appears early in most transcripts.
+  const head = raw.slice(0, 256_000);
+  for (const line of head.split(/\r?\n/)) {
+    if (!line.includes("cwd")) continue;
+    try {
+      const row = JSON.parse(line) as {
+        cwd?: string;
+        cwd_path?: string;
+        workdir?: string;
+        message?: { cwd?: string };
+      };
+      const value = String(row.cwd || row.cwd_path || row.workdir || row.message?.cwd || "").trim();
+      if (value && (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith("/"))) {
+        return value;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return "";
+}
+
 async function importClaudeSessions(store: TaskStore, limit: number): Promise<number> {
   // Claude Code stores project sessions under ~/.claude/projects/<encoded-path>/
   const root = path.join(os.homedir(), ".claude", "projects");
@@ -328,7 +496,8 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
   } catch {
     return 0;
   }
-  type Hit = { id: string; file: string; mtime: number; cwd: string };
+  const claudeJsonPaths = await loadClaudeJsonProjectPaths();
+  type Hit = { id: string; file: string; mtime: number; encodedProject: string; cwd: string };
   const hits: Hit[] = [];
   for (const project of projectDirs) {
     let files: string[] = [];
@@ -337,26 +506,21 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
     } catch {
       continue;
     }
-    let cwd = "";
-    try {
-      const base = path.basename(project);
-      // Common form: C--Users-... → C:\Users\...
-      if (/^[A-Za-z]--/.test(base)) {
-        cwd = base.replace(/^([A-Za-z])--/, "$1:\\").replace(/-/g, "\\");
-      } else if (base.startsWith("-")) {
-        // Unix: -Users-foo-bar → /Users/foo/bar
-        cwd = base.replace(/-/g, "/");
-      }
-    } catch {
-      cwd = "";
-    }
+    const base = path.basename(project);
+    const cwd = await resolveClaudeProjectCwd(base, claudeJsonPaths);
     for (const file of files) {
       if (!file.endsWith(".jsonl")) continue;
       const id = file.replace(/\.jsonl$/i, "");
       if (!/^[0-9a-f-]{16,}$/i.test(id)) continue;
       try {
         const st = await fs.stat(path.join(project, file));
-        hits.push({ id, file: path.join(project, file), mtime: st.mtimeMs / 1000, cwd });
+        hits.push({
+          id,
+          file: path.join(project, file),
+          mtime: st.mtimeMs / 1000,
+          encodedProject: base,
+          cwd
+        });
       } catch {
         // ignore
       }
@@ -367,8 +531,10 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
   for (const hit of hits.slice(0, limit)) {
     const existing = resolveExistingForProviderSession(store, hit.id, "claude");
     const messages: HistoryMessage[] = [];
+    let jsonlCwd = "";
     try {
       const raw = await fs.readFile(hit.file, "utf8");
+      jsonlCwd = extractCwdFromClaudeJsonl(raw);
       for (const line of raw.split(/\r?\n/)) {
         if (!line.trim()) continue;
         try {
@@ -401,13 +567,15 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
       : (existing?.messages || messages);
     // Keep AnytimeVibe threadId (UUID) when this native session was already bound to a web task.
     const threadId = existing?.threadId || hit.id;
+    // Order: transcript cwd → filesystem-resolved project dir → existing store.
+    // Prefer sources that still exist on disk (see pickBestTaskCwd). Do not let a
+    // prior lossy decode (py-cdp-bridge → py\cdp\bridge) stick forever.
+    const cwd = await pickBestTaskCwd(jsonlCwd, hit.cwd, existing?.cwd);
     const task: StoredTask = {
       threadId,
       engine: "claude",
       providerSessionId: hit.id,
-      cwd: (hit.cwd || existing?.cwd)
-        ? path.resolve(hit.cwd || existing?.cwd || "")
-        : (existing?.cwd || ""),
+      cwd,
       title: existing?.title || titleFromUser || `Claude ${hit.id.slice(0, 8)}`,
       status: mergeImportStatus(existing),
       createdAt: existing?.createdAt ?? hit.mtime,
