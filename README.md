@@ -138,7 +138,7 @@ flowchart LR
 
 ## 快速开始
 
-环境要求：Node.js 22+、pnpm 10+、Git；运行服务端还需要 Docker Engine 和 Docker Compose。执行远程任务至少需要在 Agent 主机上安装并登录 Codex CLI `0.144.x`、Claude Code CLI、Grok Build CLI 或 Cursor Agent CLI（`agent` / `cursor-agent`，可用 `agent login` 登录）中的一种。
+环境要求：Node.js 22+、pnpm 10+、Git；运行服务端还需要 Docker Engine 和 Docker Compose。执行远程任务至少需要在 Agent 主机上安装并登录 Codex CLI `0.144.x` / `0.145.x`、Claude Code CLI、Grok Build CLI 或 Cursor Agent CLI（`agent` / `cursor-agent`，可用 `agent login` 登录）中的一种。
 
 ```bash
 git clone https://github.com/demonrain/anytimevibe.git

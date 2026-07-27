@@ -42,7 +42,10 @@ import {
 } from "@anytimevibe/protocol";
 import {
   CodexAdapter,
+  CODEX_COMPAT_LABEL,
+  CODEX_INSTALL_PACKAGE,
   extractCodexTurnError,
+  isCodexCompatibleVersion,
   isTerminalTurnStatus,
   normalizeUnixSeconds,
   threadResumeParams,
@@ -1826,7 +1829,7 @@ async function detectEnvironment(): Promise<EnvironmentState> {
     ...(nodeOutput ? { nodeVersion: nodeOutput } : {}),
     codexInstalled: Boolean(detectedVersion),
     ...(detectedVersion ? { codexVersion: detectedVersion } : {}),
-    codexCompatible: Boolean(detectedVersion && /^0\.144\./.test(detectedVersion))
+    codexCompatible: isCodexCompatibleVersion(detectedVersion)
   };
 }
 
@@ -1839,8 +1842,8 @@ async function findCodex(): Promise<void> {
   if (!environment.codexCompatible) {
     throw new Error(
       environment.codexVersion
-        ? `Codex CLI 版本不兼容（需要 0.144.x，当前 ${environment.codexVersion}）。Claude / Grok 任务不受影响。`
-        : "Codex CLI 版本不兼容（需要 0.144.x）。Claude / Grok 任务不受影响。"
+        ? `Codex CLI 版本不兼容（需要 ${CODEX_COMPAT_LABEL}，当前 ${environment.codexVersion}）。Claude / Grok 任务不受影响。`
+        : `Codex CLI 版本不兼容（需要 ${CODEX_COMPAT_LABEL}）。Claude / Grok 任务不受影响。`
     );
   }
 }
@@ -1951,8 +1954,8 @@ async function installCodexOnWindows(): Promise<void> {
     throw new Error("未找到 npm。请确认 Node.js 安装时包含 npm，然后重启随码客户端再试。");
   }
 
-  updateState({ detail: `正在安装 @openai/codex@0.144.0…\nnpm: ${npm}` });
-  await runWindowsCommand(npm, ["install", "-g", "@openai/codex@0.144.0"], (log) => {
+  updateState({ detail: `正在安装 ${CODEX_INSTALL_PACKAGE}…\nnpm: ${npm}` });
+  await runWindowsCommand(npm, ["install", "-g", CODEX_INSTALL_PACKAGE], (log) => {
     const tail = log.replace(/\r/g, "").split("\n").filter(Boolean).slice(-4).join(" | ");
     updateState({ detail: `正在安装 Codex CLI… ${tail}` });
   });
@@ -1965,7 +1968,7 @@ async function installCodexOnWindows(): Promise<void> {
   if (!environment.codexCompatible) {
     throw new Error(
       environment.codexInstalled
-        ? `已安装但版本不兼容（当前 ${environment.codexVersion}，需要 0.144.x）。`
+        ? `已安装但版本不兼容（当前 ${environment.codexVersion}，需要 ${CODEX_COMPAT_LABEL}）。`
         : "npm 安装已结束，但仍未检测到 codex 命令。请重启客户端后再点「重新检测」。"
     );
   }
@@ -2002,11 +2005,11 @@ async function installCodexOnMac(): Promise<void> {
   if (process.platform !== "darwin") throw new Error("installCodexOnMac is macOS-only");
   updateState({ detail: "正在打开 Terminal 安装 Codex…" });
   await openMacTerminalScript(`
-echo "Installing Codex CLI 0.144.0…"
+echo "Installing Codex CLI ${CODEX_INSTALL_PACKAGE}…"
 if ! command -v npm >/dev/null 2>&1; then
   echo "未找到 npm，请先安装 Node.js。"
 else
-  npm install -g @openai/codex@0.144.0
+  npm install -g ${CODEX_INSTALL_PACKAGE}
   if command -v codex >/dev/null 2>&1; then
     codex --version
     echo "安装成功，开始登录…"
@@ -2667,7 +2670,7 @@ async function connect(force = false): Promise<void> {
       }
       // Codex is optional; failures must not mark the host offline or block the UI.
       // Skip ensureCodex entirely when Codex is absent so Claude/Grok-only hosts stay clean.
-      const codexOk = Boolean(publicState.environment.codexCompatible || /^0\.144\./.test(codexVersion));
+      const codexOk = Boolean(publicState.environment.codexCompatible || isCodexCompatibleVersion(codexVersion));
       if (!codexOk) {
         logInfo("中继已连接（未安装兼容 Codex，使用 Claude / Grok 即可）");
         updateState({
@@ -2764,13 +2767,13 @@ function scheduleReconnect(detail: string): void {
 async function ensureCodex(): Promise<void> {
   if (codex) return;
   await applyLoginPathToProcess();
-  if (!/^0\.144\./.test(codexVersion)) {
+  if (!isCodexCompatibleVersion(codexVersion)) {
     const environment = await detectEnvironment();
     updateState({ environment });
     if (!environment.codexCompatible) {
       // Codex is optional — callers that need Codex catch this; relay stays connected.
       throw new Error(environment.codexInstalled
-        ? `Codex 版本不兼容（需要 0.144.x，当前 ${environment.codexVersion}）；可用 Claude / Grok`
+        ? `Codex 版本不兼容（需要 ${CODEX_COMPAT_LABEL}，当前 ${environment.codexVersion}）；可用 Claude / Grok`
         : "未检测到 Codex CLI（可选）；可用 Claude / Grok");
     }
   }
@@ -2782,12 +2785,91 @@ async function ensureCodex(): Promise<void> {
     // Ignore exit noise while shutting down for update/quit — UI may already be destroyed.
     if (quitting || installingUpdate) return;
     // Do not tear down the relay socket when Codex exits; keep online for reconnect of Codex only.
+    const oom = /memory allocation|out of memory|oom/i.test(detail);
     updateState({
       status: socket?.readyState === WebSocket.OPEN ? "online" : publicState.status,
-      detail: `Codex 已停止：${detail}（Claude / Grok 任务不受影响）`
+      detail: oom
+        ? `Codex 因内存不足退出：${detail}。长会话请新开任务或重启客户端后再试。`
+        : `Codex 已停止：${detail}（Claude / Grok 任务不受影响）`
     });
+    // app-server crash (often Rust OOM on large threads) never emits turn/completed.
+    // Without clearing busy state, every later turn.start is durable-queued forever and
+    // drainTurnQueue refuses to run because isThreadTurnBusy stays true.
+    void recoverAfterCodexAppServerExit(detail).catch(handleError);
   });
   await codex.start();
+}
+
+/**
+ * Codex app-server died mid-turn (OOM / crash). Mark stuck Codex turns failed, free the
+ * busy flag, and re-attempt any durable follow-up queue for those threads.
+ */
+async function recoverAfterCodexAppServerExit(detail: string): Promise<void> {
+  const stuckThreadIds = new Set<string>();
+  for (const threadId of activeTurnByThread.keys()) {
+    // Headless Claude/Grok/Cursor own their own processes — never clear them here.
+    if (isHeadlessThreadActive(threadId)) continue;
+    const engine = resolveActivityEngine(threadId);
+    if (engine && engine !== "codex") continue;
+    stuckThreadIds.add(threadId);
+  }
+  for (const threadId of turnStartingByThread) {
+    if (isHeadlessThreadActive(threadId)) continue;
+    const engine = resolveActivityEngine(threadId);
+    if (engine && engine !== "codex") continue;
+    stuckThreadIds.add(threadId);
+  }
+  if (!stuckThreadIds.size) return;
+
+  const oom = /memory allocation|out of memory|oom/i.test(detail);
+  const reason = oom
+    ? `Codex 进程内存不足已退出（${detail}）。常见于超长会话历史；请新开任务或在本机关闭占用内存的程序后重试。`
+    : `Codex app-server 异常退出（${detail}）。已解除占用，可重新发送任务。`;
+  logWarn("Codex 退出，清理卡住的 turn 并尝试 drain 队列", [...stuckThreadIds].map((id) => id.slice(0, 8)).join(","));
+
+  for (const threadId of stuckThreadIds) {
+    const turnId = activeTurnByThread.get(threadId) || crypto.randomUUID();
+    activeTurnByThread.delete(threadId);
+    turnStartingByThread.delete(threadId);
+    finishLocalActivity(threadId, "failed");
+    const stored = taskStore.get(threadId);
+    if (stored) {
+      const already = stored.messages.some((m) => m.role === "system" && m.text.includes(reason.slice(0, 40)));
+      if (!already) {
+        stored.messages.push({
+          id: crypto.randomUUID(),
+          role: "system",
+          text: `错误：${reason}`
+        });
+      }
+      stored.status = "failed";
+      stored.updatedAt = Date.now() / 1000;
+      await taskStore.upsert(stored).catch(() => undefined);
+    }
+    await publish({
+      type: "error",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadId,
+      message: reason
+    }, true).catch(() => undefined);
+    await publish({
+      type: "turn.completed",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadId,
+      turnId,
+      status: "failed",
+      errorMessage: reason
+    }, true, "completed").catch(() => undefined);
+    try {
+      await publishThread(threadId, { touch: true });
+    } catch {
+      // thread may be multi-cli only
+      try { await publishStoredTaskSnapshot(threadId); } catch { /* ignore */ }
+    }
+    scheduleDrainTurnQueue(threadId);
+  }
 }
 
 /** Write project trust, then restart app-server if config changed so the new trust is loaded. */

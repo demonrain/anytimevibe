@@ -109,7 +109,7 @@ flowchart LR
 
 | 引擎 | 执行 | 会话 |
 | --- | --- | --- |
-| Codex | `codex app-server --stdio`（建议 0.144.x） | thread/list · resume |
+| Codex | `codex app-server --stdio`（建议 0.144.x / 0.145.x） | thread/list · resume |
 | Claude Code | `claude -p --output-format stream-json` | `~/.claude/projects` · `--resume` |
 | Grok Build | `grok -p --output-format streaming-json` | sessions · `--resume` |
 
@@ -303,7 +303,7 @@ flowchart LR
 
 - 服务端：Docker Compose、PostgreSQL 16、Caddy 2.8。
 - 随码桌面代理：Electron 36，x64 NSIS 安装包，当前未进行代码签名。
-- Codex：仅支持 `codex-cli 0.144.x`。
+- Codex：支持 `codex-cli 0.144.x` / `0.145.x`。
 - 浏览器：优先支持 Android Chrome 和安装到主屏幕的 iOS Safari PWA。
 - iOS Web Push 需要将 PWA 添加到主屏幕后使用。
 

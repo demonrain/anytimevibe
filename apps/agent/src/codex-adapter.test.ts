@@ -1,5 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { codexPermissionParams, normalizeUnixSeconds, threadResumeParams, threadStartParams, threadToSnapshot } from "./codex-adapter";
+import {
+  CODEX_COMPAT_LABEL,
+  CODEX_INSTALL_PACKAGE,
+  codexPermissionParams,
+  isCodexCompatibleVersion,
+  normalizeUnixSeconds,
+  threadResumeParams,
+  threadStartParams,
+  threadToSnapshot
+} from "./codex-adapter";
+
+describe("isCodexCompatibleVersion", () => {
+  it("accepts 0.144.x and 0.145.x", () => {
+    expect(isCodexCompatibleVersion("0.144.0")).toBe(true);
+    expect(isCodexCompatibleVersion("0.144.9")).toBe(true);
+    expect(isCodexCompatibleVersion("0.145.0")).toBe(true);
+    expect(isCodexCompatibleVersion("0.145.1")).toBe(true);
+    expect(isCodexCompatibleVersion("0.143.0")).toBe(false);
+    expect(isCodexCompatibleVersion("0.146.0")).toBe(false);
+    expect(CODEX_INSTALL_PACKAGE).toBe("@openai/codex@0.145.0");
+    expect(CODEX_COMPAT_LABEL).toBe("0.144.x / 0.145.x");
+  });
+});
 
 describe("threadToSnapshot", () => {
   it("maps Codex CLI permission labels to app-server settings", () => {

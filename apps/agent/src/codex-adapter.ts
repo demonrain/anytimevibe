@@ -6,6 +6,16 @@ import type { PermissionMode } from "@anytimevibe/protocol";
 type RpcId = string | number;
 type JsonObject = Record<string, any>;
 
+/** One-click install pin for Agent environment setup. */
+export const CODEX_INSTALL_PACKAGE = "@openai/codex@0.145.0";
+/** Human-readable range shown in UI / error messages. */
+export const CODEX_COMPAT_LABEL = "0.144.x / 0.145.x";
+
+/** True when local `codex --version` is an app-server minor this adapter supports. */
+export function isCodexCompatibleVersion(version: string | undefined | null): boolean {
+  return Boolean(version && /^0\.14[45]\./.test(version.trim()));
+}
+
 /**
  * Map web permission mode to Codex app-server thread/turn params.
  * Labels match Codex CLI: Read Only / Ask for approval / Approve for me / Full Access.

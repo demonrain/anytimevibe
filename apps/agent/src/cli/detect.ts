@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { CliEngine, CliEngineInfo } from "@anytimevibe/protocol";
+import { CODEX_COMPAT_LABEL } from "../codex-adapter";
 import {
   windowsCmdArguments,
   windowsExecutableRank,
@@ -304,7 +305,7 @@ export async function detectAvailableEngines(options: {
       engine: "codex",
       ready: options.codexReady,
       ...(options.codexVersion !== "unknown" ? { version: options.codexVersion } : {}),
-      ...(!options.codexReady ? { detail: "Codex CLI 未就绪（需要 0.144.x）" } : {})
+      ...(!options.codexReady ? { detail: `Codex CLI 未就绪（需要 ${CODEX_COMPAT_LABEL}）` } : {})
     },
     {
       engine: "claude",

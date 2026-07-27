@@ -138,7 +138,7 @@ flowchart LR
 
 ## Quick Start
 
-Requirements: Node.js 22+, pnpm 10+, and Git. Docker Engine and Docker Compose are required for the production stack. The Agent host needs at least one authenticated engine: Codex CLI `0.144.x`, Claude Code CLI, Grok Build CLI, or Cursor Agent CLI (`agent` / `cursor-agent`, sign in with `agent login`).
+Requirements: Node.js 22+, pnpm 10+, and Git. Docker Engine and Docker Compose are required for the production stack. The Agent host needs at least one authenticated engine: Codex CLI `0.144.x` / `0.145.x`, Claude Code CLI, Grok Build CLI, or Cursor Agent CLI (`agent` / `cursor-agent`, sign in with `agent login`).
 
 ```bash
 git clone https://github.com/demonrain/anytimevibe.git

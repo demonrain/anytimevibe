@@ -35,10 +35,10 @@ MAX_USERS=100
 
 Agent 启动后会检测 Node.js、Codex CLI 和兼容版本。若 Node.js 缺失，“安装 Node.js”会打开官方下载页；若 Codex 缺失或版本不兼容，“一键安装兼容版 Codex”会打开系统终端并执行安装与登录命令。安装完成后点击“重新检测”。
 
-当前适配器要求 `codex-cli 0.144.x`。环境安装会使用：
+当前适配器要求 `codex-cli 0.144.x` 或 `0.145.x`。环境安装会使用：
 
 ```bash
-npm install -g @openai/codex@0.144
+npm install -g @openai/codex@0.145.0
 codex login
 ```
 
@@ -89,7 +89,7 @@ pnpm --filter @anytimevibe/agent package:mac
 
 - 手册版本：`v0.3`
 - 适用产品：随码（AnytimeVibe）MVP
-- 适用 Codex：`codex-cli 0.144.x`
+- 适用 Codex：`codex-cli 0.144.x` / `0.145.x`
 
 ## 1. 使用前准备
 
@@ -103,7 +103,7 @@ pnpm --filter @anytimevibe/agent package:mac
 
 - 已有一个可以通过 HTTPS 访问的随码服务地址。
 - Windows 电脑已安装并登录 Codex CLI。
-- `codex --version` 输出为 `0.144.x`。
+- `codex --version` 输出为 `0.144.x` 或 `0.145.x`。
 - Windows 电脑能够主动访问随码服务地址。
 - Windows 用户会保持登录；锁屏可以，注销或关机会使代理离线。
 
@@ -216,7 +216,7 @@ apps/agent/release/AnytimeVibe-Agent-Setup.exe
 2. 确认或修改中继服务器地址（默认 `https://vibe.demonrain.top`）。
 3. 可选：设置「客户端名称」并保存，便于在 Web 端识别。
 4. 同一行中可点击「生成配对码」或「保存」。
-5. 确认面板显示 Codex 版本为 `0.144.x`。
+5. 确认面板显示 Codex 版本为 `0.144.x` 或 `0.145.x`。
 6. 点击「生成配对码」并记下六位配对码。
 
 配对码约十分钟后失效。失效后重新生成即可。
@@ -436,7 +436,7 @@ Diff 只用于查看。应用、撤销、暂存或提交代码仍应回到电脑
 - 只在受信任设备登录 PWA。
 - 不要将宽泛目录加入工作区白名单。
 - 定期更新 VPS、Docker 镜像和 Windows 系统。
-- 在升级 Codex CLI 前确认新版本是否仍为 `0.144.x`，否则代理会拒绝启动远程任务。
+- 在升级 Codex CLI 前确认新版本是否仍为 `0.144.x` / `0.145.x`，否则代理会拒绝启动远程任务。
 - 不要关闭 HTTPS 或把 relay 的 8787 端口直接公开到公网。
 - 不要在中继日志中主动添加请求正文或解密内容。
 
@@ -449,7 +449,7 @@ Diff 只用于查看。应用、撤销、暂存或提交代码仍应回到电脑
 | 初始化提示 `invalid_setup_token` | 设置令牌不一致 | 对照 VPS `.env` 中的 `SETUP_TOKEN` |
 | 页面提示 `invalid_origin` | 实际访问域名与 `PUBLIC_ORIGIN` 不一致 | 修正环境变量并重启 relay |
 | 配对码不存在 | 配对码错误或已过期 | 在 Windows 代理重新生成 |
-| 代理显示 `incompatible` | Codex CLI 版本不是 `0.144.x` | 安装受支持版本或等待适配器升级 |
+| 代理显示 `incompatible` | Codex CLI 版本不是 `0.144.x` / `0.145.x` | 安装受支持版本或等待适配器升级 |
 | 没有可选工作区 | 代理端尚未添加目录 | 在 Windows 代理点击“添加目录” |
 | 创建任务提示主机离线 | WSS 未连接或代理退出 | 打开托盘代理并点击“重新连接” |
 | 浏览器提示没有解密密钥 | 当前浏览器未完成该主机配对或站点数据被清除 | 重新配对并让主机重新同步 |

@@ -25,7 +25,7 @@
 | pnpm 10+ | `packageManager` 已锁定 |
 | 本地 Postgres | **推荐无需 Docker**：`pnpm dev:pg`（embedded）或本机安装 PostgreSQL 16 |
 | Docker Desktop | 可选；若一直卡在 Starting the Docker Engine，可不用 |
-| Codex CLI 0.144.x | Agent 执行任务需要 |
+| Codex CLI 0.144.x / 0.145.x | Agent 执行任务需要 |
 
 > **不要用「管理员身份」终端跑 embedded Postgres**（PostgreSQL 禁止以 Administrator 启动）。用普通 Windows Terminal / PowerShell 即可。
 
