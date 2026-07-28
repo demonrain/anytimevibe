@@ -39,6 +39,11 @@ export type HeadlessRunOptions = {
   preferredSessionId?: string;
   model?: string;
   reasoningEffort?: ReasoningEffort;
+  /**
+   * Internal: Cursor stall retry without --resume already attempted.
+   * Skips a second turn.started so the web does not duplicate the user bubble.
+   */
+  cursorResumeRetried?: boolean;
 };
 
 export type HeadlessRunResult = {

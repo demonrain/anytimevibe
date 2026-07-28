@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/protocol";
 import { collectLocalProxyEnv, mergeProxyIntoEnv } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
-import { resolveEngineBinary } from "./detect";
+import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
 import { formatCursorModelArg } from "./model-catalog";
 import type { BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
 import { ensureWorkspaceTrusted } from "./workspace-trust";
@@ -17,9 +17,16 @@ type ActiveRun = {
 
 const activeByThread = new Map<string, ActiveRun>();
 
+/** Default headless timeout (Claude rate-limit retries can take a while). */
+const HEADLESS_TIMEOUT_MS = Number(process.env.ANYTIMEVIBE_HEADLESS_TIMEOUT_MS || 8 * 60_000);
+/** If Cursor emits stream-json `result` but the process never exits (MCP child hang), force-finish. */
+const CURSOR_RESULT_EXIT_GRACE_MS = Number(process.env.ANYTIMEVIBE_CURSOR_RESULT_GRACE_MS || 1_500);
+/** No stdout at all for this long → treat as stalled (common with bad --resume / reconnect loops). */
+const CURSOR_STALL_MS = Number(process.env.ANYTIMEVIBE_CURSOR_STALL_MS || 120_000);
+
 /**
  * Kill the CLI process tree. On Windows headless spawns go through cmd.exe — bare
- * child.kill() only ends the shell and leaves claude/grok running.
+ * child.kill() only ends the shell and leaves claude/grok/cursor running.
  */
 function killChildTree(child: ChildProcess): void {
   const pid = child.pid;
@@ -54,9 +61,6 @@ function killChildTree(child: ChildProcess): void {
   try { child.kill(); } catch { /* ignore */ }
 }
 
-/** Default headless timeout (Claude rate-limit retries can take a while). */
-const HEADLESS_TIMEOUT_MS = Number(process.env.ANYTIMEVIBE_HEADLESS_TIMEOUT_MS || 8 * 60_000);
-
 function permissionArgs(engine: CliEngine, mode: PermissionMode): string[] {
   if (engine === "claude") {
     // Headless must never stop on trust/permission prompts (workspace trust is pre-marked separately).
@@ -71,15 +75,16 @@ function permissionArgs(engine: CliEngine, mode: PermissionMode): string[] {
   }
   if (engine === "cursor") {
     // Cursor Agent CLI (https://cursor.com/docs/cli/reference/parameters):
-    // --mode ask|plan, --force/--yolo, --trust (headless workspace), --sandbox
+    // --mode ask|plan, --force/--yolo, --trust (headless workspace), --sandbox, --approve-mcps
+    const common = ["--trust", "--approve-mcps"];
     if (mode === "read-only") {
-      return ["--mode", "ask", "--trust"];
+      return ["--mode", "ask", ...common];
     }
     if (mode === "full-access" || mode === "approve-for-me") {
-      return ["--force", "--trust", "--sandbox", "disabled"];
+      return ["--force", ...common, "--sandbox", "disabled"];
     }
     // accept edits / ask-for-approval: write with force so remote turns are non-interactive
-    return ["--force", "--trust"];
+    return ["--force", ...common];
   }
   // grok: always-approve so headless never blocks on TTY
   if (mode === "read-only") {
@@ -131,8 +136,8 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
     return args;
   }
   if (engine === "cursor") {
-    // Cursor Agent CLI only — never Grok flags (--cwd, streaming-json, --always-approve).
-    // Docs: agent -p --force --output-format stream-json --stream-partial-output --workspace
+    // Cursor: `-p/--print` is a boolean flag; prompt is a positional arg (not `-p <prompt>` like Claude).
+    // Docs: agent -p --force --output-format stream-json --stream-partial-output --workspace …
     // https://cursor.com/docs/cli/headless
     const hints = parseCursorModelHints(options.model);
     const modelArg = options.model?.includes("[")
@@ -142,7 +147,7 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
           ...(hints.fast !== undefined ? { fast: hints.fast } : {})
         });
     args.push(
-      "-p", options.prompt,
+      "--print",
       "--output-format", "stream-json",
       "--stream-partial-output",
       "--workspace", options.cwd
@@ -150,6 +155,8 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
     if (modelArg) args.push("--model", modelArg);
     if (options.providerSessionId) args.push("--resume", options.providerSessionId);
     args.push(...permissionArgs(engine, options.permissionMode));
+    // Positional prompt last so option parsers never swallow it.
+    args.push(options.prompt);
     return args;
   }
   // Grok Build CLI (distinct binary: grok, not agent)
@@ -228,6 +235,9 @@ type ParseState = {
   sawAssistant: boolean;
   sawThoughtStage: boolean;
   lastProgressAt: number;
+  /** Cursor emitted a terminal `result` event — process may still hang on MCP teardown. */
+  gotResult: boolean;
+  lineCount: number;
   contextUsage?: ContextUsage;
   model?: string;
 };
@@ -345,6 +355,8 @@ function handleCursorLine(
   state: ParseState,
   onEvent: (event: BackendStreamEvent) => void
 ): void {
+  state.lineCount += 1;
+  state.lastProgressAt = Date.now();
   let parsed: any;
   try {
     parsed = JSON.parse(line);
@@ -362,6 +374,20 @@ function handleCursorLine(
       const model = state.model ? `（模型 ${state.model}）` : "";
       emitDelta(onEvent, options, "stage:init", "stage", `\n▶ Cursor 会话初始化${model}\n`);
     }
+    return;
+  }
+
+  if (type === "thinking") {
+    if (!state.sawThoughtStage) {
+      state.sawThoughtStage = true;
+      emitDelta(onEvent, options, "stage:thinking", "stage", "\n… Cursor 思考中\n");
+    } else if (String(parsed.subtype || "") === "completed") {
+      emitDelta(onEvent, options, "stage:thinking", "stage", "\n✓ 思考完成\n");
+    }
+    return;
+  }
+
+  if (type === "user") {
     return;
   }
 
@@ -400,6 +426,12 @@ function handleCursorLine(
         : `已读取 ${call.readToolCall.args.path}`;
     } else if (call.function?.name) {
       label = `调用 ${call.function.name}`;
+    } else {
+      // MCP / generic tool shapes
+      const mcpName = call.mcpToolCall?.args?.name
+        || call.mcp?.name
+        || Object.keys(call).find((key) => key.endsWith("ToolCall"));
+      if (mcpName) label = `调用 ${mcpName}`;
     }
     emitDelta(
       onEvent,
@@ -412,6 +444,7 @@ function handleCursorLine(
   }
 
   if (type === "result") {
+    state.gotResult = true;
     if (parsed.session_id) state.sessionId = String(parsed.session_id);
     if (parsed.is_error) {
       state.failed = true;
@@ -425,6 +458,14 @@ function handleCursorLine(
       state.sawAssistant = true;
       emitDelta(onEvent, options, "assistant", "assistant", parsed.result);
     }
+    const duration = Number(parsed.duration_ms || 0);
+    emitDelta(
+      onEvent,
+      options,
+      "stage:result",
+      "stage",
+      duration > 0 ? `\n✓ Cursor 完成（${Math.round(duration / 1000)}s）\n` : "\n✓ Cursor 完成\n"
+    );
   }
 }
 
@@ -519,7 +560,15 @@ export async function runHeadlessTurn(
     });
   };
 
-  const command = await resolveEngineBinary(engine);
+  let command = await resolveEngineBinary(engine);
+  let cursorPrefixArgs: string[] = [];
+  if (engine === "cursor") {
+    const target = await resolveCursorSpawnTarget();
+    if (target) {
+      command = target.command;
+      cursorPrefixArgs = target.prefixArgs;
+    }
+  }
   if (!command) {
     const message = engine === "claude"
       ? "未找到 Claude Code CLI，请安装并确保 claude 在 PATH 中"
@@ -540,10 +589,11 @@ export async function runHeadlessTurn(
     // ignore
   }
 
-  const args = buildArgs(engine, options);
+  const args = [...cursorPrefixArgs, ...buildArgs(engine, options)];
   // On Windows, npm global CLIs are often `claude.cmd` / extensionless shims.
   // CreateProcess cannot spawn those directly → ENOENT; always go through cmd.exe.
-  const useCmdShim = windowsNeedsCmdShim(command);
+  // Cursor prefers node.exe+index.js (prefixArgs set) so the shim is usually skipped.
+  const useCmdShim = cursorPrefixArgs.length === 0 && windowsNeedsCmdShim(command);
   const executable = useCmdShim ? (process.env.ComSpec ?? "cmd.exe") : command;
   const finalArgs = useCmdShim ? windowsCmdArguments(command, args) : args;
 
@@ -559,7 +609,9 @@ export async function runHeadlessTurn(
     proxy
   );
 
-  safeOnEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
+  if (!options.cursorResumeRetried) {
+    safeOnEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
+  }
   const engineLabel = engine === "claude"
     ? "Claude Code"
     : engine === "cursor"
@@ -600,16 +652,21 @@ export async function runHeadlessTurn(
     errorMessage: "",
     sawAssistant: false,
     sawThoughtStage: false,
-    lastProgressAt: Date.now()
+    lastProgressAt: Date.now(),
+    gotResult: false,
+    lineCount: 0
   };
 
   const result = await new Promise<HeadlessRunResult>((resolve) => {
     let settled = false;
+    let resultGraceTimer: ReturnType<typeof setTimeout> | null = null;
     const finish = (status: HeadlessRunResult["status"]) => {
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
       if (heartbeat) clearInterval(heartbeat);
+      if (stallWatch) clearInterval(stallWatch);
+      if (resultGraceTimer) clearTimeout(resultGraceTimer);
       activeByThread.delete(options.threadId);
       resolve({
         providerSessionId: state.sessionId || options.providerSessionId || options.threadId,
@@ -629,9 +686,10 @@ export async function runHeadlessTurn(
       finish("failed");
     }, HEADLESS_TIMEOUT_MS);
 
-    // Periodic "still working" stage so the web never looks frozen with zero events.
+    // Periodic "still working" only when we have been idle (no stream progress).
     const heartbeat = setInterval(() => {
       if (settled) return;
+      if (Date.now() - state.lastProgressAt < 18_000) return;
       emitDelta(
         safeOnEvent,
         options,
@@ -641,6 +699,26 @@ export async function runHeadlessTurn(
       );
     }, 20_000);
 
+    // Cursor: known hang after `result` when MCP stdio children never close — force-finish.
+    // Also detect zero-output stalls (bad --resume / reconnect loops).
+    const stallWatch = engine === "cursor"
+      ? setInterval(() => {
+          if (settled) return;
+          const idleMs = Date.now() - state.lastProgressAt;
+          if (state.gotResult) return;
+          if (state.lineCount === 0 && idleMs >= CURSOR_STALL_MS) {
+            state.failed = true;
+            state.errorMessage = options.providerSessionId
+              ? `Cursor 超过 ${Math.round(CURSOR_STALL_MS / 1000)}s 无输出（可能是损坏的 --resume 会话）。将尝试不带 resume 重跑。`
+              : `Cursor 超过 ${Math.round(CURSOR_STALL_MS / 1000)}s 无输出，已终止。请检查登录（agent login）或网络。`;
+            safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+            emitDelta(safeOnEvent, options, "stage:stall", "stage", `\n✗ ${state.errorMessage}\n`);
+            killChildTree(child);
+            finish("failed");
+          }
+        }, 5_000)
+      : null;
+
     if (child.stdout) {
       createInterface({ input: child.stdout }).on("line", (line) => {
         if (engine === "claude") handleClaudeLine(line, options, state, safeOnEvent);
@@ -649,10 +727,26 @@ export async function runHeadlessTurn(
         if (state.sessionId && state.sessionId !== options.providerSessionId) {
           safeOnEvent({ type: "session", threadId: options.threadId, providerSessionId: state.sessionId });
         }
+        // After Cursor `result`, do not wait for process exit (MCP teardown hang).
+        if (engine === "cursor" && state.gotResult && !resultGraceTimer && !settled) {
+          resultGraceTimer = setTimeout(() => {
+            if (settled) return;
+            emitDelta(
+              safeOnEvent,
+              options,
+              "stage:force-exit",
+              "stage",
+              "\n… Cursor 已返回结果，正在结束进程（避免 MCP 残留挂起）\n"
+            );
+            killChildTree(child);
+            finish(state.failed ? "failed" : "completed");
+          }, CURSOR_RESULT_EXIT_GRACE_MS);
+        }
       });
     }
     if (child.stderr) {
       createInterface({ input: child.stderr }).on("line", (line) => {
+        state.lastProgressAt = Date.now();
         if (line.trim()) emitDelta(safeOnEvent, options, "cli-log", "cli-log", `${line}\n`);
       });
     }
@@ -669,6 +763,11 @@ export async function runHeadlessTurn(
     child.on("exit", (code, signal) => {
       // Windows taskkill often reports null signal + non-zero code — honor interrupt flag.
       if (runMeta.interrupted || signal === "SIGTERM" || signal === "SIGINT" || signal === "SIGKILL") {
+        // If we already got a Cursor result and force-killed, treat as completed.
+        if (engine === "cursor" && state.gotResult && !state.failed) {
+          finish("completed");
+          return;
+        }
         emitDelta(safeOnEvent, options, "stage:interrupt", "stage", "\n■ 已停止远程任务\n");
         finish("interrupted");
         return;
@@ -680,6 +779,11 @@ export async function runHeadlessTurn(
           safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
         }
         finish("failed");
+        return;
+      }
+      // Cursor already finalized via result event.
+      if (engine === "cursor" && state.gotResult) {
+        finish("completed");
         return;
       }
       // Some CLIs (notably Grok) exit non-zero even after a full successful reply.
@@ -711,6 +815,27 @@ export async function runHeadlessTurn(
       finish("completed");
     });
   });
+
+  // Cursor: one automatic retry without --resume when the first attempt stalled with no output.
+  if (
+    engine === "cursor"
+    && result.status === "failed"
+    && options.providerSessionId
+    && !options.cursorResumeRetried
+    && /不带 resume|损坏的 --resume|无输出/i.test(result.text || "")
+  ) {
+    emitDelta(
+      safeOnEvent,
+      options,
+      "stage:retry",
+      "stage",
+      "\n… 正在不带 --resume 重试 Cursor 任务\n"
+    );
+    const { providerSessionId: _ignored, ...rest } = options;
+    const retry = await runHeadlessTurn(engine, { ...rest, cursorResumeRetried: true }, onEvent);
+    await eventChain;
+    return retry;
+  }
 
   safeOnEvent({
     type: "turn.completed",

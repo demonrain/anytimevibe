@@ -406,3 +406,62 @@ export function resolveEngineCommand(engine: Exclude<CliEngine, "codex">): strin
   }
   return process.env.GROK_COMMAND || (process.platform === "win32" ? "grok.exe" : "grok");
 }
+
+export type CursorSpawnTarget = {
+  /** Executable to spawn (node.exe / node / cursor-agent). */
+  command: string;
+  /** Args before CLI flags (e.g. path to index.js when using node). */
+  prefixArgs: string[];
+};
+
+/**
+ * Prefer spawning Cursor via `node index.js` instead of cmd→powershell→node.
+ * The nested Windows launcher often leaves MCP child handles open so `-p` never exits.
+ */
+export async function resolveCursorSpawnTarget(): Promise<CursorSpawnTarget | null> {
+  const binary = await resolveEngineBinary("cursor");
+  if (!binary) return null;
+
+  const tryVersionDir = async (versionDir: string): Promise<CursorSpawnTarget | null> => {
+    const nodeName = process.platform === "win32" ? "node.exe" : "node";
+    const nodePath = path.join(versionDir, nodeName);
+    const indexPath = path.join(versionDir, "index.js");
+    if ((await pathExists(nodePath)) && (await pathExists(indexPath))) {
+      return { command: nodePath, prefixArgs: [indexPath] };
+    }
+    return null;
+  };
+
+  const normalized = binary.replace(/\\/g, "/");
+  const dir = path.dirname(binary);
+
+  // .../versions/<ver>/cursor-agent(.cmd) → use that version dir
+  if (/\/versions\/[^/]+$/i.test(dir.replace(/\\/g, "/")) || /[/\\]versions[/\\][^/\\]+$/i.test(dir)) {
+    const hit = await tryVersionDir(dir);
+    if (hit) return hit;
+  }
+
+  // .../cursor-agent/cursor-agent.cmd → pick newest versions/*
+  const versionsRoot = path.join(dir, "versions");
+  try {
+    const entries = await fs.readdir(versionsRoot, { withFileTypes: true });
+    const versionDirs = entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .filter((name) => /^\d{4}\.\d{1,2}\.\d{1,2}/.test(name))
+      .sort((a, b) => b.localeCompare(a));
+    for (const name of versionDirs) {
+      const hit = await tryVersionDir(path.join(versionsRoot, name));
+      if (hit) return hit;
+    }
+  } catch {
+    // ignore
+  }
+
+  // Already a direct node binary? Unlikely but keep shim path.
+  if (/node(\.exe)?$/i.test(normalized) || /index\.js$/i.test(normalized)) {
+    return { command: binary, prefixArgs: [] };
+  }
+
+  return { command: binary, prefixArgs: [] };
+}
