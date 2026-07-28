@@ -431,10 +431,10 @@ export function AdminApp() {
                   </td>
                   <td>
                     <div className="admin-engine-versions">
-                      <div><span>Codex</span><code>{formatEngineVersion(host.codexVersion)}</code></div>
-                      <div><span>Claude</span><code>{formatEngineVersion(host.claudeVersion)}</code></div>
-                      <div><span>Grok</span><code>{formatEngineVersion(host.grokVersion)}</code></div>
-                      <div><span>Cursor</span><code>{formatEngineVersion(host.cursorVersion)}</code></div>
+                      <div><span>Codex</span><code title={String(host.codexVersion || "")}>{formatEngineVersion(host.codexVersion)}</code></div>
+                      <div><span>Claude</span><code title={String(host.claudeVersion || "")}>{formatEngineVersion(host.claudeVersion)}</code></div>
+                      <div><span>Grok</span><code title={String(host.grokVersion || "")}>{formatEngineVersion(host.grokVersion)}</code></div>
+                      <div><span>Cursor</span><code title={String(host.cursorVersion || "")}>{formatEngineVersion(host.cursorVersion)}</code></div>
                     </div>
                   </td>
                   <td>{host.eventCount ?? 0}</td>

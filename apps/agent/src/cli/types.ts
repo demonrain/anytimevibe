@@ -2,13 +2,41 @@ import type { CliEngine, ContextUsage, PermissionMode, ReasoningEffort } from "@
 
 export type StreamDeltaKind = "assistant" | "stage" | "exec" | "cli-log" | "thought";
 
+export type ApprovalQuestion = {
+  id: string;
+  prompt: string;
+  options: Array<{ id: string; label: string }>;
+  allowMultiple?: boolean;
+};
+
+export type ApprovalPlan = {
+  name?: string;
+  overview?: string;
+  plan: string;
+  todos?: Array<{ id: string; content: string; status?: string }>;
+};
+
 export type BackendStreamEvent =
   | { type: "delta"; threadId: string; turnId: string; itemId: string; kind: StreamDeltaKind; delta: string }
   | { type: "turn.started"; threadId: string; turnId: string; prompt?: string }
   | { type: "turn.completed"; threadId: string; turnId: string; status: string; contextUsage?: ContextUsage }
   | { type: "session"; threadId: string; providerSessionId: string }
   | { type: "error"; threadId?: string; message: string }
-  | { type: "usage"; threadId: string; contextUsage: ContextUsage };
+  | { type: "usage"; threadId: string; contextUsage: ContextUsage }
+  | {
+      type: "approval.requested";
+      threadId: string;
+      turnId: string;
+      requestId: string;
+      itemId: string;
+      approvalType: "plan" | "question" | "command" | "file" | "permission" | "input";
+      title: string;
+      detail: string;
+      availableDecisions: Array<"accept" | "decline" | "cancel">;
+      plan?: ApprovalPlan;
+      questions?: ApprovalQuestion[];
+      permissionMode?: PermissionMode;
+    };
 
 export type StoredTask = {
   threadId: string;

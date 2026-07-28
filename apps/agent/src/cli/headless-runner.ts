@@ -5,7 +5,7 @@ import { collectLocalProxyEnv, mergeProxyIntoEnv } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
 import { formatCursorModelArg } from "./model-catalog";
-import type { BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
+import type { ApprovalPlan, ApprovalQuestion, BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
 import { ensureWorkspaceTrusted } from "./workspace-trust";
 
 type ActiveRun = {
@@ -240,7 +240,103 @@ type ParseState = {
   lineCount: number;
   contextUsage?: ContextUsage;
   model?: string;
+  /** Cursor interactive tool call ids already surfaced as approval.requested. */
+  emittedApprovalIds?: Set<string>;
+  /** Pause/kill headless Cursor so Web can answer createPlan / askQuestion. */
+  pauseForApproval?: boolean;
 };
+
+function asRecord(value: unknown): Record<string, any> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, any>
+    : null;
+}
+
+function normalizeApprovalQuestions(raw: unknown): ApprovalQuestion[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ApprovalQuestion[] = [];
+  for (const item of raw) {
+    const row = asRecord(item);
+    if (!row) continue;
+    const id = String(row.id || "").trim();
+    const prompt = String(row.prompt || row.question || row.text || "").trim();
+    const optionsRaw = Array.isArray(row.options) ? row.options : [];
+    const options: Array<{ id: string; label: string }> = [];
+    for (const opt of optionsRaw) {
+      const o = asRecord(opt);
+      if (!o) continue;
+      const oid = String(o.id || o.value || "").trim();
+      const label = String(o.label || o.text || o.title || oid).trim();
+      if (!oid || !label) continue;
+      options.push({ id: oid, label });
+    }
+    if (!id || !prompt || !options.length) continue;
+    out.push({
+      id,
+      prompt,
+      options,
+      ...(row.allowMultiple === true ? { allowMultiple: true } : {})
+    });
+  }
+  return out;
+}
+
+function normalizeApprovalPlan(raw: unknown): ApprovalPlan | null {
+  const row = asRecord(raw);
+  if (!row) return null;
+  const planText = String(row.plan || row.content || row.markdown || "").trim();
+  if (!planText) return null;
+  const todos = Array.isArray(row.todos)
+    ? row.todos
+      .map((todo) => {
+        const t = asRecord(todo);
+        if (!t) return null;
+        const id = String(t.id || "").trim();
+        const content = String(t.content || t.text || "").trim();
+        if (!id || !content) return null;
+        return {
+          id,
+          content,
+          ...(t.status != null ? { status: String(t.status) } : {})
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    : undefined;
+  return {
+    plan: planText,
+    ...(row.name != null && String(row.name).trim() ? { name: String(row.name).trim() } : {}),
+    ...(row.overview != null && String(row.overview).trim() ? { overview: String(row.overview).trim() } : {}),
+    ...(todos?.length ? { todos } : {})
+  };
+}
+
+function emitCursorInteractiveApproval(
+  options: HeadlessRunOptions,
+  state: ParseState,
+  onEvent: (event: BackendStreamEvent) => void,
+  callId: string,
+  kind: "plan" | "question",
+  payload: { plan?: ApprovalPlan; questions?: ApprovalQuestion[]; title: string; detail: string }
+): void {
+  if (!state.emittedApprovalIds) state.emittedApprovalIds = new Set();
+  if (state.emittedApprovalIds.has(callId)) return;
+  state.emittedApprovalIds.add(callId);
+  state.pauseForApproval = true;
+  onEvent({
+    type: "approval.requested",
+    threadId: options.threadId,
+    turnId: options.turnId,
+    requestId: `cursor:${options.threadId}:${callId}`,
+    itemId: callId,
+    approvalType: kind,
+    title: payload.title,
+    detail: payload.detail,
+    availableDecisions: ["accept", "decline", "cancel"],
+    permissionMode: options.permissionMode,
+    ...(payload.plan ? { plan: payload.plan } : {}),
+    ...(payload.questions?.length ? { questions: payload.questions } : {})
+  });
+}
 
 function handleClaudeLine(
   line: string,
@@ -415,6 +511,65 @@ function handleCursorLine(
   if (type === "tool_call") {
     const subtype = String(parsed.subtype || "");
     const call = parsed.tool_call || {};
+    const callId = String(parsed.call_id || "").trim() || crypto.randomUUID();
+
+    const planNode = asRecord(call.createPlanToolCall) || asRecord(call.create_plan);
+    const askNode = asRecord(call.askQuestionToolCall) || asRecord(call.ask_question);
+    if (planNode) {
+      const args = asRecord(planNode.args) || asRecord(planNode.result) || planNode;
+      const plan = normalizeApprovalPlan(args) || normalizeApprovalPlan(asRecord(args?.success) || args);
+      if (plan && (subtype === "started" || subtype === "completed")) {
+        const title = plan.name
+          ? `批准 Cursor 计划：${plan.name}`
+          : "批准 Cursor 执行计划？";
+        const detailParts = [
+          plan.overview || "",
+          plan.plan,
+          ...(plan.todos || []).map((todo) => `- [${todo.status || "pending"}] ${todo.content}`)
+        ].filter(Boolean);
+        emitCursorInteractiveApproval(options, state, onEvent, callId, "plan", {
+          plan,
+          title,
+          detail: detailParts.join("\n\n").slice(0, 12_000)
+        });
+        emitDelta(
+          onEvent,
+          options,
+          `stage:tool:${callId}`,
+          "stage",
+          subtype === "started" ? `\n▶ 生成计划（等待 Web 确认）\n` : `\n✓ 计划已就绪（等待 Web 确认）\n`
+        );
+        return;
+      }
+    }
+    if (askNode) {
+      const args = asRecord(askNode.args) || asRecord(askNode.result) || askNode;
+      let questions = normalizeApprovalQuestions(args.questions);
+      if (!questions.length) {
+        questions = normalizeApprovalQuestions(asRecord(args.success)?.questions);
+      }
+      if (questions.length && (subtype === "started" || subtype === "completed")) {
+        const title = String(args.title || "Cursor 需要你选择选项").trim() || "Cursor 需要你选择选项";
+        const detail = questions
+          .map((q) => `${q.prompt}\n${q.options.map((o) => `  - ${o.label}`).join("\n")}`)
+          .join("\n\n")
+          .slice(0, 12_000);
+        emitCursorInteractiveApproval(options, state, onEvent, callId, "question", {
+          questions,
+          title,
+          detail
+        });
+        emitDelta(
+          onEvent,
+          options,
+          `stage:tool:${callId}`,
+          "stage",
+          subtype === "started" ? `\n▶ 提问选项（等待 Web 选择）\n` : `\n✓ 选项已就绪（等待 Web 选择）\n`
+        );
+        return;
+      }
+    }
+
     let label = "工具调用";
     if (call.writeToolCall?.args?.path) {
       label = subtype === "started"
@@ -727,6 +882,20 @@ export async function runHeadlessTurn(
         if (state.sessionId && state.sessionId !== options.providerSessionId) {
           safeOnEvent({ type: "session", threadId: options.threadId, providerSessionId: state.sessionId });
         }
+        // Interactive plan/question: stop headless process so Web can choose, then --resume follow-up.
+        if (engine === "cursor" && state.pauseForApproval && !settled && !runMeta.interrupted) {
+          runMeta.interrupted = true;
+          emitDelta(
+            safeOnEvent,
+            options,
+            "stage:approval-wait",
+            "stage",
+            "\n… 等待网页确认计划/选项后继续\n"
+          );
+          killChildTree(child);
+          finish("interrupted");
+          return;
+        }
         // After Cursor `result`, do not wait for process exit (MCP teardown hang).
         if (engine === "cursor" && state.gotResult && !resultGraceTimer && !settled) {
           resultGraceTimer = setTimeout(() => {
@@ -764,11 +933,15 @@ export async function runHeadlessTurn(
       // Windows taskkill often reports null signal + non-zero code — honor interrupt flag.
       if (runMeta.interrupted || signal === "SIGTERM" || signal === "SIGINT" || signal === "SIGKILL") {
         // If we already got a Cursor result and force-killed, treat as completed.
-        if (engine === "cursor" && state.gotResult && !state.failed) {
+        if (engine === "cursor" && state.gotResult && !state.failed && !state.pauseForApproval) {
           finish("completed");
           return;
         }
-        emitDelta(safeOnEvent, options, "stage:interrupt", "stage", "\n■ 已停止远程任务\n");
+        if (state.pauseForApproval) {
+          emitDelta(safeOnEvent, options, "stage:approval-wait", "stage", "\n… 已暂停，等待网页确认\n");
+        } else {
+          emitDelta(safeOnEvent, options, "stage:interrupt", "stage", "\n■ 已停止远程任务\n");
+        }
         finish("interrupted");
         return;
       }

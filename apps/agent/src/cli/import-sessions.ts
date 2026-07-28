@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { resolveEngineBinary } from "./detect";
+import { canProbePathWithoutPrompt, isMacTccProtectedPath } from "./macos-fs";
 import type { TaskStore } from "./task-store";
 import type { StoredTask } from "./types";
 
@@ -30,9 +31,16 @@ function mergeImportStatus(existing: StoredTask | undefined): string {
 function resolveExistingForProviderSession(
   store: TaskStore,
   providerSessionId: string,
-  engine: "claude" | "grok"
+  engine: "claude" | "grok" | "cursor"
 ): StoredTask | undefined {
   return store.findByProviderSession(providerSessionId, engine) || store.get(providerSessionId);
+}
+
+function msToUnixSeconds(ms: number | undefined | null): number {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return Date.now() / 1000;
+  // Cursor meta uses epoch ms; guard against accidental seconds.
+  return n > 1e12 ? n / 1000 : n;
 }
 
 async function removeOrphanNativeDuplicate(
@@ -350,7 +358,8 @@ function encodeClaudeProjectPath(absPath: string): string {
   return resolved.replace(/[\\/]+/g, "-");
 }
 
-async function pathIsDirectory(target: string): Promise<boolean> {
+async function pathIsDirectory(target: string, allowedRoots: string[] = []): Promise<boolean> {
+  if (!canProbePathWithoutPrompt(target, allowedRoots)) return false;
   try {
     return (await fs.stat(target)).isDirectory();
   } catch {
@@ -362,11 +371,18 @@ async function pathIsDirectory(target: string): Promise<boolean> {
  * Walk the real filesystem to reverse Claude's lossy encoding.
  * Prefer longer directory names so `py-cdp-bridge` wins over `py` + `cdp` + `bridge`.
  */
-async function matchClaudeEncodedRemainder(current: string, remainder: string): Promise<string | null> {
+async function matchClaudeEncodedRemainder(
+  current: string,
+  remainder: string,
+  allowedRoots: string[] = []
+): Promise<string | null> {
+  // macOS: never reverse-walk the real filesystem — it touches Documents/Desktop and
+  // triggers repeated TCC “wants to access …” dialogs.
+  if (process.platform === "darwin") return null;
   if (!remainder) {
-    return (await pathIsDirectory(current)) ? path.resolve(current) : null;
+    return (await pathIsDirectory(current, allowedRoots)) ? path.resolve(current) : null;
   }
-  if (!(await pathIsDirectory(current))) return null;
+  if (!(await pathIsDirectory(current, allowedRoots))) return null;
   let entries: string[] = [];
   try {
     entries = await fs.readdir(current);
@@ -378,13 +394,14 @@ async function matchClaudeEncodedRemainder(current: string, remainder: string): 
     if (name.startsWith(".")) continue;
     if (name === remainder) {
       const full = path.join(current, name);
-      if (await pathIsDirectory(full)) return path.resolve(full);
+      if (await pathIsDirectory(full, allowedRoots)) return path.resolve(full);
       continue;
     }
     if (remainder.startsWith(`${name}-`)) {
       const nested = await matchClaudeEncodedRemainder(
         path.join(current, name),
-        remainder.slice(name.length + 1)
+        remainder.slice(name.length + 1),
+        allowedRoots
       );
       if (nested) return nested;
     }
@@ -421,32 +438,47 @@ async function loadClaudeJsonProjectPaths(): Promise<Map<string, string>> {
 
 async function resolveClaudeProjectCwd(
   encodedName: string,
-  claudeJsonPaths: Map<string, string>
+  claudeJsonPaths: Map<string, string>,
+  allowedRoots: string[] = []
 ): Promise<string> {
   const fromJson = claudeJsonPaths.get(encodedName);
-  if (fromJson && await pathIsDirectory(fromJson)) return path.resolve(fromJson);
+  if (fromJson) {
+    // Prefer Claude's own path table without probing TCC-protected folders.
+    if (await pathIsDirectory(fromJson, allowedRoots)) return path.resolve(fromJson);
+    if (process.platform === "darwin" && isMacTccProtectedPath(fromJson)) {
+      return path.resolve(fromJson);
+    }
+    if (process.platform !== "darwin") return path.resolve(fromJson);
+  }
 
   // Filesystem-aware reverse of the lossy encoding (handles hyphens in folder names).
+  // Skipped on macOS inside matchClaudeEncodedRemainder.
   if (/^[A-Za-z]--/.test(encodedName)) {
     const match = encodedName.match(/^([A-Za-z])--(.*)$/);
     if (match) {
       const root = `${match[1]!.toUpperCase()}:\\`;
-      const found = await matchClaudeEncodedRemainder(root, match[2] || "");
+      const found = await matchClaudeEncodedRemainder(root, match[2] || "", allowedRoots);
       if (found) return found;
     }
   } else if (encodedName.startsWith("-")) {
-    const found = await matchClaudeEncodedRemainder(path.sep, encodedName.slice(1));
+    const found = await matchClaudeEncodedRemainder(path.sep, encodedName.slice(1), allowedRoots);
     if (found) return found;
   }
 
   // Last resort: lossy decode (may be wrong when names contain `-`).
   const naive = naiveDecodeClaudeProjectDir(encodedName);
-  if (naive && await pathIsDirectory(naive)) return path.resolve(naive);
+  if (!naive) return "";
+  if (await pathIsDirectory(naive, allowedRoots)) return path.resolve(naive);
+  // Keep the decoded path string for display/resume even when we must not probe it.
+  if (process.platform === "darwin") return path.resolve(naive);
   return naive;
 }
 
 /** Prefer a path that still exists on disk; never let a broken import wipe a good existing cwd. */
-async function pickBestTaskCwd(...candidates: Array<string | undefined | null>): Promise<string> {
+async function pickBestTaskCwd(
+  allowedRoots: string[],
+  ...candidates: Array<string | undefined | null>
+): Promise<string> {
   const resolved = candidates
     .map((item) => String(item || "").trim())
     .filter(Boolean)
@@ -458,8 +490,9 @@ async function pickBestTaskCwd(...candidates: Array<string | undefined | null>):
       }
     });
   for (const candidate of resolved) {
-    if (await pathIsDirectory(candidate)) return candidate;
+    if (await pathIsDirectory(candidate, allowedRoots)) return candidate;
   }
+  // On macOS do not fs.stat TCC paths — return first candidate as metadata only.
   return resolved[0] || "";
 }
 
@@ -487,7 +520,11 @@ function extractCwdFromClaudeJsonl(raw: string): string {
   return "";
 }
 
-async function importClaudeSessions(store: TaskStore, limit: number): Promise<number> {
+async function importClaudeSessions(
+  store: TaskStore,
+  limit: number,
+  allowedRoots: string[] = []
+): Promise<number> {
   // Claude Code stores project sessions under ~/.claude/projects/<encoded-path>/
   const root = path.join(os.homedir(), ".claude", "projects");
   let projectDirs: string[] = [];
@@ -507,7 +544,7 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
       continue;
     }
     const base = path.basename(project);
-    const cwd = await resolveClaudeProjectCwd(base, claudeJsonPaths);
+    const cwd = await resolveClaudeProjectCwd(base, claudeJsonPaths, allowedRoots);
     for (const file of files) {
       if (!file.endsWith(".jsonl")) continue;
       const id = file.replace(/\.jsonl$/i, "");
@@ -570,7 +607,7 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
     // Order: transcript cwd → filesystem-resolved project dir → existing store.
     // Prefer sources that still exist on disk (see pickBestTaskCwd). Do not let a
     // prior lossy decode (py-cdp-bridge → py\cdp\bridge) stick forever.
-    const cwd = await pickBestTaskCwd(jsonlCwd, hit.cwd, existing?.cwd);
+    const cwd = await pickBestTaskCwd(allowedRoots, jsonlCwd, hit.cwd, existing?.cwd);
     const task: StoredTask = {
       threadId,
       engine: "claude",
@@ -593,14 +630,14 @@ async function importClaudeSessions(store: TaskStore, limit: number): Promise<nu
 }
 
 /**
- * Collapse Claude/Grok duplicates: same engine + provider session should be one task.
+ * Collapse Claude/Grok/Cursor duplicates: same engine + provider session should be one task.
  * Prefer the AnytimeVibe UUID record; keep failed/interrupted over a stale "completed" clone.
  */
 export async function dedupeMultiCliTasks(store: TaskStore): Promise<number> {
   const groups = new Map<string, StoredTask[]>();
   // list(1000) is enough for agent index size; import only keeps a recent window anyway.
   for (const task of store.list(1000)) {
-    if (task.engine !== "claude" && task.engine !== "grok") continue;
+    if (task.engine !== "claude" && task.engine !== "grok" && task.engine !== "cursor") continue;
     const native = (task.providerSessionId || task.threadId || "").trim();
     if (!native) continue;
     const key = `${task.engine}:${native}`;
@@ -639,16 +676,220 @@ export async function dedupeMultiCliTasks(store: TaskStore): Promise<number> {
   return removed;
 }
 
-/** Import local Claude/Grok CLI sessions into the agent task index for web sync. */
-export async function importLocalCliSessions(store: TaskStore, limit = 10): Promise<{ grok: number; claude: number }> {
-  const [grok, claude] = await Promise.all([
+/**
+ * Cursor Agent stores chats under ~/.cursor/chats/<workspaceHash>/<sessionId>/.
+ * Each session has meta.json (cwd / timestamps) and store.db (sqlite blobs).
+ * Conversation DAG blobs are protobuf; plaintext JSON role messages are still importable.
+ */
+async function readCursorSessionMessages(dbPath: string): Promise<{
+  messages: HistoryMessage[];
+  agentName?: string;
+}> {
+  const py = process.platform === "win32" ? "python" : "python3";
+  const script = [
+    "import sqlite3,json,sys,binascii",
+    `con=sqlite3.connect(${JSON.stringify(dbPath)})`,
+    "cur=con.cursor()",
+    "agent_name=''",
+    "try:",
+    "  mv=cur.execute(\"select value from meta where key='0'\").fetchone()",
+    "  if mv:",
+    "    s=mv[0].decode('utf-8') if isinstance(mv[0],(bytes,bytearray)) else str(mv[0])",
+    "    if all(c in '0123456789abcdefABCDEF' for c in s.strip()):",
+    "      meta=json.loads(binascii.unhexlify(s.strip()).decode('utf-8'))",
+    "    else:",
+    "      meta=json.loads(s)",
+    "    agent_name=str(meta.get('name') or '')",
+    "except Exception:",
+    "  pass",
+    "msgs=[]",
+    "for rowid,data in cur.execute('select rowid,data from blobs order by rowid'):",
+    "  raw=bytes(data) if not isinstance(data,str) else data.encode('utf-8','replace')",
+    "  if b'\\x00' in raw[:8]:",
+    "    continue",
+    "  try:",
+    "    obj=json.loads(raw.decode('utf-8'))",
+    "  except Exception:",
+    "    continue",
+    "  if not isinstance(obj,dict):",
+    "    continue",
+    "  role=obj.get('role')",
+    "  if role not in ('user','assistant'):",
+    "    continue",
+    "  content=obj.get('content')",
+    "  parts=[]",
+    "  if isinstance(content,str):",
+    "    parts.append(content)",
+    "  elif isinstance(content,list):",
+    "    for block in content:",
+    "      if isinstance(block,dict) and block.get('type')=='text' and block.get('text'):",
+    "        parts.append(str(block['text']))",
+    "  text='\\n'.join(parts).strip()",
+    "  if not text:",
+    "    continue",
+    "  msgs.append({'role':role,'text':text[:20000],'rowid':rowid})",
+    "print(json.dumps({'agentName':agent_name,'messages':msgs},ensure_ascii=False))"
+  ].join("\n");
+  try {
+    const { stdout } = await execFileAsync(py, ["-c", script], {
+      timeout: 20_000,
+      windowsHide: true,
+      maxBuffer: 8_000_000
+    });
+    const parsed = JSON.parse(String(stdout || "{}")) as {
+      agentName?: string;
+      messages?: Array<{ role?: string; text?: string }>;
+    };
+    const messages: HistoryMessage[] = [];
+    for (const row of parsed.messages || []) {
+      const role = row.role === "assistant" ? "assistant" : row.role === "user" ? "user" : null;
+      if (!role) continue;
+      const cleaned = cleanImportedMessageText(role, String(row.text || ""));
+      if (!cleaned) continue;
+      messages.push({ id: crypto.randomUUID(), role, text: cleaned });
+    }
+    return {
+      messages,
+      ...(parsed.agentName?.trim() ? { agentName: parsed.agentName.trim() } : {})
+    };
+  } catch {
+    return { messages: [] };
+  }
+}
+
+async function importCursorSessions(store: TaskStore, limit: number): Promise<number> {
+  const root = path.join(os.homedir(), ".cursor", "chats");
+  let workspaceDirs: string[] = [];
+  try {
+    workspaceDirs = (await fs.readdir(root)).map((name) => path.join(root, name));
+  } catch {
+    return 0;
+  }
+
+  type Hit = {
+    id: string;
+    dir: string;
+    mtime: number;
+    cwd: string;
+    createdAt: number;
+    updatedAt: number;
+  };
+  const hits: Hit[] = [];
+
+  for (const workspaceDir of workspaceDirs) {
+    let sessionDirs: string[] = [];
+    try {
+      const st = await fs.stat(workspaceDir);
+      if (!st.isDirectory()) continue;
+      sessionDirs = await fs.readdir(workspaceDir);
+    } catch {
+      continue;
+    }
+    for (const sessionId of sessionDirs) {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) continue;
+      const dir = path.join(workspaceDir, sessionId);
+      let metaRaw = "";
+      try {
+        metaRaw = await fs.readFile(path.join(dir, "meta.json"), "utf8");
+      } catch {
+        // Older sessions may only have store.db
+      }
+      let cwd = "";
+      let createdAt = 0;
+      let updatedAt = 0;
+      try {
+        const meta = JSON.parse(metaRaw || "{}") as {
+          cwd?: string;
+          createdAtMs?: number;
+          updatedAtMs?: number;
+        };
+        cwd = typeof meta.cwd === "string" ? meta.cwd : "";
+        createdAt = msToUnixSeconds(meta.createdAtMs);
+        updatedAt = msToUnixSeconds(meta.updatedAtMs);
+      } catch {
+        // ignore
+      }
+      let mtime = updatedAt || createdAt;
+      if (!mtime) {
+        try {
+          mtime = (await fs.stat(path.join(dir, "store.db"))).mtimeMs / 1000;
+        } catch {
+          try {
+            mtime = (await fs.stat(dir)).mtimeMs / 1000;
+          } catch {
+            mtime = Date.now() / 1000;
+          }
+        }
+      }
+      hits.push({
+        id: sessionId,
+        dir,
+        mtime,
+        cwd,
+        createdAt: createdAt || mtime,
+        updatedAt: updatedAt || mtime
+      });
+    }
+  }
+
+  hits.sort((a, b) => b.mtime - a.mtime);
+  let added = 0;
+  for (const hit of hits.slice(0, limit)) {
+    const existing = resolveExistingForProviderSession(store, hit.id, "cursor");
+    const dbPath = path.join(hit.dir, "store.db");
+    let imported: Awaited<ReturnType<typeof readCursorSessionMessages>> = { messages: [] };
+    try {
+      await fs.access(dbPath);
+      imported = await readCursorSessionMessages(dbPath);
+    } catch {
+      // meta-only entry still lists on web
+    }
+    const messages = imported.messages.length >= (existing?.messages?.length ?? 0)
+      ? imported.messages
+      : (existing?.messages || imported.messages);
+    const titleFromUser = messages.find((m) => m.role === "user")?.text?.slice(0, 80);
+    const agentTitle = imported.agentName && imported.agentName !== "New Agent"
+      ? imported.agentName
+      : undefined;
+    const threadId = existing?.threadId || hit.id;
+    const task: StoredTask = {
+      threadId,
+      engine: "cursor",
+      providerSessionId: hit.id,
+      cwd: (hit.cwd || existing?.cwd)
+        ? path.resolve(hit.cwd || existing?.cwd || "")
+        : (existing?.cwd || ""),
+      title: existing?.title || agentTitle || titleFromUser || `Cursor ${hit.id.slice(0, 8)}`,
+      status: mergeImportStatus(existing),
+      createdAt: existing?.createdAt ?? hit.createdAt,
+      updatedAt: Math.max(existing?.updatedAt ?? 0, hit.updatedAt, hit.mtime),
+      messages: messages.slice(-80),
+      ...(existing?.model ? { model: existing.model } : {}),
+      ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
+      ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})
+    };
+    await store.upsert(task);
+    await removeOrphanNativeDuplicate(store, hit.id, threadId);
+    added += 1;
+  }
+  return added;
+}
+
+/** Import local Claude/Grok/Cursor CLI sessions into the agent task index for web sync. */
+export async function importLocalCliSessions(
+  store: TaskStore,
+  limit = 10,
+  allowedRoots: string[] = []
+): Promise<{ grok: number; claude: number; cursor: number }> {
+  const [grok, claude, cursor] = await Promise.all([
     importGrokSessions(store, limit),
-    importClaudeSessions(store, limit)
+    importClaudeSessions(store, limit, allowedRoots),
+    importCursorSessions(store, limit)
   ]);
   try {
     await dedupeMultiCliTasks(store);
   } catch {
     // ignore
   }
-  return { grok, claude };
+  return { grok, claude, cursor };
 }

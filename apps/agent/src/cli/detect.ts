@@ -240,13 +240,17 @@ export async function resolveCommandPath(command: string): Promise<string | null
 
 function parseClaudeVersion(raw: string | null): string | undefined {
   if (!raw) return undefined;
-  const match = raw.match(/(\d+\.\d+\.\d+)/);
+  // Ignore Cursor-style calendar versions accidentally scraped from the wrong binary.
+  if (/^\d{4}\.\d{2}\.\d{2}/.test(raw.trim())) return undefined;
+  const match = raw.match(/(\d+\.\d+\.\d+(?:[-\w.]*)?)/);
   return match?.[1] ?? raw.slice(0, 80);
 }
 
 function parseGrokVersion(raw: string | null): string | undefined {
   if (!raw) return undefined;
-  const match = raw.match(/grok\s+([^\s]+)/i) || raw.match(/(\d+\.\d+\.\d+)/);
+  if (/cursor\s*agent/i.test(raw) && !/grok/i.test(raw)) return undefined;
+  if (/^\d{4}\.\d{2}\.\d{2}/.test(raw.trim()) && !/grok/i.test(raw)) return undefined;
+  const match = raw.match(/grok\s+([^\s]+)/i) || raw.match(/(\d+\.\d+\.\d+(?:[-\w.]*)?)/);
   return match?.[1] ?? raw.slice(0, 80);
 }
 
@@ -258,6 +262,23 @@ function parseCursorVersion(raw: string | null): string | undefined {
     || raw.match(/(\d+\.\d+\.\d+[-\w]*)/)
     || raw.match(/cursor[^\d]*([0-9][^\s]*)/i);
   return match?.[1] ?? (raw.length < 80 ? raw : raw.slice(0, 80));
+}
+
+/** Reject binaries that clearly belong to another coding engine. */
+function isCrossEngineBinary(engine: "claude" | "grok" | "cursor", command: string): boolean {
+  const n = command.replace(/\\/g, "/").toLowerCase();
+  const base = path.basename(n);
+  if (engine === "claude") {
+    if (n.includes("/.grok/") || n.includes("/.cursor/") || base.includes("cursor-agent")) return true;
+    if (base === "agent" || base === "agent.exe" || base === "grok" || base === "grok.exe") return true;
+  }
+  if (engine === "grok") {
+    if (n.includes("/.cursor/") || base.includes("cursor-agent") || base.includes("claude")) return true;
+  }
+  if (engine === "cursor") {
+    if (n.includes("/.grok/") || base.includes("claude") || base === "grok" || base === "grok.exe") return true;
+  }
+  return false;
 }
 
 /** True when this executable looks like Cursor Agent CLI (not Grok `agent`). */
@@ -290,9 +311,22 @@ export async function detectAvailableEngines(options: {
   codexVersion: string;
 }): Promise<CliEngineInfo[]> {
   clearEngineBinaryCache();
-  const claudePath = await resolveEngineBinary("claude");
-  const grokPath = await resolveEngineBinary("grok");
-  const cursorPath = await resolveEngineBinary("cursor");
+  let claudePath = await resolveEngineBinary("claude");
+  let grokPath = await resolveEngineBinary("grok");
+  let cursorPath = await resolveEngineBinary("cursor");
+  if (claudePath && (isCrossEngineBinary("claude", claudePath) || await looksLikeCursorAgent(claudePath))) {
+    claudePath = null;
+  }
+  if (grokPath && (isCrossEngineBinary("grok", grokPath) || await looksLikeCursorAgent(grokPath))) {
+    grokPath = null;
+  }
+  if (cursorPath && isCrossEngineBinary("cursor", cursorPath)) {
+    cursorPath = null;
+  }
+  if (cursorPath && !(await looksLikeCursorAgent(cursorPath))) {
+    cursorPath = null;
+  }
+
   const claudeRaw = claudePath ? await runVersion(claudePath, ["--version"]) : null;
   const grokRaw = grokPath ? await runVersion(grokPath, ["--version"]) : null;
   const cursorRaw = cursorPath ? await runVersion(cursorPath, ["--version"]) : null;
@@ -310,12 +344,16 @@ export async function detectAvailableEngines(options: {
     {
       engine: "claude",
       ready: Boolean(claudePath && claudeVersion),
-      ...(claudeVersion ? { version: claudeVersion } : { detail: claudePath ? "claude 已找到但无法读取版本" : "未检测到 claude 命令，请安装并登录 Claude Code CLI" })
+      ...(claudeVersion
+        ? { version: claudeVersion }
+        : { detail: claudePath ? "claude 已找到但无法读取版本" : "未检测到 claude 命令，请安装并登录 Claude Code CLI" })
     },
     {
       engine: "grok",
       ready: Boolean(grokPath && grokVersion),
-      ...(grokVersion ? { version: grokVersion } : { detail: grokPath ? "grok 已找到但无法读取版本" : "未检测到 grok 命令，请安装 Grok Build CLI" })
+      ...(grokVersion
+        ? { version: grokVersion }
+        : { detail: grokPath ? "grok 已找到但无法读取版本" : "未检测到 grok 命令，请安装 Grok Build CLI" })
     },
     {
       engine: "cursor",

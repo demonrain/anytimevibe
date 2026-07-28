@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.48";
+export const PRODUCT_VERSION = "0.4.50";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -211,7 +211,12 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
     type: z.literal("approval.resolve"),
     requestId: z.union([z.string(), z.number()]),
-    decision: z.enum(["accept", "decline", "cancel"])
+    decision: z.enum(["accept", "decline", "cancel"]),
+    /** Cursor askQuestion / Codex input: selected option ids per question. */
+    answers: z.array(z.object({
+      questionId: z.string().min(1),
+      selectedOptionIds: z.array(z.string().min(1)).min(1)
+    })).optional()
   }),
   commandBase.extend({
     type: z.literal("sync.request"),
@@ -358,10 +363,31 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     threadId: z.string(),
     turnId: z.string(),
     itemId: z.string(),
-    approvalType: z.enum(["command", "file", "permission", "input"]),
+    approvalType: z.enum(["command", "file", "permission", "input", "plan", "question"]),
     title: z.string(),
     detail: z.string(),
-    availableDecisions: z.array(z.enum(["accept", "decline", "cancel"]))
+    availableDecisions: z.array(z.enum(["accept", "decline", "cancel"])),
+    /** Cursor createPlanToolCall / ACP cursor/create_plan */
+    plan: z.object({
+      name: z.string().optional(),
+      overview: z.string().optional(),
+      plan: z.string(),
+      todos: z.array(z.object({
+        id: z.string(),
+        content: z.string(),
+        status: z.string().optional()
+      })).optional()
+    }).optional(),
+    /** Cursor askQuestionToolCall / ACP cursor/ask_question */
+    questions: z.array(z.object({
+      id: z.string(),
+      prompt: z.string(),
+      options: z.array(z.object({
+        id: z.string(),
+        label: z.string()
+      })).min(1),
+      allowMultiple: z.boolean().optional()
+    })).optional()
   }),
   eventBase.extend({
     type: z.literal("request.resolved"),

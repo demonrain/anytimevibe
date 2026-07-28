@@ -218,7 +218,83 @@ let reconnectAttempt = 0;
 /** Permanent auth failures must not flap reconnect forever. */
 let reconnectBlockedReason: string | null = null;
 const pendingPrompts = new Map<string, string>();
-const pendingRequestTypes = new Map<string, "command" | "file" | "permission" | "input">();
+const pendingRequestTypes = new Map<string, "command" | "file" | "permission" | "input" | "plan" | "question">();
+/** Cursor createPlan / askQuestion awaiting Web resolve (print mode → --resume follow-up). */
+type PendingCursorApproval = {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  approvalType: "plan" | "question";
+  title: string;
+  detail: string;
+  plan?: import("./cli/types").ApprovalPlan;
+  questions?: import("./cli/types").ApprovalQuestion[];
+  permissionMode: PermissionMode;
+};
+const pendingCursorApprovals = new Map<string, PendingCursorApproval>();
+const pendingCursorApprovalsByThread = new Map<string, Set<string>>();
+
+function trackCursorApproval(requestId: string, pending: PendingCursorApproval): void {
+  pendingCursorApprovals.set(requestId, pending);
+  const set = pendingCursorApprovalsByThread.get(pending.threadId) ?? new Set<string>();
+  set.add(requestId);
+  pendingCursorApprovalsByThread.set(pending.threadId, set);
+}
+
+function clearCursorApproval(requestId: string): PendingCursorApproval | undefined {
+  const pending = pendingCursorApprovals.get(requestId);
+  pendingCursorApprovals.delete(requestId);
+  if (pending) {
+    const set = pendingCursorApprovalsByThread.get(pending.threadId);
+    if (set) {
+      set.delete(requestId);
+      if (!set.size) pendingCursorApprovalsByThread.delete(pending.threadId);
+    }
+  }
+  return pending;
+}
+
+function threadHasPendingCursorApproval(threadId: string): boolean {
+  return (pendingCursorApprovalsByThread.get(threadId)?.size ?? 0) > 0;
+}
+
+function buildCursorApprovalFollowUp(
+  pending: PendingCursorApproval,
+  decision: "accept" | "decline" | "cancel",
+  answers?: Array<{ questionId: string; selectedOptionIds: string[] }>
+): string {
+  if (pending.approvalType === "plan") {
+    if (decision !== "accept") {
+      return "用户已拒绝该计划。请停止执行该计划，简要确认已停止，并等待新的指示。";
+    }
+    const parts = [
+      "用户已批准以下计划。请立即按该计划继续执行，不要再次询问确认。",
+      pending.plan?.name ? `计划名称：${pending.plan.name}` : "",
+      pending.plan?.overview ? `概述：${pending.plan.overview}` : "",
+      pending.plan?.plan || pending.detail,
+      pending.plan?.todos?.length
+        ? `待办：\n${pending.plan.todos.map((t) => `- [${t.status || "pending"}] ${t.content}`).join("\n")}`
+        : ""
+    ].filter(Boolean);
+    return parts.join("\n\n");
+  }
+  if (decision !== "accept") {
+    return "用户跳过了选项提问。请根据已有上下文继续，或在必要时再简要确认关键决策。";
+  }
+  const lines: string[] = ["用户已选择以下选项，请据此继续执行任务："];
+  for (const question of pending.questions || []) {
+    const answer = answers?.find((item) => item.questionId === question.id);
+    const labels = (answer?.selectedOptionIds || [])
+      .map((id) => question.options.find((opt) => opt.id === id)?.label || id)
+      .filter(Boolean);
+    lines.push(`- ${question.prompt}`);
+    lines.push(labels.length ? `  选择：${labels.join("、")}` : "  选择：（未选）");
+  }
+  if (lines.length === 1 && pending.detail.trim()) {
+    lines.push(pending.detail.trim());
+  }
+  return lines.join("\n");
+}
 /** threadId -> active turnId for streaming turn.delta to web */
 const activeTurnByThread = new Map<string, string>();
 /** Per-thread local activity buffers (multi-task concurrent remote runs). */
@@ -2995,6 +3071,41 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     await taskStore.setProviderSession(event.threadId, event.providerSessionId);
     return;
   }
+  if (event.type === "approval.requested") {
+    const approvalType = event.approvalType === "plan" || event.approvalType === "question"
+      ? event.approvalType
+      : "input";
+    pendingRequestTypes.set(String(event.requestId), approvalType);
+    if (approvalType === "plan" || approvalType === "question") {
+      trackCursorApproval(String(event.requestId), {
+        threadId: event.threadId,
+        turnId: event.turnId,
+        itemId: event.itemId,
+        approvalType,
+        title: event.title,
+        detail: event.detail,
+        ...(event.plan ? { plan: event.plan } : {}),
+        ...(event.questions ? { questions: event.questions } : {}),
+        permissionMode: event.permissionMode || "ask-for-approval"
+      });
+    }
+    await publish({
+      type: "approval.requested",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      requestId: event.requestId,
+      threadId: event.threadId,
+      turnId: event.turnId,
+      itemId: event.itemId,
+      approvalType: event.approvalType,
+      title: event.title,
+      detail: event.detail,
+      availableDecisions: event.availableDecisions,
+      ...(event.plan ? { plan: event.plan } : {}),
+      ...(event.questions ? { questions: event.questions } : {})
+    }, true, "approval");
+    return;
+  }
   if (event.type === "usage") {
     const task = taskStore.get(event.threadId);
     if (task) {
@@ -3047,10 +3158,13 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
   }
   if (event.type === "turn.completed") {
     await flushRemoteDeltas();
+    // Keep store status "active" while Web still needs to answer Cursor plan/question cards.
+    const waitingApproval = threadHasPendingCursorApproval(event.threadId);
+    const statusForStore = waitingApproval && event.status === "interrupted" ? "active" : event.status;
     activeTurnByThread.delete(event.threadId);
-    finishLocalActivity(event.threadId, event.status);
-    await taskStore.setStatus(event.threadId, event.status);
-    const failed = isTerminalTurnStatus(event.status) && /error|fail/i.test(event.status);
+    finishLocalActivity(event.threadId, statusForStore);
+    await taskStore.setStatus(event.threadId, statusForStore);
+    const failed = isTerminalTurnStatus(statusForStore) && /error|fail/i.test(statusForStore);
     if (event.contextUsage) {
       const task = taskStore.get(event.threadId);
       if (task) {
@@ -3088,7 +3202,7 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
       occurredAt: new Date().toISOString(),
       threadId: event.threadId,
       turnId: event.turnId,
-      status: event.status,
+      status: waitingApproval ? "active" : event.status,
       ...(event.contextUsage ? { contextUsage: event.contextUsage } : {}),
       ...(failedSystemText ? { errorMessage: failedSystemText } : {})
     }, true, "completed");
@@ -3245,7 +3359,12 @@ async function runHeadlessTaskTurn(options: {
   if (result.providerSessionId) latest.providerSessionId = result.providerSessionId;
   if (result.contextUsage) latest.contextUsage = result.contextUsage;
   if (result.model) latest.model = result.model;
-  latest.status = result.status;
+  // Cursor plan/question pause ends as interrupted — keep task active until Web resolves.
+  if (result.status === "interrupted" && threadHasPendingCursorApproval(options.threadId)) {
+    latest.status = "active";
+  } else {
+    latest.status = result.status;
+  }
   latest.updatedAt = Date.now() / 1000;
   if (result.text.trim()) {
     // Never dump long model replies into role=system — false failure banner on web (Grok non-zero exit).
@@ -3291,17 +3410,20 @@ async function runHeadlessTaskTurn(options: {
   await taskStore.upsert(latest);
   await publishStoredTaskSnapshot(options.threadId);
   // Headless turn fully settled — run any follow-ups queued while this turn was active.
-  scheduleDrainTurnQueue(options.threadId);
+  // Skip while Cursor plan/question cards still need a Web decision.
+  if (!threadHasPendingCursorApproval(options.threadId)) {
+    scheduleDrainTurnQueue(options.threadId);
+  }
 }
 
 async function handleCommand(command: ClientCommand): Promise<void> {
-  // host.refresh: status + re-import local Claude/Grok sessions for web list.
+  // host.refresh: status + re-import local Claude/Grok/Cursor sessions for web list.
   if (command.type === "host.refresh") {
     // Always re-push agentVersion first so web update banners clear quickly after client upgrade.
     publishAgentMeta({ agentVersion: PRODUCT_VERSION });
     await publishHostStatus();
     try {
-      await importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT);
+      await importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT, workspaceAllowRoots());
       await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
     } catch {
       // optional
@@ -3596,11 +3718,56 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "approval.resolve") {
+      const requestId = String(command.requestId);
+      const cursorPending = clearCursorApproval(requestId);
+      const requestType = pendingRequestTypes.get(requestId);
+      pendingRequestTypes.delete(requestId);
+      if (cursorPending) {
+        await publish({
+          type: "request.resolved",
+          eventId: crypto.randomUUID(),
+          occurredAt: new Date().toISOString(),
+          requestId: command.requestId,
+          threadId: cursorPending.threadId
+        }, true);
+        try {
+          interruptHeadlessThread(cursorPending.threadId);
+        } catch {
+          // ignore
+        }
+        const followUp = buildCursorApprovalFollowUp(
+          cursorPending,
+          command.decision,
+          command.answers
+        );
+        const stored = taskStore.get(cursorPending.threadId);
+        const cwd = preferTaskCwd(stored?.cwd);
+        if (!cwd) {
+          handleError(new Error("Cursor 审批后续无法执行：任务工作目录缺失"));
+          return;
+        }
+        await runHeadlessTaskTurn({
+          engine: "cursor",
+          threadId: cursorPending.threadId,
+          cwd,
+          prompt: followUp,
+          permissionMode: cursorPending.permissionMode || "ask-for-approval",
+          isNew: false,
+          ...(stored?.model ? { model: stored.model } : {}),
+          ...(stored?.reasoningEffort ? { reasoningEffort: stored.reasoningEffort } : {})
+        });
+        return;
+      }
       await ensureCodex();
-      const requestType = pendingRequestTypes.get(String(command.requestId));
-      pendingRequestTypes.delete(String(command.requestId));
-      if (requestType === "input") codex!.respond(command.requestId, { answers: {} });
-      else if (requestType === "permission") codex!.respondError(command.requestId, "Declined by remote user");
+      if (requestType === "input") {
+        const answers: Record<string, unknown> = {};
+        if (command.answers?.length) {
+          for (const answer of command.answers) {
+            answers[answer.questionId] = answer.selectedOptionIds;
+          }
+        }
+        codex!.respond(command.requestId, { answers });
+      } else if (requestType === "permission") codex!.respondError(command.requestId, "Declined by remote user");
       else codex!.respond(command.requestId, { decision: command.decision });
       return;
     }
@@ -3628,7 +3795,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       let multiCliCount = 0;
       const multiCliPromise = (async () => {
         try {
-          await importLocalCliSessions(taskStore, syncLimit);
+          await importLocalCliSessions(taskStore, syncLimit, workspaceAllowRoots());
           // Drop any re-imported sessions the user already deleted.
           for (const task of taskStore.list(Math.max(syncLimit * 20, 100))) {
             if (
@@ -3887,17 +4054,29 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
 function resolveReportedEngineVersion(engine: CliEngine): string {
   if (engine === "codex") {
     const fromEnv = publicState.environment.codexVersion || codexVersion;
-    if (fromEnv && fromEnv !== "unknown") return fromEnv;
+    if (fromEnv && fromEnv !== "unknown" && fromEnv !== PRODUCT_VERSION) return fromEnv;
     const fromList = publicState.availableEngines.find((item) => item.engine === "codex");
-    if (fromList?.version?.trim()) return fromList.version.trim();
+    if (fromList?.version?.trim() && fromList.version.trim() !== PRODUCT_VERSION) {
+      return fromList.version.trim();
+    }
     return publicState.environment.codexInstalled || publicState.environment.codexCompatible
       ? "unknown"
       : "not-installed";
   }
   const info = publicState.availableEngines.find((item) => item.engine === engine);
-  if (info?.version?.trim()) return info.version.trim();
-  if (info?.ready) return "unknown";
-  return "not-installed";
+  if (!info?.ready) return "not-installed";
+  const version = info.version?.trim() || "";
+  // Never leak AnytimeVibe client build into CLI engine columns.
+  if (!version || version === PRODUCT_VERSION || version === `v${PRODUCT_VERSION}`) {
+    return info.ready ? "unknown" : "not-installed";
+  }
+  return version;
+}
+
+function workspaceAllowRoots(): string[] {
+  return (config?.workspaces ?? publicState.workspaces ?? [])
+    .map((item) => String(item.path || "").trim())
+    .filter(Boolean);
 }
 
 function publishAgentMeta(fields: {
@@ -3911,13 +4090,24 @@ function publishAgentMeta(fields: {
 } = {}): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   try {
+    const hasEngineProbe = publicState.availableEngines.length > 0
+      || fields.codexVersion != null
+      || fields.claudeVersion != null
+      || fields.grokVersion != null
+      || fields.cursorVersion != null;
     socket.send(JSON.stringify({
       type: "agent.meta",
       name: fields.name ?? resolvedDisplayName(),
-      codexVersion: fields.codexVersion ?? resolveReportedEngineVersion("codex"),
-      claudeVersion: fields.claudeVersion ?? resolveReportedEngineVersion("claude"),
-      grokVersion: fields.grokVersion ?? resolveReportedEngineVersion("grok"),
-      cursorVersion: fields.cursorVersion ?? resolveReportedEngineVersion("cursor"),
+      // Only push CLI versions after a real detect — avoid overwriting admin columns with
+      // premature "not-installed" when availableEngines is still empty.
+      ...(hasEngineProbe
+        ? {
+          codexVersion: fields.codexVersion ?? resolveReportedEngineVersion("codex"),
+          claudeVersion: fields.claudeVersion ?? resolveReportedEngineVersion("claude"),
+          grokVersion: fields.grokVersion ?? resolveReportedEngineVersion("grok"),
+          cursorVersion: fields.cursorVersion ?? resolveReportedEngineVersion("cursor")
+        }
+        : {}),
       platform: fields.platform ?? `${process.platform} ${os.release()}`,
       agentVersion: fields.agentVersion ?? PRODUCT_VERSION
     }));
@@ -4020,7 +4210,7 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   const listLimit = Math.min(100, Math.max(1, limit));
   // Pull sessions created by local Claude/Grok CLIs into the index so web sync can see them.
   try {
-    await importLocalCliSessions(taskStore, listLimit);
+    await importLocalCliSessions(taskStore, listLimit, workspaceAllowRoots());
   } catch {
     // ignore import failures
   }
@@ -4426,7 +4616,11 @@ async function publish(event: AgentEvent, persist: boolean, hint?: "approval" | 
 }
 
 async function addWorkspace(): Promise<PublicState> {
-  const result = await dialog.showOpenDialog({ properties: ["openDirectory"] });
+  const result = await dialog.showOpenDialog({
+    properties: ["openDirectory", "createDirectory"],
+    // macOS: folder picker establishes user-intent access for the selected tree.
+    ...(process.platform === "darwin" ? { securityScopedBookmarks: true } : {})
+  });
   const selected = result.filePaths[0];
   if (!selected) return publicState;
   const resolved = path.resolve(selected);
@@ -4945,7 +5139,7 @@ function registerIpc(): void {
     }
     // After handoff, re-import CLI sessions a bit later so local work can appear on web sync.
     setTimeout(() => {
-      void importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT)
+      void importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT, workspaceAllowRoots())
         .then(async () => {
           await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
         })

@@ -863,18 +863,140 @@ const ChatMessageStream = memo(function ChatMessageStream({
         </section>
       )}
       {approvals.map((approval) => (
-        <article className="approval-card" key={String(approval.requestId)}>
-          <div className="approval-label">{actionRequiredLabel}</div>
-          <h3>{approval.title}</h3>
-          <pre>{sanitizeDisplayText(approval.detail)}</pre>
-          <div className="approval-actions">
-            <button onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "decline" })}>{declineLabel}</button>
-            <button className="approve" onClick={() => onCommand({ type: "approval.resolve", commandId: crypto.randomUUID(), requestId: approval.requestId, decision: "accept" })}>{allowOnceLabel}</button>
-          </div>
-        </article>
+        <ApprovalActionCard
+          key={String(approval.requestId)}
+          approval={approval}
+          actionRequiredLabel={actionRequiredLabel}
+          declineLabel={declineLabel}
+          allowOnceLabel={allowOnceLabel}
+          onCommand={onCommand}
+        />
       ))}
       <div className="message-end" ref={messageEndRef} />
     </div>
+  );
+});
+
+const ApprovalActionCard = memo(function ApprovalActionCard({
+  approval,
+  actionRequiredLabel,
+  declineLabel,
+  allowOnceLabel,
+  onCommand
+}: {
+  approval: Approval;
+  actionRequiredLabel: string;
+  declineLabel: string;
+  allowOnceLabel: string;
+  onCommand(command: ClientCommand): void;
+}) {
+  const questions = approval.questions ?? [];
+  const plan = approval.plan;
+  const [selected, setSelected] = useState<Record<string, string[]>>(() => {
+    const init: Record<string, string[]> = {};
+    for (const question of questions) {
+      init[question.id] = [];
+    }
+    return init;
+  });
+
+  const allAnswered = questions.length === 0 || questions.every((question) => {
+    const picks = selected[question.id] || [];
+    return picks.length > 0;
+  });
+
+  function toggleOption(questionId: string, optionId: string, allowMultiple?: boolean) {
+    setSelected((prev) => {
+      const current = prev[questionId] || [];
+      if (allowMultiple) {
+        const next = current.includes(optionId)
+          ? current.filter((id) => id !== optionId)
+          : [...current, optionId];
+        return { ...prev, [questionId]: next };
+      }
+      return { ...prev, [questionId]: [optionId] };
+    });
+  }
+
+  function resolve(decision: "accept" | "decline" | "cancel") {
+    const answers = questions.map((question) => ({
+      questionId: question.id,
+      selectedOptionIds: selected[question.id] || []
+    })).filter((item) => item.selectedOptionIds.length > 0);
+    onCommand({
+      type: "approval.resolve",
+      commandId: crypto.randomUUID(),
+      requestId: approval.requestId,
+      decision,
+      ...(decision === "accept" && answers.length ? { answers } : {})
+    });
+  }
+
+  const acceptLabel = plan
+    ? "批准并执行"
+    : questions.length
+      ? "确认选择"
+      : allowOnceLabel;
+
+  return (
+    <article className="approval-card">
+      <div className="approval-label">{actionRequiredLabel}</div>
+      <h3>{approval.title}</h3>
+      {plan ? (
+        <div className="approval-plan">
+          {plan.name ? <strong className="approval-plan-name">{plan.name}</strong> : null}
+          {plan.overview ? <p className="approval-plan-overview">{sanitizeDisplayText(plan.overview)}</p> : null}
+          <pre>{sanitizeDisplayText(plan.plan || approval.detail)}</pre>
+          {plan.todos && plan.todos.length > 0 ? (
+            <ul className="approval-todos">
+              {plan.todos.map((todo) => (
+                <li key={todo.id}>
+                  <span className="approval-todo-status">{todo.status || "pending"}</span>
+                  {sanitizeDisplayText(todo.content)}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : questions.length === 0 ? (
+        <pre>{sanitizeDisplayText(approval.detail)}</pre>
+      ) : null}
+      {questions.length > 0 && (
+        <div className="approval-questions">
+          {questions.map((question) => (
+            <div className="approval-question" key={question.id}>
+              <p>{sanitizeDisplayText(question.prompt)}</p>
+              <div className="approval-options">
+                {question.options.map((option) => {
+                  const active = (selected[question.id] || []).includes(option.id);
+                  return (
+                    <button
+                      type="button"
+                      key={option.id}
+                      className={active ? "approval-option active" : "approval-option"}
+                      onClick={() => toggleOption(question.id, option.id, question.allowMultiple)}
+                    >
+                      {sanitizeDisplayText(option.label)}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="approval-actions">
+        <button type="button" onClick={() => resolve("decline")}>{declineLabel}</button>
+        <button
+          type="button"
+          className="approve"
+          disabled={questions.length > 0 && !allAnswered}
+          onClick={() => resolve("accept")}
+        >
+          {acceptLabel}
+        </button>
+      </div>
+    </article>
   );
 });
 

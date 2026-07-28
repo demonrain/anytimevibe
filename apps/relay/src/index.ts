@@ -707,9 +707,9 @@ async function main(): Promise<void> {
             UPDATE hosts SET
               name = COALESCE(${nextName ?? null}, name),
               codex_version = COALESCE(${nextCodex ?? null}, codex_version),
-              claude_version = COALESCE(${nextClaude ?? null}, claude_version),
-              grok_version = COALESCE(${nextGrok ?? null}, grok_version),
-              cursor_version = COALESCE(${nextCursor ?? null}, cursor_version),
+              claude_version = CASE WHEN ${nextClaude ?? null}::text IS NULL THEN claude_version ELSE ${nextClaude ?? null} END,
+              grok_version = CASE WHEN ${nextGrok ?? null}::text IS NULL THEN grok_version ELSE ${nextGrok ?? null} END,
+              cursor_version = CASE WHEN ${nextCursor ?? null}::text IS NULL THEN cursor_version ELSE ${nextCursor ?? null} END,
               platform = COALESCE(${nextPlatform ?? null}, platform),
               agent_version = COALESCE(${nextAgentVersion ?? null}, agent_version),
               last_seen_at = now()
