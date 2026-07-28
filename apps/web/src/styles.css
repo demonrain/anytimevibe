@@ -1017,6 +1017,11 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 }
 @media (max-width: 700px) {
   .app-shell { height: auto; overflow: visible; }
+  .topbar {
+    padding-top: env(safe-area-inset-top, 0px);
+    height: auto;
+    min-height: calc(58px + env(safe-area-inset-top, 0px));
+  }
   .version-chip {
     flex-direction: column;
     align-items: flex-start;
@@ -1034,13 +1039,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
    */
   .workspace.mobile-tasks {
     position: fixed;
-    top: 58px;
+    top: calc(58px + env(safe-area-inset-top, 0px));
     right: 0;
     bottom: 0;
     left: 0;
     z-index: 7;
-    height: calc(100dvh - 58px);
-    max-height: calc(100dvh - 58px);
+    height: auto;
+    max-height: none;
     min-height: 0;
     background: var(--paper);
     display: flex;
@@ -1146,30 +1151,83 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   .workspace.mobile-tasks .empty-state { padding: 36px 16px; }
   .workspace.mobile-conversation {
     position: fixed;
-    top: 58px;
+    top: calc(58px + env(safe-area-inset-top, 0px));
     right: 0;
     bottom: 0;
     left: 0;
     z-index: 8;
-    height: calc(100dvh - 58px);
-    max-height: calc(100dvh - 58px);
+    /* top + bottom insets define height — avoids iOS dvh/toolbar mismatch */
+    height: auto;
+    max-height: none;
     min-height: 0;
     background: var(--paper);
     overflow: hidden;
+    display: block;
   }
   .workspace.mobile-conversation .conversation-column {
     height: 100%;
     max-height: 100%;
-    min-height: 0;
+    min-height: 0 !important;
     display: grid;
     grid-template-rows: auto minmax(0, 1fr) auto;
+    overflow: hidden;
   }
+  .workspace.mobile-conversation .conversation-head {
+    position: relative;
+    z-index: 2;
+    background: rgba(242,234,219,.96);
+    max-height: 32vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  /* Middle row must scroll — height:auto was pushing the composer off-screen on iPhone Safari */
   .workspace.mobile-conversation .message-stream {
-    height: auto;
-    max-height: none;
-    min-height: 0;
+    min-height: 0 !important;
+    height: 100% !important;
+    max-height: none !important;
+    overflow-x: hidden;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
   }
-  .workspace.mobile-conversation .conversation-head { position: relative; z-index: 2; background: rgba(242,234,219,.96); }
+  .workspace.mobile-conversation .composer {
+    position: relative;
+    z-index: 5;
+    flex: 0 0 auto;
+    min-width: 0;
+    padding: 8px 10px max(12px, env(safe-area-inset-bottom, 0px));
+    background: rgba(242,234,219,.96);
+    backdrop-filter: blur(18px);
+  }
+  .workspace.mobile-conversation .composer textarea {
+    min-height: 44px;
+    max-height: 96px;
+    font-size: 16px; /* iOS Safari: <16px triggers page zoom and breaks fixed layout */
+    line-height: 1.4;
+  }
+  .workspace.mobile-conversation .composer > div {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 6px;
+  }
+  .workspace.mobile-conversation .composer > div > small {
+    flex: 1 1 100%;
+    margin-right: 0;
+    gap: 6px;
+  }
+  .workspace.mobile-conversation .composer > div > button {
+    flex: 0 0 auto;
+    min-height: 40px;
+    padding: 8px 14px;
+  }
+  .workspace.mobile-conversation .composer-permission select,
+  .workspace.mobile-conversation .composer-reply-detail select {
+    min-width: 72px;
+    max-width: 110px;
+  }
   .workspace.mobile-conversation .mobile-back { position: relative; z-index: 3; }
 }
 @media (max-width: 700px) { .composer textarea { max-height: 180px; }.composer-permission select, .composer-reply-detail select { min-width: 96px; max-width: 128px; }.settings-row { gap: 8px; }.permission-select, .reply-detail-select { grid-template-columns: auto minmax(0, 1fr); } }

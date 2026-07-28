@@ -605,6 +605,18 @@ async function deleteLocalThread(threadId: string): Promise<void> {
   logInfo(`已删除本地任务`, threadId.slice(0, 8));
 }
 
+/** Drop Temp/empty Cursor imports and publish deletions so Web list stays clean. */
+async function pruneJunkCursorImports(junkCursorIds: string[]): Promise<void> {
+  for (const threadId of junkCursorIds) {
+    if (!threadId || isThreadDeleted(threadId)) continue;
+    try {
+      await deleteLocalThread(threadId);
+    } catch {
+      // ignore single prune failure
+    }
+  }
+}
+
 function scheduleDrainTurnQueue(threadId: string): void {
   setImmediate(() => {
     void drainTurnQueue(threadId).catch(handleError);
@@ -3423,7 +3435,8 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     publishAgentMeta({ agentVersion: PRODUCT_VERSION });
     await publishHostStatus();
     try {
-      await importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT, workspaceAllowRoots());
+      const imported = await importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT, workspaceAllowRoots());
+      await pruneJunkCursorImports(imported.junkCursorIds);
       await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
     } catch {
       // optional
@@ -3795,7 +3808,8 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       let multiCliCount = 0;
       const multiCliPromise = (async () => {
         try {
-          await importLocalCliSessions(taskStore, syncLimit, workspaceAllowRoots());
+          const imported = await importLocalCliSessions(taskStore, syncLimit, workspaceAllowRoots());
+          await pruneJunkCursorImports(imported.junkCursorIds);
           // Drop any re-imported sessions the user already deleted.
           for (const task of taskStore.list(Math.max(syncLimit * 20, 100))) {
             if (
@@ -4210,7 +4224,8 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   const listLimit = Math.min(100, Math.max(1, limit));
   // Pull sessions created by local Claude/Grok CLIs into the index so web sync can see them.
   try {
-    await importLocalCliSessions(taskStore, listLimit, workspaceAllowRoots());
+    const imported = await importLocalCliSessions(taskStore, listLimit, workspaceAllowRoots());
+    await pruneJunkCursorImports(imported.junkCursorIds);
   } catch {
     // ignore import failures
   }
@@ -5140,7 +5155,8 @@ function registerIpc(): void {
     // After handoff, re-import CLI sessions a bit later so local work can appear on web sync.
     setTimeout(() => {
       void importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT, workspaceAllowRoots())
-        .then(async () => {
+        .then(async (imported) => {
+          await pruneJunkCursorImports(imported.junkCursorIds);
           await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
         })
         .catch(() => undefined);

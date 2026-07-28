@@ -43,6 +43,59 @@ function msToUnixSeconds(ms: number | undefined | null): number {
   return n > 1e12 ? n / 1000 : n;
 }
 
+/** Temp / scratch dirs used by headless smoke tests — not useful on the web task list. */
+export function isEphemeralImportCwd(cwd: string | undefined | null): boolean {
+  const raw = String(cwd || "").trim();
+  if (!raw) return false;
+  const normalized = raw.replace(/\//g, "\\").toLowerCase();
+  if (/\\appdata\\local\\temp(\\|$)/i.test(normalized)) return true;
+  if (/\\(?:local\\)?temp(?:\\|$)|\btmp(\\|$)/i.test(normalized) && /\\users\\|\\appdata\\/i.test(normalized)) {
+    return true;
+  }
+  // Bare Windows %TEMP% / system temp
+  if (/^[a-z]:\\temp(\\|$)/i.test(normalized)) return true;
+  if (/^[a-z]:\\windows\\temp(\\|$)/i.test(normalized)) return true;
+  const posix = raw.replace(/\\/g, "/").toLowerCase();
+  if (posix === "/tmp" || posix.startsWith("/tmp/")) return true;
+  if (posix.startsWith("/var/folders/")) return true; // macOS mktemp
+  if (/\/t\/tmp\//i.test(posix)) return true;
+  return false;
+}
+
+function hasUsefulTranscript(messages: HistoryMessage[]): boolean {
+  return messages.some((message) => {
+    if (message.role !== "user" && message.role !== "assistant") return false;
+    return Boolean(message.text?.trim());
+  });
+}
+
+/** Cursor sessions with no real chat, or only Temp/scratch cwd — skip sync/list noise. */
+export function isJunkCursorImportTask(task: {
+  cwd?: string;
+  title?: string;
+  messages?: HistoryMessage[];
+  providerSessionId?: string;
+  threadId?: string;
+}): boolean {
+  if (isEphemeralImportCwd(task.cwd)) return true;
+  const messages = task.messages || [];
+  if (!hasUsefulTranscript(messages)) return true;
+  const title = String(task.title || "").trim();
+  // Fallback title "Cursor ab12cd34" with no real user ask
+  if (/^cursor\s+[0-9a-f]{8}$/i.test(title)) {
+    const hasUser = messages.some((message) => message.role === "user" && message.text.trim());
+    if (!hasUser) return true;
+  }
+  return false;
+}
+
+/** Cursor Temp/empty imports already in the local index — caller should tombstone + delete. */
+export function listJunkCursorImportThreadIds(store: TaskStore): string[] {
+  return store.list(1000)
+    .filter((task) => task.engine === "cursor" && isJunkCursorImportTask(task))
+    .map((task) => task.threadId);
+}
+
 async function removeOrphanNativeDuplicate(
   store: TaskStore,
   providerSessionId: string,
@@ -834,7 +887,8 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
 
   hits.sort((a, b) => b.mtime - a.mtime);
   let added = 0;
-  for (const hit of hits.slice(0, limit)) {
+  for (const hit of hits.slice(0, Math.max(limit * 3, limit))) {
+    if (isEphemeralImportCwd(hit.cwd)) continue;
     const existing = resolveExistingForProviderSession(store, hit.id, "cursor");
     const dbPath = path.join(hit.dir, "store.db");
     let imported: Awaited<ReturnType<typeof readCursorSessionMessages>> = { messages: [] };
@@ -842,7 +896,7 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
       await fs.access(dbPath);
       imported = await readCursorSessionMessages(dbPath);
     } catch {
-      // meta-only entry still lists on web
+      // meta-only entry — skip unless already bound to a web task with content
     }
     const messages = imported.messages.length >= (existing?.messages?.length ?? 0)
       ? imported.messages
@@ -851,15 +905,21 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
     const agentTitle = imported.agentName && imported.agentName !== "New Agent"
       ? imported.agentName
       : undefined;
+    const title = existing?.title || agentTitle || titleFromUser || `Cursor ${hit.id.slice(0, 8)}`;
+    const cwd = (hit.cwd || existing?.cwd)
+      ? path.resolve(hit.cwd || existing?.cwd || "")
+      : (existing?.cwd || "");
+    if (isJunkCursorImportTask({ cwd, title, messages })) {
+      continue;
+    }
+    if (added >= limit) break;
     const threadId = existing?.threadId || hit.id;
     const task: StoredTask = {
       threadId,
       engine: "cursor",
       providerSessionId: hit.id,
-      cwd: (hit.cwd || existing?.cwd)
-        ? path.resolve(hit.cwd || existing?.cwd || "")
-        : (existing?.cwd || ""),
-      title: existing?.title || agentTitle || titleFromUser || `Cursor ${hit.id.slice(0, 8)}`,
+      cwd,
+      title,
       status: mergeImportStatus(existing),
       createdAt: existing?.createdAt ?? hit.createdAt,
       updatedAt: Math.max(existing?.updatedAt ?? 0, hit.updatedAt, hit.mtime),
@@ -880,7 +940,7 @@ export async function importLocalCliSessions(
   store: TaskStore,
   limit = 10,
   allowedRoots: string[] = []
-): Promise<{ grok: number; claude: number; cursor: number }> {
+): Promise<{ grok: number; claude: number; cursor: number; junkCursorIds: string[] }> {
   const [grok, claude, cursor] = await Promise.all([
     importGrokSessions(store, limit),
     importClaudeSessions(store, limit, allowedRoots),
@@ -891,5 +951,6 @@ export async function importLocalCliSessions(
   } catch {
     // ignore
   }
-  return { grok, claude, cursor };
+  const junkCursorIds = listJunkCursorImportThreadIds(store);
+  return { grok, claude, cursor, junkCursorIds };
 }
