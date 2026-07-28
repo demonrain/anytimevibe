@@ -72,6 +72,27 @@ async function runVersion(command: string, args: string[]): Promise<string | nul
   }
 }
 
+/** Fuller CLI text for fingerprinting (help can be multi-line). */
+async function runCommandText(command: string, args: string[], maxChars = 8_000): Promise<string | null> {
+  try {
+    const isWindows = process.platform === "win32";
+    const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
+    const finalArgs = isWindows ? windowsCmdArguments(command, args) : args;
+    const { stdout, stderr } = await execFileAsync(executable, finalArgs, {
+      timeout: 12_000,
+      windowsHide: true,
+      windowsVerbatimArguments: isWindows,
+      env: process.env,
+      maxBuffer: 512_000
+    });
+    const text = `${stdout || ""}\n${stderr || ""}`.trim();
+    if (!text) return null;
+    return text.length > maxChars ? text.slice(0, maxChars) : text;
+  } catch {
+    return null;
+  }
+}
+
 function enrichedPathEnv(): NodeJS.ProcessEnv {
   const home = os.homedir();
   const extras = process.platform === "win32"
@@ -241,7 +262,7 @@ export async function resolveCommandPath(command: string): Promise<string | null
 function parseClaudeVersion(raw: string | null): string | undefined {
   if (!raw) return undefined;
   // Ignore Cursor-style calendar versions accidentally scraped from the wrong binary.
-  if (/^\d{4}\.\d{2}\.\d{2}/.test(raw.trim())) return undefined;
+  if (/^\d{4}\.\d{2}\.\d{2}/.test(raw.trim()) && !/claude/i.test(raw)) return undefined;
   const match = raw.match(/(\d+\.\d+\.\d+(?:[-\w.]*)?)/);
   return match?.[1] ?? raw.slice(0, 80);
 }
@@ -258,6 +279,7 @@ function parseCursorVersion(raw: string | null): string | undefined {
   if (!raw) return undefined;
   // Avoid treating Grok's `agent` binary as Cursor (common PATH name collision).
   if (/grok/i.test(raw) && !/cursor/i.test(raw)) return undefined;
+  if (/claude\s*code|\(Claude Code\)/i.test(raw) && !/cursor/i.test(raw)) return undefined;
   const match = raw.match(/(\d{4}\.\d{2}\.\d{2}[-\w]*)/i)
     || raw.match(/(\d+\.\d+\.\d+[-\w]*)/)
     || raw.match(/cursor[^\d]*([0-9][^\s]*)/i);
@@ -277,32 +299,54 @@ function isCrossEngineBinary(engine: "claude" | "grok" | "cursor", command: stri
   }
   if (engine === "cursor") {
     if (n.includes("/.grok/") || base.includes("claude") || base === "grok" || base === "grok.exe") return true;
+    if (n.includes("claudecode") || n.includes("/.claude/")) return true;
   }
   return false;
 }
 
-/** True when this executable looks like Cursor Agent CLI (not Grok `agent`). */
+function looksLikeClaudePath(command: string): boolean {
+  const n = command.replace(/\\/g, "/").toLowerCase();
+  const base = path.basename(n);
+  if (base === "claude" || base === "claude.exe" || base === "claude.cmd" || base === "claude.bat") return true;
+  if (n.includes("claudecode") || n.includes("anthropic.claudecode") || n.includes("/.claude/")) return true;
+  if (n.includes("/programs/claude/")) return true;
+  return false;
+}
+
+/** True when this executable looks like Cursor Agent CLI (not Grok `agent` / Claude Code). */
 async function looksLikeCursorAgent(command: string): Promise<boolean> {
   const normalized = command.replace(/\\/g, "/").toLowerCase();
-  // Never treat Grok Build's agent.exe as Cursor (common Windows PATH collision).
-  if (normalized.includes("/.grok/") || normalized.includes("\\/.grok\\") || /\/\.grok\//.test(normalized)) {
-    return false;
-  }
+  // Never treat Grok Build / Claude Code as Cursor (PATH / flag collisions).
+  if (normalized.includes("/.grok/") || /\/\.grok\//.test(normalized)) return false;
   if (/[/\\]\.grok[/\\]/.test(command.replace(/\\/g, "/"))) return false;
+  if (looksLikeClaudePath(command)) return false;
 
-  const help = await runVersion(command, ["--help"]);
+  const help = await runCommandText(command, ["--help"]);
   const version = await runVersion(command, ["--version"]);
   const text = `${help || ""}\n${version || ""}`;
   if (!text.trim()) return false;
   if (/grok\s+build|Grok Build TUI|Usage:\s*grok\b/i.test(text)) return false;
+  // Claude Code also exposes --print; fingerprint must not treat it as Cursor.
+  if (/claude\s*code|Usage:\s*claude\b|\(Claude Code\)/i.test(text)) return false;
+
   // Cursor Agent CLI markers (https://cursor.com/docs/cli)
-  if (/cursor\s*agent|--stream-partial-output|--list-models|--workspace\b|CURSOR_API_KEY/i.test(text)) {
+  if (/cursor\s*agent|--stream-partial-output|--list-models|CURSOR_API_KEY/i.test(text)) {
     return true;
   }
-  if (/--print|--output-format|stream-json|--force|--yolo/i.test(text) && !/grok/i.test(text)) {
+  // Cursor publishes calendar versions (YYYY.MM.DD); plain semver alone is NOT enough
+  // (Claude Code reports e.g. "2.1.218 (Claude Code)").
+  if (/\b\d{4}\.\d{2}\.\d{2}(?:[-\w]*)?\b/.test(version || "") && !/claude|grok/i.test(text)) {
     return true;
   }
-  if (parseCursorVersion(version) && !/grok/i.test(text)) return true;
+  const base = path.basename(normalized);
+  const looksNamedCursor = base.includes("cursor") || base === "agent" || base === "agent.exe" || base === "agent.cmd";
+  if (
+    looksNamedCursor
+    && /--print|--output-format|stream-json|--force|--yolo/i.test(text)
+    && !/claude|grok/i.test(text)
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -314,7 +358,10 @@ export async function detectAvailableEngines(options: {
   let claudePath = await resolveEngineBinary("claude");
   let grokPath = await resolveEngineBinary("grok");
   let cursorPath = await resolveEngineBinary("cursor");
-  if (claudePath && (isCrossEngineBinary("claude", claudePath) || await looksLikeCursorAgent(claudePath))) {
+  // Claude path/name is authoritative — do not run Cursor fingerprinting on it.
+  if (claudePath && isCrossEngineBinary("claude", claudePath)) {
+    claudePath = null;
+  } else if (claudePath && !looksLikeClaudePath(claudePath) && await looksLikeCursorAgent(claudePath)) {
     claudePath = null;
   }
   if (grokPath && (isCrossEngineBinary("grok", grokPath) || await looksLikeCursorAgent(grokPath))) {
