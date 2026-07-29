@@ -17,8 +17,18 @@ type ActiveRun = {
 
 const activeByThread = new Map<string, ActiveRun>();
 
-/** Default headless timeout (Claude rate-limit retries can take a while). */
-const HEADLESS_TIMEOUT_MS = Number(process.env.ANYTIMEVIBE_HEADLESS_TIMEOUT_MS || 8 * 60_000);
+/** Default headless idle timeout — only kill when the CLI stops emitting progress. */
+const HEADLESS_IDLE_TIMEOUT_MS = Number(
+  process.env.ANYTIMEVIBE_HEADLESS_IDLE_TIMEOUT_MS || 15 * 60_000
+);
+/**
+ * Absolute ceiling for a single headless turn (runaway protection).
+ * Override with ANYTIMEVIBE_HEADLESS_TIMEOUT_MS. Previously defaulted to 8 minutes and
+ * killed long but healthy Cursor/Claude runs that were still streaming.
+ */
+const HEADLESS_MAX_TIMEOUT_MS = Number(
+  process.env.ANYTIMEVIBE_HEADLESS_TIMEOUT_MS || 2 * 60 * 60_000
+);
 /** If Cursor emits stream-json `result` but the process never exits (MCP child hang), force-finish. */
 const CURSOR_RESULT_EXIT_GRACE_MS = Number(process.env.ANYTIMEVIBE_CURSOR_RESULT_GRACE_MS || 1_500);
 /** No stdout at all for this long → treat as stalled (common with bad --resume / reconnect loops). */
@@ -344,6 +354,7 @@ function handleClaudeLine(
   state: ParseState,
   onEvent: (event: BackendStreamEvent) => void
 ): void {
+  state.lastProgressAt = Date.now();
   let parsed: any;
   try {
     parsed = JSON.parse(line);
@@ -630,6 +641,7 @@ function handleGrokLine(
   state: ParseState,
   onEvent: (event: BackendStreamEvent) => void
 ): void {
+  state.lastProgressAt = Date.now();
   let parsed: any;
   try {
     parsed = JSON.parse(line);
@@ -815,10 +827,11 @@ export async function runHeadlessTurn(
   const result = await new Promise<HeadlessRunResult>((resolve) => {
     let settled = false;
     let resultGraceTimer: ReturnType<typeof setTimeout> | null = null;
+    const startedAt = Date.now();
     const finish = (status: HeadlessRunResult["status"]) => {
       if (settled) return;
       settled = true;
-      if (timeout) clearTimeout(timeout);
+      if (timeoutWatch) clearInterval(timeoutWatch);
       if (heartbeat) clearInterval(heartbeat);
       if (stallWatch) clearInterval(stallWatch);
       if (resultGraceTimer) clearTimeout(resultGraceTimer);
@@ -832,14 +845,32 @@ export async function runHeadlessTurn(
       });
     };
 
-    const timeout = setTimeout(() => {
-      state.failed = true;
-      state.errorMessage = `${engineLabel} 执行超时（${Math.round(HEADLESS_TIMEOUT_MS / 1000)}s），已终止`;
-      safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
-      emitDelta(safeOnEvent, options, "stage:timeout", "stage", `\n✗ ${state.errorMessage}\n`);
-      killChildTree(child);
-      finish("failed");
-    }, HEADLESS_TIMEOUT_MS);
+    // Idle-based kill: long healthy runs OK while the CLI keeps streaming progress.
+    // Absolute ceiling only as runaway protection (default 2h).
+    const timeoutWatch = setInterval(() => {
+      if (settled) return;
+      if (state.gotResult) return; // Cursor result path owns teardown
+      const idleMs = Date.now() - state.lastProgressAt;
+      const elapsedMs = Date.now() - startedAt;
+      if (idleMs >= HEADLESS_IDLE_TIMEOUT_MS) {
+        state.failed = true;
+        state.errorMessage = `${engineLabel} 超过 ${Math.round(HEADLESS_IDLE_TIMEOUT_MS / 1000)}s 无进度输出，已终止`;
+        safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+        emitDelta(safeOnEvent, options, "stage:timeout", "stage", `\n✗ ${state.errorMessage}\n`);
+        killChildTree(child);
+        finish("failed");
+        return;
+      }
+      if (elapsedMs >= HEADLESS_MAX_TIMEOUT_MS) {
+        state.failed = true;
+        state.errorMessage = `${engineLabel} 执行超过上限（${Math.round(HEADLESS_MAX_TIMEOUT_MS / 1000)}s），已终止`;
+        safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+        emitDelta(safeOnEvent, options, "stage:timeout", "stage", `\n✗ ${state.errorMessage}\n`);
+        killChildTree(child);
+        finish("failed");
+      }
+    }, 5_000);
+    timeoutWatch.unref?.();
 
     // Periodic "still working" only when we have been idle (no stream progress).
     const heartbeat = setInterval(() => {

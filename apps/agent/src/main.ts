@@ -324,6 +324,36 @@ let turnQueueFilePath = "";
 const WS_CONNECT_TIMEOUT_MS = 15_000;
 const PATH_REFRESH_TIMEOUT_MS = 8_000;
 
+/**
+ * Dispose a relay socket without crashing the Electron main process.
+ * `ws` emits "WebSocket was closed before the connection was established" when
+ * terminate/close runs while CONNECTING; if listeners were cleared first, that
+ * becomes an uncaughtException and bricks the tray UI after a while.
+ */
+function safeDisposeSocket(target: WebSocket | null | undefined): void {
+  if (!target) return;
+  try {
+    target.removeAllListeners();
+    // Must re-attach AFTER removeAllListeners — CONNECTING abort emits "error".
+    target.on("error", () => undefined);
+    if (target.readyState !== WebSocket.CLOSED) {
+      target.terminate();
+    }
+  } catch {
+    try {
+      target.on("error", () => undefined);
+      target.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function isBenignWsAbortError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /WebSocket was closed before the connection was established/i.test(message);
+}
+
 /** In-app diagnostics ring buffer + append-only log file for user troubleshooting. */
 type AgentLogLevel = "info" | "warn" | "error";
 type AgentLogEntry = {
@@ -936,9 +966,36 @@ function rebuildTray(): void {
 }
 
 function showWindow(): void {
-  if (!windowRef) createWindow();
-  windowRef?.show();
-  windowRef?.focus();
+  if (!isWindowAlive()) {
+    try {
+      if (windowRef && !windowRef.isDestroyed()) windowRef.destroy();
+    } catch {
+      // ignore
+    }
+    windowRef = null;
+    createWindow();
+  }
+  try {
+    if (windowRef?.isMinimized()) windowRef.restore();
+    windowRef?.show();
+    windowRef?.focus();
+    if (process.platform === "darwin") app.dock?.show();
+  } catch (error) {
+    logWarn("打开主界面失败，正在重建窗口", error instanceof Error ? error.message : String(error));
+    try {
+      if (windowRef && !windowRef.isDestroyed()) windowRef.destroy();
+    } catch {
+      // ignore
+    }
+    windowRef = null;
+    try {
+      createWindow();
+      windowRef?.show();
+      windowRef?.focus();
+    } catch (recreateError) {
+      logError("重建主界面失败", recreateError instanceof Error ? recreateError.message : String(recreateError));
+    }
+  }
 }
 
 function createWindow(): void {
@@ -979,6 +1036,28 @@ function createWindow(): void {
   });
   windowRef.webContents.on("console-message", (_event, level, message) => {
     if (level >= 2) console.error("[renderer]", message);
+  });
+  windowRef.webContents.on("render-process-gone", (_event, details) => {
+    logError("渲染进程退出", `${details.reason || "unknown"} · exit=${details.exitCode ?? "?"}`);
+    windowRef = null;
+    if (!quitting && !installingUpdate) {
+      setTimeout(() => {
+        if (!quitting && !installingUpdate && !isWindowAlive()) {
+          try {
+            createWindow();
+            windowRef?.hide();
+          } catch (error) {
+            logError("渲染进程退出后重建窗口失败", error instanceof Error ? error.message : String(error));
+          }
+        }
+      }, 300);
+    }
+  });
+  windowRef.on("unresponsive", () => {
+    logWarn("主界面无响应", "可尝试从托盘重新打开");
+  });
+  windowRef.on("closed", () => {
+    windowRef = null;
   });
   windowRef.on("close", (event) => {
     // When quitting for update/install, allow the window to close so quitAndInstall can proceed.
@@ -2640,18 +2719,7 @@ async function connect(force = false): Promise<void> {
   const generation = ++connectGeneration;
   const previousSocket = socket;
   socket = null;
-  if (previousSocket) {
-    previousSocket.removeAllListeners();
-    try {
-      previousSocket.terminate();
-    } catch {
-      try {
-        previousSocket.close();
-      } catch {
-        // ignore
-      }
-    }
-  }
+  safeDisposeSocket(previousSocket);
   try {
     syncKey ??= await importAesKey(base64ToBytes(decryptSecret(config.encryptedSyncKey)));
   } catch (error) {
@@ -2700,13 +2768,8 @@ async function connect(force = false): Promise<void> {
     if (connection.readyState === WebSocket.OPEN) return;
     clearConnectTimer();
     connecting = false;
-    try {
-      connection.removeAllListeners();
-      connection.terminate();
-    } catch {
-      // ignore
-    }
     if (socket === connection) socket = null;
+    safeDisposeSocket(connection);
     logWarn(`连接中继超时（${Math.round(WS_CONNECT_TIMEOUT_MS / 1000)}s）`, config.relayUrl);
     scheduleReconnect(`连接中继超时（${Math.round(WS_CONNECT_TIMEOUT_MS / 1000)}s），正在重试。`);
   }, WS_CONNECT_TIMEOUT_MS);
@@ -2714,11 +2777,7 @@ async function connect(force = false): Promise<void> {
 
   connection.on("open", () => {
     if (generation !== connectGeneration || socket !== connection) {
-      try {
-        connection.close();
-      } catch {
-        // ignore
-      }
+      safeDisposeSocket(connection);
       return;
     }
     clearConnectTimer();
@@ -2816,6 +2875,8 @@ async function connect(force = false): Promise<void> {
   });
   connection.on("error", (error) => {
     if (generation !== connectGeneration) return;
+    // Expected when we abort a CONNECTING socket (timeout / force reconnect).
+    if (isBenignWsAbortError(error)) return;
     // Do not close here — the 'close' event will follow and owns reconnect.
     // If close never comes (rare), the connect timer still recovers us.
     logError("中继 WebSocket 错误", error.message || "网络错误");
@@ -4671,8 +4732,46 @@ function handleError(error: unknown): void {
 let updateListenersRegistered = false;
 /** Path to the zip/installer finished by electron-updater (needed for macOS shell fallback). */
 let pendingDownloadedUpdateFile: string | null = null;
+/** Version string of the package currently sitting in the updater pending cache. */
+let pendingDownloadedVersion: string | null = null;
 /** Native Squirrel.Mac finished staging the update (macOS only). */
 let macNativeUpdateReady = false;
+/** Avoid overlapping check+download sequences from UI spam / interval. */
+let updateCheckInFlight: Promise<void> | null = null;
+
+/** Drop a stale pending installer so a newer feed version can download cleanly. */
+async function clearPendingUpdaterCache(reason: string): Promise<void> {
+  logInfo("清除本地更新缓存", reason);
+  pendingDownloadedUpdateFile = null;
+  pendingDownloadedVersion = null;
+  macNativeUpdateReady = false;
+  try {
+    const helper = (autoUpdater as unknown as {
+      downloadedUpdateHelper?: { clear?: () => Promise<void> };
+    }).downloadedUpdateHelper;
+    if (helper?.clear) await helper.clear();
+  } catch (error) {
+    logWarn("清除更新缓存失败", error instanceof Error ? error.message : String(error));
+  }
+}
+
+function compareSemverLike(left: string, right: string): number {
+  const parse = (value: string): number[] => value
+    .replace(/^v/i, "")
+    .split(/[.-]/)
+    .map((part) => {
+      const n = Number.parseInt(part, 10);
+      return Number.isFinite(n) ? n : 0;
+    });
+  const a = parse(left);
+  const b = parse(right);
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i += 1) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
 
 /** True when the packaged app is still running from a mounted DMG (read-only, cannot self-update). */
 function isRunningFromDmgOrReadOnlyVolume(): boolean {
@@ -4762,27 +4861,59 @@ echo "[$(date -Iseconds)] done"
 function registerUpdateListeners(): void {
   if (updateListenersRegistered) return;
   updateListenersRegistered = true;
-  // Ensure both Windows NSIS and macOS zip feeds auto-download after check.
-  autoUpdater.autoDownload = true;
+  // Manual download from checkForAgentUpdate — avoids racing autoDownload + downloadUpdate().
+  autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.autoRunAppAfterInstall = true;
   autoUpdater.allowDowngrade = false;
-  autoUpdater.on("checking-for-update", () => updateState({ update: { status: "checking" } }));
+  autoUpdater.on("checking-for-update", () => {
+    if (publicState.update.status === "downloading") return;
+    updateState({ update: { status: "checking" } });
+  });
   autoUpdater.on("update-available", (info) => {
-    updateState({ update: { status: "available", version: info.version, message: "正在下载更新…" } });
-    // Explicit download: on some macOS builds autoDownload alone does not start.
-    void autoUpdater.downloadUpdate().catch((error: Error) => {
-      if (installingUpdate) return;
-      updateState({ update: { status: "error", message: error.message || "下载更新失败" } });
+    const version = String(info.version || "");
+    // Same package already on disk — keep "ready", do not leave UI stuck on "available".
+    if (
+      version
+      && pendingDownloadedVersion
+      && compareSemverLike(version, pendingDownloadedVersion) === 0
+      && pendingDownloadedUpdateFile
+    ) {
+      updateState({
+        update: {
+          status: "ready",
+          version,
+          message: process.platform === "darwin"
+            ? "更新已下载。点击「重启更新」将替换应用并自动重新打开。"
+            : "更新已在后台下载完成"
+        }
+      });
+      return;
+    }
+    if (publicState.update.status === "downloading") return;
+    updateState({
+      update: {
+        status: "available",
+        version,
+        message: "发现新版本，正在准备下载…"
+      }
     });
   });
   autoUpdater.on("update-not-available", () => updateState({ update: { status: "idle", message: "当前已是最新版本" } }));
-  autoUpdater.on("download-progress", (progress) => updateState({ update: { status: "downloading", progress: Math.round(progress.percent) } }));
+  autoUpdater.on("download-progress", (progress) => updateState({
+    update: {
+      status: "downloading",
+      version: publicState.update.version,
+      progress: Math.round(progress.percent),
+      message: `正在下载更新… ${Math.round(progress.percent)}%`
+    }
+  }));
   autoUpdater.on("update-downloaded", (info) => {
     const downloadedFile = typeof (info as { downloadedFile?: string }).downloadedFile === "string"
       ? (info as { downloadedFile: string }).downloadedFile
       : null;
     if (downloadedFile) pendingDownloadedUpdateFile = downloadedFile;
+    pendingDownloadedVersion = String(info.version || pendingDownloadedVersion || "");
     macNativeUpdateReady = false;
 
     if (process.platform === "darwin" && isRunningFromDmgOrReadOnlyVolume()) {
@@ -4869,13 +5000,9 @@ function prepareForUpdateQuit(): void {
   activityFlushTimers.clear();
   activityOutputBuffers.clear();
   activityItemsByThread.clear();
-  try {
-    socket?.removeAllListeners();
-    socket?.close();
-  } catch {
-    // ignore
-  }
+  const updateSocket = socket;
   socket = null;
+  safeDisposeSocket(updateSocket);
   try {
     codex?.stop();
   } catch {
@@ -4983,25 +5110,92 @@ function installDownloadedUpdate(): void {
 }
 
 async function checkForAgentUpdate(): Promise<void> {
-  if (!app.isPackaged) {
-    updateState({ update: { status: "idle", message: "开发模式不检查更新" } });
-    return;
-  }
-  if (!config.relayUrl) return;
-  registerUpdateListeners();
-  const response = await fetch(`${config.relayUrl}/api/agent/config`);
-  if (!response.ok) throw new Error(`无法读取更新配置：HTTP ${response.status}`);
-  const remoteConfig = await response.json() as { updateFeedUrl: string | null };
-  if (!remoteConfig.updateFeedUrl) {
-    updateState({ update: { status: "idle", message: "服务端未配置更新源" } });
-    return;
-  }
-  autoUpdater.setFeedURL({ provider: "generic", url: remoteConfig.updateFeedUrl });
-  // Re-assert after setFeedURL — macOS generic provider occasionally resets download flags.
-  autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
-  // Do not await downloadPromise here — it can hang for minutes and must never block UI/IPC.
-  await autoUpdater.checkForUpdates();
+  if (updateCheckInFlight) return updateCheckInFlight;
+  updateCheckInFlight = (async () => {
+    if (!app.isPackaged) {
+      updateState({ update: { status: "idle", message: "开发模式不检查更新" } });
+      return;
+    }
+    if (!config.relayUrl) return;
+    if (installingUpdate) return;
+    registerUpdateListeners();
+    const response = await fetch(`${config.relayUrl}/api/agent/config`);
+    if (!response.ok) throw new Error(`无法读取更新配置：HTTP ${response.status}`);
+    const remoteConfig = await response.json() as { updateFeedUrl: string | null };
+    if (!remoteConfig.updateFeedUrl) {
+      updateState({ update: { status: "idle", message: "服务端未配置更新源" } });
+      return;
+    }
+    autoUpdater.setFeedURL({ provider: "generic", url: remoteConfig.updateFeedUrl });
+    // Bust CDN/proxy caches so a just-published latest.yml is visible immediately.
+    autoUpdater.requestHeaders = {
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache"
+    };
+    // Drive download ourselves after reconciling any stale pending installer.
+    autoUpdater.autoDownload = false;
+    autoUpdater.autoInstallOnAppQuit = true;
+    updateState({ update: { status: "checking", message: "正在检查更新…" } });
+
+    const result = await autoUpdater.checkForUpdates();
+    if (!result?.isUpdateAvailable || !result.updateInfo) {
+      return;
+    }
+
+    const remoteVersion = String(result.updateInfo.version || "").trim();
+    if (!remoteVersion) {
+      updateState({ update: { status: "error", message: "更新源未返回有效版本号" } });
+      return;
+    }
+
+    // Already have this exact package ready — keep install CTA, skip re-download.
+    if (
+      pendingDownloadedVersion
+      && compareSemverLike(pendingDownloadedVersion, remoteVersion) === 0
+      && pendingDownloadedUpdateFile
+    ) {
+      updateState({
+        update: {
+          status: "ready",
+          version: remoteVersion,
+          message: process.platform === "darwin"
+            ? "更新已下载。点击「重启更新」将替换应用并自动重新打开。"
+            : "更新已在后台下载完成"
+        }
+      });
+      return;
+    }
+
+    // Had an older pending package while a newer release appeared — drop cache first.
+    if (
+      pendingDownloadedVersion
+      && compareSemverLike(remoteVersion, pendingDownloadedVersion) > 0
+    ) {
+      await clearPendingUpdaterCache(`${pendingDownloadedVersion} → ${remoteVersion}`);
+      // Differential patching against a stale pending installer often stalls; force full download.
+      autoUpdater.disableDifferentialDownload = true;
+    }
+
+    updateState({
+      update: {
+        status: "available",
+        version: remoteVersion,
+        message: "正在下载最新版本…"
+      }
+    });
+    // Do not await the whole download here — it can take minutes; progress events update UI.
+    void autoUpdater.downloadUpdate().then(() => {
+      // Re-enable differential for subsequent cycles once a fresh package is on disk.
+      autoUpdater.disableDifferentialDownload = false;
+    }).catch((error: Error) => {
+      autoUpdater.disableDifferentialDownload = false;
+      if (installingUpdate) return;
+      updateState({ update: { status: "error", message: error.message || "下载更新失败" } });
+    });
+  })().finally(() => {
+    updateCheckInFlight = null;
+  });
+  return updateCheckInFlight;
 }
 
 function registerIpc(): void {
@@ -5204,6 +5398,32 @@ if (process.platform === "win32") {
   app.setAppUserModelId("com.anytimevibe.agent");
 }
 
+// Keep the tray agent alive: a CONNECTING WebSocket abort used to surface as an
+// uncaught main-process exception and leave the UI unable to reopen.
+process.on("uncaughtException", (error) => {
+  if (isBenignWsAbortError(error)) {
+    try {
+      logWarn("忽略预期的 WebSocket 中止", error.message);
+    } catch {
+      // logging may not be ready yet
+    }
+    return;
+  }
+  try {
+    logError("未捕获异常（主进程继续运行）", error);
+  } catch {
+    console.error("[uncaughtException]", error);
+  }
+});
+process.on("unhandledRejection", (reason) => {
+  if (isBenignWsAbortError(reason)) return;
+  try {
+    logError("未处理的 Promise 拒绝", reason instanceof Error ? reason : String(reason));
+  } catch {
+    console.error("[unhandledRejection]", reason);
+  }
+});
+
 app.whenReady().then(async () => {
   await loadConfig();
   await taskStore.load(app.getPath("userData"));
@@ -5304,13 +5524,9 @@ app.on("before-quit", () => {
   }
   reconnectTimer && clearTimeout(reconnectTimer);
   pairingTimer && clearTimeout(pairingTimer);
-  try {
-    socket?.removeAllListeners();
-    socket?.close();
-  } catch {
-    // ignore
-  }
+  const closingSocket = socket;
   socket = null;
+  safeDisposeSocket(closingSocket);
   try {
     codex?.stop();
   } catch {
