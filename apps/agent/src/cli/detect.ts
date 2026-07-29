@@ -95,29 +95,88 @@ async function runCommandText(command: string, args: string[], maxChars = 8_000)
 
 function enrichedPathEnv(): NodeJS.ProcessEnv {
   const home = os.homedir();
+  // Cursor Agent paths MUST come before .grok/bin — both ship an `agent` binary on Windows.
   const extras = process.platform === "win32"
     ? [
-        path.join(home, ".grok", "bin"),
-        path.join(home, ".local", "bin"),
-        path.join(home, ".cursor", "bin"),
         path.join(process.env.LOCALAPPDATA || "", "cursor-agent"),
+        path.join(home, ".cursor", "bin"),
+        path.join(home, ".local", "bin"),
         path.join(process.env.LOCALAPPDATA || "", "Programs", "claude"),
         path.join(process.env.LOCALAPPDATA || "", "Microsoft", "WinGet", "Links"),
         path.join(process.env.APPDATA || "", "npm"),
-        path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs")
+        path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs"),
+        // Grok last among coding CLIs so bare `agent` does not shadow Cursor.
+        path.join(home, ".grok", "bin")
       ]
     : [
-        path.join(home, ".grok", "bin"),
-        path.join(home, ".local", "bin"),
         path.join(home, ".cursor", "bin"),
+        path.join(home, ".local", "bin"),
         path.join(home, ".claude", "local"),
         "/opt/homebrew/bin",
-        "/usr/local/bin"
+        "/usr/local/bin",
+        path.join(home, ".grok", "bin")
       ];
   const sep = process.platform === "win32" ? ";" : ":";
   const current = process.env.PATH || process.env.Path || "";
   const merged = [...extras.filter(Boolean), current].join(sep);
   return { ...process.env, PATH: merged, Path: merged };
+}
+
+function isGrokInstallPath(command: string): boolean {
+  const n = command.replace(/\\/g, "/").toLowerCase();
+  return n.includes("/.grok/") || /\/grok\/bin\//i.test(n);
+}
+
+function isCursorInstallPath(command: string): boolean {
+  const n = command.replace(/\\/g, "/").toLowerCase();
+  const base = path.basename(n);
+  if (n.includes("/cursor-agent/") || n.includes("/.cursor/")) return true;
+  if ((base === "agent" || base === "agent.exe" || base === "agent.cmd" || base.startsWith("cursor-agent"))
+    && (n.includes("/.local/bin/") || n.includes("/appdata/local/cursor-agent/"))) {
+    return true;
+  }
+  return false;
+}
+
+/** All Windows `where` hits for a command (ranked), without collapsing to a single cache entry. */
+async function listWindowsCommandHits(command: string): Promise<string[]> {
+  const env = enrichedPathEnv();
+  const whereTargets = /\.(cmd|exe|bat|com)$/i.test(command)
+    ? [command]
+    : [command, `${command}.cmd`, `${command}.exe`, `${command}.bat`];
+  const hits: string[] = [];
+  for (const target of whereTargets) {
+    try {
+      const { stdout } = await execFileAsync("where.exe", [target], {
+        timeout: 8_000,
+        windowsHide: true,
+        env,
+        maxBuffer: 256_000
+      });
+      for (const line of stdout.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+        if (!hits.includes(line)) hits.push(line);
+      }
+    } catch {
+      // try next
+    }
+  }
+  const expanded: string[] = [];
+  for (const hit of hits) {
+    for (const candidate of windowsLauncherCandidates(hit)) {
+      if (!expanded.includes(candidate) && await pathExists(candidate)) expanded.push(candidate);
+    }
+  }
+  expanded.sort((a, b) => {
+    // Prefer Cursor install locations over Grok when both expose `agent`.
+    const aCursor = isCursorInstallPath(a) ? 0 : 1;
+    const bCursor = isCursorInstallPath(b) ? 0 : 1;
+    if (aCursor !== bCursor) return aCursor - bCursor;
+    const aGrok = isGrokInstallPath(a) ? 1 : 0;
+    const bGrok = isGrokInstallPath(b) ? 1 : 0;
+    if (aGrok !== bGrok) return aGrok - bGrok;
+    return windowsExecutableRank(a) - windowsExecutableRank(b);
+  });
+  return expanded;
 }
 
 /** Resolve an absolute executable path so Electron (often PATH-starved) can spawn CLIs. */
@@ -295,11 +354,11 @@ function isCrossEngineBinary(engine: "claude" | "grok" | "cursor", command: stri
     if (base === "agent" || base === "agent.exe" || base === "grok" || base === "grok.exe") return true;
   }
   if (engine === "grok") {
-    if (n.includes("/.cursor/") || base.includes("cursor-agent") || base.includes("claude")) return true;
+    if (n.includes("/.cursor/") || n.includes("/cursor-agent/") || base.includes("cursor-agent") || base.includes("claude")) return true;
   }
   if (engine === "cursor") {
-    if (n.includes("/.grok/") || base.includes("claude") || base === "grok" || base === "grok.exe") return true;
-    if (n.includes("claudecode") || n.includes("/.claude/")) return true;
+    if (isGrokInstallPath(command) || base === "grok" || base === "grok.exe") return true;
+    if (base.includes("claude") || n.includes("claudecode") || n.includes("/.claude/")) return true;
   }
   return false;
 }
@@ -315,39 +374,55 @@ function looksLikeClaudePath(command: string): boolean {
 
 /** True when this executable looks like Cursor Agent CLI (not Grok `agent` / Claude Code). */
 async function looksLikeCursorAgent(command: string): Promise<boolean> {
-  const normalized = command.replace(/\\/g, "/").toLowerCase();
-  // Never treat Grok Build / Claude Code as Cursor (PATH / flag collisions).
-  if (normalized.includes("/.grok/") || /\/\.grok\//.test(normalized)) return false;
-  if (/[/\\]\.grok[/\\]/.test(command.replace(/\\/g, "/"))) return false;
+  // Hard path excludes — never trust Grok's identically named agent.exe.
+  if (isGrokInstallPath(command)) return false;
   if (looksLikeClaudePath(command)) return false;
+  if (isCrossEngineBinary("cursor", command)) return false;
 
   const help = await runCommandText(command, ["--help"]);
   const version = await runVersion(command, ["--version"]);
   const text = `${help || ""}\n${version || ""}`;
   if (!text.trim()) return false;
-  if (/grok\s+build|Grok Build TUI|Usage:\s*grok\b/i.test(text)) return false;
+  if (/grok\s+build|Grok Build TUI|Usage:\s*grok\b|^grok\s+\d/i.test(text)) return false;
   // Claude Code also exposes --print; fingerprint must not treat it as Cursor.
   if (/claude\s*code|Usage:\s*claude\b|\(Claude Code\)/i.test(text)) return false;
 
-  // Cursor Agent CLI markers (https://cursor.com/docs/cli)
+  // Strong Cursor Agent CLI markers (https://cursor.com/docs/cli)
   if (/cursor\s*agent|--stream-partial-output|--list-models|CURSOR_API_KEY/i.test(text)) {
     return true;
   }
-  // Cursor publishes calendar versions (YYYY.MM.DD); plain semver alone is NOT enough
-  // (Claude Code reports e.g. "2.1.218 (Claude Code)").
+  // Cursor publishes calendar versions (YYYY.MM.DD…); plain semver alone is NOT enough.
   if (/\b\d{4}\.\d{2}\.\d{2}(?:[-\w]*)?\b/.test(version || "") && !/claude|grok/i.test(text)) {
     return true;
   }
-  const base = path.basename(normalized);
-  const looksNamedCursor = base.includes("cursor") || base === "agent" || base === "agent.exe" || base === "agent.cmd";
+  // Only accept weaker flag matches when the binary lives in a known Cursor install dir.
+  // (Grok's help text mentions --output-format; bare PATH `agent.exe` must not match.)
   if (
-    looksNamedCursor
+    isCursorInstallPath(command)
     && /--print|--output-format|stream-json|--force|--yolo/i.test(text)
     && !/claude|grok/i.test(text)
   ) {
     return true;
   }
   return false;
+}
+
+/** Pick the first Cursor-looking binary from an ordered candidate list. */
+async function firstCursorBinary(candidates: Array<string | null | undefined>): Promise<string | null> {
+  const seen = new Set<string>();
+  for (const raw of candidates) {
+    const candidate = raw?.trim();
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (isGrokInstallPath(candidate) || isCrossEngineBinary("cursor", candidate)) continue;
+    if (!(await pathExists(candidate)) && !path.isAbsolute(candidate)) {
+      // Allow resolveCommandPath results that already exist; skip missing locals.
+      continue;
+    }
+    if (path.isAbsolute(candidate) && !(await pathExists(candidate))) continue;
+    if (await looksLikeCursorAgent(candidate)) return candidate;
+  }
+  return null;
 }
 
 export async function detectAvailableEngines(options: {
@@ -426,57 +501,72 @@ export async function resolveEngineBinary(engine: Exclude<CliEngine, "codex">): 
   if (engine === "cursor") {
     if (process.env.CURSOR_COMMAND) {
       const forced = await resolveCommandPath(process.env.CURSOR_COMMAND);
-      if (forced && await looksLikeCursorAgent(forced)) return forced;
+      if (forced && !isGrokInstallPath(forced) && await looksLikeCursorAgent(forced)) return forced;
       if (forced) console.warn("[detect] CURSOR_COMMAND is not Cursor Agent CLI:", forced);
     }
     if (process.env.CURSOR_AGENT_COMMAND) {
       const forced = await resolveCommandPath(process.env.CURSOR_AGENT_COMMAND);
-      if (forced && await looksLikeCursorAgent(forced)) return forced;
+      if (forced && !isGrokInstallPath(forced) && await looksLikeCursorAgent(forced)) return forced;
     }
     // Prefer unambiguous names first — bare `agent` collides with Grok on Windows
     // (C:\Users\…\.grok\bin\agent.exe is Grok Build TUI, not Cursor).
-    const named = (await resolveCommandPath("cursor-agent"))
-      || (await resolveCommandPath("cursor-agent.exe"))
-      || (await resolveCommandPath("cursor-agent.cmd"));
-    if (named && await looksLikeCursorAgent(named)) return named;
-    if (named) {
-      // Name matched but failed signature check — ignore.
-    }
+    const namedHits = process.platform === "win32"
+      ? [
+          ...(await listWindowsCommandHits("cursor-agent")),
+          ...(await listWindowsCommandHits("cursor-agent.exe")),
+          ...(await listWindowsCommandHits("cursor-agent.cmd"))
+        ]
+      : [
+          await resolveCommandPath("cursor-agent")
+        ];
+    const named = await firstCursorBinary(namedHits);
+    if (named) return named;
+
     const home = os.homedir();
     // Cursor install locations only (see https://cursor.com/cn/cli). Never scan .grok.
     const localCandidates = process.platform === "win32"
       ? [
-          path.join(home, ".local", "bin", "agent.exe"),
-          path.join(home, ".local", "bin", "cursor-agent.exe"),
-          path.join(home, ".local", "bin", "agent.cmd"),
-          path.join(home, ".local", "bin", "agent"),
-          path.join(home, ".cursor", "bin", "agent.exe"),
-          path.join(home, ".cursor", "bin", "cursor-agent.exe"),
-          path.join(home, ".cursor", "bin", "agent"),
+          path.join(process.env.LOCALAPPDATA || "", "cursor-agent", "cursor-agent.cmd"),
+          path.join(process.env.LOCALAPPDATA || "", "cursor-agent", "cursor-agent.exe"),
+          path.join(process.env.LOCALAPPDATA || "", "cursor-agent", "agent.cmd"),
           path.join(process.env.LOCALAPPDATA || "", "cursor-agent", "agent.exe"),
-          path.join(process.env.LOCALAPPDATA || "", "cursor-agent", "cursor-agent.exe")
+          path.join(home, ".cursor", "bin", "cursor-agent.exe"),
+          path.join(home, ".cursor", "bin", "agent.exe"),
+          path.join(home, ".cursor", "bin", "agent.cmd"),
+          path.join(home, ".cursor", "bin", "agent"),
+          path.join(home, ".local", "bin", "cursor-agent.exe"),
+          path.join(home, ".local", "bin", "agent.exe"),
+          path.join(home, ".local", "bin", "agent.cmd"),
+          path.join(home, ".local", "bin", "agent")
         ]
       : [
-          path.join(home, ".local", "bin", "agent"),
           path.join(home, ".local", "bin", "cursor-agent"),
-          path.join(home, ".cursor", "bin", "agent"),
-          path.join(home, ".cursor", "bin", "cursor-agent")
+          path.join(home, ".cursor", "bin", "cursor-agent"),
+          path.join(home, ".local", "bin", "agent"),
+          path.join(home, ".cursor", "bin", "agent")
         ];
-    for (const candidate of localCandidates) {
-      if (!candidate || !(await pathExists(candidate))) continue;
-      if (await looksLikeCursorAgent(candidate)) return candidate;
-    }
-    // Last resort: PATH `agent`, but only if it is not Grok Build.
-    for (const name of process.platform === "win32" ? ["agent.exe", "agent.cmd", "agent"] : ["agent"]) {
-      const hit = await resolveCommandPath(name);
-      if (hit && await looksLikeCursorAgent(hit)) return hit;
+    const local = await firstCursorBinary(localCandidates);
+    if (local) return local;
+
+    // Last resort: every PATH `agent` hit, skipping Grok's agent.exe explicitly.
+    // IMPORTANT: do not use resolveCommandPath("agent") — it prefers .exe and caches Grok first.
+    if (process.platform === "win32") {
+      for (const name of ["agent.cmd", "agent.exe", "agent"]) {
+        const hit = await firstCursorBinary(await listWindowsCommandHits(name));
+        if (hit) return hit;
+      }
+    } else {
+      const hit = await resolveCommandPath("agent");
+      if (hit && !isGrokInstallPath(hit) && await looksLikeCursorAgent(hit)) return hit;
     }
     return null;
   }
   if (process.env.GROK_COMMAND) return resolveCommandPath(process.env.GROK_COMMAND);
+  // Prefer the dedicated `grok` binary — never the shared `agent` name (Cursor collision).
   return (await resolveCommandPath("grok"))
     || (await resolveCommandPath("grok.exe"))
-    || (await resolveCommandPath("grok.cmd"));
+    || (await resolveCommandPath("grok.cmd"))
+    || (await resolveCommandPath(path.join(os.homedir(), ".grok", "bin", process.platform === "win32" ? "grok.exe" : "grok")));
 }
 
 /** @deprecated use resolveEngineBinary */
@@ -506,6 +596,10 @@ export type CursorSpawnTarget = {
 export async function resolveCursorSpawnTarget(): Promise<CursorSpawnTarget | null> {
   const binary = await resolveEngineBinary("cursor");
   if (!binary) return null;
+  if (isGrokInstallPath(binary) || isCrossEngineBinary("cursor", binary)) {
+    console.warn("[detect] refusing Grok/cross-engine binary for Cursor spawn:", binary);
+    return null;
+  }
 
   const tryVersionDir = async (versionDir: string): Promise<CursorSpawnTarget | null> => {
     const nodeName = process.platform === "win32" ? "node.exe" : "node";

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import path from "node:path";
 import { createInterface } from "node:readline";
 import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/protocol";
 import { collectLocalProxyEnv, mergeProxyIntoEnv } from "../local-proxy";
@@ -729,11 +730,26 @@ export async function runHeadlessTurn(
 
   let command = await resolveEngineBinary(engine);
   let cursorPrefixArgs: string[] = [];
+  let cursorBinaryLabel = "";
   if (engine === "cursor") {
     const target = await resolveCursorSpawnTarget();
     if (target) {
       command = target.command;
       cursorPrefixArgs = target.prefixArgs;
+      cursorBinaryLabel = cursorPrefixArgs.length
+        ? `${target.command} + ${path.basename(cursorPrefixArgs[0] || "")}`
+        : target.command;
+    } else if (command) {
+      cursorBinaryLabel = command;
+    }
+    // Final guard: never spawn Grok's identically named agent.exe as Cursor.
+    if (command && /[/\\]\.grok[/\\]/i.test(command.replace(/\\/g, "/"))) {
+      const message = `已拒绝使用 Grok 的 agent 二进制作为 Cursor（${command}）。请安装 Cursor Agent CLI（cursor-agent）或设置 CURSOR_COMMAND。`;
+      safeOnEvent({ type: "error", threadId: options.threadId, message });
+      safeOnEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
+      safeOnEvent({ type: "turn.completed", threadId: options.threadId, turnId: options.turnId, status: "failed" });
+      await eventChain;
+      return { providerSessionId: options.providerSessionId || options.threadId, status: "failed", text: message };
     }
   }
   if (!command) {
@@ -1008,7 +1024,7 @@ export async function runHeadlessTurn(
           state.errorMessage = engine === "claude"
             ? `Claude 退出码 ${code ?? "unknown"}（模型不可用时请设置 CLAUDE_MODEL，或在 Claude CLI 中切换模型；未登录请执行 claude auth login）`
             : engine === "cursor"
-              ? `Cursor 退出码 ${code ?? "unknown"}（请确认 agent 已登录或设置 CURSOR_API_KEY；勿与 Grok 的 agent 混淆）`
+              ? `Cursor 退出码 ${code ?? "unknown"}（请确认已登录：agent login 或设置 CURSOR_API_KEY${cursorBinaryLabel ? `；实际二进制：${cursorBinaryLabel}` : ""}）`
               : `Grok 退出码 ${code ?? "unknown"}`;
           safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
           emitDelta(safeOnEvent, options, "stage:error", "stage", `\n✗ ${state.errorMessage}\n`);

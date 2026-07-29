@@ -7,6 +7,7 @@ import {
   Menu,
   nativeImage,
   safeStorage,
+  session,
   shell,
   Tray
 } from "electron";
@@ -3846,7 +3847,11 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "sync.request") {
-      const syncLimit = command.limit ?? DEFAULT_SYNC_LIMIT;
+      const hasQuery = Boolean(command.query?.trim());
+      // Plain sync is always the recent window (10). Search may use a larger publish/scan budget.
+      const syncLimit = hasQuery
+        ? Math.min(SEARCH_LIST_LIMIT, Math.max(1, command.limit ?? DEFAULT_SYNC_LIMIT))
+        : DEFAULT_SYNC_LIMIT;
       // Lightweight status push (no full engine re-detect) — full detect is expensive on every sync.
       void publish({
         type: "host.status",
@@ -4301,8 +4306,8 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   let codexTasks: AgentTask[] = [];
   try {
     if (!codex) await ensureCodex();
-    const response = await codex!.request("thread/list", { limit: listLimit, sortDirection: "desc" });
-    let threads: Array<Record<string, any>> = response.data ?? [];
+    const response = await codex!.request("thread/list", { limit: listLimit, sortDirection: "desc", sortKey: "updated_at" });
+    let threads: Array<Record<string, any>> = extractCodexThreadList(response);
     threads = [...threads].sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0));
     codexTasks = threads.map((thread) => ({
       threadId: String(thread.id),
@@ -4331,9 +4336,12 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   updateState({ tasks });
 }
 
-/** Recent tasks to fully sync per coding engine (Codex / Claude / Grok each). */
+/** Recent tasks to fully sync per coding engine (Codex / Claude / Grok / Cursor each). */
 const DEFAULT_SYNC_LIMIT = 10;
+/** Codex thread/list page size / max matches published for one search. */
 const SEARCH_LIST_LIMIT = 100;
+/** Max Codex list pages to walk while searching (100 × 20 = 2000 titles scanned). */
+const SEARCH_MAX_PAGES = 20;
 
 /** Run async work over items with a fixed concurrency limit. */
 async function mapPool<T>(
@@ -4354,18 +4362,80 @@ async function mapPool<T>(
   await Promise.all(Array.from({ length: limit }, () => run()));
 }
 
+function extractCodexThreadList(response: unknown): Array<Record<string, any>> {
+  if (Array.isArray(response)) return response as Array<Record<string, any>>;
+  if (!response || typeof response !== "object") return [];
+  const row = response as Record<string, any>;
+  if (Array.isArray(row.data)) return row.data as Array<Record<string, any>>;
+  if (Array.isArray(row.threads)) return row.threads as Array<Record<string, any>>;
+  return [];
+}
+
+function extractCodexNextCursor(response: unknown): string | undefined {
+  if (!response || typeof response !== "object") return undefined;
+  const cursor = (response as Record<string, any>).nextCursor;
+  return typeof cursor === "string" && cursor.trim() ? cursor.trim() : undefined;
+}
+
+/**
+ * List Codex threads. Plain sync: one page of `limit` newest.
+ * Search: walk pages so older tasks remain findable (client-side case-insensitive match).
+ */
+async function listCodexThreadsForSync(options: {
+  limit: number;
+  query?: string;
+}): Promise<Array<Record<string, any>>> {
+  const query = options.query?.trim() ?? "";
+  const pageLimit = query
+    ? SEARCH_LIST_LIMIT
+    : Math.min(SEARCH_LIST_LIMIT, Math.max(1, options.limit));
+  const maxPages = query ? SEARCH_MAX_PAGES : 1;
+  const collected: Array<Record<string, any>> = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const response = await codex!.request("thread/list", {
+      limit: pageLimit,
+      sortDirection: "desc",
+      sortKey: "updated_at",
+      ...(cursor ? { cursor } : {})
+    });
+    const batch = extractCodexThreadList(response);
+    for (const thread of batch) {
+      const id = String(thread?.id || "").trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      collected.push(thread);
+    }
+    if (!query) break;
+    cursor = extractCodexNextCursor(response);
+    if (!cursor || batch.length === 0) break;
+  }
+
+  collected.sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0));
+  if (query) {
+    const q = query.toLowerCase();
+    return collected.filter((thread) => threadMatchesQuery(thread, q));
+  }
+  // Hard cap — never sync more than the requested recent window.
+  return collected.slice(0, Math.max(1, options.limit));
+}
+
 /** Publish up to `limit` recent non-Codex tasks for each multi-CLI engine. */
 async function publishRecentMultiCliSnapshots(limit: number, query?: string): Promise<number> {
   const q = query?.trim().toLowerCase() ?? "";
   const counts: Record<"claude" | "grok" | "cursor", number> = { claude: 0, grok: 0, cursor: 0 };
   const toPublish: string[] = [];
-  // Pull a wider window so each engine can still fill its quota after filtering.
-  for (const task of taskStore.list(Math.max(limit * 10, 50))) {
+  // Search may scan a wider local index; plain sync stays on a small recent window.
+  const scanWindow = q ? 1_000 : Math.max(limit * 10, 50);
+  const perEngineCap = q ? SEARCH_LIST_LIMIT : limit;
+  for (const task of taskStore.list(scanWindow)) {
     if (task.engine !== "claude" && task.engine !== "grok" && task.engine !== "cursor") continue;
     if (isThreadDeleted(task.threadId) || (task.providerSessionId && isThreadDeleted(task.providerSessionId))) {
       continue;
     }
-    if (counts[task.engine] >= limit) continue;
+    if (counts[task.engine] >= perEngineCap) continue;
     if (q && !`${task.title}\n${task.cwd}\n${task.status}`.toLowerCase().includes(q)) continue;
     counts[task.engine] += 1;
     toPublish.push(task.threadId);
@@ -4394,24 +4464,22 @@ function threadMatchesQuery(thread: Record<string, any>, query: string): boolean
 
 /**
  * Lazy sync: by default only the most recently updated N threads (desc).
- * With query: scan a larger list window and publish matches so search can find older tasks.
+ * With query: scan/paginate Codex history and publish matches so search can find older tasks.
  */
 async function syncAllThreads(options: { limit?: number; query?: string } = {}): Promise<{ threadCount: number; partial: boolean }> {
   await ensureCodex();
-  const query = options.query?.trim().toLowerCase() ?? "";
-  const limit = Math.min(100, Math.max(1, options.limit ?? DEFAULT_SYNC_LIMIT));
-  const listLimit = query ? SEARCH_LIST_LIMIT : limit;
-  const response = await codex!.request("thread/list", { limit: listLimit, sortDirection: "desc" });
-  let threads: Array<Record<string, any>> = response.data ?? [];
-  // Ensure newest-first by updatedAt when available.
-  threads = [...threads].sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0));
-  if (query) {
-    threads = threads.filter((thread) => threadMatchesQuery(thread, query));
-  } else {
-    threads = threads.slice(0, limit);
-  }
+  const query = options.query?.trim() ?? "";
+  const limit = Math.min(SEARCH_LIST_LIMIT, Math.max(1, options.limit ?? DEFAULT_SYNC_LIMIT));
+  let threads = await listCodexThreadsForSync({
+    limit,
+    ...(query ? { query } : {})
+  });
   // Skip user-deleted threads so they do not reappear after sync.
   threads = threads.filter((thread) => !isThreadDeleted(String(thread.id)));
+  // Belt-and-suspenders: plain sync never exceeds the recent window.
+  if (!query && threads.length > limit) {
+    threads = threads.slice(0, limit);
+  }
   const total = threads.length;
   const okFlags = new Array<boolean>(total).fill(false);
   // Parallel Codex thread reads (app-server round-trips are the main cost).
@@ -4421,7 +4489,7 @@ async function syncAllThreads(options: { limit?: number; query?: string } = {}):
         type: "sync.progress",
         eventId: crypto.randomUUID(),
         occurredAt: new Date().toISOString(),
-        current: index,
+        current: index + 1,
         total,
         title: String(thread.name || thread.preview || thread.id || "")
       }, false);
@@ -5119,6 +5187,20 @@ async function checkForAgentUpdate(): Promise<void> {
     if (!config.relayUrl) return;
     if (installingUpdate) return;
     registerUpdateListeners();
+
+    // 使用本机代理（环境变量 / Windows 系统代理）完成后续所有网络请求。
+    // session.defaultSession.setProxy 同时覆盖 Electron fetch 和 electron-updater（均走 Chromium net 层）。
+    const localProxy = await collectLocalProxyEnv();
+    const proxyUrl = localProxy.HTTPS_PROXY || localProxy.HTTP_PROXY || localProxy.ALL_PROXY
+      || localProxy.https_proxy || localProxy.http_proxy || localProxy.all_proxy;
+    if (proxyUrl) {
+      try {
+        await session.defaultSession.setProxy({ proxyRules: proxyUrl, proxyBypassRules: localProxy.NO_PROXY || localProxy.no_proxy || "" });
+      } catch (proxyErr) {
+        console.warn("[update] 设置代理失败，继续直连：", proxyErr);
+      }
+    }
+
     const response = await fetch(`${config.relayUrl}/api/agent/config`);
     if (!response.ok) throw new Error(`无法读取更新配置：HTTP ${response.status}`);
     const remoteConfig = await response.json() as { updateFeedUrl: string | null };

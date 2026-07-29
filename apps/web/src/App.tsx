@@ -1919,7 +1919,7 @@ export function App() {
             }
             if (online && !autoSyncedHostsRef.current.has(hostId)) {
               autoSyncedHostsRef.current.add(hostId);
-              syncHostTasks(hostId).catch((syncError) => {
+              syncHostTasks(hostId, { limit: 10 }).catch((syncError) => {
                 autoSyncedHostsRef.current.delete(hostId);
                 setError(syncError.message);
               });
@@ -2046,12 +2046,13 @@ export function App() {
       });
     }, 90_000);
     try {
+      const query = options.query?.trim() || undefined;
       await sendCommand(hostId, {
         type: "sync.request",
         commandId: crypto.randomUUID(),
-        // Per-engine recent window (Codex / Claude / Grok each); keep low to limit bandwidth.
+        // Sync button: recent 10 only. Search: same per-engine recent default; agent expands Codex scan via query.
         limit: options.limit ?? 10,
-        ...(options.query ? { query: options.query } : {})
+        ...(query ? { query } : {})
       });
     } catch (syncError) {
       setSyncStatus((current) => {
@@ -2248,7 +2249,7 @@ export function App() {
           <div className="section-title">
             <div><p className="eyebrow">{t("taskStream")}</p><h1 className="host-title">{activeHost?.name ?? t("noHost")}</h1></div>
             <div className="section-actions">
-              <button className="sync-tasks" disabled={!activeHost || activeRuntime.online !== true || String(syncStatus[activeHost.id] ?? "").startsWith(t("syncing"))} onClick={() => activeHost && syncHostTasks(activeHost.id).catch((syncError) => setError(syncError.message))}>{activeHost ? syncStatus[activeHost.id] ?? t("syncTasks") : t("syncTasks")}</button>
+              <button className="sync-tasks" disabled={!activeHost || activeRuntime.online !== true || String(syncStatus[activeHost.id] ?? "").startsWith(t("syncing"))} onClick={() => activeHost && syncHostTasks(activeHost.id, { limit: 10 }).catch((syncError) => setError(syncError.message))}>{activeHost ? syncStatus[activeHost.id] ?? t("syncTasks") : t("syncTasks")}</button>
               <button className="new-task" disabled={!activeHost || activeRuntime.online !== true} onClick={() => setComposerOpen(true)}>{t("newTask")}</button>
             </div>
           </div>
