@@ -320,29 +320,39 @@ export async function resolveCommandPath(command: string): Promise<string | null
 
 function parseClaudeVersion(raw: string | null): string | undefined {
   if (!raw) return undefined;
+  const text = raw.trim();
   // Ignore Cursor-style calendar versions accidentally scraped from the wrong binary.
-  if (/^\d{4}\.\d{2}\.\d{2}/.test(raw.trim()) && !/claude/i.test(raw)) return undefined;
-  const match = raw.match(/(\d+\.\d+\.\d+(?:[-\w.]*)?)/);
-  return match?.[1] ?? raw.slice(0, 80);
+  if (/^\d{4}\.\d{2}\.\d{2}/.test(text) && !/claude/i.test(text)) return undefined;
+  // Accept semver, prerelease (1.2.3-alpha.1), two-part (1.2), and branded lines.
+  const match = text.match(/(\d+\.\d+\.\d+(?:[-\w.]*)?)/)
+    || text.match(/(\d+\.\d+(?:[-\w.]*)?)/)
+    || text.match(/claude[^\d]*([0-9][^\s]*)/i);
+  return match?.[1] ?? text.slice(0, 80);
 }
 
 function parseGrokVersion(raw: string | null): string | undefined {
   if (!raw) return undefined;
-  if (/cursor\s*agent/i.test(raw) && !/grok/i.test(raw)) return undefined;
-  if (/^\d{4}\.\d{2}\.\d{2}/.test(raw.trim()) && !/grok/i.test(raw)) return undefined;
-  const match = raw.match(/grok\s+([^\s]+)/i) || raw.match(/(\d+\.\d+\.\d+(?:[-\w.]*)?)/);
-  return match?.[1] ?? raw.slice(0, 80);
+  const text = raw.trim();
+  if (/cursor\s*agent/i.test(text) && !/grok/i.test(text)) return undefined;
+  if (/^\d{4}\.\d{2}\.\d{2}/.test(text) && !/grok/i.test(text)) return undefined;
+  const match = text.match(/grok\s+([^\s]+)/i)
+    || text.match(/(\d+\.\d+\.\d+(?:[-\w.]*)?)/)
+    || text.match(/(\d+\.\d+(?:[-\w.]*)?)/);
+  return match?.[1] ?? text.slice(0, 80);
 }
 
 function parseCursorVersion(raw: string | null): string | undefined {
   if (!raw) return undefined;
+  const text = raw.trim();
   // Avoid treating Grok's `agent` binary as Cursor (common PATH name collision).
-  if (/grok/i.test(raw) && !/cursor/i.test(raw)) return undefined;
-  if (/claude\s*code|\(Claude Code\)/i.test(raw) && !/cursor/i.test(raw)) return undefined;
-  const match = raw.match(/(\d{4}\.\d{2}\.\d{2}[-\w]*)/i)
-    || raw.match(/(\d+\.\d+\.\d+[-\w]*)/)
-    || raw.match(/cursor[^\d]*([0-9][^\s]*)/i);
-  return match?.[1] ?? (raw.length < 80 ? raw : raw.slice(0, 80));
+  if (/grok/i.test(text) && !/cursor/i.test(text)) return undefined;
+  if (/claude\s*code|\(Claude Code\)/i.test(text) && !/cursor/i.test(text)) return undefined;
+  // Calendar (YYYY.MM.DD), semver, or branded fallback — never require a fixed scheme.
+  const match = text.match(/(\d{4}\.\d{2}\.\d{2}[-\w]*)/i)
+    || text.match(/(\d+\.\d+\.\d+[-\w]*)/)
+    || text.match(/(\d+\.\d+[-\w]*)/)
+    || text.match(/cursor[^\d]*([0-9][^\s]*)/i);
+  return match?.[1] ?? (text.length < 80 ? text : text.slice(0, 80));
 }
 
 /** Reject binaries that clearly belong to another coding engine. */
@@ -465,26 +475,35 @@ export async function detectAvailableEngines(options: {
     },
     {
       engine: "claude",
-      ready: Boolean(claudePath && claudeVersion),
+      // Binary presence is enough — never gate readiness on a brittle version-string schema.
+      ready: Boolean(claudePath),
       ...(claudeVersion
         ? { version: claudeVersion }
-        : { detail: claudePath ? "claude 已找到但无法读取版本" : "未检测到 claude 命令，请安装并登录 Claude Code CLI" })
+        : {
+          detail: claudePath
+            ? (claudeRaw ? `claude 已找到（版本原文：${String(claudeRaw).slice(0, 60)}）` : "claude 已找到但无法读取版本")
+            : "未检测到 claude 命令，请安装并登录 Claude Code CLI"
+        })
     },
     {
       engine: "grok",
-      ready: Boolean(grokPath && grokVersion),
+      ready: Boolean(grokPath),
       ...(grokVersion
         ? { version: grokVersion }
-        : { detail: grokPath ? "grok 已找到但无法读取版本" : "未检测到 grok 命令，请安装 Grok Build CLI" })
+        : {
+          detail: grokPath
+            ? (grokRaw ? `grok 已找到（版本原文：${String(grokRaw).slice(0, 60)}）` : "grok 已找到但无法读取版本")
+            : "未检测到 grok 命令，请安装 Grok Build CLI"
+        })
     },
     {
       engine: "cursor",
-      ready: Boolean(cursorPath && (cursorVersion || cursorRaw)),
-      ...(cursorVersion || cursorRaw
-        ? { version: cursorVersion || String(cursorRaw).slice(0, 40) }
+      ready: Boolean(cursorPath),
+      ...(cursorVersion
+        ? { version: cursorVersion }
         : {
           detail: cursorPath
-            ? "cursor agent 已找到但无法读取版本"
+            ? (cursorRaw ? `cursor agent 已找到（版本原文：${String(cursorRaw).slice(0, 60)}）` : "cursor agent 已找到但无法读取版本")
             : "未检测到 Cursor Agent CLI（agent / cursor-agent），请安装并登录"
         })
     }
