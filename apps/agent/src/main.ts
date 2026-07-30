@@ -62,6 +62,7 @@ import { appendEngineDiffChunk, buildTurnDiff, clearEngineDiffChunks, extractFil
 import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
 import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
+import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt } from "./cli/macos-fs";
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
@@ -86,6 +87,7 @@ type AgentConfig = {
   publicKey?: JsonWebKey;
   pairing?: StoredPairing;
   workspaces: Workspace[];
+  workspaceBookmarks?: Record<string, string>;
   sequence: number;
 };
 
@@ -104,7 +106,11 @@ type PublicState = {
   engineCapabilities: EngineCapability[];
   workspaces: Workspace[];
   environment: EnvironmentState;
+  /** False until first local engine/env probe finishes ? UI shows a loading mask. */
+  environmentReady: boolean;
   update: UpdateState;
+  /** Running desktop build (prefer Electron app.getVersion when packaged). */
+  agentVersion: string;
   tasks: AgentTask[];
   /** @deprecated Prefer activities + selectedActivityThreadId (kept for older UI paint paths). */
   activity?: ActivityState;
@@ -166,11 +172,26 @@ let publicState: PublicState = {
   engineCapabilities: [],
   workspaces: [],
   environment: initialEnvironment,
+  environmentReady: false,
   update: { status: "idle" },
+  agentVersion: PRODUCT_VERSION,
   tasks: [],
   activities: []
 };
 const taskStore = new TaskStore();
+
+/** Prefer packaged Electron version so UI / updater / host.status never drift from protocol constant. */
+function agentAppVersion(): string {
+  try {
+    if (app?.isPackaged) {
+      const v = String(app.getVersion() || "").trim();
+      if (v) return v;
+    }
+  } catch {
+    // app may not be ready yet during module init
+  }
+  return PRODUCT_VERSION;
+}
 
 function productIconPath(): string {
   const candidates = [
@@ -718,7 +739,8 @@ function syncActivitiesState(nextActivities: ActivityState[], selectedThreadId?:
     relayUrl: config?.relayUrl ?? publicState.relayUrl,
     displayName: config ? resolvedDisplayName() : publicState.displayName,
     codexVersion,
-    workspaces: config?.workspaces ?? publicState.workspaces
+    workspaces: config?.workspaces ?? publicState.workspaces,
+    agentVersion: patch.agentVersion ?? agentAppVersion()
   };
   if (selected) next.selectedActivityThreadId = selected;
   else delete next.selectedActivityThreadId;
@@ -1208,7 +1230,15 @@ function rendererHtml(): string {
   .footer .lang-switch{display:inline-flex;border:1px solid rgba(23,33,27,.12);border-radius:8px;overflow:hidden}
   .footer .lang-switch button{border:0;border-radius:0;background:#eee6d8;color:#6b726b;padding:5px 8px;font-size:10px}
   .footer .lang-switch button.active{background:#17211b;color:#fff}
-  </style></head><body><div class="frame"><main class="shell">
+  .boot-mask{position:absolute;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;padding:18px;border-radius:18px;background:rgba(242,234,219,.88);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);-webkit-app-region:no-drag;app-region:no-drag}
+  .boot-mask.hidden{display:none}
+  .boot-mask .boot-card{max-width:280px;text-align:center}
+  .boot-mask .boot-card strong{display:block;font:700 14px Rockwell,serif;color:#17211b;margin-bottom:6px}
+  .boot-mask .boot-card span{display:block;font-size:11px;line-height:1.45;color:#6b726b}
+  .boot-mask .spinner{width:28px;height:28px;margin:0 auto 12px;border-radius:50%;border:3px solid rgba(23,33,27,.12);border-top-color:#2d7653;animation:bootspin .8s linear infinite}
+  @keyframes bootspin{to{transform:rotate(360deg)}}
+  </style></head><body><div class="frame"><main class="shell" style="position:relative">
+  <div id="bootMask" class="boot-mask" aria-live="polite"><div class="boot-card"><div class="spinner"></div><strong id="bootTitle">&#x6B63;&#x5728;&#x68C0;&#x6D4B;&#x672C;&#x673A;&#x7F16;&#x7801;&#x73AF;&#x5883;</strong><span id="bootHint">&#x52A0;&#x8F7D;&#x5B8C;&#x6210;&#x524D;&#x4E0D;&#x4F1A;&#x63D0;&#x793A;&#x5B89;&#x88C5;&#x524D;&#x7F6E;&#x73AF;&#x5883;&#xFF0C;&#x8BF7;&#x7A0D;&#x5019;&#x2026;</span></div></div>
   <div class="titlebar">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1 id="brandTitle">随码</h1><p id="brandTag">随时续上你的代码 · ${platformLabel}</p></div><div class="win-actions"><button type="button" id="openLogs" class="logs-btn" title="运行日志">日志</button><button type="button" id="winMin" title="最小化">–</button><button type="button" id="winClose" class="close" title="关闭">×</button></div></div>
   <section class="card" style="flex:0 0 auto"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
   <nav class="nav-tabs" role="tablist" aria-label="客户端功能">
@@ -1381,7 +1411,7 @@ function rendererHtml(): string {
       btn.addEventListener('click',function(){ setActiveTab(btn.getAttribute('data-goto')||'guide'); });
     });
     // First successful paint: jump to first incomplete step's tab if still on default guide.
-    if(!guidedOnce){
+    if(!guidedOnce && state.environmentReady){
       guidedOnce=true;
       try{
         var stored=localStorage.getItem('anytimevibe-tab');
@@ -1410,9 +1440,17 @@ function rendererHtml(): string {
       if(detail) detail.textContent=state.detail||'';
       if(relay && document.activeElement!==relay) relay.value=state.relayUrl||'';
       if(displayName && document.activeElement!==displayName) displayName.value=state.displayName||'';
-      if(meta) meta.textContent='客户端 v'+${JSON.stringify(PRODUCT_VERSION)}+(state.hostId?' · '+String(state.hostId).slice(0,8):'');
+      if(meta) meta.textContent='\u5ba2\u6237\u7aef v'+(state.agentVersion||${JSON.stringify(PRODUCT_VERSION)})+(state.hostId?' \u00b7 '+String(state.hostId).slice(0,8):'');
+      var bootMask=document.querySelector('#bootMask');
+      if(bootMask) bootMask.classList.toggle('hidden',!!state.environmentReady);
       var env=state.environment||{nodeInstalled:false,codexCompatible:false,codexInstalled:false};
       var engines=state.availableEngines||[];
+      if(!state.environmentReady){
+        if(environment) environment.innerHTML='<div class="check"><b>\u672c\u673a\u73af\u5883</b><span>\u6b63\u5728\u68c0\u6d4b\u672c\u673a\u7f16\u7801\u73af\u5883\uff0c\u8bf7\u7a0d\u5019\u2026</span></div>';
+        renderGuide(state);
+        renderUpdate(state.update||{status:'idle'});
+        return;
+      }
       var nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">一键安装</button>':'';
       // Codex install needs npm; only show after Node is present (unlike Claude/Grok).
       var codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">'+(env.codexInstalled?'安装兼容版':'一键安装')+'</button>':'';
@@ -1720,14 +1758,72 @@ async function loadConfig(): Promise<void> {
     dirty = true;
   }
   config.workspaces ??= [];
+  config.workspaceBookmarks ??= {};
   config.sequence ??= 0;
   if (dirty) await saveConfig();
   publicState = {
     ...publicState,
     relayUrl: config.relayUrl,
     displayName: resolvedDisplayName(),
-    workspaces: config.workspaces
+    workspaces: config.workspaces,
+    agentVersion: agentAppVersion(),
+    environmentReady: false
   };
+  activateMacWorkspaceBookmarks();
+}
+
+const macBookmarkStoppers: Array<() => void> = [];
+
+function activateMacWorkspaceBookmarks(): void {
+  if (process.platform !== "darwin") return;
+  for (const stop of macBookmarkStoppers.splice(0)) {
+    try { stop(); } catch { /* ignore */ }
+  }
+  const bookmarks = config.workspaceBookmarks || {};
+  for (const workspace of config.workspaces || []) {
+    const bookmark = bookmarks[workspace.id];
+    if (!bookmark) continue;
+    try {
+      const stop = app.startAccessingSecurityScopedResource(bookmark);
+      if (typeof stop === "function") macBookmarkStoppers.push(stop);
+      grantMacFsAccessRoot(workspace.path);
+      logInfo("\u5df2\u6fc0\u6d3b\u5de5\u4f5c\u533a\u4e66\u7b7e\u8bbf\u95ee", workspace.path);
+    } catch (error) {
+      logWarn("\u6fc0\u6d3b\u5de5\u4f5c\u533a\u4e66\u7b7e\u5931\u8d25", `${workspace.path}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+async function ensureMacFolderAccess(targetPath: string, reason: string): Promise<string> {
+  const resolved = path.resolve(targetPath);
+  if (process.platform !== "darwin" || !isMacTccProtectedPath(resolved)) return resolved;
+  if (canProbePathWithoutPrompt(resolved, workspaceAllowRoots())) {
+    grantMacFsAccessRoot(resolved);
+    return resolved;
+  }
+  const result = await dialog.showOpenDialog({
+    title: "\u6388\u6743\u8bbf\u95ee\u5de5\u4f5c\u533a",
+    message: reason || "\u9700\u8981\u6388\u6743\u8bbf\u95ee\u8be5\u6587\u4ef6\u5939\u540e\u624d\u80fd\u7ee7\u7eed",
+    defaultPath: resolved,
+    properties: ["openDirectory", "createDirectory"],
+    securityScopedBookmarks: true
+  });
+  if (result.canceled || !result.filePaths[0]) {
+    throw new Error("\u672a\u6388\u6743\u8bbf\u95ee\u8be5\u6587\u4ef6\u5939\uff0c\u5df2\u53d6\u6d88\u64cd\u4f5c");
+  }
+  const selected = path.resolve(result.filePaths[0]);
+  const bookmark = Array.isArray(result.bookmarks) ? result.bookmarks[0] : undefined;
+  const matched = config.workspaces.find((item) => path.resolve(item.path).toLowerCase() === selected.toLowerCase());
+  if (matched && bookmark) {
+    config.workspaceBookmarks = { ...(config.workspaceBookmarks || {}), [matched.id]: bookmark };
+    await saveConfig();
+    try {
+      const stop = app.startAccessingSecurityScopedResource(bookmark);
+      if (typeof stop === "function") macBookmarkStoppers.push(stop);
+    } catch { /* ignore */ }
+  }
+  grantMacFsAccessRoot(selected);
+  return selected;
 }
 
 // ---------------------------------------------------------------------------
@@ -1739,6 +1835,7 @@ let cachedMacLoginPath: string | null = null;
 let cachedWindowsPath: string | null = null;
 
 async function pathExists(filePath: string): Promise<boolean> {
+  if (!canProbePathWithoutPrompt(filePath, workspaceAllowRoots())) return false;
   try {
     await fs.access(filePath);
     return true;
@@ -3024,9 +3121,10 @@ async function recoverAfterCodexAppServerExit(detail: string): Promise<void> {
 
 /** Write project trust, then restart app-server if config changed so the new trust is loaded. */
 async function ensureCodexTrustedAndReady(cwd: string): Promise<void> {
-  const trustChanged = await ensureWorkspaceTrusted("codex", cwd);
+  const accessCwd = await ensureMacFolderAccess(cwd, "Codex 任务需要访问该工作区文件夹");
+  const trustChanged = await ensureWorkspaceTrusted("codex", accessCwd);
   if (trustChanged && codex) {
-    logInfo("Codex 项目信任已更新，正在重载 app-server", cwd);
+    logInfo("Codex 项目信任已更新，正在重载 app-server", accessCwd);
     try {
       codex.stop();
     } catch {
@@ -3494,7 +3592,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
   // host.refresh: status + re-import local Claude/Grok/Cursor sessions for web list.
   if (command.type === "host.refresh") {
     // Always re-push agentVersion first so web update banners clear quickly after client upgrade.
-    publishAgentMeta({ agentVersion: PRODUCT_VERSION });
+    publishAgentMeta({ agentVersion: agentAppVersion() });
     await publishHostStatus();
     try {
       const imported = await importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT, workspaceAllowRoots());
@@ -3560,7 +3658,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
   }
   // host.set_cli_engine kept for protocol compatibility; engine is chosen per-task on web.
   if (command.type === "host.set_cli_engine") {
-    publishAgentMeta({ agentVersion: PRODUCT_VERSION });
+    publishAgentMeta({ agentVersion: agentAppVersion() });
     await publishHostStatus();
     return;
   }
@@ -3568,17 +3666,18 @@ async function handleCommand(command: ClientCommand): Promise<void> {
   try {
     if (command.type === "task.create") {
       if (!isAllowedWorkspace(command.cwd)) throw new Error("工作目录不在代理白名单中");
+      const accessCwd = await ensureMacFolderAccess(command.cwd, "远程任务需要访问该工作区文件夹");
       const mode = command.permissionMode ?? "ask-for-approval";
       if (!command.cliEngine) throw new Error("请在网页端选择编码引擎后再下发任务");
       const engine = normalizeCliEngine(command.cliEngine);
       if (engine === "claude" || engine === "grok" || engine === "cursor") {
         const threadId = crypto.randomUUID();
         localThreadId = threadId;
-        await ensureWorkspaceTrusted(engine, command.cwd);
+        await ensureWorkspaceTrusted(engine, accessCwd);
         await runHeadlessTaskTurn({
           engine,
           threadId,
-          cwd: command.cwd,
+          cwd: accessCwd,
           prompt: command.prompt,
           ...(command.title ? { title: command.title } : {}),
           permissionMode: mode,
@@ -3590,7 +3689,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       }
       // Pre-trust project root so Codex app-server does not hang on the interactive
       // "Do you trust the contents of this directory?" prompt (no TTY in remote mode).
-      const absoluteCwd = resolveAbsoluteCwd(command.cwd);
+      const absoluteCwd = resolveAbsoluteCwd(accessCwd);
       await ensureCodexTrustedAndReady(absoluteCwd);
       const startParams: Record<string, unknown> = { ...threadStartParams(absoluteCwd, mode) };
       if (command.model) startParams.model = command.model;
@@ -3865,10 +3964,10 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         cliEngine: taskStore.getDefaultEngine(),
         availableEngines: publicState.availableEngines,
         engineCapabilities: publicState.engineCapabilities,
-        agentVersion: PRODUCT_VERSION,
+        agentVersion: agentAppVersion(),
         ...(lastEngineQuotas.length ? { engineQuotas: lastEngineQuotas } : {})
       }, true).catch(() => undefined);
-      publishAgentMeta({ agentVersion: PRODUCT_VERSION });
+      publishAgentMeta({ agentVersion: agentAppVersion() });
 
       // Import multi-CLI sessions and publish snapshots in parallel with Codex path where possible.
       let multiCliCount = 0;
@@ -4189,7 +4288,7 @@ function publishAgentMeta(fields: {
         }
         : {}),
       platform: fields.platform ?? `${process.platform} ${os.release()}`,
-      agentVersion: fields.agentVersion ?? PRODUCT_VERSION
+      agentVersion: fields.agentVersion ?? agentAppVersion()
     }));
   } catch {
     // ignore
@@ -4229,7 +4328,7 @@ async function publishHostStatus(): Promise<void> {
   // Keep encrypted host.status for workspaces/online UX; version/name also go via agent.meta for DB.
   await refreshAvailableEngines().catch(() => undefined);
   // Always stamp the running build version so web banners update without waiting for a full re-pair.
-  publishAgentMeta({ agentVersion: PRODUCT_VERSION });
+  publishAgentMeta({ agentVersion: agentAppVersion() });
   await publish({
     type: "host.status", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), online: true,
     name: resolvedDisplayName(), platform: `${process.platform} ${os.release()}`, codexVersion,
@@ -4237,7 +4336,7 @@ async function publishHostStatus(): Promise<void> {
     cliEngine: taskStore.getDefaultEngine(),
     availableEngines: publicState.availableEngines,
     engineCapabilities: publicState.engineCapabilities,
-    agentVersion: PRODUCT_VERSION,
+    agentVersion: agentAppVersion(),
     ...(lastEngineQuotas.length ? { engineQuotas: lastEngineQuotas } : {})
   }, true);
 }
@@ -4638,6 +4737,7 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   const stored = taskStore.get(threadId);
   const engine = task.engine ?? stored?.engine ?? "codex";
   const cwd = task.cwd || os.homedir();
+  const accessCwd = await ensureMacFolderAccess(cwd, "接力终端需要访问该工作区文件夹");
   // Only resume with provider-native session ids (not our product thread UUID unless they match).
   const providerSessionId = (stored?.providerSessionId || "").trim();
 
@@ -4646,7 +4746,7 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     engine === "claude" || engine === "grok" || engine === "codex" || engine === "cursor"
       ? engine
       : "codex",
-    cwd
+    accessCwd
   );
 
   if (engine === "claude") {
@@ -4660,10 +4760,10 @@ async function relayTaskToCli(threadId: string): Promise<void> {
       ...(providerSessionId ? ["--resume", providerSessionId] : [])
     ];
     if (process.platform === "win32") {
-      await openExternalTerminal(cwd, formatWinCliCommand(binary, args));
+      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args));
     } else {
       await openExternalTerminal(
-        cwd,
+        accessCwd,
         [shellQuote(binary), ...args.map((part) => (part.startsWith("-") ? part : shellQuote(part)))].join(" ")
       );
     }
@@ -4677,18 +4777,18 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     const args = [
       ...(providerSessionId ? ["--resume", providerSessionId] : []),
       ...(model ? ["--model", model] : []),
-      "--cwd", cwd
+      "--cwd", accessCwd
     ];
     if (process.platform === "win32") {
-      await openExternalTerminal(cwd, formatWinCliCommand(binary, args));
+      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args));
     } else {
       await openExternalTerminal(
-        cwd,
+        accessCwd,
         [
           shellQuote(binary),
           ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : []),
           ...(model ? ["--model", shellQuote(model)] : []),
-          "--cwd", shellQuote(cwd)
+          "--cwd", shellQuote(accessCwd)
         ].join(" ")
       );
     }
@@ -4705,18 +4805,18 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     const args = [
       ...(providerSessionId ? ["--resume", providerSessionId] : []),
       ...(model ? ["--model", model] : []),
-      "--workspace", cwd
+      "--workspace", accessCwd
     ];
     if (process.platform === "win32") {
-      await openExternalTerminal(cwd, formatWinCliCommand(binary, args));
+      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args));
     } else {
       await openExternalTerminal(
-        cwd,
+        accessCwd,
         [
           shellQuote(binary),
           ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : []),
           ...(model ? ["--model", shellQuote(model)] : []),
-          "--workspace", shellQuote(cwd)
+          "--workspace", shellQuote(accessCwd)
         ].join(" ")
       );
     }
@@ -4725,7 +4825,7 @@ async function relayTaskToCli(threadId: string): Promise<void> {
 
   // Codex session id is the product/thread id.
   const binary = await resolveCodexBinaryForRelay();
-  console.log(`[relay] codex binary=${binary} thread=${threadId} cwd=${cwd}`);
+  console.log(`[relay] codex binary=${binary} thread=${threadId} cwd=${accessCwd}`);
   if (process.platform === "win32") {
     // Prefer invoking via `node …/codex.js` when the discovery path is a .cmd shim —
     // some environments break on nested batch files even with `call`.
@@ -4740,11 +4840,11 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     } catch {
       // keep call codex.cmd
     }
-    await openExternalTerminal(cwd, commandLine);
+    await openExternalTerminal(accessCwd, commandLine);
     return;
   }
   if (process.platform === "darwin") {
-    await openExternalTerminal(cwd, `${shellQuote(binary)} resume ${shellQuote(threadId)}`);
+    await openExternalTerminal(accessCwd, `${shellQuote(binary)} resume ${shellQuote(threadId)}`);
     return;
   }
   throw new Error("当前系统暂不支持启动接力终端。");
@@ -4769,7 +4869,19 @@ async function addWorkspace(): Promise<PublicState> {
   if (!selected) return publicState;
   const resolved = path.resolve(selected);
   if (!config.workspaces.some((workspace) => path.resolve(workspace.path).toLowerCase() === resolved.toLowerCase())) {
-    config.workspaces.push({ id: crypto.randomUUID(), name: path.basename(resolved), path: resolved });
+    const workspace = { id: crypto.randomUUID(), name: path.basename(resolved), path: resolved };
+    config.workspaces.push(workspace);
+    const bookmark = Array.isArray(result.bookmarks) ? result.bookmarks[0] : undefined;
+    if (bookmark) {
+      config.workspaceBookmarks = { ...(config.workspaceBookmarks || {}), [workspace.id]: bookmark };
+      try {
+        const stop = app.startAccessingSecurityScopedResource(bookmark);
+        if (typeof stop === "function") macBookmarkStoppers.push(stop);
+      } catch {
+        // The grant below still covers the current agent session.
+      }
+    }
+    grantMacFsAccessRoot(resolved);
     await saveConfig();
     updateState({ workspaces: config.workspaces });
     // Pre-trust so first remote task in this folder is not blocked by CLI trust prompts.
@@ -5177,6 +5289,48 @@ function installDownloadedUpdate(): void {
   }, 150);
 }
 
+function toElectronProxyRules(proxyUrl: string): string {
+  const raw = String(proxyUrl || "").trim();
+  if (!raw) return raw;
+  try {
+    const parsed = new URL(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw) ? raw : `http://${raw}`);
+    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    const hostPort = `${parsed.hostname}:${port}`;
+    if (parsed.protocol.startsWith("socks")) return `socks5://${hostPort}`;
+    return `http=${hostPort};https=${hostPort}`;
+  } catch {
+    return raw.replace(/^https?:\/\//i, "");
+  }
+}
+
+async function applyLocalProxyToElectronSessions(mode: "auto" | "direct" = "auto"): Promise<void> {
+  const targets = [session.defaultSession];
+  try {
+    targets.push(session.fromPartition("electron-updater"));
+  } catch {
+    // optional
+  }
+  if (windowRef && !windowRef.isDestroyed()) targets.push(windowRef.webContents.session);
+  if (mode === "direct") {
+    await Promise.all(targets.map((target) => target.setProxy({ mode: "direct" })));
+    return;
+  }
+  const localProxy = await collectLocalProxyEnv();
+  const proxyUrl = localProxy.HTTPS_PROXY || localProxy.HTTP_PROXY || localProxy.ALL_PROXY
+    || localProxy.https_proxy || localProxy.http_proxy || localProxy.all_proxy;
+  if (!proxyUrl) return;
+  const bypass = ["localhost", "127.0.0.1", "::1", "<local>", localProxy.NO_PROXY, localProxy.no_proxy]
+    .filter(Boolean)
+    .join(",");
+  const proxyConfig = {
+    proxyRules: toElectronProxyRules(proxyUrl),
+    proxyBypassRules: bypass
+  };
+  await Promise.all(targets.map((target) => target.setProxy(proxyConfig)));
+  Object.assign(process.env, mergeProxyIntoEnv({}, localProxy));
+  logInfo("更新检查已启用本机代理", proxyConfig.proxyRules);
+}
+
 async function checkForAgentUpdate(): Promise<void> {
   if (updateCheckInFlight) return updateCheckInFlight;
   updateCheckInFlight = (async () => {
@@ -5184,53 +5338,62 @@ async function checkForAgentUpdate(): Promise<void> {
       updateState({ update: { status: "idle", message: "开发模式不检查更新" } });
       return;
     }
-    if (!config.relayUrl) return;
-    if (installingUpdate) return;
+    if (!config.relayUrl || installingUpdate) return;
     registerUpdateListeners();
-
-    // 使用本机代理（环境变量 / Windows 系统代理）完成后续所有网络请求。
-    // session.defaultSession.setProxy 同时覆盖 Electron fetch 和 electron-updater（均走 Chromium net 层）。
-    const localProxy = await collectLocalProxyEnv();
-    const proxyUrl = localProxy.HTTPS_PROXY || localProxy.HTTP_PROXY || localProxy.ALL_PROXY
-      || localProxy.https_proxy || localProxy.http_proxy || localProxy.all_proxy;
-    if (proxyUrl) {
-      try {
-        await session.defaultSession.setProxy({ proxyRules: proxyUrl, proxyBypassRules: localProxy.NO_PROXY || localProxy.no_proxy || "" });
-      } catch (proxyErr) {
-        console.warn("[update] 设置代理失败，继续直连：", proxyErr);
+    const localVersion = agentAppVersion();
+    const runCheck = async (mode: "auto" | "direct") => {
+      await applyLocalProxyToElectronSessions(mode);
+      const response = await fetch(`${config.relayUrl}/api/agent/config`);
+      if (!response.ok) throw new Error(`无法读取更新配置：HTTP ${response.status}`);
+      const remoteConfig = await response.json() as { updateFeedUrl: string | null };
+      if (!remoteConfig.updateFeedUrl) {
+        updateState({ update: { status: "idle", message: `服务端未配置更新源（本地 v${localVersion}）` } });
+        return null;
       }
-    }
-
-    const response = await fetch(`${config.relayUrl}/api/agent/config`);
-    if (!response.ok) throw new Error(`无法读取更新配置：HTTP ${response.status}`);
-    const remoteConfig = await response.json() as { updateFeedUrl: string | null };
-    if (!remoteConfig.updateFeedUrl) {
-      updateState({ update: { status: "idle", message: "服务端未配置更新源" } });
-      return;
-    }
-    autoUpdater.setFeedURL({ provider: "generic", url: remoteConfig.updateFeedUrl });
-    // Bust CDN/proxy caches so a just-published latest.yml is visible immediately.
-    autoUpdater.requestHeaders = {
-      "Cache-Control": "no-cache",
-      Pragma: "no-cache"
+      autoUpdater.setFeedURL({ provider: "generic", url: remoteConfig.updateFeedUrl });
+      autoUpdater.requestHeaders = { "Cache-Control": "no-cache", Pragma: "no-cache" };
+      autoUpdater.autoDownload = false;
+      autoUpdater.autoInstallOnAppQuit = true;
+      return autoUpdater.checkForUpdates();
     };
-    // Drive download ourselves after reconciling any stale pending installer.
-    autoUpdater.autoDownload = false;
-    autoUpdater.autoInstallOnAppQuit = true;
-    updateState({ update: { status: "checking", message: "正在检查更新…" } });
 
-    const result = await autoUpdater.checkForUpdates();
-    if (!result?.isUpdateAvailable || !result.updateInfo) {
-      return;
+    updateState({ update: { status: "checking", message: `正在检查更新…（当前 v${localVersion}）` } });
+    let result;
+    try {
+      result = await runCheck("auto");
+    } catch (error) {
+      logWarn("更新检查走代理失败，改为直连重试", error instanceof Error ? error.message : String(error));
+      result = await runCheck("direct");
     }
+    if (!result?.updateInfo) return;
 
     const remoteVersion = String(result.updateInfo.version || "").trim();
     if (!remoteVersion) {
-      updateState({ update: { status: "error", message: "更新源未返回有效版本号" } });
+      updateState({ update: { status: "error", message: `更新源未返回有效版本号（本地 v${localVersion}）` } });
+      return;
+    }
+    if (!result.isUpdateAvailable) {
+      const comparison = compareSemverLike(remoteVersion, agentAppVersion());
+      if (comparison > 0) {
+        updateState({
+          update: {
+            status: "available",
+            version: remoteVersion,
+            message: `发现新版本 ${remoteVersion}（当前 ${localVersion}）。自动下载未就绪，请到 GitHub Releases 手动安装`
+          }
+        });
+      } else {
+        updateState({
+          update: {
+            status: "idle",
+            version: remoteVersion,
+            message: `当前已是最新（本地 ${localVersion}，源 ${remoteVersion}）`
+          }
+        });
+      }
       return;
     }
 
-    // Already have this exact package ready — keep install CTA, skip re-download.
     if (
       pendingDownloadedVersion
       && compareSemverLike(pendingDownloadedVersion, remoteVersion) === 0
@@ -5240,39 +5403,28 @@ async function checkForAgentUpdate(): Promise<void> {
         update: {
           status: "ready",
           version: remoteVersion,
-          message: process.platform === "darwin"
-            ? "更新已下载。点击「重启更新」将替换应用并自动重新打开。"
-            : "更新已在后台下载完成"
+          message: `更新已下载完成（v${remoteVersion}，当前 v${localVersion}）`
         }
       });
       return;
     }
-
-    // Had an older pending package while a newer release appeared — drop cache first.
-    if (
-      pendingDownloadedVersion
-      && compareSemverLike(remoteVersion, pendingDownloadedVersion) > 0
-    ) {
-      await clearPendingUpdaterCache(`${pendingDownloadedVersion} → ${remoteVersion}`);
-      // Differential patching against a stale pending installer often stalls; force full download.
+    if (pendingDownloadedVersion && compareSemverLike(remoteVersion, pendingDownloadedVersion) > 0) {
+      await clearPendingUpdaterCache(`${pendingDownloadedVersion} ? ${remoteVersion}`);
       autoUpdater.disableDifferentialDownload = true;
     }
-
     updateState({
       update: {
         status: "available",
         version: remoteVersion,
-        message: "正在下载最新版本…"
+        message: `Downloading v${remoteVersion} (current v${localVersion})?`
       }
     });
-    // Do not await the whole download here — it can take minutes; progress events update UI.
     void autoUpdater.downloadUpdate().then(() => {
-      // Re-enable differential for subsequent cycles once a fresh package is on disk.
       autoUpdater.disableDifferentialDownload = false;
     }).catch((error: Error) => {
       autoUpdater.disableDifferentialDownload = false;
       if (installingUpdate) return;
-      updateState({ update: { status: "error", message: error.message || "下载更新失败" } });
+      updateState({ update: { status: "error", message: error.message || "Update download failed" } });
     });
   })().finally(() => {
     updateCheckInFlight = null;
@@ -5307,6 +5459,9 @@ function registerIpc(): void {
   ipcMain.handle("agent:add-workspace", () => addWorkspace());
   ipcMain.handle("agent:remove-workspace", async (_event, id: string) => {
     config.workspaces = config.workspaces.filter((workspace) => workspace.id !== id);
+    if (config.workspaceBookmarks?.[id]) {
+      delete config.workspaceBookmarks[id];
+    }
     await saveConfig();
     updateState({ workspaces: config.workspaces });
     await publishHostStatus();
@@ -5349,10 +5504,9 @@ function registerIpc(): void {
     }
     clearEngineBinaryCache();
     const environment = await detectEnvironment();
-    const availableEngines = await detectAvailableEngines({
-      codexReady: environment.codexCompatible,
-      codexVersion: environment.codexVersion || "unknown"
-    });
+    updateState({ environment, codexVersion: environment.codexVersion || publicState.codexVersion });
+    await refreshAvailableEngines();
+    const availableEngines = publicState.availableEngines;
     const ready = anyCodingEngineReady(environment, availableEngines);
     const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
     const readyLabels = availableEngines
@@ -5362,6 +5516,9 @@ function registerIpc(): void {
     updateState({
       environment,
       availableEngines,
+      engineCapabilities: publicState.engineCapabilities,
+      environmentReady: true,
+      agentVersion: agentAppVersion(),
       codexVersion: environment.codexVersion || publicState.codexVersion,
       status: statusForEngineAvailability({ environment, engines: availableEngines, paired }),
       detail: !ready
@@ -5512,7 +5669,7 @@ app.whenReady().then(async () => {
   await loadTurnQueue(app.getPath("userData"));
   await loadDeletedThreads(app.getPath("userData"));
   await initAgentLogFile(app.getPath("userData"));
-  updateState({ cliEngine: taskStore.getDefaultEngine() });
+  updateState({ cliEngine: taskStore.getDefaultEngine(), agentVersion: agentAppVersion() });
   registerIpc();
   if (process.platform === "darwin") {
     Menu.setApplicationMenu(Menu.buildFromTemplate([{ role: "appMenu" }]));
@@ -5562,10 +5719,9 @@ app.whenReady().then(async () => {
     try {
       await applyLoginPathToProcessBounded();
       const environment = await detectEnvironment();
-      const availableEngines = await detectAvailableEngines({
-        codexReady: environment.codexCompatible,
-        codexVersion: environment.codexVersion || "unknown"
-      }).catch(() => publicState.availableEngines);
+      updateState({ environment, codexVersion: environment.codexVersion || codexVersion });
+      await refreshAvailableEngines().catch(() => undefined);
+      const availableEngines = publicState.availableEngines;
       const ready = anyCodingEngineReady(environment, availableEngines);
       const readyLabels = availableEngines
         .filter((item) => item.ready)
@@ -5574,6 +5730,9 @@ app.whenReady().then(async () => {
       updateState({
         environment,
         availableEngines,
+        engineCapabilities: publicState.engineCapabilities,
+        environmentReady: true,
+        agentVersion: agentAppVersion(),
         codexVersion: environment.codexVersion || codexVersion,
         // Do not overwrite online/connecting with incompatible when engines not yet found on PATH.
         ...(publicState.status === "online" || publicState.status === "connecting"
@@ -5590,9 +5749,13 @@ app.whenReady().then(async () => {
       if (environment.codexCompatible) {
         void ensureCodex().then(() => refreshLocalTasks()).catch(() => undefined);
       }
+      if (socket?.readyState === WebSocket.OPEN) {
+        void publishHostStatus().catch(() => undefined);
+      }
     } catch (error) {
       // Env probe failures must never force offline/incompatible over a live socket.
       logWarn("启动环境检测失败", error instanceof Error ? error.message : String(error));
+      updateState({ environmentReady: true, agentVersion: agentAppVersion() });
     }
   })();
 });

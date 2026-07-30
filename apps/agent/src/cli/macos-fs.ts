@@ -9,6 +9,41 @@ import path from "node:path";
 const MAC_TCC_SEGMENT_RE =
   /(^|\/)(Documents|Desktop|Downloads|Movies|Music|Pictures|Library\/Mobile Documents)(\/|$)/i;
 
+/** Roots the user explicitly authorized in this process (Open dialog / security-scoped bookmark). */
+const sessionGrantedRoots = new Set<string>();
+
+function normalizeFsPath(target: string): string {
+  let resolved = String(target || "").trim();
+  if (!resolved) return "";
+  try {
+    resolved = path.resolve(resolved);
+  } catch {
+    // keep raw
+  }
+  return resolved.replace(/\\/g, "/").replace(/\/$/, "").toLowerCase();
+}
+
+/** Record that the user granted access to this folder for the current process. */
+export function grantMacFsAccessRoot(root: string): void {
+  if (process.platform !== "darwin") return;
+  const normalized = normalizeFsPath(root);
+  if (normalized) sessionGrantedRoots.add(normalized);
+}
+
+export function clearMacFsAccessRoots(): void {
+  sessionGrantedRoots.clear();
+}
+
+export function isMacFsAccessGranted(target: string): boolean {
+  if (process.platform !== "darwin") return true;
+  const resolved = normalizeFsPath(target);
+  if (!resolved) return false;
+  for (const root of sessionGrantedRoots) {
+    if (resolved === root || resolved.startsWith(root + "/")) return true;
+  }
+  return false;
+}
+
 /** True when probing this path may trigger a macOS privacy dialog. */
 export function isMacTccProtectedPath(target: string): boolean {
   if (process.platform !== "darwin") return false;
@@ -82,29 +117,16 @@ export function isMacFsProbeSafePath(target: string): boolean {
 export function canProbePathWithoutPrompt(target: string, allowedRoots: string[] = []): boolean {
   if (process.platform !== "darwin") return true;
   if (isMacFsProbeSafePath(target)) return true;
+
+  // TCC folders: only after an explicit Open-dialog / bookmark grant this session.
+  // Do NOT treat saved workspace allowlist alone as consent — that re-triggers TCC every launch.
   if (isMacTccProtectedPath(target)) {
-    const resolved = (() => {
-      try {
-        return path.resolve(target);
-      } catch {
-        return target;
-      }
-    })().replace(/\\/g, "/").toLowerCase();
-    for (const root of allowedRoots) {
-      const base = (() => {
-        try {
-          return path.resolve(root);
-        } catch {
-          return root;
-        }
-      })().replace(/\\/g, "/").toLowerCase().replace(/\/$/, "");
-      if (!base) continue;
-      if (resolved === base || resolved.startsWith(base + "/")) return true;
-    }
-    return false;
+    return isMacFsAccessGranted(target);
   }
+
   // Other paths under home (e.g. ~/code) — probing can still prompt on newer macOS
-  // when the folder is synced/iCloud; only allow if under an explicit workspace root.
+  // when the folder is synced/iCloud; only allow if under an explicit workspace root
+  // that was granted this session, or a non-TCC allowlisted root.
   const home = os.homedir().replace(/\\/g, "/").toLowerCase();
   let resolved = target;
   try {
@@ -114,15 +136,12 @@ export function canProbePathWithoutPrompt(target: string, allowedRoots: string[]
   }
   const lower = resolved.replace(/\\/g, "/").toLowerCase();
   if (home && lower.startsWith(home + "/")) {
+    if (isMacFsAccessGranted(target)) return true;
     for (const root of allowedRoots) {
-      const base = (() => {
-        try {
-          return path.resolve(root);
-        } catch {
-          return root;
-        }
-      })().replace(/\\/g, "/").toLowerCase().replace(/\/$/, "");
+      const base = normalizeFsPath(root);
       if (!base) continue;
+      // Still skip if the allowlisted root itself is TCC-protected without grant.
+      if (isMacTccProtectedPath(root) && !isMacFsAccessGranted(root)) continue;
       if (lower === base || lower.startsWith(base + "/")) return true;
     }
     return false;

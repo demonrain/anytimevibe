@@ -6,14 +6,25 @@ import type { PermissionMode } from "@anytimevibe/protocol";
 type RpcId = string | number;
 type JsonObject = Record<string, any>;
 
-/** One-click install pin for Agent environment setup. */
+/** One-click install pin for Agent environment setup (floor; newer CLIs remain accepted). */
 export const CODEX_INSTALL_PACKAGE = "@openai/codex@0.145.0";
-/** Human-readable range shown in UI / error messages. */
-export const CODEX_COMPAT_LABEL = "0.144.x / 0.145.x";
+/** Human-readable floor shown in UI / error messages. */
+export const CODEX_COMPAT_LABEL = "≥ 0.144.0";
 
-/** True when local `codex --version` is an app-server minor this adapter supports. */
+/**
+ * True when local `codex --version` is new enough for app-server.
+ * Accepts stable and prerelease strings such as `0.146.0-alpha.3.1`.
+ * Floor is 0.144.0 — do not pin an upper bound so engine upgrades keep working.
+ */
 export function isCodexCompatibleVersion(version: string | undefined | null): boolean {
-  return Boolean(version && /^0\.14[45]\./.test(version.trim()));
+  if (!version) return false;
+  const match = version.trim().match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  if (major > 0) return true;
+  if (major === 0 && minor >= 144) return true;
+  return false;
 }
 
 /**

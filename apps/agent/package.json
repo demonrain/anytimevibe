@@ -1,6 +1,6 @@
 {
   "name": "@anytimevibe/agent",
-  "version": "0.4.54",
+  "version": "0.4.55",
   "description": "随码桌面代理：在 Windows / macOS 上安全接力远程 Codex 任务",
   "author": "随码",
   "private": true,
@@ -52,7 +52,15 @@
       ],
       "icon": "assets/icon.png",
       "artifactName": "AnytimeVibe-Agent.${ext}",
-      "category": "public.app-category.developer-tools"
+      "category": "public.app-category.developer-tools",
+      "extendInfo": {
+        "NSDocumentsFolderUsageDescription": "随码需要在你授权的工作区文件夹中读写项目文件，以便远程下发编码任务。",
+        "NSDesktopFolderUsageDescription": "随码需要在你授权的工作区文件夹中读写项目文件，以便远程下发编码任务。",
+        "NSDownloadsFolderUsageDescription": "随码需要在你授权的工作区文件夹中读写项目文件，以便远程下发编码任务。",
+        "NSRemovableVolumesUsageDescription": "随码需要访问你授权的工作区路径以执行远程编码任务。"
+      },
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
     },
     "publish": [
       {
