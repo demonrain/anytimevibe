@@ -79,14 +79,303 @@ export function isJunkCursorImportTask(task: {
 }): boolean {
   if (isEphemeralImportCwd(task.cwd)) return true;
   const messages = task.messages || [];
-  if (!hasUsefulTranscript(messages)) return true;
+  if (hasUsefulTranscript(messages)) return false;
   const title = String(task.title || "").trim();
+  // Named agent / real title without Temp cwd is still worth listing after handoff.
+  if (title && !/^cursor\s+[0-9a-f]{8}$/i.test(title) && title !== "New Agent") return false;
   // Fallback title "Cursor ab12cd34" with no real user ask
-  if (/^cursor\s+[0-9a-f]{8}$/i.test(title)) {
-    const hasUser = messages.some((message) => message.role === "user" && message.text.trim());
-    if (!hasUser) return true;
+  if (/^cursor\s+[0-9a-f]{8}$/i.test(title)) return true;
+  return true;
+}
+
+function titleFromCursorPromptHistory(history: string[]): string | undefined {
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const text = String(history[i] || "").trim();
+    if (!text) continue;
+    if (text.startsWith("/")) continue;
+    if (text.length <= 2 && /^[A-Za-z0-9]+$/.test(text)) continue;
+    return text.slice(0, 80);
   }
-  return false;
+  return undefined;
+}
+
+function messagesFromCursorPromptHistory(history: string[]): HistoryMessage[] {
+  const out: HistoryMessage[] = [];
+  for (const item of history) {
+    const text = String(item || "").trim();
+    if (!text || text.startsWith("/")) continue;
+    if (text.length <= 2 && /^[A-Za-z0-9]+$/.test(text)) continue;
+    out.push({ id: crypto.randomUUID(), role: "user", text: text.slice(0, 20_000) });
+  }
+  return out;
+}
+
+async function readCursorPromptHistory(sessionDir: string): Promise<string[]> {
+  try {
+    const raw = await fs.readFile(path.join(sessionDir, "prompt_history.json"), "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((item) => String(item ?? "").trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Cursor Agent stores chats under ~/.cursor/chats/<workspaceHash>/<sessionId>/.
+ * Each session has meta.json (cwd / timestamps), optional prompt_history.json, and store.db.
+ *
+ * Real handoff sessions often grow store.db to tens/hundreds of MB. Scanning every blob
+ * times out and yields zero messages → junk filter drops them. Scan newest JSON blobs only.
+ */
+async function readCursorSessionMessages(dbPath: string): Promise<{
+  messages: HistoryMessage[];
+  agentName?: string;
+}> {
+  const py = process.platform === "win32" ? "python" : "python3";
+  // Scan newest blobs first and cap rows — 133MB DBs finish in <100ms this way.
+  const script = [
+    "import sqlite3,json,sys,binascii,os",
+    `db=${JSON.stringify(dbPath)}`,
+    "con=sqlite3.connect(db)",
+    "cur=con.cursor()",
+    "agent_name=''",
+    "try:",
+    "  mv=cur.execute(\"select value from meta where key='0'\").fetchone()",
+    "  if mv:",
+    "    s=mv[0].decode('utf-8') if isinstance(mv[0],(bytes,bytearray)) else str(mv[0])",
+    "    if all(c in '0123456789abcdefABCDEF' for c in s.strip()):",
+    "      meta=json.loads(binascii.unhexlify(s.strip()).decode('utf-8'))",
+    "    else:",
+    "      meta=json.loads(s)",
+    "    agent_name=str(meta.get('name') or '')",
+    "except Exception:",
+    "  pass",
+    "size=0",
+    "try:",
+    "  size=os.path.getsize(db)",
+    "except Exception:",
+    "  pass",
+    // Large DBs: only the recent window; small DBs can afford a fuller scan.
+    "limit=2500 if size>8_000_000 else 8000",
+    "rows=cur.execute('select rowid,data from blobs order by rowid desc limit %d'%limit).fetchall()",
+    "msgs=[]",
+    "for rowid,data in rows:",
+    "  raw=bytes(data) if not isinstance(data,str) else data.encode('utf-8','replace')",
+    "  if not raw or raw[0] not in (0x7b,0x5b):",
+    "    continue",
+    "  try:",
+    "    obj=json.loads(raw.decode('utf-8'))",
+    "  except Exception:",
+    "    continue",
+    "  if not isinstance(obj,dict):",
+    "    continue",
+    "  role=obj.get('role')",
+    "  if role not in ('user','assistant'):",
+    "    continue",
+    "  content=obj.get('content')",
+    "  parts=[]",
+    "  if isinstance(content,str):",
+    "    parts.append(content)",
+    "  elif isinstance(content,list):",
+    "    for block in content:",
+    "      if isinstance(block,dict) and block.get('type')=='text' and block.get('text'):",
+    "        parts.append(str(block['text']))",
+    "  text='\\n'.join(parts).strip()",
+    "  if not text:",
+    "    continue",
+    "  msgs.append({'role':role,'text':text[:20000],'rowid':rowid})",
+    // Newest-first → chronological
+    "msgs.reverse()",
+    "print(json.dumps({'agentName':agent_name,'messages':msgs},ensure_ascii=False))"
+  ].join("\n");
+  try {
+    const { stdout } = await execFileAsync(py, ["-c", script], {
+      timeout: 45_000,
+      windowsHide: true,
+      maxBuffer: 16_000_000
+    });
+    const parsed = JSON.parse(String(stdout || "{}")) as {
+      agentName?: string;
+      messages?: Array<{ role?: string; text?: string }>;
+    };
+    const messages: HistoryMessage[] = [];
+    for (const row of parsed.messages || []) {
+      const role = row.role === "assistant" ? "assistant" : row.role === "user" ? "user" : null;
+      if (!role) continue;
+      const cleaned = cleanImportedMessageText(role, String(row.text || ""));
+      if (!cleaned) continue;
+      messages.push({ id: crypto.randomUUID(), role, text: cleaned });
+    }
+    return {
+      messages,
+      ...(parsed.agentName?.trim() ? { agentName: parsed.agentName.trim() } : {})
+    };
+  } catch {
+    return { messages: [] };
+  }
+}
+
+async function importCursorSessions(store: TaskStore, limit: number): Promise<number> {
+  const root = path.join(os.homedir(), ".cursor", "chats");
+  let workspaceDirs: string[] = [];
+  try {
+    workspaceDirs = (await fs.readdir(root)).map((name) => path.join(root, name));
+  } catch {
+    return 0;
+  }
+
+  type Hit = {
+    id: string;
+    dir: string;
+    mtime: number;
+    cwd: string;
+    createdAt: number;
+    updatedAt: number;
+    hasConversation: boolean;
+    isSubagent: boolean;
+  };
+  const hits: Hit[] = [];
+
+  for (const workspaceDir of workspaceDirs) {
+    let sessionDirs: string[] = [];
+    try {
+      const st = await fs.stat(workspaceDir);
+      if (!st.isDirectory()) continue;
+      sessionDirs = await fs.readdir(workspaceDir);
+    } catch {
+      continue;
+    }
+    for (const sessionId of sessionDirs) {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) continue;
+      const dir = path.join(workspaceDir, sessionId);
+      let metaRaw = "";
+      try {
+        metaRaw = await fs.readFile(path.join(dir, "meta.json"), "utf8");
+      } catch {
+        // Older sessions may only have store.db
+      }
+      let cwd = "";
+      let createdAt = 0;
+      let updatedAt = 0;
+      let hasConversation = false;
+      let isSubagent = false;
+      try {
+        const meta = JSON.parse(metaRaw || "{}") as {
+          cwd?: string;
+          createdAtMs?: number;
+          updatedAtMs?: number;
+          hasConversation?: boolean;
+          isSubagent?: boolean;
+        };
+        cwd = typeof meta.cwd === "string" ? meta.cwd : "";
+        createdAt = msToUnixSeconds(meta.createdAtMs);
+        updatedAt = msToUnixSeconds(meta.updatedAtMs);
+        hasConversation = Boolean(meta.hasConversation);
+        isSubagent = Boolean(meta.isSubagent);
+      } catch {
+        // ignore
+      }
+      let mtime = updatedAt || createdAt;
+      if (!mtime) {
+        try {
+          mtime = (await fs.stat(path.join(dir, "store.db"))).mtimeMs / 1000;
+        } catch {
+          try {
+            mtime = (await fs.stat(dir)).mtimeMs / 1000;
+          } catch {
+            mtime = Date.now() / 1000;
+          }
+        }
+      } else {
+        // Prefer fresher store.db mtime after local handoff continues the chat.
+        try {
+          const dbMtime = (await fs.stat(path.join(dir, "store.db"))).mtimeMs / 1000;
+          if (dbMtime > mtime) mtime = dbMtime;
+        } catch {
+          // ignore
+        }
+      }
+      hits.push({
+        id: sessionId,
+        dir,
+        mtime,
+        cwd,
+        createdAt: createdAt || mtime,
+        updatedAt: Math.max(updatedAt || 0, mtime),
+        hasConversation,
+        isSubagent
+      });
+    }
+  }
+
+  hits.sort((a, b) => b.mtime - a.mtime);
+  let added = 0;
+  // Over-scan candidates: junk / subagent skips should not starve the recent window.
+  for (const hit of hits.slice(0, Math.max(limit * 5, limit))) {
+    if (isEphemeralImportCwd(hit.cwd)) continue;
+    const existing = resolveExistingForProviderSession(store, hit.id, "cursor");
+    const promptHistory = await readCursorPromptHistory(hit.dir);
+    const dbPath = path.join(hit.dir, "store.db");
+    let imported: Awaited<ReturnType<typeof readCursorSessionMessages>> = { messages: [] };
+    try {
+      await fs.access(dbPath);
+      imported = await readCursorSessionMessages(dbPath);
+    } catch {
+      // meta/prompt-history only
+    }
+    const historyMessages = messagesFromCursorPromptHistory(promptHistory);
+    let messages = imported.messages.length >= (existing?.messages?.length ?? 0)
+      ? imported.messages
+      : (existing?.messages || imported.messages);
+    // If sqlite yielded nothing useful (timeout / protobuf-heavy), fall back to prompt history.
+    if (!hasUsefulTranscript(messages) && historyMessages.length) {
+      messages = historyMessages;
+    } else if (messages.length < historyMessages.length && historyMessages.length > 0) {
+      // Keep richer DB transcript when present; otherwise history is better than empty.
+      if (!hasUsefulTranscript(messages)) messages = historyMessages;
+    }
+    const titleFromUser = messages.find((m) => m.role === "user")?.text?.slice(0, 80);
+    const titleFromHistory = titleFromCursorPromptHistory(promptHistory);
+    const agentTitle = imported.agentName && imported.agentName !== "New Agent"
+      ? imported.agentName
+      : undefined;
+    const title = existing?.title || agentTitle || titleFromUser || titleFromHistory || `Cursor ${hit.id.slice(0, 8)}`;
+    const cwd = (hit.cwd || existing?.cwd)
+      ? path.resolve(hit.cwd || existing?.cwd || "")
+      : (existing?.cwd || "");
+    // Skip empty Cursor subagents with no cwd / transcript (parent chat is the useful one).
+    if (hit.isSubagent && !cwd && !hasUsefulTranscript(messages) && !titleFromHistory) {
+      continue;
+    }
+    if (isJunkCursorImportTask({ cwd, title, messages })) {
+      // Still keep sessions Cursor itself marks as having a conversation when we at least
+      // have a prompt history title — otherwise handoff chats never reach the web list.
+      if (!(hit.hasConversation && (titleFromHistory || agentTitle))) {
+        continue;
+      }
+    }
+    if (added >= limit) break;
+    const threadId = existing?.threadId || hit.id;
+    const task: StoredTask = {
+      threadId,
+      engine: "cursor",
+      providerSessionId: hit.id,
+      cwd,
+      title,
+      status: mergeImportStatus(existing),
+      createdAt: existing?.createdAt ?? hit.createdAt,
+      updatedAt: Math.max(existing?.updatedAt ?? 0, hit.updatedAt, hit.mtime),
+      messages: messages.slice(-80),
+      ...(existing?.model ? { model: existing.model } : {}),
+      ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
+      ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})
+    };
+    await store.upsert(task);
+    await removeOrphanNativeDuplicate(store, hit.id, threadId);
+    added += 1;
+  }
+  return added;
 }
 
 /** Cursor Temp/empty imports already in the local index — caller should tombstone + delete. */
@@ -727,212 +1016,6 @@ export async function dedupeMultiCliTasks(store: TaskStore): Promise<number> {
     }
   }
   return removed;
-}
-
-/**
- * Cursor Agent stores chats under ~/.cursor/chats/<workspaceHash>/<sessionId>/.
- * Each session has meta.json (cwd / timestamps) and store.db (sqlite blobs).
- * Conversation DAG blobs are protobuf; plaintext JSON role messages are still importable.
- */
-async function readCursorSessionMessages(dbPath: string): Promise<{
-  messages: HistoryMessage[];
-  agentName?: string;
-}> {
-  const py = process.platform === "win32" ? "python" : "python3";
-  const script = [
-    "import sqlite3,json,sys,binascii",
-    `con=sqlite3.connect(${JSON.stringify(dbPath)})`,
-    "cur=con.cursor()",
-    "agent_name=''",
-    "try:",
-    "  mv=cur.execute(\"select value from meta where key='0'\").fetchone()",
-    "  if mv:",
-    "    s=mv[0].decode('utf-8') if isinstance(mv[0],(bytes,bytearray)) else str(mv[0])",
-    "    if all(c in '0123456789abcdefABCDEF' for c in s.strip()):",
-    "      meta=json.loads(binascii.unhexlify(s.strip()).decode('utf-8'))",
-    "    else:",
-    "      meta=json.loads(s)",
-    "    agent_name=str(meta.get('name') or '')",
-    "except Exception:",
-    "  pass",
-    "msgs=[]",
-    "for rowid,data in cur.execute('select rowid,data from blobs order by rowid'):",
-    "  raw=bytes(data) if not isinstance(data,str) else data.encode('utf-8','replace')",
-    "  if b'\\x00' in raw[:8]:",
-    "    continue",
-    "  try:",
-    "    obj=json.loads(raw.decode('utf-8'))",
-    "  except Exception:",
-    "    continue",
-    "  if not isinstance(obj,dict):",
-    "    continue",
-    "  role=obj.get('role')",
-    "  if role not in ('user','assistant'):",
-    "    continue",
-    "  content=obj.get('content')",
-    "  parts=[]",
-    "  if isinstance(content,str):",
-    "    parts.append(content)",
-    "  elif isinstance(content,list):",
-    "    for block in content:",
-    "      if isinstance(block,dict) and block.get('type')=='text' and block.get('text'):",
-    "        parts.append(str(block['text']))",
-    "  text='\\n'.join(parts).strip()",
-    "  if not text:",
-    "    continue",
-    "  msgs.append({'role':role,'text':text[:20000],'rowid':rowid})",
-    "print(json.dumps({'agentName':agent_name,'messages':msgs},ensure_ascii=False))"
-  ].join("\n");
-  try {
-    const { stdout } = await execFileAsync(py, ["-c", script], {
-      timeout: 20_000,
-      windowsHide: true,
-      maxBuffer: 8_000_000
-    });
-    const parsed = JSON.parse(String(stdout || "{}")) as {
-      agentName?: string;
-      messages?: Array<{ role?: string; text?: string }>;
-    };
-    const messages: HistoryMessage[] = [];
-    for (const row of parsed.messages || []) {
-      const role = row.role === "assistant" ? "assistant" : row.role === "user" ? "user" : null;
-      if (!role) continue;
-      const cleaned = cleanImportedMessageText(role, String(row.text || ""));
-      if (!cleaned) continue;
-      messages.push({ id: crypto.randomUUID(), role, text: cleaned });
-    }
-    return {
-      messages,
-      ...(parsed.agentName?.trim() ? { agentName: parsed.agentName.trim() } : {})
-    };
-  } catch {
-    return { messages: [] };
-  }
-}
-
-async function importCursorSessions(store: TaskStore, limit: number): Promise<number> {
-  const root = path.join(os.homedir(), ".cursor", "chats");
-  let workspaceDirs: string[] = [];
-  try {
-    workspaceDirs = (await fs.readdir(root)).map((name) => path.join(root, name));
-  } catch {
-    return 0;
-  }
-
-  type Hit = {
-    id: string;
-    dir: string;
-    mtime: number;
-    cwd: string;
-    createdAt: number;
-    updatedAt: number;
-  };
-  const hits: Hit[] = [];
-
-  for (const workspaceDir of workspaceDirs) {
-    let sessionDirs: string[] = [];
-    try {
-      const st = await fs.stat(workspaceDir);
-      if (!st.isDirectory()) continue;
-      sessionDirs = await fs.readdir(workspaceDir);
-    } catch {
-      continue;
-    }
-    for (const sessionId of sessionDirs) {
-      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) continue;
-      const dir = path.join(workspaceDir, sessionId);
-      let metaRaw = "";
-      try {
-        metaRaw = await fs.readFile(path.join(dir, "meta.json"), "utf8");
-      } catch {
-        // Older sessions may only have store.db
-      }
-      let cwd = "";
-      let createdAt = 0;
-      let updatedAt = 0;
-      try {
-        const meta = JSON.parse(metaRaw || "{}") as {
-          cwd?: string;
-          createdAtMs?: number;
-          updatedAtMs?: number;
-        };
-        cwd = typeof meta.cwd === "string" ? meta.cwd : "";
-        createdAt = msToUnixSeconds(meta.createdAtMs);
-        updatedAt = msToUnixSeconds(meta.updatedAtMs);
-      } catch {
-        // ignore
-      }
-      let mtime = updatedAt || createdAt;
-      if (!mtime) {
-        try {
-          mtime = (await fs.stat(path.join(dir, "store.db"))).mtimeMs / 1000;
-        } catch {
-          try {
-            mtime = (await fs.stat(dir)).mtimeMs / 1000;
-          } catch {
-            mtime = Date.now() / 1000;
-          }
-        }
-      }
-      hits.push({
-        id: sessionId,
-        dir,
-        mtime,
-        cwd,
-        createdAt: createdAt || mtime,
-        updatedAt: updatedAt || mtime
-      });
-    }
-  }
-
-  hits.sort((a, b) => b.mtime - a.mtime);
-  let added = 0;
-  for (const hit of hits.slice(0, Math.max(limit * 3, limit))) {
-    if (isEphemeralImportCwd(hit.cwd)) continue;
-    const existing = resolveExistingForProviderSession(store, hit.id, "cursor");
-    const dbPath = path.join(hit.dir, "store.db");
-    let imported: Awaited<ReturnType<typeof readCursorSessionMessages>> = { messages: [] };
-    try {
-      await fs.access(dbPath);
-      imported = await readCursorSessionMessages(dbPath);
-    } catch {
-      // meta-only entry — skip unless already bound to a web task with content
-    }
-    const messages = imported.messages.length >= (existing?.messages?.length ?? 0)
-      ? imported.messages
-      : (existing?.messages || imported.messages);
-    const titleFromUser = messages.find((m) => m.role === "user")?.text?.slice(0, 80);
-    const agentTitle = imported.agentName && imported.agentName !== "New Agent"
-      ? imported.agentName
-      : undefined;
-    const title = existing?.title || agentTitle || titleFromUser || `Cursor ${hit.id.slice(0, 8)}`;
-    const cwd = (hit.cwd || existing?.cwd)
-      ? path.resolve(hit.cwd || existing?.cwd || "")
-      : (existing?.cwd || "");
-    if (isJunkCursorImportTask({ cwd, title, messages })) {
-      continue;
-    }
-    if (added >= limit) break;
-    const threadId = existing?.threadId || hit.id;
-    const task: StoredTask = {
-      threadId,
-      engine: "cursor",
-      providerSessionId: hit.id,
-      cwd,
-      title,
-      status: mergeImportStatus(existing),
-      createdAt: existing?.createdAt ?? hit.createdAt,
-      updatedAt: Math.max(existing?.updatedAt ?? 0, hit.updatedAt, hit.mtime),
-      messages: messages.slice(-80),
-      ...(existing?.model ? { model: existing.model } : {}),
-      ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
-      ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})
-    };
-    await store.upsert(task);
-    await removeOrphanNativeDuplicate(store, hit.id, threadId);
-    added += 1;
-  }
-  return added;
 }
 
 /** Import local Claude/Grok/Cursor CLI sessions into the agent task index for web sync. */
