@@ -1197,8 +1197,10 @@ function rendererHtml(): string {
   .check b{font-weight:800;flex:0 0 auto}
   .check span{flex:1 1 auto;margin-left:6px;color:#687068;font:10px "Cascadia Code",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;text-align:right}
   .check button{flex:0 0 auto;margin-left:8px;padding:5px 8px;font-size:10px}
-  .update-row{display:flex;align-items:center;gap:6px;margin-top:6px;min-width:0}
+  .update-row{display:flex;align-items:center;gap:6px;margin-top:6px;min-width:0;flex-wrap:wrap}
   .update-row .check{flex:1 1 auto;margin:0}
+  .update-progress{flex:1 1 100%;height:6px;border-radius:999px;background:rgba(23,33,27,.1);overflow:hidden;margin-top:2px}
+  .update-progress>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#2d7653,#3bab70);transition:width .2s ease}
   .pair{font:900 28px/1 monospace;letter-spacing:.18em;text-align:center;color:#e25832;margin:8px 0 4px;padding-left:.18em}
   .workspaces{display:grid;gap:5px;margin-top:7px}
   .workspace{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px;background:#eee6d8;border-radius:8px;min-width:0}
@@ -1496,8 +1498,15 @@ function rendererHtml(): string {
     update=update||{status:'idle'};
     var labels={idle:t('latest'),checking:t('checking'),available:t('available'),downloading:t('downloading'),ready:t('ready'),error:t('error')};
     var tone=update.status==='idle'?'ok':update.status==='error'?'err':(update.status==='available'||update.status==='downloading'||update.status==='ready')?'warn':'';
-    var text=update.version||update.message||(update.progress!==undefined?update.progress+'%':'');
-    updateBox.innerHTML='<div class="check '+tone+'"><b>'+(labels[update.status]||update.status)+'</b><span>'+escapeHtml(text)+'</span></div><button id="checkUpdate" class="secondary">'+escapeHtml(t('checkUpdate'))+'</button>'+(update.status==='ready'?'<button id="installUpdate">'+escapeHtml(t('installUpdate'))+'</button>':'');
+    // Prefer message (includes download percent) over bare version — version alone hid progress.
+    var text=update.message
+      || (update.progress!==undefined?(update.version?('v'+update.version+' · '+update.progress+'%'):(update.progress+'%')):'')
+      || update.version
+      || '';
+    var pct=update.status==='downloading'&&update.progress!==undefined?Math.max(0,Math.min(100,Number(update.progress)||0)):null;
+    var bar=pct!==null?'<div class="update-progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><i style="width:'+pct+'%"></i></div>':'';
+    var busy=update.status==='checking'||update.status==='downloading';
+    updateBox.innerHTML='<div class="check '+tone+'"><b>'+(labels[update.status]||update.status)+'</b><span>'+escapeHtml(text)+'</span></div><button id="checkUpdate" class="secondary"'+(busy?' disabled':'')+'>'+escapeHtml(t('checkUpdate'))+'</button>'+(update.status==='ready'?'<button id="installUpdate">'+escapeHtml(t('installUpdate'))+'</button>':'')+bar;
     var checkBtn=document.querySelector('#checkUpdate');
     var installBtn=document.querySelector('#installUpdate');
     if(checkBtn&&api) checkBtn.addEventListener('click',function(){api.checkUpdate();});
@@ -5081,14 +5090,20 @@ function registerUpdateListeners(): void {
     });
   });
   autoUpdater.on("update-not-available", () => updateState({ update: { status: "idle", message: "当前已是最新版本" } }));
-  autoUpdater.on("download-progress", (progress) => updateState({
-    update: {
-      status: "downloading",
-      version: publicState.update.version,
-      progress: Math.round(progress.percent),
-      message: `正在下载更新… ${Math.round(progress.percent)}%`
-    }
-  }));
+  autoUpdater.on("download-progress", (progress) => {
+    const percent = Math.max(0, Math.min(100, Math.round(Number(progress.percent) || 0)));
+    const version = publicState.update.version;
+    updateState({
+      update: {
+        status: "downloading",
+        ...(version ? { version } : {}),
+        progress: percent,
+        message: version
+          ? `正在下载 v${version}… ${percent}%`
+          : `正在下载更新… ${percent}%`
+      }
+    });
+  });
   autoUpdater.on("update-downloaded", (info) => {
     const downloadedFile = typeof (info as { downloadedFile?: string }).downloadedFile === "string"
       ? (info as { downloadedFile: string }).downloadedFile
