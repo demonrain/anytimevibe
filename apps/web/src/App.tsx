@@ -387,6 +387,24 @@ function emptyRuntime(online: boolean | null = null): HostRuntime {
   return { online, workspaces: [], tasks: {}, availableEngines: [] };
 }
 
+/** Deep-clone host runtime without `structuredClone` (missing on Safari < 15.4). */
+function cloneRuntime(runtime: HostRuntime): HostRuntime {
+  return JSON.parse(JSON.stringify(runtime)) as HostRuntime;
+}
+
+function lastItem<T>(items: T[]): T | undefined {
+  return items.length ? items[items.length - 1] : undefined;
+}
+
+function scrollWindowTop(): void {
+  // Prefer "auto" — Safari rejects/ignores unsupported `behavior: "instant"`.
+  try {
+    window.scrollTo({ top: 0, behavior: "auto" });
+  } catch {
+    window.scrollTo(0, 0);
+  }
+}
+
 function normalizeCliEngine(value: string | null | undefined): CliEngine {
   if (value === "claude" || value === "grok" || value === "codex" || value === "cursor") return value;
   return "codex";
@@ -1282,7 +1300,7 @@ function pruneStaleQueueAgainstMessages(
 }
 
 function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
-  const next = structuredClone(runtime);
+  const next = cloneRuntime(runtime);
   if (event.type === "host.status") {
     next.online = event.online;
     next.workspaces = event.workspaces;
@@ -1683,7 +1701,7 @@ export function App() {
   function selectTask(threadId: string) {
     setSelectedTaskId(threadId);
     setMobilePane("conversation");
-    window.scrollTo({ top: 0, behavior: "instant" });
+    scrollWindowTop();
   }
 
   function markExpectingNewTask(
@@ -2330,7 +2348,7 @@ export function App() {
       </section>
 
       <section className="conversation-column">
-        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} replyDetail={replyDetail} engineCapabilities={activeRuntime.engineCapabilities ?? []} engineQuotas={QUOTA_QUERY_ENABLED ? (activeRuntime.engineQuotas ?? []) : []} {...(QUOTA_QUERY_ENABLED && activeRuntime.quotaDetail ? { quotaDetail: activeRuntime.quotaDetail } : {})} quotaLoading={QUOTA_QUERY_ENABLED && Boolean(activeRuntime.quotaLoading)} onPermissionModeChange={(mode) => { const next = normalizePermissionMode(mode); setPermissionMode(next); localStorage.setItem("permission-mode", next); }} onReplyDetailChange={(detail) => { const next = normalizeReplyDetail(detail); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }} onBack={() => { setMobilePane("tasks"); window.scrollTo({ top: 0, behavior: "instant" }); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} onQuotaRefresh={QUOTA_QUERY_ENABLED ? () => {
+        {activeTask ? <TaskConversation key={activeTask.threadId} task={activeTask} online={activeRuntime.online} visible={mobilePane === "conversation"} permissionMode={permissionMode} replyDetail={replyDetail} engineCapabilities={activeRuntime.engineCapabilities ?? []} engineQuotas={QUOTA_QUERY_ENABLED ? (activeRuntime.engineQuotas ?? []) : []} {...(QUOTA_QUERY_ENABLED && activeRuntime.quotaDetail ? { quotaDetail: activeRuntime.quotaDetail } : {})} quotaLoading={QUOTA_QUERY_ENABLED && Boolean(activeRuntime.quotaLoading)} onPermissionModeChange={(mode) => { const next = normalizePermissionMode(mode); setPermissionMode(next); localStorage.setItem("permission-mode", next); }} onReplyDetailChange={(detail) => { const next = normalizeReplyDetail(detail); setReplyDetail(next); localStorage.setItem(REPLY_DETAIL_STORAGE_KEY, next); }} onBack={() => { setMobilePane("tasks"); scrollWindowTop(); }} onCommand={(command) => sendCommand(activeHost!.id, command).catch((sendError) => setError(sendError.message))} onQuotaRefresh={QUOTA_QUERY_ENABLED ? () => {
           setRuntime((current) => {
             const hostId = activeHost!.id;
             const prev = current[hostId] ?? emptyRuntime(true);
@@ -2414,7 +2432,7 @@ function TaskListRow({
         minute: "2-digit"
       })
     : "";
-  const preview = (task.messages.at(-1)?.text || task.cwd || "").replace(/\s+/g, " ").trim();
+  const preview = (lastItem(task.messages)?.text || task.cwd || "").replace(/\s+/g, " ").trim();
   const [swipeX, setSwipeX] = useState(0);
   const startX = useRef<number | null>(null);
   const swiping = useRef(false);
@@ -2667,7 +2685,7 @@ function TaskConversation({
   );
   const isMac = isMacPlatform();
   // Cheap scroll metrics without re-filtering the full transcript on every parent render path.
-  const lastMessageLength = task.messages.at(-1)?.text.length ?? 0;
+  const lastMessageLength = lastItem(task.messages)?.text.length ?? 0;
   const messageCount = task.messages.length;
   // Hide optimistic send bubble once the same text is already in the transcript (avoids double YOU).
   const pendingAlreadyCommitted = Boolean(
