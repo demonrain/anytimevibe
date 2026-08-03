@@ -740,7 +740,7 @@ function syncActivitiesState(nextActivities: ActivityState[], selectedThreadId?:
     displayName: config ? resolvedDisplayName() : publicState.displayName,
     codexVersion,
     workspaces: config?.workspaces ?? publicState.workspaces,
-    agentVersion: patch.agentVersion ?? agentAppVersion()
+    agentVersion: agentAppVersion()
   };
   if (selected) next.selectedActivityThreadId = selected;
   else delete next.selectedActivityThreadId;
@@ -952,6 +952,7 @@ function updateState(patch: Partial<PublicState>): void {
     relayUrl: config?.relayUrl ?? publicState.relayUrl,
     displayName: config ? resolvedDisplayName() : publicState.displayName,
     codexVersion,
+    agentVersion: patch.agentVersion ?? agentAppVersion(),
     workspaces: config?.workspaces ?? publicState.workspaces
   };
   // During quit/update the BrowserWindow/Tray may already be destroyed; never touch them.
