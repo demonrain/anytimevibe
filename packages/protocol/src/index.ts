@@ -13,6 +13,31 @@ export const PRODUCT_VERSION = "0.4.59";
  */
 export const MIN_AGENT_VERSION = PRODUCT_VERSION;
 
+/**
+ * RFC4122 v4 UUID that works in Node, modern browsers, and older Safari/iOS WebKit
+ * where `crypto.randomUUID` is missing (Safari < 15.4).
+ */
+export function randomUuid(): string {
+  const c = globalThis.crypto as Crypto | undefined;
+  if (c && typeof c.randomUUID === "function") {
+    return c.randomUUID();
+  }
+  if (c && typeof c.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    c.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  // Extremely old environments — still produce a unique-enough id for command correlation.
+  return `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`.replace(/[xy]/g, (ch) => {
+    const n = (Math.random() * 16) | 0;
+    const v = ch === "x" ? n : (n & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 /** Compare dotted versions (ignores leading v). Returns negative if a < b. */
 export function compareSemver(a: string, b: string): number {
   const parse = (value: string) =>
@@ -539,7 +564,7 @@ export async function createEnvelope(
   payload: ClientCommand | AgentEvent,
   options: { persist?: boolean; hint?: "approval" | "completed" } = {}
 ): Promise<EncryptedEnvelope> {
-  const messageId = crypto.randomUUID();
+  const messageId = randomUuid();
   const encrypted = await encryptPayload(key, payload, `${PROTOCOL_VERSION}:${messageId}:${hostId}`);
   return {
     v: PROTOCOL_VERSION,

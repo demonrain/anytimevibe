@@ -25,6 +25,7 @@ import {
   importAesKey,
   openEnvelope,
   pairingClaimResponseSchema,
+  randomUuid,
   type AgentEvent,
   type CliEngine,
   type CliEngineInfo,
@@ -925,7 +926,7 @@ const ApprovalActionCard = memo(function ApprovalActionCard({
     })).filter((item) => item.selectedOptionIds.length > 0);
     onCommand({
       type: "approval.resolve",
-      commandId: crypto.randomUUID(),
+      commandId: randomUuid(),
       requestId: approval.requestId,
       decision,
       ...(decision === "accept" && answers.length ? { answers } : {})
@@ -1914,7 +1915,7 @@ export function App() {
               // Always re-pull allowlisted workspaces when the host comes online.
               void getHostKey(hostId).then((key) => {
                 if (!key) return;
-                return sendCommand(hostId, { type: "host.refresh", commandId: crypto.randomUUID() });
+                return sendCommand(hostId, { type: "host.refresh", commandId: randomUuid() });
               }).catch(() => undefined);
             }
             if (online && !autoSyncedHostsRef.current.has(hostId)) {
@@ -2049,7 +2050,7 @@ export function App() {
       const query = options.query?.trim() || undefined;
       await sendCommand(hostId, {
         type: "sync.request",
-        commandId: crypto.randomUUID(),
+        commandId: randomUuid(),
         // Sync button: recent 10 only. Search: same per-engine recent default; agent expands Codex scan via query.
         limit: options.limit ?? 10,
         ...(query ? { query } : {})
@@ -2316,7 +2317,7 @@ export function App() {
                 if (activeRuntime.online === true) {
                   void sendCommand(activeHost.id, {
                     type: "thread.delete",
-                    commandId: crypto.randomUUID(),
+                    commandId: randomUuid(),
                     threadId: task.threadId
                   }).catch((err) => setError(err.message));
                 }
@@ -2337,7 +2338,7 @@ export function App() {
           });
           return sendCommand(activeHost!.id, {
             type: "host.quota.refresh",
-            commandId: crypto.randomUUID(),
+            commandId: randomUuid(),
             cliEngine: normalizeCliEngine(activeTask.cliEngine)
           }).catch((sendError) => {
             setError(sendError.message);
@@ -2359,7 +2360,7 @@ export function App() {
       availableEngines={activeRuntime.availableEngines ?? []}
       engineCapabilities={activeRuntime.engineCapabilities ?? []}
       onClose={() => setComposerOpen(false)}
-      onRefreshWorkspaces={() => sendCommand(activeHost.id, { type: "host.refresh", commandId: crypto.randomUUID() })}
+      onRefreshWorkspaces={() => sendCommand(activeHost.id, { type: "host.refresh", commandId: randomUuid() })}
       onCreate={async (cwd, prompt, title, engine, mode, model, reasoningEffort) => {
         setPermissionMode(mode);
         localStorage.setItem("permission-mode", mode);
@@ -2373,7 +2374,7 @@ export function App() {
         setMobilePane("conversation");
         await sendCommand(activeHost.id, {
           type: "task.create",
-          commandId: crypto.randomUUID(),
+          commandId: randomUuid(),
           cwd,
           prompt,
           permissionMode: mode,
@@ -2586,11 +2587,11 @@ function TaskConversation({
           if (Array.isArray(raw)) {
             restored = raw.map((item) => {
               if (typeof item === "string") {
-                return { commandId: crypto.randomUUID(), prompt: item };
+                return { commandId: randomUuid(), prompt: item };
               }
               const row = item as Partial<QueuedTurnItem>;
               return {
-                commandId: String(row.commandId || crypto.randomUUID()),
+                commandId: String(row.commandId || randomUuid()),
                 prompt: String(row.prompt || "")
               };
             }).filter((item) => item.prompt.trim());
@@ -2735,7 +2736,7 @@ function TaskConversation({
     return model;
   }
 
-  function turnStartCommand(text: string, commandId = crypto.randomUUID()): ClientCommand {
+  function turnStartCommand(text: string, commandId = randomUuid()): ClientCommand {
     const outboundModel = resolveOutboundModel();
     const effort = effortOptions.length ? reasoningEffort : "";
     return {
@@ -2755,7 +2756,7 @@ function TaskConversation({
     // Guard against double Enter / rapid re-clicks before React re-renders pending state.
     if (!running && !pendingPrompt && submittingRef.current) return;
     const text = submittedPrompt.trim();
-    const commandId = crypto.randomUUID();
+    const commandId = randomUuid();
     stickToBottomRef.current = true;
     // Always deliver to the agent. When a turn is already running the agent durable-queues
     // the follow-up so closing the browser no longer drops queued prompts.
@@ -2786,7 +2787,7 @@ function TaskConversation({
     if (online === true) {
       onCommand({
         type: "turn.queue.cancel",
-        commandId: crypto.randomUUID(),
+        commandId: randomUuid(),
         threadId: task.threadId,
         queueCommandId
       });
@@ -2798,7 +2799,7 @@ function TaskConversation({
     if (online === true) {
       onCommand({
         type: "turn.queue.cancel",
-        commandId: crypto.randomUUID(),
+        commandId: randomUuid(),
         threadId: task.threadId
       });
     }
@@ -2815,9 +2816,9 @@ function TaskConversation({
     // Agent also clears its durable queue for this thread.
     onCommand({
       type: "turn.interrupt",
-      commandId: crypto.randomUUID(),
+      commandId: randomUuid(),
       threadId: task.threadId,
-      turnId: task.activeTurnId || crypto.randomUUID()
+      turnId: task.activeTurnId || randomUuid()
     });
   }, [onCommand, task.threadId, task.activeTurnId]);
 
