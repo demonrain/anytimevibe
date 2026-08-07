@@ -267,6 +267,48 @@ export function mergeProxyIntoEnv(base: NodeJS.ProcessEnv, proxy: LocalProxyEnv)
   return next;
 }
 
+/**
+ * Remove proxy env vars so Codex talks to local gateways (e.g. :3310) the same way as a clean cmd.
+ * NO_PROXY alone is not enough: Codex stream_open / some Clash paths still route localhost via HTTP_PROXY.
+ */
+export function stripProxyFromEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const next = { ...base };
+  for (const key of PROXY_ENV_KEYS) {
+    if (key === "NO_PROXY" || key === "no_proxy") continue;
+    delete next[key];
+  }
+  // Keep an explicit bypass list for any residual tooling that still reads proxy settings.
+  const merged = mergeNoProxyLists(next.NO_PROXY, next.no_proxy, ...LOCAL_NO_PROXY_HOSTS);
+  next.NO_PROXY = merged;
+  next.no_proxy = merged;
+  return next;
+}
+
+/** Shell lines that clear proxy vars (cmd / powershell / bash). */
+export function proxyClearShellLines(platform: "win32" | "darwin" | "powershell"): string[] {
+  const keys = PROXY_ENV_KEYS.filter((key) => key !== "NO_PROXY" && key !== "no_proxy");
+  const noProxy = mergeNoProxyLists(...LOCAL_NO_PROXY_HOSTS);
+  if (platform === "powershell") {
+    return [
+      ...keys.map((key) => `Remove-Item Env:${key} -ErrorAction SilentlyContinue`),
+      `$env:NO_PROXY = ${JSON.stringify(noProxy)}`,
+      `$env:no_proxy = ${JSON.stringify(noProxy)}`
+    ];
+  }
+  if (platform === "win32") {
+    return [
+      ...keys.map((key) => `set "${key}="`),
+      `set "NO_PROXY=${noProxy}"`,
+      `set "no_proxy=${noProxy}"`
+    ];
+  }
+  return [
+    ...keys.map((key) => `unset ${key}`),
+    `export NO_PROXY=${JSON.stringify(noProxy)}`,
+    `export no_proxy=${JSON.stringify(noProxy)}`
+  ];
+}
+
 /** Shell prefix that sets proxy vars before the real CLI command. */
 export function proxyShellPrefix(proxy: LocalProxyEnv, platform: NodeJS.Platform = process.platform): string {
   const safe = withLocalNoProxy(proxy);

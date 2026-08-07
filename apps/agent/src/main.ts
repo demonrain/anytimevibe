@@ -63,7 +63,7 @@ import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
 import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
 import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt } from "./cli/macos-fs";
-import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
+import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix, proxyClearShellLines, stripProxyFromEnv, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
 const execFileAsync = promisify(execFile);
@@ -4757,19 +4757,18 @@ async function resolveRelayTask(threadId: string): Promise<AgentTask & { provide
 }
 
 async function openExternalTerminal(cwd: string, commandLine: string): Promise<void> {
-  const proxy = await collectLocalProxyEnv();
-  const env = mergeProxyIntoEnv(process.env, proxy);
-
+  // Handoff must match a clean cmd: do NOT inject HTTP(S)_PROXY.
+  // Codex stream_open to localhost:3310 still follows HTTP_PROXY under Clash and times out (504),
+  // even when NO_PROXY lists localhost.
   if (process.platform === "win32") {
-    // Electron GUI-spawned `cmd /k` with long `set A=… && set B=… && call …` lines is unreliable
-    // (window may never appear). Use the same WScript-visible console path as installers.
-    const proxyLines = await proxyShellLines("win32");
+    const clearLines = proxyClearShellLines("win32");
     const workdir = cwd && cwd.trim() ? cwd : os.homedir();
     await openWindowsVisibleConsole([
-      ...proxyLines,
+      ...clearLines,
       `cd /d ${quoteWinArg(workdir)}`,
       "echo.",
-      "echo [AnytimeVibe] CLI handoff",
+      "echo [AnytimeVibe] CLI handoff (proxy cleared for local Codex gateway)",
+      "echo [AnytimeVibe] HTTP_PROXY=%HTTP_PROXY%",
       "echo [AnytimeVibe] NO_PROXY=%NO_PROXY%",
       "echo.",
       commandLine
@@ -4777,11 +4776,12 @@ async function openExternalTerminal(cwd: string, commandLine: string): Promise<v
     return;
   }
   if (process.platform === "darwin") {
-    const prefix = proxyShellPrefix(proxy);
+    const clearLines = proxyClearShellLines("darwin");
+    const prefix = clearLines.length ? `${clearLines.join(" && ")} && ` : "";
     const fullCommand = `${prefix}${commandLine}`;
     const command = `cd ${shellQuote(cwd || os.homedir())} && ${fullCommand}`;
     await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`], {
-      env
+      env: stripProxyFromEnv(process.env)
     });
     await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
     return;
