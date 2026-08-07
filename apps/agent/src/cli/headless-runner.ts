@@ -5,7 +5,7 @@ import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/proto
 import { cloudProxyChildEnv, ensureCursorHttp1ForProxy, collectLocalProxyEnv } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
-import { formatCursorModelArg } from "./model-catalog";
+import { formatCursorModelArg, parseCursorModelRef } from "./model-catalog";
 import { headlessPermissionArgs } from "./permission-args";
 import type { ApprovalPlan, ApprovalQuestion, BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
 import { ensureWorkspaceTrusted } from "./workspace-trust";
@@ -74,26 +74,22 @@ function killChildTree(child: ChildProcess): void {
 }
 
 /**
- * Parse optional fast flag encoded by the web as model id suffix:
- *   composer-2.5[fast=true,effort=high]  → already complete
- *   or bare id + separate reasoningEffort field
+ * Parse optional fast / base from web model field:
+ *   legacy: composer-2.5[fast=true,effort=high]
+ *   slug:   gpt-5.6-sol-medium-fast
+ *   bare:   gpt-5.6-sol  (+ separate reasoningEffort)
  */
 function parseCursorModelHints(model: string | undefined): {
   model: string;
   fast?: boolean;
+  reasoningEffort?: import("@anytimevibe/protocol").ReasoningEffort;
 } {
-  const raw = (model || "").trim();
-  if (!raw) return { model: "composer-2.5" };
-  const m = raw.match(/^([^[\]]+)\[([^\]]+)\]\s*$/);
-  if (!m) return { model: raw };
-  const base = (m[1] || raw).trim() || "composer-2.5";
-  let fast: boolean | undefined;
-  for (const part of (m[2] || "").split(",")) {
-    const [k, v] = part.split("=").map((s) => s.trim());
-    if (!k) continue;
-    if (k === "fast") fast = v === "true" || v === "1";
-  }
-  return fast === undefined ? { model: base } : { model: base, fast };
+  const parsed = parseCursorModelRef(model);
+  return {
+    model: parsed.base,
+    ...(parsed.fast !== undefined ? { fast: parsed.fast } : {}),
+    ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {})
+  };
 }
 
 function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
@@ -119,13 +115,14 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
     // Cursor: `-p/--print` is a boolean flag; prompt is a positional arg (not `-p <prompt>` like Claude).
     // Docs: agent -p --force --output-format stream-json --stream-partial-output --workspace …
     // https://cursor.com/docs/cli/headless
+    // Always rewrite to suffix slugs (gpt-5.6-sol-medium-fast). Never pass legacy [fast=…] brackets.
     const hints = parseCursorModelHints(options.model);
-    const modelArg = options.model?.includes("[")
-      ? options.model.trim()
-      : formatCursorModelArg(hints.model, {
-          ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
-          ...(hints.fast !== undefined ? { fast: hints.fast } : {})
-        });
+    const modelArg = formatCursorModelArg(hints.model, {
+      ...(options.reasoningEffort || hints.reasoningEffort
+        ? { reasoningEffort: options.reasoningEffort || hints.reasoningEffort }
+        : {}),
+      ...(hints.fast !== undefined ? { fast: hints.fast } : {})
+    });
     args.push(
       "--print",
       "--output-format", "stream-json",
@@ -212,6 +209,8 @@ type ParseState = {
   text: string;
   failed: boolean;
   errorMessage: string;
+  /** Normalized error texts already published as type:error (suppress retries / result duplicates). */
+  emittedErrors: Set<string>;
   sawAssistant: boolean;
   sawThoughtStage: boolean;
   lastProgressAt: number;
@@ -225,6 +224,32 @@ type ParseState = {
   /** Pause/kill headless Cursor so Web can answer createPlan / askQuestion. */
   pauseForApproval?: boolean;
 };
+
+/** Strip UI prefixes so "错误：API Error" and "API Error" dedupe as one. */
+export function normalizeSystemErrorText(text: string): string {
+  return text
+    .trim()
+    .replace(/^(错误|任务失败|Error|Failed)[:：\s]*/i, "")
+    .trim();
+}
+
+function emitHeadlessErrorOnce(
+  state: ParseState,
+  onEvent: (event: BackendStreamEvent) => void,
+  options: HeadlessRunOptions,
+  message: string,
+  stageId = "stage:error"
+): void {
+  const trimmed = message.trim();
+  if (!trimmed) return;
+  state.failed = true;
+  state.errorMessage = trimmed;
+  const key = normalizeSystemErrorText(trimmed).toLowerCase();
+  if (key && state.emittedErrors.has(key)) return;
+  if (key) state.emittedErrors.add(key);
+  onEvent({ type: "error", threadId: options.threadId, message: trimmed });
+  emitDelta(onEvent, options, stageId, "stage", `\n✗ ${trimmed}\n`);
+}
 
 function asRecord(value: unknown): Record<string, any> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -379,10 +404,8 @@ function handleClaudeLine(
         const text = String(block.text);
         // Synthetic assistant error payloads (auth / model offline)
         if (parsed.message?.model === "<synthetic>" || /API Error:|not logged in|已下线/i.test(text)) {
-          state.failed = true;
-          state.errorMessage = text;
-          onEvent({ type: "error", threadId: options.threadId, message: text });
-          emitDelta(onEvent, options, "stage:error", "stage", `\n✗ ${text}\n`);
+          // Claude may emit the same synthetic error on each api_retry — publish once.
+          emitHeadlessErrorOnce(state, onEvent, options, text);
         } else {
           state.text += text;
           state.sawAssistant = true;
@@ -401,23 +424,19 @@ function handleClaudeLine(
     }
     if (typeof parsed.result === "string" && parsed.result) {
       if (parsed.is_error) {
-        state.failed = true;
-        state.errorMessage = parsed.result;
+        let message = parsed.result;
         // Common after interactive trust decline
         if (/trust|workspace|not.*allowed|permission/i.test(parsed.result)) {
-          state.errorMessage = `${parsed.result}\n（若曾在接力终端拒绝信任目录，请在本机重新接力并选择信任，或删除该目录后重建任务）`;
+          message = `${parsed.result}\n（若曾在接力终端拒绝信任目录，请在本机重新接力并选择信任，或删除该目录后重建任务）`;
         }
-        onEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
-        emitDelta(onEvent, options, "stage:error", "stage", `\n✗ ${state.errorMessage}\n`);
+        emitHeadlessErrorOnce(state, onEvent, options, message);
       } else if (!state.sawAssistant) {
         state.text = parsed.result;
         state.sawAssistant = true;
         emitDelta(onEvent, options, "assistant", "assistant", parsed.result);
       }
     } else if (parsed.is_error) {
-      state.failed = true;
-      state.errorMessage = "Claude 运行失败";
-      onEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+      emitHeadlessErrorOnce(state, onEvent, options, "Claude 运行失败");
     }
   }
 }
@@ -583,10 +602,7 @@ function handleCursorLine(
     state.gotResult = true;
     if (parsed.session_id) state.sessionId = String(parsed.session_id);
     if (parsed.is_error) {
-      state.failed = true;
-      state.errorMessage = String(parsed.result || parsed.error || "Cursor 运行失败");
-      onEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
-      emitDelta(onEvent, options, "stage:error", "stage", `\n✗ ${state.errorMessage}\n`);
+      emitHeadlessErrorOnce(state, onEvent, options, String(parsed.result || parsed.error || "Cursor 运行失败"));
       return;
     }
     if (typeof parsed.result === "string" && parsed.result && !state.sawAssistant) {
@@ -661,10 +677,7 @@ function handleGrokLine(
     return;
   }
   if (type === "error") {
-    state.failed = true;
-    state.errorMessage = String(parsed.message || "Grok 运行失败");
-    onEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
-    emitDelta(onEvent, options, "stage:error", "stage", `\n✗ ${state.errorMessage}\n`);
+    emitHeadlessErrorOnce(state, onEvent, options, String(parsed.message || "Grok 运行失败"));
     return;
   }
   if (parsed.sessionId && !state.sessionId) state.sessionId = String(parsed.sessionId);
@@ -811,6 +824,7 @@ export async function runHeadlessTurn(
     text: "",
     failed: false,
     errorMessage: "",
+    emittedErrors: new Set(),
     sawAssistant: false,
     sawThoughtStage: false,
     lastProgressAt: Date.now(),
@@ -847,19 +861,25 @@ export async function runHeadlessTurn(
       const idleMs = Date.now() - state.lastProgressAt;
       const elapsedMs = Date.now() - startedAt;
       if (idleMs >= HEADLESS_IDLE_TIMEOUT_MS) {
-        state.failed = true;
-        state.errorMessage = `${engineLabel} 超过 ${Math.round(HEADLESS_IDLE_TIMEOUT_MS / 1000)}s 无进度输出，已终止`;
-        safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
-        emitDelta(safeOnEvent, options, "stage:timeout", "stage", `\n✗ ${state.errorMessage}\n`);
+        emitHeadlessErrorOnce(
+          state,
+          safeOnEvent,
+          options,
+          `${engineLabel} 超过 ${Math.round(HEADLESS_IDLE_TIMEOUT_MS / 1000)}s 无进度输出，已终止`,
+          "stage:timeout"
+        );
         killChildTree(child);
         finish("failed");
         return;
       }
       if (elapsedMs >= HEADLESS_MAX_TIMEOUT_MS) {
-        state.failed = true;
-        state.errorMessage = `${engineLabel} 执行超过上限（${Math.round(HEADLESS_MAX_TIMEOUT_MS / 1000)}s），已终止`;
-        safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
-        emitDelta(safeOnEvent, options, "stage:timeout", "stage", `\n✗ ${state.errorMessage}\n`);
+        emitHeadlessErrorOnce(
+          state,
+          safeOnEvent,
+          options,
+          `${engineLabel} 执行超过上限（${Math.round(HEADLESS_MAX_TIMEOUT_MS / 1000)}s），已终止`,
+          "stage:timeout"
+        );
         killChildTree(child);
         finish("failed");
       }
@@ -887,12 +907,15 @@ export async function runHeadlessTurn(
           const idleMs = Date.now() - state.lastProgressAt;
           if (state.gotResult) return;
           if (state.lineCount === 0 && idleMs >= CURSOR_STALL_MS) {
-            state.failed = true;
-            state.errorMessage = options.providerSessionId
-              ? `Cursor 超过 ${Math.round(CURSOR_STALL_MS / 1000)}s 无输出（可能是损坏的 --resume 会话）。将尝试不带 resume 重跑。`
-              : `Cursor 超过 ${Math.round(CURSOR_STALL_MS / 1000)}s 无输出，已终止。请检查登录（agent login）或网络。`;
-            safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
-            emitDelta(safeOnEvent, options, "stage:stall", "stage", `\n✗ ${state.errorMessage}\n`);
+            emitHeadlessErrorOnce(
+              state,
+              safeOnEvent,
+              options,
+              options.providerSessionId
+                ? `Cursor 超过 ${Math.round(CURSOR_STALL_MS / 1000)}s 无输出（可能是损坏的 --resume 会话）。将尝试不带 resume 重跑。`
+                : `Cursor 超过 ${Math.round(CURSOR_STALL_MS / 1000)}s 无输出，已终止。请检查登录（agent login）或网络。`,
+              "stage:stall"
+            );
             killChildTree(child);
             finish("failed");
           }
@@ -949,9 +972,7 @@ export async function runHeadlessTurn(
         finish("interrupted");
         return;
       }
-      state.failed = true;
-      state.errorMessage = error.message;
-      safeOnEvent({ type: "error", threadId: options.threadId, message: error.message });
+      emitHeadlessErrorOnce(state, safeOnEvent, options, error.message);
       finish("failed");
     });
     child.on("exit", (code, signal) => {
@@ -973,8 +994,7 @@ export async function runHeadlessTurn(
       // Explicit parse/runtime failure always wins.
       if (state.failed) {
         if (!state.errorMessage) {
-          state.errorMessage = `${engineLabel} 运行失败`;
-          safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
+          emitHeadlessErrorOnce(state, safeOnEvent, options, `${engineLabel} 运行失败`);
         }
         finish("failed");
         return;
@@ -999,13 +1019,16 @@ export async function runHeadlessTurn(
           return;
         }
         if (!state.errorMessage) {
-          state.errorMessage = engine === "claude"
-            ? `Claude 退出码 ${code ?? "unknown"}（模型不可用时请设置 CLAUDE_MODEL，或在 Claude CLI 中切换模型；未登录请执行 claude auth login）`
-            : engine === "cursor"
-              ? `Cursor 退出码 ${code ?? "unknown"}（请确认已登录：agent login 或设置 CURSOR_API_KEY${cursorBinaryLabel ? `；实际二进制：${cursorBinaryLabel}` : ""}）`
-              : `Grok 退出码 ${code ?? "unknown"}`;
-          safeOnEvent({ type: "error", threadId: options.threadId, message: state.errorMessage });
-          emitDelta(safeOnEvent, options, "stage:error", "stage", `\n✗ ${state.errorMessage}\n`);
+          emitHeadlessErrorOnce(
+            state,
+            safeOnEvent,
+            options,
+            engine === "claude"
+              ? `Claude 退出码 ${code ?? "unknown"}（模型不可用时请设置 CLAUDE_MODEL，或在 Claude CLI 中切换模型；未登录请执行 claude auth login）`
+              : engine === "cursor"
+                ? `Cursor 退出码 ${code ?? "unknown"}（请确认已登录：agent login 或设置 CURSOR_API_KEY${cursorBinaryLabel ? `；实际二进制：${cursorBinaryLabel}` : ""}）`
+                : `Grok 退出码 ${code ?? "unknown"}`
+          );
         }
         finish("failed");
         return;

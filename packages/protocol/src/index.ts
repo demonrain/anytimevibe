@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.65";
+export const PRODUCT_VERSION = "0.4.66";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -114,7 +114,8 @@ export const engineModelOptionSchema = z.object({
   contextWindow: z.number().positive().optional(),
   /**
    * Cursor (and similar): model supports a Fast variant.
-   * Web/agent encode as `--model id[fast=true|false]` when set.
+   * Web may send `id[fast=true|false]`; agent rewrites to CLI slugs
+   * (`gpt-5.6-sol-medium-fast`) before spawn.
    */
   supportsFast: z.boolean().optional(),
   /**

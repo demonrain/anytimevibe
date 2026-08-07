@@ -55,7 +55,7 @@ import {
 } from "./codex-adapter";
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
-import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn } from "./cli/headless-runner";
+import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn, normalizeSystemErrorText } from "./cli/headless-runner";
 import { importLocalCliSessions } from "./cli/import-sessions";
 import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
 import { appendEngineDiffChunk, buildTurnDiff, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
@@ -69,6 +69,13 @@ import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-comm
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_RELAY_URL = "https://vibe.demonrain.top";
+
+function isErrorLookingSystemText(text: string | undefined): boolean {
+  const value = String(text || "").trim();
+  if (!value || value.length > 800) return false;
+  return /^(错误|任务失败|Error|Failed|失败)[:：\s（(]/i.test(value)
+    || /退出码|API Error|未找到.*CLI|无法连接|not logged in|auth/i.test(value);
+}
 
 type StoredPairing = {
   id: string;
@@ -3355,8 +3362,9 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
       const task = taskStore.get(threadId);
       if (task) {
         const text = event.message.trim();
-        const already = task.messages.some(
-          (message) => message.role === "system" && message.text.trim() === text
+        const norm = normalizeSystemErrorText(text).toLowerCase();
+        const already = Boolean(norm) && task.messages.some(
+          (message) => message.role === "system" && normalizeSystemErrorText(message.text).toLowerCase() === norm
         );
         if (text && !already) {
           task.messages.push({
@@ -3606,13 +3614,19 @@ async function runHeadlessTaskTurn(options: {
     const text = result.text.trim();
     const looksLikeErrorOnly = result.status === "failed"
       && text.length < 600
-      && /失败|错误|exit|退出码|未找到|无法|not found|error|failed|login|auth/i.test(text);
+      && /失败|错误|exit|退出码|未找到|无法|not found|error|failed|login|auth|API Error/i.test(text);
+    const norm = normalizeSystemErrorText(text).toLowerCase();
+    const alreadySystemError = Boolean(norm) && latest.messages.some(
+      (message) => message.role === "system" && normalizeSystemErrorText(message.text).toLowerCase() === norm
+    );
     if (result.status === "failed" && looksLikeErrorOnly) {
-      latest.messages.push({
-        id: crypto.randomUUID(),
-        role: "system",
-        text: text.startsWith("错误") || text.startsWith("任务失败") ? text : ("错误：" + text)
-      });
+      if (!alreadySystemError) {
+        latest.messages.push({
+          id: crypto.randomUUID(),
+          role: "system",
+          text: text.startsWith("错误") || text.startsWith("任务失败") ? text : ("错误：" + text)
+        });
+      }
     } else {
       latest.messages.push({
         id: crypto.randomUUID(),
@@ -3620,27 +3634,39 @@ async function runHeadlessTaskTurn(options: {
         text
       });
       if (result.status === "failed") {
-        latest.messages.push({
-          id: crypto.randomUUID(),
-          role: "system",
-          text: options.engine === "claude"
-            ? "错误：Claude 任务失败（已保留上方模型输出）。请检查登录与模型配置。"
-            : options.engine === "cursor"
-              ? "错误：Cursor 任务失败（已保留上方模型输出）。请确认 agent 登录 / CURSOR_API_KEY。"
-              : "错误：Grok 任务失败（已保留上方模型输出）。请检查本机 Grok CLI 状态。"
-        });
+        const fallback = options.engine === "claude"
+          ? "错误：Claude 任务失败（已保留上方模型输出）。请检查登录与模型配置。"
+          : options.engine === "cursor"
+            ? "错误：Cursor 任务失败（已保留上方模型输出）。请确认 agent 登录 / CURSOR_API_KEY。"
+            : "错误：Grok 任务失败（已保留上方模型输出）。请检查本机 Grok CLI 状态。";
+        const fallbackNorm = normalizeSystemErrorText(fallback).toLowerCase();
+        const hasAnySystemError = latest.messages.some(
+          (message) => message.role === "system" && isErrorLookingSystemText(message.text)
+        );
+        if (!hasAnySystemError && !latest.messages.some((m) => m.role === "system" && normalizeSystemErrorText(m.text).toLowerCase() === fallbackNorm)) {
+          latest.messages.push({
+            id: crypto.randomUUID(),
+            role: "system",
+            text: fallback
+          });
+        }
       }
     }
   } else if (result.status === "failed") {
-    latest.messages.push({
-      id: crypto.randomUUID(),
-      role: "system",
-      text: options.engine === "claude"
-        ? "错误：Claude 任务失败。请确认本机已安装 Claude Code 并登录；若提示模型已下线，请设置环境变量 CLAUDE_MODEL（例如 claude-opus-4-7）或在 Claude CLI 中切换模型。"
-        : options.engine === "cursor"
-          ? "错误：Cursor 任务失败。请确认已安装 Cursor Agent CLI（agent）并登录（agent login 或设置 CURSOR_API_KEY）；勿与 Grok 的 agent 命令混淆。"
-          : "错误：Grok 任务失败。请确认本机已安装 Grok Build 并已登录。"
-    });
+    const hasAnySystemError = latest.messages.some(
+      (message) => message.role === "system" && isErrorLookingSystemText(message.text)
+    );
+    if (!hasAnySystemError) {
+      latest.messages.push({
+        id: crypto.randomUUID(),
+        role: "system",
+        text: options.engine === "claude"
+          ? "错误：Claude 任务失败。请确认本机已安装 Claude Code 并登录；若提示模型已下线，请设置环境变量 CLAUDE_MODEL（例如 claude-opus-4-7）或在 Claude CLI 中切换模型。"
+          : options.engine === "cursor"
+            ? "错误：Cursor 任务失败。请确认已安装 Cursor Agent CLI（agent）并登录（agent login 或设置 CURSOR_API_KEY）；勿与 Grok 的 agent 命令混淆。"
+            : "错误：Grok 任务失败。请确认本机已安装 Grok Build 并已登录。"
+      });
+    }
   }
   await taskStore.upsert(latest);
   await publishStoredTaskSnapshot(options.threadId);

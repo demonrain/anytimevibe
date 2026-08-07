@@ -167,7 +167,10 @@ function modelOptionMeta(
   return capabilityForEngine(capabilities, engine)?.models.find((item) => item.id === baseId);
 }
 
-/** Encode Cursor Fast / strip prior params so agent can compose CLI --model. */
+/**
+ * Encode Cursor Fast for the wire as legacy `base[fast=…]`.
+ * Agent always rewrites to CLI slugs (`gpt-5.6-sol-medium-fast`) before spawn.
+ */
 function composeCursorModelId(baseModel: string, fast: boolean | undefined, supportsFast: boolean): string {
   const base = (baseModel || "composer-2.5").split("[")[0]!.trim() || "composer-2.5";
   if (!supportsFast || fast === undefined) return base;
@@ -175,14 +178,19 @@ function composeCursorModelId(baseModel: string, fast: boolean | undefined, supp
 }
 
 function parseFastFromModelId(modelId?: string): boolean | undefined {
-  if (!modelId?.includes("[")) return undefined;
-  const m = modelId.match(/\[([^\]]+)\]/);
-  const body = m?.[1];
-  if (!body) return undefined;
-  for (const part of body.split(",")) {
-    const [k, v] = part.split("=").map((s) => s.trim());
-    if (k === "fast") return v === "true" || v === "1";
+  if (!modelId) return undefined;
+  if (modelId.includes("[")) {
+    const m = modelId.match(/\[([^\]]+)\]/);
+    const body = m?.[1];
+    if (!body) return undefined;
+    for (const part of body.split(",")) {
+      const [k, v] = part.split("=").map((s) => s.trim());
+      if (k === "fast") return v === "true" || v === "1";
+    }
+    return undefined;
   }
+  // Live slug: gpt-5.6-sol-medium-fast
+  if (/-fast$/i.test(modelId)) return true;
   return undefined;
 }
 
@@ -379,7 +387,15 @@ function isErrorSystemMessage(text: string | undefined): boolean {
   if (value.length > 800 || value.split(/\n/).length > 12) return false;
   return /^(错误|任务失败|Error|Failed|失败)[:：\s（(]/i.test(value)
     || /任务失败（/.test(value)
-    || /退出码|systemerror|未找到.*CLI|无法连接|not logged in|auth/i.test(value);
+    || /退出码|systemerror|未找到.*CLI|无法连接|not logged in|auth|API Error/i.test(value);
+}
+
+/** Strip UI prefixes so "错误：API Error" and "API Error" dedupe as one. */
+function normalizeSystemErrorText(text: string): string {
+  return text
+    .trim()
+    .replace(/^(错误|任务失败|Error|Failed)[:：\s]*/i, "")
+    .trim();
 }
 
 function findLastSystemErrorText(messages: Array<{ role: string; text: string }>): string {
@@ -1449,14 +1465,17 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       delete task.activeTurnId;
       if (event.message) {
         const text = event.message.trim();
-        const already = task.messages.some(
-          (message) => message.role === "system" && message.text.trim() === text
+        const norm = normalizeSystemErrorText(text).toLowerCase();
+        const already = Boolean(norm) && task.messages.some(
+          (message) => message.role === "system" && normalizeSystemErrorText(message.text).toLowerCase() === norm
         );
         if (text && !already) {
           task.messages.push({
             id: event.eventId,
             role: "system",
-            text
+            text: text.startsWith("错误") || text.startsWith("任务失败") || text.startsWith("Error")
+              ? text
+              : `错误：${text}`
           });
         }
       }
@@ -1539,8 +1558,9 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     if (event.contextUsage) task.contextUsage = event.contextUsage;
     const errText = event.errorMessage?.trim();
     if (errText) {
-      const already = task.messages.some(
-        (message) => message.role === "system" && message.text.includes(errText)
+      const norm = normalizeSystemErrorText(errText).toLowerCase();
+      const already = Boolean(norm) && task.messages.some(
+        (message) => message.role === "system" && normalizeSystemErrorText(message.text).toLowerCase() === norm
       );
       if (!already) {
         task.messages.push({
@@ -1550,7 +1570,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
         });
       }
     } else if (isFailedTaskStatus(event.status)) {
-      const hasSystem = task.messages.some((message) => message.role === "system" && message.text.trim());
+      const hasSystem = task.messages.some((message) => message.role === "system" && isErrorSystemMessage(message.text));
       if (!hasSystem) {
         task.messages.push({
           id: event.eventId,

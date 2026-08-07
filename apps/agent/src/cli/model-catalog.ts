@@ -208,8 +208,10 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
 
 /**
  * Cursor Agent CLI models (see https://cursor.com/docs/cli + https://cursor.com/docs/models).
- * IDs are CLI `--model` slugs; Fast/effort are composed as `id[fast=…,effort=…]` at spawn time.
- * Prefer live `agent models` / `--list-models` when the binary is installed.
+ *
+ * Current CLI uses suffix slugs, NOT bracket params:
+ *   gpt-5.6-sol-medium / gpt-5.6-sol-medium-fast / composer-2.5-fast
+ * Older docs used `id[fast=…,effort=…]` — we still accept that from the web and rewrite to slugs.
  */
 const CURSOR_FALLBACK_MODELS: EngineModelOption[] = [
   { id: "auto", label: "Auto" },
@@ -225,80 +227,200 @@ const CURSOR_FALLBACK_MODELS: EngineModelOption[] = [
     reasoningEfforts: ["low", "medium", "high", "xhigh"]
   },
   {
+    id: "claude-opus-5-thinking",
+    label: "Claude Opus 5 Thinking",
+    supportsFast: true,
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
     id: "claude-fable-5",
     label: "Claude Fable 5",
-    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]
   },
   {
     id: "gpt-5.6-sol",
     label: "GPT-5.6 Sol",
     supportsFast: true,
-    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]
   },
   {
     id: "gpt-5.6-terra",
     label: "GPT-5.6 Terra",
     supportsFast: true,
-    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]
   },
   {
     id: "gpt-5.6-luna",
     label: "GPT-5.6 Luna",
     supportsFast: true,
-    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]
   },
-  { id: "grok-4.5", label: "Grok 4.5" },
+  { id: "cursor-grok-4.5", label: "Grok 4.5", supportsFast: true, reasoningEfforts: ["low", "medium", "high"] },
   { id: "gemini-3.1-pro", label: "Gemini 3.1 Pro" },
   {
     id: "claude-sonnet-5",
     label: "Claude Sonnet 5",
     supportsFast: true,
-    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]
   }
 ];
 
+/** Live CLI slugs from the last successful `agent models` probe (used to pick valid --model). */
+let cursorLiveSlugSet: Set<string> = new Set();
+
+/** Effort tokens that appear as `-{token}` before optional `-fast` in Cursor CLI slugs. */
+const CURSOR_EFFORT_TOKENS = [
+  "thinking-max",
+  "thinking-xhigh",
+  "thinking-high",
+  "thinking-medium",
+  "thinking-low",
+  "extra-high",
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max"
+] as const;
+
+type CursorEffortToken = (typeof CURSOR_EFFORT_TOKENS)[number];
+
+function reasoningToEffortToken(effort: ReasoningEffort): CursorEffortToken {
+  if (effort === "xhigh") return "xhigh";
+  return effort;
+}
+
+function effortTokenToReasoning(token: CursorEffortToken): ReasoningEffort | undefined {
+  if (token === "none") return undefined;
+  if (token === "extra-high") return "xhigh";
+  if (token.startsWith("thinking-")) {
+    const inner = token.slice("thinking-".length) as ReasoningEffort | "xhigh";
+    if (inner === "low" || inner === "medium" || inner === "high" || inner === "xhigh" || inner === "max") {
+      return inner;
+    }
+    return undefined;
+  }
+  if (token === "low" || token === "medium" || token === "high" || token === "xhigh" || token === "max") {
+    return token;
+  }
+  return undefined;
+}
+
+function splitCursorSlug(id: string): { base: string; effortToken?: CursorEffortToken; fast: boolean } {
+  let rest = id.trim();
+  if (!rest) return { base: "", fast: false };
+  let fast = false;
+  if (rest.endsWith("-fast")) {
+    fast = true;
+    rest = rest.slice(0, -5);
+  }
+  for (const token of CURSOR_EFFORT_TOKENS) {
+    const suffix = `-${token}`;
+    if (rest.endsWith(suffix) && rest.length > suffix.length) {
+      return { base: rest.slice(0, -suffix.length), effortToken: token, fast };
+    }
+  }
+  return { base: rest, fast };
+}
+
+function humanizeCursorBase(base: string): string {
+  if (base === "auto") return "Auto";
+  if (base === "composer-2.5") return "Composer 2.5";
+  return base
+    .split("-")
+    .map((part) => {
+      if (/^\d+(\.\d+)*$/.test(part)) return part;
+      if (part.toLowerCase() === "gpt") return "GPT";
+      return part.charAt(0).toUpperCase() + part.slice(1);
+    })
+    .join(" ");
+}
+
+type CursorFamily = {
+  base: string;
+  label: string;
+  supportsFast: boolean;
+  reasoningEfforts: ReasoningEffort[];
+  /** All live slugs belonging to this family. */
+  slugs: string[];
+};
+
+function groupCursorLiveSlugs(ids: string[]): CursorFamily[] {
+  const byBase = new Map<string, {
+    slugs: string[];
+    efforts: Set<ReasoningEffort>;
+    supportsFast: boolean;
+    hasBare: boolean;
+  }>();
+
+  for (const id of ids) {
+    const { base, effortToken, fast } = splitCursorSlug(id);
+    if (!base || base.includes("[")) continue;
+    let row = byBase.get(base);
+    if (!row) {
+      row = { slugs: [], efforts: new Set(), supportsFast: false, hasBare: false };
+      byBase.set(base, row);
+    }
+    row.slugs.push(id);
+    if (fast) row.supportsFast = true;
+    if (!effortToken) row.hasBare = true;
+    const effort = effortToken ? effortTokenToReasoning(effortToken) : undefined;
+    if (effort) row.efforts.add(effort);
+  }
+
+  const families: CursorFamily[] = [];
+  for (const [base, row] of byBase) {
+    const order: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
+    const reasoningEfforts = order.filter((e) => row.efforts.has(e));
+    families.push({
+      base,
+      label: humanizeCursorBase(base),
+      supportsFast: row.supportsFast,
+      reasoningEfforts,
+      slugs: row.slugs
+    });
+  }
+  return families;
+}
+
 function looksLikeCursorModelLine(line: string): boolean {
   const t = line.trim();
-  if (!t || t.length > 120) return false;
+  if (!t || t.length > 200) return false;
   if (/^(Available|Models|NAME|ID|Usage|\$|──|==)/i.test(t)) return false;
-  // Skip Grok Build help noise if wrong binary ever leaks in.
   if (/grok\s+build|Grok Build/i.test(t)) return false;
   return true;
 }
 
-function parseCursorModelsCliOutput(raw: string): EngineModelOption[] {
-  const models: EngineModelOption[] = [];
+function extractCursorModelIds(raw: string): string[] {
+  const ids: string[] = [];
   const seen = new Set<string>();
+
+  // Comma-separated dump from error text / some CLI versions.
+  if (raw.includes(",") && !raw.includes("\n")) {
+    for (const part of raw.split(",")) {
+      const id = part.trim();
+      if (!id || seen.has(id) || /\s/.test(id) || id.includes("[")) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    if (ids.length) return ids;
+  }
+
   for (const line of raw.split(/\r?\n/)) {
     if (!looksLikeCursorModelLine(line)) continue;
-    // Formats seen: "composer-2.5", "composer-2.5  Composer 2.5", "- composer-2.5 (Composer 2.5)"
     const cleaned = line.replace(/^[-*•]\s*/, "").trim();
     const m =
-      cleaned.match(/^([a-z0-9][\w./+-]*(?:\[[^\]]+\])?)\s{2,}(.+)$/i)
+      cleaned.match(/^([a-z0-9][\w./+-]*)\s{2,}(.+)$/i)
       || cleaned.match(/^([a-z0-9][\w./+-]*)\s+\(([^)]+)\)\s*$/i)
       || cleaned.match(/^([a-z0-9][\w./+-]+)\s*$/i);
     if (!m?.[1]) continue;
     const id = m[1].trim();
-    if (!id || seen.has(id) || id.includes(" ")) continue;
-    // Drop param-only variants from listing; we compose params ourselves.
-    if (id.includes("[")) continue;
+    if (!id || seen.has(id) || id.includes(" ") || id.includes("[")) continue;
     seen.add(id);
-    const label = (m[2] || id).trim();
-    const lower = `${id} ${label}`.toLowerCase();
-    const supportsFast =
-      /composer|opus|sonnet|gpt|gemini/i.test(lower) && !/auto|grok/i.test(id);
-    const reasoningEfforts: ReasoningEffort[] | undefined =
-      /gpt|opus|fable|sonnet|claude/i.test(lower) && !/composer|auto|grok/i.test(id)
-        ? ["low", "medium", "high", "xhigh"]
-        : undefined;
-    models.push({
-      id,
-      label,
-      ...(supportsFast ? { supportsFast: true } : {}),
-      ...(reasoningEfforts ? { reasoningEfforts } : {})
-    });
+    ids.push(id);
   }
-  return models;
+  return ids;
 }
 
 async function runCursorModelsList(command: string): Promise<string | null> {
@@ -322,7 +444,7 @@ async function runCursorModelsList(command: string): Promise<string | null> {
           windowsVerbatimArguments: isWindows,
           // Must use proxy: Cursor model list is IP-region gated.
           env,
-          maxBuffer: 512_000
+          maxBuffer: 1_000_000
         });
         const text = `${stdout || ""}\n${stderr || ""}`.trim();
         if (text && !/unknown command|unrecognized|error:/i.test(text.slice(0, 200))) {
@@ -341,33 +463,153 @@ async function runCursorModelsList(command: string): Promise<string | null> {
   return null;
 }
 
+function pickCursorSlug(
+  base: string,
+  options?: { reasoningEffort?: ReasoningEffort; fast?: boolean },
+  live?: Set<string>
+): string {
+  const fast = options?.fast === true;
+  let effort = options?.reasoningEffort;
+
+  // Bare base (e.g. gpt-5.6-sol) is often not a valid CLI id — default to medium when live set known.
+  if (!effort && live && live.size && !live.has(base) && !live.has(`${base}-fast`)) {
+    const fallbacks: ReasoningEffort[] = ["medium", "high", "low", "xhigh", "max"];
+    for (const candidate of fallbacks) {
+      const token = reasoningToEffortToken(candidate);
+      const slug = fast ? `${base}-${token}-fast` : `${base}-${token}`;
+      const alt = candidate === "xhigh"
+        ? (fast ? `${base}-extra-high-fast` : `${base}-extra-high`)
+        : null;
+      if (live.has(slug) || (alt && live.has(alt))) {
+        effort = candidate;
+        break;
+      }
+    }
+  }
+
+  const tokens: Array<string | undefined> = [];
+  if (effort) {
+    const primary = reasoningToEffortToken(effort);
+    tokens.push(primary);
+    if (effort === "xhigh") tokens.push("extra-high");
+    if (base.endsWith("-thinking") || /(?:^|-)thinking$/i.test(base)) {
+      tokens.unshift(`thinking-${effort === "xhigh" ? "xhigh" : effort}`);
+    }
+  } else {
+    tokens.push(undefined);
+  }
+
+  const candidates: string[] = [];
+  for (const token of tokens) {
+    const core = token ? `${base}-${token}` : base;
+    if (fast) candidates.push(`${core}-fast`);
+    candidates.push(core);
+  }
+  if (fast) candidates.push(`${base}-fast`);
+  candidates.push(base);
+
+  const seen = new Set<string>();
+  const ordered = candidates.filter((id) => {
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+
+  if (live && live.size) {
+    for (const id of ordered) {
+      if (live.has(id)) return id;
+    }
+    if (effort) {
+      const want = reasoningToEffortToken(effort);
+      for (const slug of live) {
+        const parts = splitCursorSlug(slug);
+        if (parts.base !== base) continue;
+        if (parts.fast !== fast) continue;
+        if (parts.effortToken === want || (want === "xhigh" && parts.effortToken === "extra-high")) {
+          return slug;
+        }
+      }
+    }
+  }
+
+  return ordered[0] || base;
+}
+
+/**
+ * Parse legacy `id[fast=true,effort=high]` or bare / slug ids into parts.
+ */
+export function parseCursorModelRef(model: string | undefined): {
+  base: string;
+  fast?: boolean;
+  reasoningEffort?: ReasoningEffort;
+} {
+  const raw = (model || "").trim();
+  if (!raw) return { base: "composer-2.5" };
+  const bracket = raw.match(/^([^[\]]+)\[([^\]]+)\]\s*$/);
+  if (bracket) {
+    const base = (bracket[1] || "").trim() || "composer-2.5";
+    let fast: boolean | undefined;
+    let reasoningEffort: ReasoningEffort | undefined;
+    for (const part of (bracket[2] || "").split(",")) {
+      const [k, v] = part.split("=").map((s) => s.trim());
+      if (!k) continue;
+      if (k === "fast") fast = v === "true" || v === "1";
+      if (k === "effort") {
+        const mapped = v === "extra_high" || v === "extra-high" ? "xhigh" : v;
+        if (mapped === "low" || mapped === "medium" || mapped === "high" || mapped === "xhigh" || mapped === "max") {
+          reasoningEffort = mapped;
+        }
+      }
+    }
+    return { base, ...(fast !== undefined ? { fast } : {}), ...(reasoningEffort ? { reasoningEffort } : {}) };
+  }
+
+  // Already a live slug like gpt-5.6-sol-medium-fast
+  if (!raw.includes("[") && (raw.includes("-fast") || CURSOR_EFFORT_TOKENS.some((t) => raw.endsWith(`-${t}`)))) {
+    const parts = splitCursorSlug(raw);
+    const effort = parts.effortToken ? effortTokenToReasoning(parts.effortToken) : undefined;
+    return {
+      base: parts.base,
+      ...(parts.fast ? { fast: true } : { fast: false }),
+      ...(effort ? { reasoningEffort: effort } : {})
+    };
+  }
+
+  return { base: raw };
+}
+
 async function discoverCursorCapability(): Promise<EngineCapability> {
   const models: EngineModelOption[] = [];
   const seen = new Set<string>();
   let liveCount = 0;
+  cursorLiveSlugSet = new Set();
 
-  // Live list from Cursor Agent CLI when installed (never Grok's `agent`).
   try {
     const { resolveEngineBinary } = await import("./detect");
     const binary = await resolveEngineBinary("cursor");
     if (binary) {
       const raw = await runCursorModelsList(binary);
       if (raw) {
-        for (const row of parseCursorModelsCliOutput(raw)) {
-          if (seen.has(row.id)) continue;
-          seen.add(row.id);
-          models.push(row);
-          liveCount += 1;
+        const ids = extractCursorModelIds(raw);
+        for (const id of ids) cursorLiveSlugSet.add(id);
+        liveCount = ids.length;
+        const families = groupCursorLiveSlugs(ids);
+        for (const family of families) {
+          if (seen.has(family.base)) continue;
+          seen.add(family.base);
+          models.push({
+            id: family.base,
+            label: family.label,
+            ...(family.supportsFast ? { supportsFast: true } : {}),
+            ...(family.reasoningEfforts.length ? { reasoningEfforts: family.reasoningEfforts } : {})
+          });
         }
       }
     }
   } catch {
-    // fall through to static catalog
+    // fall through
   }
 
-  // When live discovery works, only merge metadata onto real CLI models —
-  // never advertise gpt-5.6-sol / Claude etc. that this account cannot use.
-  // Fallback catalog is only used when `agent models` is empty/unavailable.
   if (liveCount === 0) {
     for (const row of CURSOR_FALLBACK_MODELS) {
       if (seen.has(row.id)) continue;
@@ -386,28 +628,30 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
     }
   }
 
-  // Prefer Composer 2.5 first in the picker (after optional Auto).
   models.sort((a, b) => {
     const rank = (id: string) => {
       if (id === "composer-2.5") return 0;
       if (id === "auto") return 1;
       if (id.startsWith("claude-opus")) return 2;
       if (id.includes("fable")) return 3;
-      if (id.startsWith("gpt-")) return 4;
-      if (id.startsWith("grok") || id.startsWith("cursor-grok")) return 5;
+      if (id.startsWith("gpt-5.6-sol")) return 4;
+      if (id.startsWith("gpt-")) return 5;
+      if (id.startsWith("grok") || id.startsWith("cursor-grok")) return 6;
       return 10;
     };
     return rank(a.id) - rank(b.id) || a.label.localeCompare(b.label);
   });
 
   const envModel = process.env.CURSOR_MODEL?.trim();
-  const currentModel = envModel || (models.some((m) => m.id === "composer-2.5") ? "composer-2.5" : models[0]?.id) || "auto";
-  if (currentModel && !seen.has(currentModel.split("[")[0]!)) {
-    models.unshift({ id: currentModel, label: currentModel });
+  const envBase = envModel ? parseCursorModelRef(envModel).base : "";
+  const currentModel = envBase
+    || (models.some((m) => m.id === "composer-2.5") ? "composer-2.5" : models[0]?.id)
+    || "auto";
+  if (currentModel && !seen.has(currentModel)) {
+    models.unshift({ id: currentModel, label: humanizeCursorBase(currentModel) });
   }
 
-  // Engine-level efforts are a union used as fallback when a model has none.
-  const reasoningEfforts: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
+  const reasoningEfforts: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
 
   return {
     engine: "cursor",
@@ -418,44 +662,27 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
 }
 
 /**
- * Build Cursor CLI `--model` value from base id + effort + optional fast flag.
- * Docs/community use forms like `composer-2.5[fast=false]` and effort-bearing GPT names.
+ * Build Cursor CLI `--model` slug from base id + effort + optional fast flag.
+ * Emits `gpt-5.6-sol-medium-fast`, never legacy `gpt-5.6-sol[fast=true]`.
  */
 export function formatCursorModelArg(
   model: string | undefined,
   options?: { reasoningEffort?: ReasoningEffort; fast?: boolean }
 ): string {
-  const raw = (model || process.env.CURSOR_MODEL || "composer-2.5").trim() || "composer-2.5";
-  // Already parameterized by web/UI — pass through.
-  if (raw.includes("[")) return raw;
-  if (raw === "auto") return "auto";
+  const parsed = parseCursorModelRef(model);
+  if (parsed.base === "auto") return "auto";
 
-  const base = raw;
-  const params: string[] = [];
-  const lower = base.toLowerCase();
-  const catalog = CURSOR_FALLBACK_MODELS.find((m) => m.id === base);
-  const supportsFast = catalog?.supportsFast ?? /composer|opus|sonnet|gpt/i.test(lower);
-  const supportsEffort =
-    Boolean(catalog?.reasoningEfforts?.length)
-    || /gpt|opus|fable|sonnet|claude/i.test(lower);
+  const fast = options?.fast ?? parsed.fast;
+  const reasoningEffort = options?.reasoningEffort ?? parsed.reasoningEffort;
 
-  if (supportsFast && options?.fast !== undefined) {
-    params.push(`fast=${options.fast ? "true" : "false"}`);
-  }
-
-  if (supportsEffort && options?.reasoningEffort) {
-    const effortMap: Record<ReasoningEffort, string> = {
-      low: "low",
-      medium: "medium",
-      high: "high",
-      xhigh: "extra_high",
-      max: "extra_high"
-    };
-    params.push(`effort=${effortMap[options.reasoningEffort]}`);
-  }
-
-  if (!params.length) return base;
-  return `${base}[${params.join(",")}]`;
+  return pickCursorSlug(
+    parsed.base,
+    {
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(fast !== undefined ? { fast } : {})
+    },
+    cursorLiveSlugSet.size ? cursorLiveSlugSet : undefined
+  );
 }
 
 /** Collect model + effort options from local CLI configs/caches on this machine. */
