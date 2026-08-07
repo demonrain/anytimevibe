@@ -210,12 +210,9 @@ export function explainCodexUpstreamError(message: string): string {
       raw,
       "",
       "说明：HTTP 499 表示「客户端」在上游还没回完时就断开了连接（nginx 记法）。",
-      "对随码 + 本机网关（localhost:3310 → store…）常见原因：",
-      "1) 本机网关 / 代理的流空闲超时过短（如 stream-idle-timeout-ms=60s），长推理无输出时被掐断；",
-      "2) Clash/系统代理干扰本地网关或上游长连接；",
-      "3) Codex app-server 中途被重启，或网页点了停止；",
-      "4) 网关进程已挂掉后仍继续请求。",
-      "处理：确认 Cockpit/本地网关在跑；把 sidecar 的 stream-idle-timeout-ms 调到 ≥300000；先试用较低 reasoning effort；确认 Agent 已清掉对 localhost 的 HTTP_PROXY。"
+      "你当前链路一般是：Codex app-server → localhost:3310（Cockpit）→ store.demonrain.top。",
+      "最常见根因：Cockpit sidecar 被重置为 stream-idle-timeout-ms=60s，或强制 responses_websockets；长推理静默时网关先掐流，上游就记 499。",
+      "处理：保持 Cockpit Local Access 运行；更新随码客户端（会在任务前自动加固 sidecar 超时并清 WS beta）；仍失败则降低 reasoning effort，并确认 Agent 未给 localhost 套 HTTP_PROXY。"
     ].join("\n");
   }
   if (/ECONNREFUSED|connection refused|Failed to connect|tcp connect error|网关不可达/i.test(raw)) {
