@@ -63,7 +63,7 @@ import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
 import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
 import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt } from "./cli/macos-fs";
-import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix } from "./local-proxy";
+import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
 const execFileAsync = promisify(execFile);
@@ -5431,7 +5431,11 @@ async function applyLocalProxyToElectronSessions(mode: "auto" | "direct" = "auto
   const proxyUrl = localProxy.HTTPS_PROXY || localProxy.HTTP_PROXY || localProxy.ALL_PROXY
     || localProxy.https_proxy || localProxy.http_proxy || localProxy.all_proxy;
   if (!proxyUrl) return;
-  const bypass = ["localhost", "127.0.0.1", "::1", "<local>", localProxy.NO_PROXY, localProxy.no_proxy]
+  const bypass = [
+    ...LOCAL_PROXY_BYPASS_RULES,
+    localProxy.NO_PROXY,
+    localProxy.no_proxy
+  ]
     .filter(Boolean)
     .join(",");
   const proxyConfig = {
@@ -5439,7 +5443,7 @@ async function applyLocalProxyToElectronSessions(mode: "auto" | "direct" = "auto
     proxyBypassRules: bypass
   };
   await Promise.all(targets.map((target) => target.setProxy(proxyConfig)));
-  // Keep Electron updater / fetch on proxy, but never route loopback (Codex :3310) through it.
+  // Keep Electron updater / fetch on proxy, but never route LAN/loopback through it.
   Object.assign(process.env, mergeProxyIntoEnv({ ...process.env }, localProxy));
   logInfo("更新检查已启用本机代理", proxyConfig.proxyRules);
 }

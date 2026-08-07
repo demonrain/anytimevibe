@@ -16,8 +16,53 @@ const PROXY_ENV_KEYS = [
 
 export type LocalProxyEnv = Partial<Record<(typeof PROXY_ENV_KEYS)[number], string>>;
 
-/** Hosts that must never go through the system proxy (local Codex / cockpit gateways). */
-export const LOCAL_NO_PROXY_HOSTS = ["localhost", "127.0.0.1", "::1", "0.0.0.0"] as const;
+/** Hosts/CIDRs/suffixes that must never go through the system proxy. */
+export const LOCAL_NO_PROXY_HOSTS = [
+  // Loopback
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "0.0.0.0",
+  // Common LAN / intranet DNS suffixes (leading dot = suffix match for curl/reqwest)
+  ".localhost",
+  ".local",
+  ".lan",
+  ".home",
+  ".internal",
+  ".intranet",
+  ".corp",
+  ".private",
+  ".localdomain",
+  // RFC1918 + link-local (CIDR — supported by curl / Rust no_proxy / many CLIs)
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "169.254.0.0/16",
+  // IPv6 ULA + link-local
+  "fc00::/7",
+  "fe80::/10"
+] as const;
+
+/** Chromium/Electron bypass list (wildcards + <local>). */
+export const LOCAL_PROXY_BYPASS_RULES = [
+  "<local>",
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "*.localhost",
+  "*.local",
+  "*.lan",
+  "*.home",
+  "*.internal",
+  "*.intranet",
+  "*.corp",
+  "*.private",
+  "*.localdomain",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "169.254.0.0/16"
+] as const;
 
 function normalizeProxyUrl(raw: string): string {
   const value = raw.trim();
@@ -51,9 +96,9 @@ export function mergeNoProxyLists(...parts: Array<string | undefined>): string {
 }
 
 /**
- * Ensure local loopback hosts bypass the proxy.
- * Without this, Clash/system proxy intercepts http://localhost:3310 and yields 504
- * (CLI in a clean cmd works; Agent handoff / app-server fails).
+ * Ensure loopback + LAN hosts/domains bypass the proxy.
+ * Without this, Clash/system proxy intercepts http://localhost:3310 (and LAN IPs)
+ * and yields 504 — while a clean cmd CLI works.
  */
 export function withLocalNoProxy(proxy: LocalProxyEnv): LocalProxyEnv {
   const hasProxy = Boolean(
