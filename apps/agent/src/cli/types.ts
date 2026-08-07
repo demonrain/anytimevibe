@@ -49,6 +49,8 @@ export type StoredTask = {
   updatedAt: number;
   model?: string;
   reasoningEffort?: ReasoningEffort;
+  /** Last web permission mode — reused by interactive CLI handoff. */
+  permissionMode?: PermissionMode;
   contextUsage?: ContextUsage;
   /** Last known unified diff / git status for the Diff tab (persisted across reconnect). */
   lastDiff?: string;

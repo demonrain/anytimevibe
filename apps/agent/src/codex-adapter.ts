@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { windowsCmdArguments } from "./windows-command";
-import { stripProxyFromEnv } from "./local-proxy";
+import { localGatewayChildEnv } from "./local-proxy";
 import type { PermissionMode } from "@anytimevibe/protocol";
 
 type RpcId = string | number;
@@ -78,8 +78,8 @@ export class CodexAdapter {
       windowsHide: true,
       windowsVerbatimArguments: isWindows,
       stdio: ["pipe", "pipe", "pipe"],
-      // Strip proxy: Codex local gateway (:3310) stream_open still follows HTTP_PROXY under Clash.
-      env: stripProxyFromEnv(process.env)
+      // Local Codex gateway only — never inherit Clash HTTP_PROXY.
+      env: localGatewayChildEnv(process.env)
     });
     this.process = child;
     createInterface({ input: child.stdout }).on("line", (line) => this.handleLine(line));

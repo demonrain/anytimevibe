@@ -2,10 +2,11 @@ import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/protocol";
-import { collectLocalProxyEnv, mergeProxyIntoEnv, ensureCursorHttp1ForProxy } from "../local-proxy";
+import { cloudProxyChildEnv, ensureCursorHttp1ForProxy, collectLocalProxyEnv } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
 import { formatCursorModelArg } from "./model-catalog";
+import { headlessPermissionArgs } from "./permission-args";
 import type { ApprovalPlan, ApprovalQuestion, BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
 import { ensureWorkspaceTrusted } from "./workspace-trust";
 
@@ -72,38 +73,6 @@ function killChildTree(child: ChildProcess): void {
   try { child.kill(); } catch { /* ignore */ }
 }
 
-function permissionArgs(engine: CliEngine, mode: PermissionMode): string[] {
-  if (engine === "claude") {
-    // Headless must never stop on trust/permission prompts (workspace trust is pre-marked separately).
-    if (mode === "full-access") {
-      return ["--permission-mode", "bypassPermissions", "--dangerously-skip-permissions"];
-    }
-    if (mode === "read-only") {
-      return ["--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep"];
-    }
-    // acceptEdits still needs non-interactive safety for untrusted-folder edge cases
-    return ["--permission-mode", "acceptEdits", "--dangerously-skip-permissions"];
-  }
-  if (engine === "cursor") {
-    // Cursor Agent CLI (https://cursor.com/docs/cli/reference/parameters):
-    // --mode ask|plan, --force/--yolo, --trust (headless workspace), --sandbox, --approve-mcps
-    const common = ["--trust", "--approve-mcps"];
-    if (mode === "read-only") {
-      return ["--mode", "ask", ...common];
-    }
-    if (mode === "full-access" || mode === "approve-for-me") {
-      return ["--force", ...common, "--sandbox", "disabled"];
-    }
-    // accept edits / ask-for-approval: write with force so remote turns are non-interactive
-    return ["--force", ...common];
-  }
-  // grok: always-approve so headless never blocks on TTY
-  if (mode === "read-only") {
-    return ["--permission-mode", "dontAsk", "--tools", "read_file,grep,list_dir"];
-  }
-  return ["--always-approve"];
-}
-
 /**
  * Parse optional fast flag encoded by the web as model id suffix:
  *   composer-2.5[fast=true,effort=high]  → already complete
@@ -143,7 +112,7 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
     // Only use --bare when API key is present (bare skips keychain/OAuth).
     if (process.env.ANTHROPIC_API_KEY) args.push("--bare");
     if (options.providerSessionId) args.push("--resume", options.providerSessionId);
-    args.push(...permissionArgs(engine, options.permissionMode));
+    args.push(...headlessPermissionArgs(engine, options.permissionMode));
     return args;
   }
   if (engine === "cursor") {
@@ -165,7 +134,7 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
     );
     if (modelArg) args.push("--model", modelArg);
     if (options.providerSessionId) args.push("--resume", options.providerSessionId);
-    args.push(...permissionArgs(engine, options.permissionMode));
+    args.push(...headlessPermissionArgs(engine, options.permissionMode));
     // Positional prompt last so option parsers never swallow it.
     args.push(options.prompt);
     return args;
@@ -185,7 +154,7 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
     args.push("--reasoning-effort", "high");
   }
   if (options.providerSessionId) args.push("--resume", options.providerSessionId);
-  args.push(...permissionArgs(engine, options.permissionMode));
+  args.push(...headlessPermissionArgs(engine, options.permissionMode));
   return args;
 }
 
@@ -791,16 +760,12 @@ export async function runHeadlessTurn(
       console.warn("[headless] ensureCursorHttp1ForProxy failed:", error);
     }
   }
-  const env = mergeProxyIntoEnv(
-    {
-      ...process.env,
-      // Headless / non-TTY friendly
-      CI: process.env.CI || "1",
-      TERM: process.env.TERM || "dumb",
-      NO_COLOR: process.env.NO_COLOR || "1"
-    },
-    proxy
-  );
+  // Cursor/Claude/Grok must egress via proxy (IP region gates Cursor model list).
+  const env = await cloudProxyChildEnv({
+    CI: process.env.CI || "1",
+    TERM: process.env.TERM || "dumb",
+    NO_COLOR: process.env.NO_COLOR || "1"
+  });
 
   if (!options.cursorResumeRetried) {
     safeOnEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });

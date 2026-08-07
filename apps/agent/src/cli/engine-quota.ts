@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import { ENGINE_QUOTA_DETAIL_MAX, type CliEngine, type EngineQuota } from "@anytimevibe/protocol";
 import { windowsCmdArguments } from "../windows-command";
 import { resolveEngineBinary } from "./detect";
+import { cloudProxyChildEnv } from "../local-proxy";
 
 const execFileAsync = promisify(execFile);
 const DETAIL_MAX = ENGINE_QUOTA_DETAIL_MAX;
@@ -26,18 +27,21 @@ async function pathExists(filePath: string): Promise<boolean> {
 export async function runCliText(
   command: string,
   args: string[],
-  options?: { timeoutMs?: number; cwd?: string }
+  options?: { timeoutMs?: number; cwd?: string; useProxy?: boolean }
 ): Promise<{ ok: boolean; text: string; code?: number }> {
   const timeoutMs = options?.timeoutMs ?? 25_000;
   try {
     const isWindows = process.platform === "win32";
     const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
     const finalArgs = isWindows ? windowsCmdArguments(command, args) : args;
+    const env = options?.useProxy === false
+      ? process.env
+      : await cloudProxyChildEnv();
     const { stdout, stderr } = await execFileAsync(executable, finalArgs, {
       timeout: timeoutMs,
       windowsHide: true,
       windowsVerbatimArguments: isWindows,
-      env: process.env,
+      env,
       cwd: options?.cwd || process.cwd(),
       maxBuffer: 1_000_000
     });

@@ -308,6 +308,9 @@ async function runCursorModelsList(command: string): Promise<string | null> {
     const execFileAsync = promisify(execFile);
     const isWindows = process.platform === "win32";
     const { windowsCmdArguments } = await import("../windows-command");
+    const { collectLocalProxyEnv, cloudProxyChildEnv } = await import("../local-proxy");
+    const proxy = await collectLocalProxyEnv();
+    const env = await cloudProxyChildEnv();
     const attempts: string[][] = [["models"], ["--list-models"], ["models", "--json"]];
     for (const args of attempts) {
       try {
@@ -317,11 +320,15 @@ async function runCursorModelsList(command: string): Promise<string | null> {
           timeout: 20_000,
           windowsHide: true,
           windowsVerbatimArguments: isWindows,
-          env: process.env,
+          // Must use proxy: Cursor model list is IP-region gated.
+          env,
           maxBuffer: 512_000
         });
         const text = `${stdout || ""}\n${stderr || ""}`.trim();
         if (text && !/unknown command|unrecognized|error:/i.test(text.slice(0, 200))) {
+          if (Object.keys(proxy).length) {
+            console.log("[models] Cursor models listed via local proxy (non-China egress)");
+          }
           return text;
         }
       } catch {
@@ -337,6 +344,7 @@ async function runCursorModelsList(command: string): Promise<string | null> {
 async function discoverCursorCapability(): Promise<EngineCapability> {
   const models: EngineModelOption[] = [];
   const seen = new Set<string>();
+  let liveCount = 0;
 
   // Live list from Cursor Agent CLI when installed (never Grok's `agent`).
   try {
@@ -349,6 +357,7 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
           if (seen.has(row.id)) continue;
           seen.add(row.id);
           models.push(row);
+          liveCount += 1;
         }
       }
     }
@@ -356,22 +365,25 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
     // fall through to static catalog
   }
 
-  // Ensure curated first-party / popular models exist even if CLI list is sparse.
-  for (const row of CURSOR_FALLBACK_MODELS) {
-    if (seen.has(row.id)) {
-      // Merge metadata onto live row when CLI omitted flags.
-      const existing = models.find((m) => m.id === row.id);
-      if (existing) {
-        if (row.supportsFast && existing.supportsFast === undefined) existing.supportsFast = true;
-        if (row.reasoningEfforts?.length && !existing.reasoningEfforts?.length) {
-          existing.reasoningEfforts = row.reasoningEfforts;
-        }
-        if (row.label && existing.label === existing.id) existing.label = row.label;
-      }
-      continue;
+  // When live discovery works, only merge metadata onto real CLI models —
+  // never advertise gpt-5.6-sol / Claude etc. that this account cannot use.
+  // Fallback catalog is only used when `agent models` is empty/unavailable.
+  if (liveCount === 0) {
+    for (const row of CURSOR_FALLBACK_MODELS) {
+      if (seen.has(row.id)) continue;
+      seen.add(row.id);
+      models.push({ ...row });
     }
-    seen.add(row.id);
-    models.push({ ...row });
+  } else {
+    for (const row of CURSOR_FALLBACK_MODELS) {
+      const existing = models.find((m) => m.id === row.id);
+      if (!existing) continue;
+      if (row.supportsFast && existing.supportsFast === undefined) existing.supportsFast = true;
+      if (row.reasoningEfforts?.length && !existing.reasoningEfforts?.length) {
+        existing.reasoningEfforts = row.reasoningEfforts;
+      }
+      if (row.label && existing.label === existing.id) existing.label = row.label;
+    }
   }
 
   // Prefer Composer 2.5 first in the picker (after optional Auto).
@@ -382,14 +394,14 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
       if (id.startsWith("claude-opus")) return 2;
       if (id.includes("fable")) return 3;
       if (id.startsWith("gpt-")) return 4;
-      if (id.startsWith("grok")) return 5;
+      if (id.startsWith("grok") || id.startsWith("cursor-grok")) return 5;
       return 10;
     };
     return rank(a.id) - rank(b.id) || a.label.localeCompare(b.label);
   });
 
   const envModel = process.env.CURSOR_MODEL?.trim();
-  const currentModel = envModel || "composer-2.5";
+  const currentModel = envModel || (models.some((m) => m.id === "composer-2.5") ? "composer-2.5" : models[0]?.id) || "auto";
   if (currentModel && !seen.has(currentModel.split("[")[0]!)) {
     models.unshift({ id: currentModel, label: currentModel });
   }

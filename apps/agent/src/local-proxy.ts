@@ -230,7 +230,15 @@ async function readWindowsInternetProxy(): Promise<LocalProxyEnv> {
   }
 }
 
-/** Collect local proxy settings from process env, then Windows system proxy as fallback. */
+/**
+ * Proxy policy for AnytimeVibe agent:
+ *
+ * - Cloud CLIs (Cursor / Claude / Grok): MUST inherit HTTP(S)_PROXY so the
+ *   egress IP is non-China. Cursor gates model catalogs by IP — China → kimi/glm,
+ *   non-China → gpt/opus/…. Also set NODE_USE_ENV_PROXY=1 for bundled Node.
+ * - Local services (Codex app-server → localhost:3310, LAN): MUST strip proxy.
+ *   Clash still routes loopback via HTTP_PROXY even with NO_PROXY, causing 504.
+ */
 export async function collectLocalProxyEnv(): Promise<LocalProxyEnv> {
   const fromEnv: LocalProxyEnv = {};
   for (const key of PROXY_ENV_KEYS) {
@@ -285,6 +293,34 @@ export function stripProxyFromEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   next.NO_PROXY = merged;
   next.no_proxy = merged;
   return next;
+}
+
+/**
+ * Apply system/Clash proxy onto process.env early (cloud CLIs + model discovery).
+ * Safe to call repeatedly. Does not strip — Codex spawn paths call stripProxyFromEnv themselves.
+ */
+export async function applyProcessProxyEnv(): Promise<LocalProxyEnv> {
+  const proxy = await collectLocalProxyEnv();
+  Object.assign(process.env, mergeProxyIntoEnv({ ...process.env }, proxy));
+  return proxy;
+}
+
+/**
+ * Env for cloud-bound child processes (Cursor / Claude / Grok).
+ * Always merges local proxy + NODE_USE_ENV_PROXY.
+ */
+export async function cloudProxyChildEnv(
+  extra: NodeJS.ProcessEnv = {}
+): Promise<NodeJS.ProcessEnv> {
+  const proxy = await collectLocalProxyEnv();
+  return mergeProxyIntoEnv({ ...process.env, ...extra }, proxy);
+}
+
+/**
+ * Env for local-gateway children (Codex app-server / handoff to localhost).
+ */
+export function localGatewayChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return stripProxyFromEnv(base);
 }
 
 /**

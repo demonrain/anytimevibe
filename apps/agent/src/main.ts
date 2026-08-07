@@ -61,9 +61,10 @@ import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-c
 import { appendEngineDiffChunk, buildTurnDiff, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
 import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
+import { handoffPermissionArgs, normalizePermissionMode } from "./cli/permission-args";
 import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
 import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt } from "./cli/macos-fs";
-import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix, proxyClearShellLines, stripProxyFromEnv, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
+import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix, proxyClearShellLines, stripProxyFromEnv, applyProcessProxyEnv, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
 const execFileAsync = promisify(execFile);
@@ -2300,7 +2301,14 @@ fi
 /** Build shell export/set lines for the current machine proxy (so curl/irm work offline-LAN). */
 async function proxyShellLines(platform: "win32" | "darwin" | "powershell"): Promise<string[]> {
   const proxy = await collectLocalProxyEnv();
-  const entries = Object.entries(proxy).filter((entry): entry is [string, string] => Boolean(entry[1]));
+  const merged = mergeProxyIntoEnv({}, proxy);
+  const keys = [
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+    "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY"
+  ] as const;
+  const entries = keys
+    .map((key) => [key, merged[key]] as const)
+    .filter((entry): entry is readonly [string, string] => Boolean(entry[1]));
   if (!entries.length) return [];
   if (platform === "powershell") {
     return entries.map(([key, value]) => `$env:${key} = ${JSON.stringify(value)}`);
@@ -3537,6 +3545,7 @@ async function runHeadlessTaskTurn(options: {
       createdAt: now,
       updatedAt: now,
       messages: [],
+      permissionMode: options.permissionMode,
       ...(options.model ? { model: options.model } : {}),
       ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {})
     };
@@ -3546,6 +3555,7 @@ async function runHeadlessTaskTurn(options: {
   }
   if (options.model) stored.model = options.model;
   if (options.reasoningEffort) stored.reasoningEffort = options.reasoningEffort;
+  stored.permissionMode = options.permissionMode;
   stored.messages.push({ id: crypto.randomUUID(), role: "user", text: options.prompt });
   stored.status = "active";
   stored.updatedAt = now;
@@ -3771,6 +3781,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         createdAt: Date.now() / 1000,
         updatedAt: Date.now() / 1000,
         messages: [],
+        permissionMode: mode,
         ...(command.model ? { model: command.model } : {}),
         ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {})
       });
@@ -3823,12 +3834,13 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         const mode = command.permissionMode ?? "ask-for-approval";
         const stored = taskStore.get(command.threadId);
         if (stored && (stored.engine === "claude" || stored.engine === "grok" || stored.engine === "cursor")) {
-          // Persist UI-selected model/effort before the turn so refresh/import keep them.
+          // Persist UI-selected model/effort/permission before the turn so handoff/refresh keep them.
+          stored.permissionMode = mode;
           if (command.model || command.reasoningEffort) {
             if (command.model) stored.model = command.model;
             if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
-            await taskStore.upsert(stored);
           }
+          await taskStore.upsert(stored);
           await ensureWorkspaceTrusted(stored.engine, stored.cwd);
           await runHeadlessTaskTurn({
             engine: stored.engine,
@@ -3848,6 +3860,12 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         const codexCwd = stored?.cwd || "";
         if (codexCwd) await ensureCodexTrustedAndReady(codexCwd);
         else await ensureCodex();
+        if (stored) {
+          stored.permissionMode = mode;
+          if (command.model) stored.model = command.model;
+          if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+          await taskStore.upsert(stored);
+        }
         await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
         startLocalActivity(command.threadId, command.prompt, "继续远程任务", "codex");
         if (stored && (command.model || command.reasoningEffort)) {
@@ -4756,33 +4774,54 @@ async function resolveRelayTask(threadId: string): Promise<AgentTask & { provide
   return cached;
 }
 
-async function openExternalTerminal(cwd: string, commandLine: string): Promise<void> {
-  // Handoff must match a clean cmd: do NOT inject HTTP(S)_PROXY.
-  // Codex stream_open to localhost:3310 still follows HTTP_PROXY under Clash and times out (504),
-  // even when NO_PROXY lists localhost.
+async function openExternalTerminal(
+  cwd: string,
+  commandLine: string,
+  proxyMode: "strip" | "inject" = "strip"
+): Promise<void> {
+  // strip  = local gateway only (Codex → localhost:3310). Clash still hijacks loopback via HTTP_PROXY.
+  // inject = cloud CLIs (Cursor/Claude/Grok). Egress IP decides Cursor model catalog
+  //         (China → kimi/glm; non-China → gpt/opus).
   if (process.platform === "win32") {
-    const clearLines = proxyClearShellLines("win32");
+    const proxyLines = proxyMode === "inject"
+      ? await proxyShellLines("win32")
+      : proxyClearShellLines("win32");
     const workdir = cwd && cwd.trim() ? cwd : os.homedir();
+    const modeLabel = proxyMode === "inject"
+      ? "proxy injected for cloud CLI"
+      : "proxy cleared for local Codex gateway";
     await openWindowsVisibleConsole([
-      ...clearLines,
+      ...proxyLines,
       `cd /d ${quoteWinArg(workdir)}`,
       "echo.",
-      "echo [AnytimeVibe] CLI handoff (proxy cleared for local Codex gateway)",
+      `echo [AnytimeVibe] CLI handoff (${modeLabel})`,
       "echo [AnytimeVibe] HTTP_PROXY=%HTTP_PROXY%",
       "echo [AnytimeVibe] NO_PROXY=%NO_PROXY%",
+      "echo [AnytimeVibe] NODE_USE_ENV_PROXY=%NODE_USE_ENV_PROXY%",
       "echo.",
       commandLine
     ]);
     return;
   }
   if (process.platform === "darwin") {
-    const clearLines = proxyClearShellLines("darwin");
-    const prefix = clearLines.length ? `${clearLines.join(" && ")} && ` : "";
-    const fullCommand = `${prefix}${commandLine}`;
-    const command = `cd ${shellQuote(cwd || os.homedir())} && ${fullCommand}`;
-    await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`], {
-      env: stripProxyFromEnv(process.env)
-    });
+    if (proxyMode === "inject") {
+      const proxy = await collectLocalProxyEnv();
+      const prefix = proxyShellPrefix(proxy);
+      const nodeProxy = "export NODE_USE_ENV_PROXY=1 && ";
+      const fullCommand = `${prefix}${Object.keys(proxy).length ? nodeProxy : ""}${commandLine}`;
+      const command = `cd ${shellQuote(cwd || os.homedir())} && ${fullCommand}`;
+      await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`], {
+        env: mergeProxyIntoEnv({ ...process.env }, proxy)
+      });
+    } else {
+      const clearLines = proxyClearShellLines("darwin");
+      const prefix = clearLines.length ? `${clearLines.join(" && ")} && ` : "";
+      const fullCommand = `${prefix}${commandLine}`;
+      const command = `cd ${shellQuote(cwd || os.homedir())} && ${fullCommand}`;
+      await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`], {
+        env: stripProxyFromEnv(process.env)
+      });
+    }
     await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
     return;
   }
@@ -4877,6 +4916,7 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   const accessCwd = await ensureMacFolderAccess(cwd, "接力终端需要访问该工作区文件夹");
   // Only resume with provider-native session ids (not our product thread UUID unless they match).
   const providerSessionId = (stored?.providerSessionId || "").trim();
+  const permissionMode = normalizePermissionMode(stored?.permissionMode);
 
   // Pre-accept directory trust prompts before opening an interactive handoff terminal.
   await ensureWorkspaceTrusted(
@@ -4893,15 +4933,18 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     // drops the user into the interactive model picker). Only pass when explicitly set.
     const model = (stored?.model || process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "").trim();
     const args = [
+      ...handoffPermissionArgs("claude", permissionMode),
       ...(model ? ["--model", model] : []),
       ...(providerSessionId ? ["--resume", providerSessionId] : [])
     ];
+    console.log(`[relay] claude permission=${permissionMode} args=${args.join(" ")}`);
     if (process.platform === "win32") {
-      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args));
+      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
     } else {
       await openExternalTerminal(
         accessCwd,
-        [shellQuote(binary), ...args.map((part) => (part.startsWith("-") ? part : shellQuote(part)))].join(" ")
+        [shellQuote(binary), ...args.map((part) => (part.startsWith("-") ? part : shellQuote(part)))].join(" "),
+        "inject"
       );
     }
     return;
@@ -4912,21 +4955,25 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     if (!binary) throw new Error("未找到 Grok Build CLI，无法接力");
     const model = (process.env.GROK_MODEL || process.env.XAI_MODEL || "").trim();
     const args = [
+      ...handoffPermissionArgs("grok", permissionMode),
       ...(providerSessionId ? ["--resume", providerSessionId] : []),
       ...(model ? ["--model", model] : []),
       "--cwd", accessCwd
     ];
+    console.log(`[relay] grok permission=${permissionMode}`);
     if (process.platform === "win32") {
-      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args));
+      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
     } else {
       await openExternalTerminal(
         accessCwd,
         [
           shellQuote(binary),
+          ...handoffPermissionArgs("grok", permissionMode),
           ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : []),
           ...(model ? ["--model", shellQuote(model)] : []),
           "--cwd", shellQuote(accessCwd)
-        ].join(" ")
+        ].join(" "),
+        "inject"
       );
     }
     return;
@@ -4940,21 +4987,25 @@ async function relayTaskToCli(threadId: string): Promise<void> {
       ...(stored?.reasoningEffort ? { reasoningEffort: stored.reasoningEffort } : {})
     });
     const args = [
+      ...handoffPermissionArgs("cursor", permissionMode),
       ...(providerSessionId ? ["--resume", providerSessionId] : []),
       ...(model ? ["--model", model] : []),
       "--workspace", accessCwd
     ];
+    console.log(`[relay] cursor permission=${permissionMode}`);
     if (process.platform === "win32") {
-      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args));
+      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
     } else {
       await openExternalTerminal(
         accessCwd,
         [
           shellQuote(binary),
+          ...handoffPermissionArgs("cursor", permissionMode).map((part) => (part.startsWith("-") ? part : shellQuote(part))),
           ...(providerSessionId ? ["--resume", shellQuote(providerSessionId)] : []),
           ...(model ? ["--model", shellQuote(model)] : []),
           "--workspace", shellQuote(accessCwd)
-        ].join(" ")
+        ].join(" "),
+        "inject"
       );
     }
     return;
@@ -4963,17 +5014,19 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   // Codex session id is the product/thread id.
   await releaseCodexThreadForHandoff(threadId);
   const binary = await resolveCodexBinaryForRelay();
-  console.log(`[relay] codex binary=${binary} thread=${threadId} cwd=${accessCwd}`);
+  const permissionArgs = handoffPermissionArgs("codex", permissionMode);
+  console.log(`[relay] codex binary=${binary} thread=${threadId} cwd=${accessCwd} permission=${permissionMode}`);
   if (process.platform === "win32") {
     // Prefer invoking via `node …/codex.js` when the discovery path is a .cmd shim —
     // some environments break on nested batch files even with `call`.
     const nodeBin = (await findOnWindowsPath("node.exe")) || (await findOnWindowsPath("node"));
     const codexJs = path.join(path.dirname(binary), "node_modules", "@openai", "codex", "bin", "codex.js");
-    let commandLine = formatWinCliCommand(binary, ["resume", threadId]);
+    const resumeArgs = [...permissionArgs, "resume", threadId];
+    let commandLine = formatWinCliCommand(binary, resumeArgs);
     try {
       await fs.access(codexJs);
       if (nodeBin) {
-        commandLine = formatWinCliCommand(nodeBin, [codexJs, "resume", threadId]);
+        commandLine = formatWinCliCommand(nodeBin, [codexJs, ...resumeArgs]);
       }
     } catch {
       // keep call codex.cmd
@@ -4982,7 +5035,13 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     return;
   }
   if (process.platform === "darwin") {
-    await openExternalTerminal(accessCwd, `${shellQuote(binary)} resume ${shellQuote(threadId)}`);
+    const flagPart = permissionArgs
+      .map((part) => (part.startsWith("-") ? part : shellQuote(part)))
+      .join(" ");
+    await openExternalTerminal(
+      accessCwd,
+      `${shellQuote(binary)}${flagPart ? ` ${flagPart}` : ""} resume ${shellQuote(threadId)}`
+    );
     return;
   }
   throw new Error("当前系统暂不支持启动接力终端。");
@@ -5476,7 +5535,7 @@ async function applyLocalProxyToElectronSessions(mode: "auto" | "direct" = "auto
   };
   await Promise.all(targets.map((target) => target.setProxy(proxyConfig)));
   // Keep Electron updater / fetch on proxy, but never route LAN/loopback through it.
-  Object.assign(process.env, mergeProxyIntoEnv({ ...process.env }, localProxy));
+  await applyProcessProxyEnv();
   logInfo("更新检查已启用本机代理", proxyConfig.proxyRules);
 }
 
@@ -5814,6 +5873,13 @@ process.on("unhandledRejection", (reason) => {
 
 app.whenReady().then(async () => {
   await loadConfig();
+  // Apply Clash/system proxy BEFORE env detect / Cursor model list —
+  // Cursor catalogs models by egress IP (China → kimi/glm; proxy → gpt/opus).
+  try {
+    await applyProcessProxyEnv();
+  } catch (error) {
+    console.warn("[proxy] applyProcessProxyEnv failed:", error);
+  }
   await taskStore.load(app.getPath("userData"));
   await loadTurnQueue(app.getPath("userData"));
   await loadDeletedThreads(app.getPath("userData"));
