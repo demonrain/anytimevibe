@@ -174,26 +174,51 @@ export function normalizeUnixSeconds(value: unknown, fallback = Date.now() / 100
 export function extractCodexTurnError(turn: JsonObject | undefined | null): string | undefined {
   if (!turn || typeof turn !== "object") return undefined;
   const direct = turn.error ?? turn.errorMessage ?? turn.message ?? turn.failureReason ?? turn.reason;
-  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  if (typeof direct === "string" && direct.trim()) return explainCodexUpstreamError(direct.trim());
   if (direct && typeof direct === "object") {
     const nested = (direct as JsonObject).message ?? (direct as JsonObject).detail ?? (direct as JsonObject).text;
-    if (typeof nested === "string" && nested.trim()) return nested.trim();
+    if (typeof nested === "string" && nested.trim()) return explainCodexUpstreamError(nested.trim());
   }
   for (const item of turn.items ?? []) {
     const type = String(item?.type ?? "").toLowerCase();
     if (type === "error" || type === "systemerror" || type === "systemmessage" || type === "system") {
       const text = String(item.text ?? item.message ?? item.detail ?? "").trim();
-      if (text) return text;
+      if (text) return explainCodexUpstreamError(text);
     }
     if (item?.error) {
-      if (typeof item.error === "string" && item.error.trim()) return item.error.trim();
+      if (typeof item.error === "string" && item.error.trim()) return explainCodexUpstreamError(item.error.trim());
       if (typeof item.error === "object" && item.error) {
         const msg = String((item.error as JsonObject).message ?? (item.error as JsonObject).detail ?? "").trim();
-        if (msg) return msg;
+        if (msg) return explainCodexUpstreamError(msg);
       }
     }
   }
   return undefined;
+}
+
+/**
+ * Annotate opaque upstream transport failures (e.g. nginx 499) so users know this is
+ * usually a client-side abort / timeout / provider mismatch — not an AnytimeVibe bug.
+ */
+export function explainCodexUpstreamError(message: string): string {
+  const raw = String(message || "").trim();
+  if (!raw) return raw;
+  if (/status\s*499|Client Closed Request/i.test(raw)) {
+    return [
+      raw,
+      "",
+      "说明：HTTP 499 表示 Codex 作为客户端提前断开了上游请求（常见：推理过久被超时/代理掐断、app-server 中途重启、或 model_provider 与本机 CLI 不一致）。",
+      "请确认 ~/.codex/config.toml 的 model_provider 与 CLI 一致、本地网关端口可达，并先试用较低的 reasoning effort。"
+    ].join("\n");
+  }
+  if (/ECONNREFUSED|connection refused|Failed to connect|tcp connect error/i.test(raw)) {
+    return [
+      raw,
+      "",
+      "说明：连不上模型供应商地址。若使用 codex_local_access，请先启动本机网关后再从随码下发任务。"
+    ].join("\n");
+  }
+  return raw;
 }
 
 export function isTerminalTurnStatus(status: string): boolean {

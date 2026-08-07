@@ -3130,17 +3130,60 @@ async function recoverAfterCodexAppServerExit(detail: string): Promise<void> {
 }
 
 /** Write project trust, then restart app-server if config changed so the new trust is loaded. */
+let pendingCodexAppServerReload: string | null = null;
+
+function hasActiveCodexTurn(): boolean {
+  for (const threadId of activeTurnByThread.keys()) {
+    if (isHeadlessThreadActive(threadId)) continue;
+    const engine = resolveActivityEngine(threadId);
+    if (!engine || engine === "codex") return true;
+  }
+  for (const threadId of turnStartingByThread) {
+    if (isHeadlessThreadActive(threadId)) continue;
+    const engine = resolveActivityEngine(threadId);
+    if (!engine || engine === "codex") return true;
+  }
+  return false;
+}
+
+async function reloadCodexAppServer(reason: string): Promise<void> {
+  logInfo("正在重载 Codex app-server", reason);
+  try {
+    codex?.stop();
+  } catch {
+    // ignore
+  }
+  codex = null;
+  await ensureCodex();
+}
+
+async function maybeReloadCodexAppServerWhenIdle(): Promise<void> {
+  if (!pendingCodexAppServerReload) return;
+  if (hasActiveCodexTurn()) return;
+  const reason = pendingCodexAppServerReload;
+  pendingCodexAppServerReload = null;
+  await reloadCodexAppServer(`空闲后应用目录信任：${reason}`);
+}
+
 async function ensureCodexTrustedAndReady(cwd: string): Promise<void> {
   const accessCwd = await ensureMacFolderAccess(cwd, "Codex 任务需要访问该工作区文件夹");
   const trustChanged = await ensureWorkspaceTrusted("codex", accessCwd);
   if (trustChanged && codex) {
-    logInfo("Codex 项目信任已更新，正在重载 app-server", accessCwd);
-    try {
-      codex.stop();
-    } catch {
-      // ignore
+    // Never kill app-server mid-turn — that aborts upstream /responses and surfaces as HTTP 499.
+    if (hasActiveCodexTurn()) {
+      pendingCodexAppServerReload = accessCwd;
+      logWarn("Codex 目录信任已写入，有任务进行中，延后重载 app-server", accessCwd);
+      for (const threadId of activeTurnByThread.keys()) {
+        if (isHeadlessThreadActive(threadId)) continue;
+        const engine = resolveActivityEngine(threadId);
+        if (engine && engine !== "codex") continue;
+        appendLocalActivityStage(threadId, "ℹ 已写入目录信任；当前回合不中断，空闲后再重载 Codex");
+      }
+    } else {
+      pendingCodexAppServerReload = null;
+      await reloadCodexAppServer(accessCwd);
+      return;
     }
-    codex = null;
   }
   await ensureCodex();
 }
@@ -4195,6 +4238,58 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     try { await publishThread(threadId, { touch: true }); } catch { /* ignore */ }
     // Codex turn finished — drain durable follow-up prompts for this thread.
     scheduleDrainTurnQueue(threadId);
+    void maybeReloadCodexAppServerWhenIdle().catch(handleError);
+  }
+  // Reasoning streams — without these, long xhigh turns stay on「等待引擎输出…」with an empty pane.
+  if (
+    message.method === "item/reasoning/summaryTextDelta"
+    || message.method === "item/reasoning/textDelta"
+    || message.method === "item/reasoning/summaryPartAdded"
+  ) {
+    const params = message.params ?? {};
+    const threadId = String(params.threadId ?? "");
+    const itemId = String(params.itemId ?? params.item?.id ?? "thought");
+    const delta = String(params.delta ?? params.text ?? "");
+    if (threadId && delta) {
+      appendLocalActivity(threadId, delta);
+      queueRemoteDelta(threadId, `stage:thought:${itemId}`, delta);
+    } else if (threadId && message.method === "item/reasoning/summaryPartAdded") {
+      appendLocalActivityStage(threadId, "▶ 思考中");
+      queueRemoteDelta(threadId, `stage:thought:${itemId}`, "\n▶ 思考中\n");
+    }
+  }
+  if (message.method === "thread/status/changed") {
+    const params = message.params ?? {};
+    const threadId = String(params.threadId ?? "");
+    const status = params.status;
+    const flags = Array.isArray(status?.activeFlags) ? status.activeFlags.map(String) : [];
+    if (threadId && flags.includes("waitingOnApproval")) {
+      appendLocalActivityStage(threadId, "⏸ 等待审批（请在网页端确认，或检查 Codex 权限模式）");
+      queueRemoteDelta(threadId, "stage:approval-wait", "\n⏸ 等待审批（请在网页端确认）\n");
+    }
+  }
+  if (message.method === "mcpServer/startupStatus/updated") {
+    const params = message.params ?? {};
+    const name = String(params.name ?? "mcp");
+    const status = String(params.status ?? "");
+    const error = params.error ? String(params.error) : "";
+    const threadId = String(params.threadId ?? "");
+    const line = status === "failed"
+      ? `✗ MCP ${name} 启动失败${error ? `：${error}` : ""}`
+      : status === "ready"
+        ? `✓ MCP ${name} 已就绪`
+        : status === "starting"
+          ? `… MCP ${name} 启动中`
+          : `MCP ${name}：${status || "updated"}`;
+    if (threadId) {
+      appendLocalActivityStage(threadId, line);
+      queueRemoteDelta(threadId, `stage:mcp:${name}`, `\n${line}\n`);
+    } else {
+      for (const id of activeTurnByThread.keys()) {
+        if (isHeadlessThreadActive(id)) continue;
+        appendLocalActivityStage(id, line);
+      }
+    }
   }
   if (message.method === "serverRequest/resolved") {
     pendingRequestTypes.delete(String(message.params.requestId));
