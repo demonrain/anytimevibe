@@ -142,8 +142,8 @@ function effortOptionsFromHost(
     return base;
   }
   // Cursor models without effort (Composer / Auto / Grok) → no dropdown.
+  // Do NOT keep a stale currentEffort here: switching GPT→Auto must clear the picker.
   if (engine === "cursor") {
-    if (currentEffort) return [currentEffort];
     return [];
   }
   const base = cap?.reasoningEfforts?.length
@@ -225,10 +225,19 @@ function loadTaskUiPrefs(threadId: string): TaskUiPrefs {
   }
 }
 
-function saveTaskUiPrefs(threadId: string, prefs: TaskUiPrefs): void {
+function saveTaskUiPrefs(threadId: string, prefs: TaskUiPrefs & { reasoningEffort?: ReasoningEffort | null }): void {
   try {
     const current = loadTaskUiPrefs(threadId);
-    const next: TaskUiPrefs = { ...current, ...prefs };
+    const next: TaskUiPrefs = { ...current };
+    if (prefs.model !== undefined) {
+      if (prefs.model) next.model = prefs.model;
+      else delete next.model;
+    }
+    if ("reasoningEffort" in prefs) {
+      if (prefs.reasoningEffort) next.reasoningEffort = prefs.reasoningEffort;
+      else delete next.reasoningEffort;
+    }
+    if (prefs.fast !== undefined) next.fast = prefs.fast;
     if (!next.model && !next.reasoningEffort && next.fast === undefined) {
       localStorage.removeItem(taskPrefsKey(threadId));
     } else {
@@ -2719,14 +2728,30 @@ function TaskConversation({
     }
 
     if (task.reasoningEffort) {
-      setReasoningEffort(task.reasoningEffort);
-      saveTaskUiPrefs(task.threadId, { reasoningEffort: task.reasoningEffort });
+      const baseModel = (task.model || prefs.model || model || "").split("[")[0] || "";
+      const supported = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, baseModel);
+      if (taskEngine === "cursor" && supported.length === 0) {
+        // Task snapshot may still carry an old GPT effort after switching to Auto.
+        setReasoningEffort("");
+        saveTaskUiPrefs(task.threadId, { reasoningEffort: null });
+      } else {
+        setReasoningEffort(task.reasoningEffort);
+        saveTaskUiPrefs(task.threadId, { reasoningEffort: task.reasoningEffort });
+      }
     } else if (prefs.reasoningEffort) {
-      setReasoningEffort(prefs.reasoningEffort);
+      const baseModel = (task.model || prefs.model || model || "").split("[")[0] || "";
+      const supported = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, baseModel);
+      if (taskEngine === "cursor" && supported.length === 0) {
+        setReasoningEffort("");
+        saveTaskUiPrefs(task.threadId, { reasoningEffort: null });
+      } else {
+        setReasoningEffort(prefs.reasoningEffort);
+      }
     } else {
-      setReasoningEffort((current) =>
-        current || cap?.currentReasoningEffort || effortOptions[0] || ""
-      );
+      setReasoningEffort((current) => {
+        if (taskEngine === "cursor" && effortOptions.length === 0) return "";
+        return current || cap?.currentReasoningEffort || effortOptions[0] || "";
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.threadId, task.model, task.reasoningEffort]);
@@ -2737,7 +2762,11 @@ function TaskConversation({
     const nextEfforts = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, model);
     setReasoningEffort((current) => {
       if (current && nextEfforts.includes(current as ReasoningEffort)) return current;
-      return nextEfforts[0] || "";
+      const next = nextEfforts[0] || "";
+      // Persist clear so Auto/Composer do not keep showing a prior GPT effort.
+      if (!next) saveTaskUiPrefs(task.threadId, { reasoningEffort: null });
+      else saveTaskUiPrefs(task.threadId, { reasoningEffort: next });
+      return next;
     });
     const meta = modelOptionMeta(engineCapabilities, taskEngine, model);
     if (meta?.supportsFast && /composer/i.test(model) && uiPrefs.fast === undefined) {

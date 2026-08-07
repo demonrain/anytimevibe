@@ -263,6 +263,9 @@ export function mergeProxyIntoEnv(base: NodeJS.ProcessEnv, proxy: LocalProxyEnv)
     const merged = mergeNoProxyLists(next.NO_PROXY, next.no_proxy, ...LOCAL_NO_PROXY_HOSTS);
     next.NO_PROXY = merged;
     next.no_proxy = merged;
+    // Node 22+ / Cursor Agent bundled Node ignore HTTP(S)_PROXY unless this is set.
+    // Docs: https://cursor.com/docs/cli/reference/configuration#proxy-configuration
+    if (!next.NODE_USE_ENV_PROXY) next.NODE_USE_ENV_PROXY = "1";
   }
   return next;
 }
@@ -282,6 +285,57 @@ export function stripProxyFromEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   next.NO_PROXY = merged;
   next.no_proxy = merged;
   return next;
+}
+
+/**
+ * Clash / system HTTP proxies often break Cursor Agent HTTP/2 streams (GPT models like gpt-5.6-sol).
+ * Official fallback: ~/.cursor/cli-config.json → network.useHttp1ForAgent = true
+ * Only flips false→true when a local proxy is active; never disables an existing true.
+ */
+export async function ensureCursorHttp1ForProxy(proxy: LocalProxyEnv): Promise<boolean> {
+  const hasProxy = Boolean(
+    proxy.HTTP_PROXY
+    || proxy.http_proxy
+    || proxy.HTTPS_PROXY
+    || proxy.https_proxy
+    || proxy.ALL_PROXY
+    || proxy.all_proxy
+    || process.env.HTTP_PROXY
+    || process.env.http_proxy
+    || process.env.HTTPS_PROXY
+    || process.env.https_proxy
+    || process.env.ALL_PROXY
+    || process.env.all_proxy
+  );
+  if (!hasProxy) return false;
+
+  const { promises: fs } = await import("node:fs");
+  const path = await import("node:path");
+  const os = await import("node:os");
+  const configPath = path.join(os.homedir(), ".cursor", "cli-config.json");
+  try {
+    let raw = "";
+    try {
+      raw = await fs.readFile(configPath, "utf8");
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    const parsed = raw.trim() ? JSON.parse(raw) as Record<string, any> : { version: 1 };
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const network = (parsed.network && typeof parsed.network === "object" && !Array.isArray(parsed.network))
+      ? { ...parsed.network }
+      : {};
+    if (network.useHttp1ForAgent === true) return false;
+    network.useHttp1ForAgent = true;
+    parsed.network = network;
+    if (parsed.version == null) parsed.version = 1;
+    await fs.mkdir(path.dirname(configPath), { recursive: true });
+    await fs.writeFile(configPath, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+    return true;
+  } catch (error) {
+    console.warn("[proxy] failed to enable Cursor useHttp1ForAgent:", error);
+    return false;
+  }
 }
 
 /** Shell lines that clear proxy vars (cmd / powershell / bash). */

@@ -4838,6 +4838,37 @@ async function resolveCodexBinaryForRelay(): Promise<string> {
   throw new Error("未找到 Codex CLI，请先在「本机环境」中安装兼容版 Codex。");
 }
 
+async function releaseCodexThreadForHandoff(threadId: string): Promise<void> {
+  // Codex only allows one live writer per thread. Agent app-server and CLI handoff
+  // share ~/.codex, so resume fails with: "already has an active writer".
+  const turnId = activeTurnByThread.get(threadId);
+  if (codex && turnId) {
+    logWarn("接力前中断进行中的 Codex turn", threadId.slice(0, 8));
+    await Promise.race([
+      codex.request("turn/interrupt", { threadId, turnId }).catch(() => undefined),
+      new Promise((resolve) => setTimeout(resolve, 1500))
+    ]);
+  }
+  activeTurnByThread.delete(threadId);
+  turnStartingByThread.delete(threadId);
+  finishLocalActivity(threadId, "interrupted");
+  if (!codex) return;
+  // Unsubscribe alone keeps a 30m unload grace; stop app-server to drop the live writer now.
+  logInfo("接力前释放 Codex app-server 写锁", threadId.slice(0, 8));
+  try {
+    await codex.request("thread/unsubscribe", { threadId }).catch(() => undefined);
+  } catch {
+    // ignore
+  }
+  try {
+    codex.stop();
+  } catch {
+    // ignore
+  }
+  codex = null;
+  pendingCodexAppServerReload = null;
+}
+
 async function relayTaskToCli(threadId: string): Promise<void> {
   const task = await resolveRelayTask(threadId);
   const stored = taskStore.get(threadId);
@@ -4930,6 +4961,7 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   }
 
   // Codex session id is the product/thread id.
+  await releaseCodexThreadForHandoff(threadId);
   const binary = await resolveCodexBinaryForRelay();
   console.log(`[relay] codex binary=${binary} thread=${threadId} cwd=${accessCwd}`);
   if (process.platform === "win32") {

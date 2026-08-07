@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/protocol";
-import { collectLocalProxyEnv, mergeProxyIntoEnv } from "../local-proxy";
+import { collectLocalProxyEnv, mergeProxyIntoEnv, ensureCursorHttp1ForProxy } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
 import { formatCursorModelArg } from "./model-catalog";
@@ -781,6 +781,16 @@ export async function runHeadlessTurn(
   const finalArgs = useCmdShim ? windowsCmdArguments(command, args) : args;
 
   const proxy = await collectLocalProxyEnv();
+  if (engine === "cursor") {
+    try {
+      const enabledHttp1 = await ensureCursorHttp1ForProxy(proxy);
+      if (enabledHttp1) {
+        console.log("[headless] enabled Cursor network.useHttp1ForAgent for local proxy (GPT/stream)");
+      }
+    } catch (error) {
+      console.warn("[headless] ensureCursorHttp1ForProxy failed:", error);
+    }
+  }
   const env = mergeProxyIntoEnv(
     {
       ...process.env,
@@ -808,7 +818,10 @@ export async function runHeadlessTurn(
     `\n▶ 使用 ${engineLabel} 执行\n`
   );
   if (Object.keys(proxy).length) {
-    emitDelta(safeOnEvent, options, "stage:proxy", "stage", "\n… 已注入本机代理环境\n");
+    const proxyNote = engine === "cursor"
+      ? "\n… 已注入本机代理环境（NODE_USE_ENV_PROXY + HTTP/1.1 fallback）\n"
+      : "\n… 已注入本机代理环境\n";
+    emitDelta(safeOnEvent, options, "stage:proxy", "stage", proxyNote);
   }
   console.log(`[headless] spawn ${executable} ${finalArgs.map((a) => (a.includes(" ") ? JSON.stringify(a) : a)).join(" ")}`);
 
