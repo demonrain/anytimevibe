@@ -16,12 +16,66 @@ const PROXY_ENV_KEYS = [
 
 export type LocalProxyEnv = Partial<Record<(typeof PROXY_ENV_KEYS)[number], string>>;
 
+/** Hosts that must never go through the system proxy (local Codex / cockpit gateways). */
+export const LOCAL_NO_PROXY_HOSTS = ["localhost", "127.0.0.1", "::1", "0.0.0.0"] as const;
+
 function normalizeProxyUrl(raw: string): string {
   const value = raw.trim();
   if (!value) return value;
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value)) return value;
   // Windows Internet Settings often store host:port without scheme.
   return `http://${value}`;
+}
+
+function splitNoProxy(value: string | undefined): string[] {
+  if (!value?.trim()) return [];
+  return value
+    .split(/[\s,;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+/** Merge NO_PROXY lists; keep first-seen order, case-insensitive dedupe. */
+export function mergeNoProxyLists(...parts: Array<string | undefined>): string {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of parts) {
+    for (const item of splitNoProxy(part)) {
+      const key = item.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+    }
+  }
+  return out.join(",");
+}
+
+/**
+ * Ensure local loopback hosts bypass the proxy.
+ * Without this, Clash/system proxy intercepts http://localhost:3310 and yields 504
+ * (CLI in a clean cmd works; Agent handoff / app-server fails).
+ */
+export function withLocalNoProxy(proxy: LocalProxyEnv): LocalProxyEnv {
+  const hasProxy = Boolean(
+    proxy.HTTP_PROXY
+    || proxy.http_proxy
+    || proxy.HTTPS_PROXY
+    || proxy.https_proxy
+    || proxy.ALL_PROXY
+    || proxy.all_proxy
+  );
+  if (!hasProxy) return { ...proxy };
+
+  const merged = mergeNoProxyLists(
+    proxy.NO_PROXY,
+    proxy.no_proxy,
+    ...LOCAL_NO_PROXY_HOSTS
+  );
+  return {
+    ...proxy,
+    NO_PROXY: merged,
+    no_proxy: merged
+  };
 }
 
 function parseWindowsProxyServer(proxyServer: string): LocalProxyEnv {
@@ -68,6 +122,21 @@ function parseWindowsProxyServer(proxyServer: string): LocalProxyEnv {
   return out;
 }
 
+/** Convert IE ProxyOverride list into NO_PROXY (preserve <local> as loopback hosts). */
+export function proxyOverrideToNoProxy(override: string): string {
+  const parts: string[] = [];
+  for (const raw of override.split(";")) {
+    const item = raw.trim();
+    if (!item) continue;
+    if (item.toLowerCase() === "<local>") {
+      parts.push(...LOCAL_NO_PROXY_HOSTS);
+      continue;
+    }
+    parts.push(item);
+  }
+  return mergeNoProxyLists(...parts);
+}
+
 async function readWindowsInternetProxy(): Promise<LocalProxyEnv> {
   if (process.platform !== "win32") return {};
   try {
@@ -101,12 +170,7 @@ async function readWindowsInternetProxy(): Promise<LocalProxyEnv> {
       const overrideMatch = overrideResult.stdout.match(/ProxyOverride\s+REG_SZ\s+(.+)\s*$/im);
       const override = overrideMatch?.[1]?.trim();
       if (override) {
-        // Convert IE-style list to NO_PROXY (comma separated, drop <local>)
-        const noProxy = override
-          .split(";")
-          .map((item) => item.trim())
-          .filter((item) => item && item.toLowerCase() !== "<local>")
-          .join(",");
+        const noProxy = proxyOverrideToNoProxy(override);
         if (noProxy) {
           env.NO_PROXY = noProxy;
           env.no_proxy = noProxy;
@@ -129,23 +193,39 @@ export async function collectLocalProxyEnv(): Promise<LocalProxyEnv> {
     if (value) fromEnv[key] = value;
   }
   const hasHttp = Boolean(fromEnv.HTTP_PROXY || fromEnv.http_proxy || fromEnv.HTTPS_PROXY || fromEnv.https_proxy || fromEnv.ALL_PROXY || fromEnv.all_proxy);
-  if (hasHttp) return fromEnv;
+  if (hasHttp) return withLocalNoProxy(fromEnv);
 
   const fromSystem = await readWindowsInternetProxy();
-  return { ...fromSystem, ...fromEnv };
+  return withLocalNoProxy({ ...fromSystem, ...fromEnv });
 }
 
 export function mergeProxyIntoEnv(base: NodeJS.ProcessEnv, proxy: LocalProxyEnv): NodeJS.ProcessEnv {
+  const safe = withLocalNoProxy(proxy);
   const next = { ...base };
-  for (const [key, value] of Object.entries(proxy)) {
+  for (const [key, value] of Object.entries(safe)) {
     if (value) next[key] = value;
+  }
+  // Even if `proxy` was empty, keep loopback bypass when the parent already has a proxy set.
+  const parentHasProxy = Boolean(
+    next.HTTP_PROXY
+    || next.http_proxy
+    || next.HTTPS_PROXY
+    || next.https_proxy
+    || next.ALL_PROXY
+    || next.all_proxy
+  );
+  if (parentHasProxy) {
+    const merged = mergeNoProxyLists(next.NO_PROXY, next.no_proxy, ...LOCAL_NO_PROXY_HOSTS);
+    next.NO_PROXY = merged;
+    next.no_proxy = merged;
   }
   return next;
 }
 
 /** Shell prefix that sets proxy vars before the real CLI command. */
 export function proxyShellPrefix(proxy: LocalProxyEnv, platform: NodeJS.Platform = process.platform): string {
-  const entries = Object.entries(proxy).filter((entry): entry is [string, string] => Boolean(entry[1]));
+  const safe = withLocalNoProxy(proxy);
+  const entries = Object.entries(safe).filter((entry): entry is [string, string] => Boolean(entry[1]));
   if (!entries.length) return "";
   if (platform === "win32") {
     // cmd.exe: set VAR=value && ...

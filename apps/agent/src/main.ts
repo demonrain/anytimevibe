@@ -4770,6 +4770,7 @@ async function openExternalTerminal(cwd: string, commandLine: string): Promise<v
       `cd /d ${quoteWinArg(workdir)}`,
       "echo.",
       "echo [AnytimeVibe] CLI handoff",
+      "echo [AnytimeVibe] NO_PROXY=%NO_PROXY%",
       "echo.",
       commandLine
     ]);
@@ -5438,7 +5439,8 @@ async function applyLocalProxyToElectronSessions(mode: "auto" | "direct" = "auto
     proxyBypassRules: bypass
   };
   await Promise.all(targets.map((target) => target.setProxy(proxyConfig)));
-  Object.assign(process.env, mergeProxyIntoEnv({}, localProxy));
+  // Keep Electron updater / fetch on proxy, but never route loopback (Codex :3310) through it.
+  Object.assign(process.env, mergeProxyIntoEnv({ ...process.env }, localProxy));
   logInfo("更新检查已启用本机代理", proxyConfig.proxyRules);
 }
 
