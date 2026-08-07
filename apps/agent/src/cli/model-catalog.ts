@@ -324,10 +324,33 @@ function splitCursorSlug(id: string): { base: string; effortToken?: CursorEffort
   return { base: rest, fast };
 }
 
+/** Normalize Cursor model family ids (CLI may print `Auto` as a label-looking line). */
+function normalizeCursorBaseId(base: string): string {
+  const raw = (base || "").trim();
+  if (!raw) return raw;
+  if (/^auto$/i.test(raw)) return "auto";
+  return raw;
+}
+
+/** True when the Cursor model family is Auto (any casing / legacy bracket form). */
+export function isCursorAutoModel(modelId?: string): boolean {
+  const base = normalizeCursorBaseId((modelId || "").split("[")[0] || "");
+  return base === "auto";
+}
+
+/** Persistable family id for UI snapshots — strips `[fast=…]` and normalizes Auto. */
+export function cursorPersistedModelId(modelId?: string): string | undefined {
+  const raw = (modelId || "").trim();
+  if (!raw) return undefined;
+  if (isCursorAutoModel(raw)) return "auto";
+  return normalizeCursorBaseId(raw.split("[")[0]?.trim() || raw) || undefined;
+}
+
 function humanizeCursorBase(base: string): string {
-  if (base === "auto") return "Auto";
-  if (base === "composer-2.5") return "Composer 2.5";
-  return base
+  const id = normalizeCursorBaseId(base);
+  if (id === "auto") return "Auto";
+  if (id === "composer-2.5") return "Composer 2.5";
+  return id
     .split("-")
     .map((part) => {
       if (/^\d+(\.\d+)*$/.test(part)) return part;
@@ -355,7 +378,9 @@ function groupCursorLiveSlugs(ids: string[]): CursorFamily[] {
   }>();
 
   for (const id of ids) {
-    const { base, effortToken, fast } = splitCursorSlug(id);
+    const split = splitCursorSlug(id);
+    const base = normalizeCursorBaseId(split.base);
+    const { effortToken, fast } = split;
     if (!base || base.includes("[")) continue;
     let row = byBase.get(base);
     if (!row) {
@@ -547,7 +572,9 @@ export function parseCursorModelRef(model: string | undefined): {
   if (!raw) return { base: "composer-2.5" };
   const bracket = raw.match(/^([^[\]]+)\[([^\]]+)\]\s*$/);
   if (bracket) {
-    const base = (bracket[1] || "").trim() || "composer-2.5";
+    const base = normalizeCursorBaseId((bracket[1] || "").trim() || "composer-2.5");
+    // Auto never takes effort/fast params.
+    if (base === "auto") return { base: "auto" };
     let fast: boolean | undefined;
     let reasoningEffort: ReasoningEffort | undefined;
     for (const part of (bracket[2] || "").split(",")) {
@@ -567,15 +594,17 @@ export function parseCursorModelRef(model: string | undefined): {
   // Already a live slug like gpt-5.6-sol-medium-fast
   if (!raw.includes("[") && (raw.includes("-fast") || CURSOR_EFFORT_TOKENS.some((t) => raw.endsWith(`-${t}`)))) {
     const parts = splitCursorSlug(raw);
+    const base = normalizeCursorBaseId(parts.base);
+    if (base === "auto") return { base: "auto" };
     const effort = parts.effortToken ? effortTokenToReasoning(parts.effortToken) : undefined;
     return {
-      base: parts.base,
+      base,
       ...(parts.fast ? { fast: true } : { fast: false }),
       ...(effort ? { reasoningEffort: effort } : {})
     };
   }
 
-  return { base: raw };
+  return { base: normalizeCursorBaseId(raw) };
 }
 
 async function discoverCursorCapability(): Promise<EngineCapability> {
@@ -591,9 +620,12 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
       const raw = await runCursorModelsList(binary);
       if (raw) {
         const ids = extractCursorModelIds(raw);
-        for (const id of ids) cursorLiveSlugSet.add(id);
-        liveCount = ids.length;
-        const families = groupCursorLiveSlugs(ids);
+        for (const id of ids) {
+          const normalized = /^auto$/i.test(id) ? "auto" : id;
+          cursorLiveSlugSet.add(normalized);
+        }
+        liveCount = cursorLiveSlugSet.size;
+        const families = groupCursorLiveSlugs([...cursorLiveSlugSet]);
         for (const family of families) {
           if (seen.has(family.base)) continue;
           seen.add(family.base);
@@ -670,13 +702,14 @@ export function formatCursorModelArg(
   options?: { reasoningEffort?: ReasoningEffort; fast?: boolean }
 ): string {
   const parsed = parseCursorModelRef(model);
-  if (parsed.base === "auto") return "auto";
+  // Auto is a bare CLI id — never append effort/fast (would become Auto-xhigh).
+  if (isCursorAutoModel(parsed.base) || isCursorAutoModel(model)) return "auto";
 
   const fast = options?.fast ?? parsed.fast;
   const reasoningEffort = options?.reasoningEffort ?? parsed.reasoningEffort;
 
   return pickCursorSlug(
-    parsed.base,
+    normalizeCursorBaseId(parsed.base),
     {
       ...(reasoningEffort ? { reasoningEffort } : {}),
       ...(fast !== undefined ? { fast } : {})

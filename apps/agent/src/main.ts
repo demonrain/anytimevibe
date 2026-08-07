@@ -3563,7 +3563,17 @@ async function runHeadlessTaskTurn(options: {
     // Keep the real absolute working dir (subdir under a workspace root stays full path).
     stored.cwd = preferTaskCwd(absoluteCwd, stored.cwd);
   }
-  if (options.model) stored.model = options.model;
+  if (options.model) {
+    if (options.engine === "cursor") {
+      const { cursorPersistedModelId, isCursorAutoModel } = await import("./cli/model-catalog");
+      stored.model = isCursorAutoModel(options.model)
+        ? "auto"
+        : (cursorPersistedModelId(options.model) || options.model);
+      if (isCursorAutoModel(options.model)) delete stored.reasoningEffort;
+    } else {
+      stored.model = options.model;
+    }
+  }
   if (options.reasoningEffort) stored.reasoningEffort = options.reasoningEffort;
   stored.permissionMode = options.permissionMode;
   stored.messages.push({ id: crypto.randomUUID(), role: "user", text: options.prompt });
@@ -3864,19 +3874,39 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         if (stored && (stored.engine === "claude" || stored.engine === "grok" || stored.engine === "cursor")) {
           // Persist UI-selected model/effort/permission before the turn so handoff/refresh keep them.
           stored.permissionMode = mode;
-          if (command.model) stored.model = command.model;
-          if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
           const outboundModel = command.model || stored.model;
-          // Cursor Auto never carries effort — drop stale GPT effort so we don't emit Auto-xhigh.
-          let useEffort = command.reasoningEffort || stored.reasoningEffort;
+          // Cursor: persist family id only (never `id[fast=false]`) so the web picker stays clean.
+          // Spawn still uses outboundModel (may include [fast=…]) below.
           if (stored.engine === "cursor") {
-            const { isCursorAutoModel } = await import("./cli/model-catalog");
-            if (isCursorAutoModel(outboundModel)) {
+            const { isCursorAutoModel, cursorPersistedModelId } = await import("./cli/model-catalog");
+            if (command.model || outboundModel) {
+              stored.model = cursorPersistedModelId(outboundModel) || "auto";
+            }
+            let useEffort = command.reasoningEffort || stored.reasoningEffort;
+            if (isCursorAutoModel(outboundModel) || isCursorAutoModel(stored.model)) {
               stored.model = "auto";
               delete stored.reasoningEffort;
               useEffort = undefined;
+            } else if (command.reasoningEffort) {
+              stored.reasoningEffort = command.reasoningEffort;
             }
+            await taskStore.upsert(stored);
+            await ensureWorkspaceTrusted(stored.engine, stored.cwd);
+            await runHeadlessTaskTurn({
+              engine: stored.engine,
+              threadId: command.threadId,
+              cwd: stored.cwd,
+              prompt: command.prompt,
+              title: stored.title,
+              permissionMode: mode,
+              isNew: false,
+              ...(outboundModel ? { model: isCursorAutoModel(outboundModel) ? "auto" : outboundModel } : {}),
+              ...(useEffort ? { reasoningEffort: useEffort } : {})
+            });
+            return;
           }
+          if (command.model) stored.model = command.model;
+          if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
           await taskStore.upsert(stored);
           await ensureWorkspaceTrusted(stored.engine, stored.cwd);
           await runHeadlessTaskTurn({
@@ -3887,10 +3917,10 @@ async function handleCommand(command: ClientCommand): Promise<void> {
             title: stored.title,
             permissionMode: mode,
             isNew: false,
-            ...(outboundModel
-              ? { model: stored.engine === "cursor" && stored.model === "auto" ? "auto" : outboundModel }
-              : {}),
-            ...(useEffort ? { reasoningEffort: useEffort } : {})
+            ...(outboundModel ? { model: outboundModel } : {}),
+            ...(command.reasoningEffort || stored.reasoningEffort
+              ? { reasoningEffort: command.reasoningEffort || stored.reasoningEffort }
+              : {})
           });
           return;
         }

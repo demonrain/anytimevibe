@@ -109,6 +109,18 @@ function capabilityForEngine(
   return capabilities?.find((item) => item.engine === engine);
 }
 
+/** Strip wire params (`id[fast=…]`) / effort-fast slugs → family id for the picker. */
+function cursorModelBaseId(modelId?: string): string {
+  let raw = (modelId || "").trim();
+  if (!raw) return "";
+  raw = (raw.split("[")[0] || raw).trim();
+  if (/^auto$/i.test(raw)) return "auto";
+  // Live slugs: composer-2.5-fast / cursor-grok-4.5-high-fast → family id
+  if (/-fast$/i.test(raw)) raw = raw.slice(0, -5);
+  raw = raw.replace(/-(?:thinking-)?(?:none|low|medium|high|xhigh|extra-high|max)$/i, "");
+  return raw;
+}
+
 /** Prefer host-reported models; always include the task's current model if missing. */
 function modelOptionsFromHost(
   capabilities: EngineCapability[] | undefined,
@@ -118,8 +130,11 @@ function modelOptionsFromHost(
   const cap = capabilityForEngine(capabilities, engine);
   const models = [...(cap?.models ?? [])];
   const seen = new Set(models.map((item) => item.id));
-  if (currentModel && !seen.has(currentModel)) {
-    models.unshift({ id: currentModel, label: currentModel });
+  // Never inject wire forms like `cursor-grok-4.5[fast=false]` as a fake first option.
+  const base = cursorModelBaseId(currentModel);
+  if (base && !seen.has(base)) {
+    const known = cap?.models.find((item) => item.id === base);
+    models.unshift({ id: base, label: known?.label || base });
   }
   return models;
 }
@@ -131,7 +146,7 @@ function effortOptionsFromHost(
   modelId?: string
 ): ReasoningEffort[] {
   const cap = capabilityForEngine(capabilities, engine);
-  const baseId = (modelId || "").split("[")[0]?.trim();
+  const baseId = cursorModelBaseId(modelId);
   const modelMeta = baseId
     ? cap?.models.find((item) => item.id === baseId)
     : undefined;
@@ -162,7 +177,7 @@ function modelOptionMeta(
   engine: CliEngine,
   modelId?: string
 ): EngineModelOption | undefined {
-  const baseId = (modelId || "").split("[")[0]?.trim();
+  const baseId = cursorModelBaseId(modelId);
   if (!baseId) return undefined;
   return capabilityForEngine(capabilities, engine)?.models.find((item) => item.id === baseId);
 }
@@ -2668,7 +2683,7 @@ function TaskConversation({
   const [model, setModel] = useState(
     () => {
       const raw = task.model || uiPrefs.model || cap?.currentModel || modelOptions[0]?.id || "";
-      return raw.split("[")[0] || raw;
+      return cursorModelBaseId(raw) || raw.split("[")[0] || raw;
     }
   );
   const modelMeta = useMemo(
@@ -2735,16 +2750,16 @@ function TaskConversation({
   useEffect(() => {
     const prefs = loadTaskUiPrefs(task.threadId);
     if (task.model) {
-      const base = task.model.split("[")[0] || task.model;
+      const base = cursorModelBaseId(task.model) || task.model.split("[")[0] || task.model;
       setModel(base);
       saveTaskUiPrefs(task.threadId, { model: base });
       const parsedFast = parseFastFromModelId(task.model);
       if (parsedFast !== undefined) setFastMode(parsedFast);
     } else if (prefs.model) {
-      setModel(prefs.model.split("[")[0] || prefs.model);
+      setModel(cursorModelBaseId(prefs.model) || prefs.model.split("[")[0] || prefs.model);
       if (prefs.fast !== undefined) setFastMode(prefs.fast);
     } else {
-      setModel((current) => current || cap?.currentModel || modelOptions[0]?.id || "");
+      setModel((current) => current || cursorModelBaseId(cap?.currentModel) || cap?.currentModel || modelOptions[0]?.id || "");
     }
 
     if (task.reasoningEffort) {
@@ -2927,9 +2942,21 @@ function TaskConversation({
   }, [canResend, lastUserPrompt, onCommand, model, modelMeta, fastMode, taskEngine, effortOptions.length, reasoningEffort, permissionMode, task.threadId]);
 
   const handleModelChange = useCallback((next: string) => {
-    setModel(next);
-    if (next) saveTaskUiPrefs(task.threadId, { model: next });
-  }, [task.threadId]);
+    const normalized = cursorModelBaseId(next) || (next || "").split("[")[0]!.trim() || next;
+    setModel(normalized);
+    if (normalized) saveTaskUiPrefs(task.threadId, { model: normalized });
+    // Switching to Auto/Composer must drop prior GPT effort immediately (don't wait for effect).
+    if (taskEngine === "cursor") {
+      const nextEfforts = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, normalized);
+      if (!nextEfforts.length) {
+        setReasoningEffort("");
+        saveTaskUiPrefs(task.threadId, { reasoningEffort: null });
+      } else if (reasoningEffort && !nextEfforts.includes(reasoningEffort as ReasoningEffort)) {
+        setReasoningEffort(nextEfforts[0] || "");
+        saveTaskUiPrefs(task.threadId, { reasoningEffort: nextEfforts[0] || null });
+      }
+    }
+  }, [task.threadId, taskEngine, engineCapabilities, reasoningEffort]);
 
   const handleReasoningEffortChange = useCallback((next: ReasoningEffort) => {
     setReasoningEffort(next);
@@ -3502,7 +3529,14 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
       </div>
     </div>
     <label>模型
-      <select value={model} onChange={(event) => setModel(event.target.value.split("[")[0] || event.target.value)} disabled={!engine || !modelOptions.length}>
+      <select
+        value={model}
+        onChange={(event) => {
+          const base = cursorModelBaseId(event.target.value) || event.target.value.split("[")[0] || event.target.value;
+          setModel(base);
+        }}
+        disabled={!engine || !modelOptions.length}
+      >
         {!modelOptions.length && <option value="">主机未上报模型列表</option>}
         {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
       </select>
