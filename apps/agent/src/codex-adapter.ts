@@ -209,15 +209,20 @@ export function explainCodexUpstreamError(message: string): string {
     return [
       raw,
       "",
-      "说明：HTTP 499 表示 Codex 作为客户端提前断开了上游请求（常见：推理过久被超时/代理掐断、app-server 中途重启、或 model_provider 与本机 CLI 不一致）。",
-      "请确认 ~/.codex/config.toml 的 model_provider 与 CLI 一致、本地网关端口可达，并先试用较低的 reasoning effort。"
+      "说明：HTTP 499 表示「客户端」在上游还没回完时就断开了连接（nginx 记法）。",
+      "对随码 + 本机网关（localhost:3310 → store…）常见原因：",
+      "1) 本机网关 / 代理的流空闲超时过短（如 stream-idle-timeout-ms=60s），长推理无输出时被掐断；",
+      "2) Clash/系统代理干扰本地网关或上游长连接；",
+      "3) Codex app-server 中途被重启，或网页点了停止；",
+      "4) 网关进程已挂掉后仍继续请求。",
+      "处理：确认 Cockpit/本地网关在跑；把 sidecar 的 stream-idle-timeout-ms 调到 ≥300000；先试用较低 reasoning effort；确认 Agent 已清掉对 localhost 的 HTTP_PROXY。"
     ].join("\n");
   }
-  if (/ECONNREFUSED|connection refused|Failed to connect|tcp connect error/i.test(raw)) {
+  if (/ECONNREFUSED|connection refused|Failed to connect|tcp connect error|网关不可达/i.test(raw)) {
     return [
       raw,
       "",
-      "说明：连不上模型供应商地址。若使用 codex_local_access，请先启动本机网关后再从随码下发任务。"
+      "说明：连不上模型供应商地址。若使用 codex_local_access（localhost:3310），请先启动本机网关（Cockpit Tools / cockpit-cliproxy）后再从随码下发任务。"
     ].join("\n");
   }
   return raw;

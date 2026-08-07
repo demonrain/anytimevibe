@@ -63,6 +63,7 @@ import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
 import { handoffPermissionArgs, normalizePermissionMode } from "./cli/permission-args";
 import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
+import { assertCodexLocalGatewayReady } from "./cli/codex-gateway";
 import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt } from "./cli/macos-fs";
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix, proxyClearShellLines, stripProxyFromEnv, applyProcessProxyEnv, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
@@ -3182,6 +3183,7 @@ async function maybeReloadCodexAppServerWhenIdle(): Promise<void> {
 
 async function ensureCodexTrustedAndReady(cwd: string): Promise<void> {
   const accessCwd = await ensureMacFolderAccess(cwd, "Codex 任务需要访问该工作区文件夹");
+  await assertCodexLocalGatewayReady();
   const trustChanged = await ensureWorkspaceTrusted("codex", accessCwd);
   if (trustChanged && codex) {
     // Never kill app-server mid-turn — that aborts upstream /responses and surfaces as HTTP 499.
@@ -3862,9 +3864,18 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         if (stored && (stored.engine === "claude" || stored.engine === "grok" || stored.engine === "cursor")) {
           // Persist UI-selected model/effort/permission before the turn so handoff/refresh keep them.
           stored.permissionMode = mode;
-          if (command.model || command.reasoningEffort) {
-            if (command.model) stored.model = command.model;
-            if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+          if (command.model) stored.model = command.model;
+          if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+          const outboundModel = command.model || stored.model;
+          // Cursor Auto never carries effort — drop stale GPT effort so we don't emit Auto-xhigh.
+          let useEffort = command.reasoningEffort || stored.reasoningEffort;
+          if (stored.engine === "cursor") {
+            const { isCursorAutoModel } = await import("./cli/model-catalog");
+            if (isCursorAutoModel(outboundModel)) {
+              stored.model = "auto";
+              delete stored.reasoningEffort;
+              useEffort = undefined;
+            }
           }
           await taskStore.upsert(stored);
           await ensureWorkspaceTrusted(stored.engine, stored.cwd);
@@ -3876,10 +3887,10 @@ async function handleCommand(command: ClientCommand): Promise<void> {
             title: stored.title,
             permissionMode: mode,
             isNew: false,
-            ...(command.model || stored.model ? { model: command.model || stored.model } : {}),
-            ...(command.reasoningEffort || stored.reasoningEffort
-              ? { reasoningEffort: command.reasoningEffort || stored.reasoningEffort }
-              : {})
+            ...(outboundModel
+              ? { model: stored.engine === "cursor" && stored.model === "auto" ? "auto" : outboundModel }
+              : {}),
+            ...(useEffort ? { reasoningEffort: useEffort } : {})
           });
           return;
         }
