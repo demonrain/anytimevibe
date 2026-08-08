@@ -15,15 +15,39 @@ function isLoopbackHost(hostname: string): boolean {
   return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "0.0.0.0";
 }
 
+const BUILTIN_CODEX_PROVIDERS = new Set(["openai"]);
+
+function codexHomeDir(): string {
+  return process.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex");
+}
+
+function hasModelProviderSection(text: string, provider: string): boolean {
+  const sectionRe = new RegExp(
+    `\\[model_providers\\.${provider.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]`,
+    "i"
+  );
+  return sectionRe.test(text);
+}
+
+function listCustomModelProviders(text: string): string[] {
+  const names: string[] = [];
+  const re = /\[model_providers\.([^\]]+)\]/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text))) {
+    const name = match[1]?.trim();
+    if (name) names.push(name);
+  }
+  return names;
+}
+
 /** Read active model_provider base_url from ~/.codex/config.toml (no secrets). */
 export async function resolveCodexProviderBaseUrl(): Promise<{
   provider: string;
   baseUrl: string;
 } | null> {
-  const codexHome = process.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex");
   let text = "";
   try {
-    text = await fs.readFile(path.join(codexHome, "config.toml"), "utf8");
+    text = await fs.readFile(path.join(codexHomeDir(), "config.toml"), "utf8");
   } catch {
     return null;
   }
@@ -35,9 +59,83 @@ export async function resolveCodexProviderBaseUrl(): Promise<{
     "i"
   );
   const section = text.match(sectionRe)?.[1] ?? "";
-  const baseUrl = parseTomlString(section, "base_url") || parseTomlString(text, "base_url");
+  const baseUrl =
+    parseTomlString(section, "base_url") ||
+    parseTomlString(text, "openai_base_url") ||
+    parseTomlString(text, "base_url");
   if (!baseUrl) return null;
   return { provider, baseUrl };
+}
+
+/**
+ * Cockpit Local Access often sets `model_provider = "codex_local_access"` then later
+ * strips `[model_providers.codex_local_access]`, which makes Codex fail at startup with:
+ *   failed to load configuration: Model provider `codex_local_access` not found
+ *
+ * Repair by switching to an existing custom provider (preferred), or recreating a
+ * minimal local-access section from openai_base_url / localhost:3310.
+ */
+export async function repairCodexModelProviderConfig(): Promise<{
+  repaired: boolean;
+  detail: string;
+}> {
+  const configPath = path.join(codexHomeDir(), "config.toml");
+  let text = "";
+  try {
+    text = await fs.readFile(configPath, "utf8");
+  } catch {
+    return { repaired: false, detail: "config.toml missing" };
+  }
+
+  const provider = parseTomlString(text, "model_provider");
+  if (!provider) return { repaired: false, detail: "model_provider unset" };
+  if (BUILTIN_CODEX_PROVIDERS.has(provider) || hasModelProviderSection(text, provider)) {
+    return { repaired: false, detail: `provider ${provider} ok` };
+  }
+
+  const customs = listCustomModelProviders(text);
+  const fallback =
+    customs.find((name) => name.toLowerCase() === "custom") ||
+    customs.find((name) => name.toLowerCase() !== "codex_local_access") ||
+    customs[0];
+
+  if (fallback) {
+    const next = text.replace(
+      /(?:^|\n)\s*model_provider\s*=\s*"[^"]*"/i,
+      (m) => m.replace(/=\s*"[^"]*"/, `= "${fallback}"`)
+    );
+    if (next === text) {
+      return { repaired: false, detail: `failed to rewrite model_provider → ${fallback}` };
+    }
+    await fs.writeFile(configPath, next, "utf8");
+    return {
+      repaired: true,
+      detail: `model_provider ${provider} missing section → switched to ${fallback}`
+    };
+  }
+
+  // No custom providers at all: recreate a minimal section so Codex can boot.
+  const baseUrl =
+    parseTomlString(text, "openai_base_url") ||
+    (provider === "codex_local_access" ? "http://localhost:3310/v1" : "") ||
+    "http://localhost:3310/v1";
+  const block = [
+    "",
+    `[model_providers.${provider}]`,
+    `name = "${provider}"`,
+    `base_url = "${baseUrl}"`,
+    `wire_api = "responses"`,
+    "requires_openai_auth = true",
+    ""
+  ].join("\n");
+  const insertAt = text.search(/\n\[(?!model_providers\.)/);
+  const next =
+    insertAt >= 0 ? `${text.slice(0, insertAt)}\n${block}${text.slice(insertAt + 1)}` : `${text.trimEnd()}\n${block}`;
+  await fs.writeFile(configPath, next, "utf8");
+  return {
+    repaired: true,
+    detail: `recreated [model_providers.${provider}] base_url=${baseUrl}`
+  };
 }
 
 function probeTcp(host: string, port: number, timeoutMs: number): Promise<boolean> {
@@ -213,6 +311,9 @@ export async function restartCodexLocalAccessSidecar(): Promise<boolean> {
  * Also harden Cockpit sidecar streaming defaults that commonly cause HTTP 499.
  */
 export async function assertCodexLocalGatewayReady(): Promise<void> {
+  // Repair broken Cockpit leftovers before Codex app-server loads config.toml.
+  await repairCodexModelProviderConfig();
+
   const resolved = await resolveCodexProviderBaseUrl();
   if (!resolved) return;
   let url: URL;

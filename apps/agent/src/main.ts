@@ -63,7 +63,7 @@ import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
 import { handoffPermissionArgs, normalizePermissionMode } from "./cli/permission-args";
 import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
-import { assertCodexLocalGatewayReady } from "./cli/codex-gateway";
+import { assertCodexLocalGatewayReady, repairCodexModelProviderConfig } from "./cli/codex-gateway";
 import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt } from "./cli/macos-fs";
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix, proxyClearShellLines, stripProxyFromEnv, applyProcessProxyEnv, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
@@ -3183,6 +3183,18 @@ async function maybeReloadCodexAppServerWhenIdle(): Promise<void> {
 
 async function ensureCodexTrustedAndReady(cwd: string): Promise<void> {
   const accessCwd = await ensureMacFolderAccess(cwd, "Codex 任务需要访问该工作区文件夹");
+  // Cockpit Local Access 常留下 model_provider=codex_local_access 却删掉对应 section。
+  const providerRepair = await repairCodexModelProviderConfig();
+  if (providerRepair.repaired) {
+    logWarn("已自动修复 Codex model_provider 配置", providerRepair.detail);
+    if (codex) {
+      if (hasActiveCodexTurn()) {
+        pendingCodexAppServerReload = `provider-repair:${providerRepair.detail}`;
+      } else {
+        await reloadCodexAppServer(`provider-repair:${providerRepair.detail}`);
+      }
+    }
+  }
   await assertCodexLocalGatewayReady();
   const trustChanged = await ensureWorkspaceTrusted("codex", accessCwd);
   if (trustChanged && codex) {

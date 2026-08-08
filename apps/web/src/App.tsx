@@ -115,10 +115,34 @@ function cursorModelBaseId(modelId?: string): string {
   if (!raw) return "";
   raw = (raw.split("[")[0] || raw).trim();
   if (/^auto$/i.test(raw)) return "auto";
+  // Legacy humanized display strings (e.g. "Cursor Grok 4.5 High") — drop trailing effort word,
+  // lowercase + hyphenate so they collapse back to a family id.
+  if (/\s/.test(raw)) {
+    raw = raw
+      .replace(/\s+(fast)$/i, "")
+      .replace(/\s+(none|low|medium|high|xhigh|extra[- ]?high|max)$/i, "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "-");
+  }
   // Live slugs: composer-2.5-fast / cursor-grok-4.5-high-fast → family id
   if (/-fast$/i.test(raw)) raw = raw.slice(0, -5);
   raw = raw.replace(/-(?:thinking-)?(?:none|low|medium|high|xhigh|extra-high|max)$/i, "");
   return raw;
+}
+
+/** Match a stored/legacy model value to a known catalog family (by id or label). */
+function resolveCursorModelFamily(
+  models: EngineModelOption[],
+  rawModel?: string
+): EngineModelOption | undefined {
+  if (!rawModel) return undefined;
+  const base = cursorModelBaseId(rawModel);
+  const byId = models.find((item) => item.id === base);
+  if (byId) return byId;
+  // Fallback: match by label (handles legacy humanized values like "Cursor Grok 4.5 High").
+  const wanted = base.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  return models.find((item) => item.label.replace(/[^a-z0-9]/gi, "").toLowerCase() === wanted);
 }
 
 /** Prefer host-reported models; always include the task's current model if missing. */
@@ -133,8 +157,11 @@ function modelOptionsFromHost(
   // Never inject wire forms like `cursor-grok-4.5[fast=false]` as a fake first option.
   const base = cursorModelBaseId(currentModel);
   if (base && !seen.has(base)) {
-    const known = cap?.models.find((item) => item.id === base);
-    models.unshift({ id: base, label: known?.label || base });
+    // If the stored value maps to a known family (by id or legacy label), don't inject a dup.
+    const known = resolveCursorModelFamily(cap?.models ?? [], currentModel);
+    if (!known) {
+      models.unshift({ id: base, label: base });
+    }
   }
   return models;
 }
@@ -2750,13 +2777,19 @@ function TaskConversation({
   useEffect(() => {
     const prefs = loadTaskUiPrefs(task.threadId);
     if (task.model) {
-      const base = cursorModelBaseId(task.model) || task.model.split("[")[0] || task.model;
+      const known = taskEngine === "cursor"
+        ? resolveCursorModelFamily(modelOptions, task.model)
+        : undefined;
+      const base = known?.id || cursorModelBaseId(task.model) || task.model.split("[")[0] || task.model;
       setModel(base);
       saveTaskUiPrefs(task.threadId, { model: base });
       const parsedFast = parseFastFromModelId(task.model);
       if (parsedFast !== undefined) setFastMode(parsedFast);
     } else if (prefs.model) {
-      setModel(cursorModelBaseId(prefs.model) || prefs.model.split("[")[0] || prefs.model);
+      const known = taskEngine === "cursor"
+        ? resolveCursorModelFamily(modelOptions, prefs.model)
+        : undefined;
+      setModel(known?.id || cursorModelBaseId(prefs.model) || prefs.model.split("[")[0] || prefs.model);
       if (prefs.fast !== undefined) setFastMode(prefs.fast);
     } else {
       setModel((current) => current || cursorModelBaseId(cap?.currentModel) || cap?.currentModel || modelOptions[0]?.id || "");
