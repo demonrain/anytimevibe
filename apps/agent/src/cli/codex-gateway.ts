@@ -67,13 +67,48 @@ export async function resolveCodexProviderBaseUrl(): Promise<{
   return { provider, baseUrl };
 }
 
+function resolveFallbackProviderBaseUrl(text: string): string {
+  const customs = listCustomModelProviders(text);
+  for (const name of customs) {
+    if (name.toLowerCase() === "codex_local_access") continue;
+    const sectionRe = new RegExp(
+      `\\[model_providers\\.${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]([\\s\\S]*?)(?=\\n\\[|$)`,
+      "i"
+    );
+    const section = text.match(sectionRe)?.[1] ?? "";
+    const baseUrl = parseTomlString(section, "base_url");
+    if (baseUrl) return baseUrl;
+  }
+  return parseTomlString(text, "openai_base_url") || parseTomlString(text, "base_url") || "http://localhost:3310/v1";
+}
+
+function ensureProviderSection(text: string, provider: string, baseUrl: string): string {
+  if (hasModelProviderSection(text, provider)) return text;
+  const block = [
+    "",
+    `[model_providers.${provider}]`,
+    `name = "${provider}"`,
+    `base_url = "${baseUrl}"`,
+    `wire_api = "responses"`,
+    "requires_openai_auth = true",
+    ""
+  ].join("\n");
+  const insertAt = text.search(/\n\[(?!model_providers\.)/);
+  return insertAt >= 0
+    ? `${text.slice(0, insertAt)}\n${block}${text.slice(insertAt + 1)}`
+    : `${text.trimEnd()}\n${block}`;
+}
+
 /**
  * Cockpit Local Access often sets `model_provider = "codex_local_access"` then later
- * strips `[model_providers.codex_local_access]`, which makes Codex fail at startup with:
+ * strips `[model_providers.codex_local_access]`. Old threads still store that provider
+ * name, so thread/resume and CLI handoff fail with:
  *   failed to load configuration: Model provider `codex_local_access` not found
  *
- * Repair by switching to an existing custom provider (preferred), or recreating a
- * minimal local-access section from openai_base_url / localhost:3310.
+ * Repair:
+ * 1) Always ensure the `codex_local_access` section exists (clone upstream URL).
+ * 2) If the active model_provider itself is missing a section, fall back to `custom`
+ *    or recreate a minimal section.
  */
 export async function repairCodexModelProviderConfig(): Promise<{
   repaired: boolean;
@@ -87,55 +122,50 @@ export async function repairCodexModelProviderConfig(): Promise<{
     return { repaired: false, detail: "config.toml missing" };
   }
 
-  const provider = parseTomlString(text, "model_provider");
-  if (!provider) return { repaired: false, detail: "model_provider unset" };
-  if (BUILTIN_CODEX_PROVIDERS.has(provider) || hasModelProviderSection(text, provider)) {
-    return { repaired: false, detail: `provider ${provider} ok` };
+  const details: string[] = [];
+  let next = text;
+  const fallbackBaseUrl = resolveFallbackProviderBaseUrl(next);
+
+  // Historical threads created under Cockpit Local Access still reference this provider.
+  if (!hasModelProviderSection(next, "codex_local_access")) {
+    next = ensureProviderSection(next, "codex_local_access", fallbackBaseUrl);
+    details.push(`ensured [model_providers.codex_local_access] base_url=${fallbackBaseUrl}`);
   }
 
-  const customs = listCustomModelProviders(text);
-  const fallback =
-    customs.find((name) => name.toLowerCase() === "custom") ||
-    customs.find((name) => name.toLowerCase() !== "codex_local_access") ||
-    customs[0];
-
-  if (fallback) {
-    const next = text.replace(
-      /(?:^|\n)\s*model_provider\s*=\s*"[^"]*"/i,
-      (m) => m.replace(/=\s*"[^"]*"/, `= "${fallback}"`)
-    );
-    if (next === text) {
-      return { repaired: false, detail: `failed to rewrite model_provider → ${fallback}` };
-    }
+  const provider = parseTomlString(next, "model_provider");
+  if (!provider) {
+    if (next === text) return { repaired: false, detail: "model_provider unset" };
     await fs.writeFile(configPath, next, "utf8");
-    return {
-      repaired: true,
-      detail: `model_provider ${provider} missing section → switched to ${fallback}`
-    };
+    return { repaired: true, detail: details.join("; ") };
   }
 
-  // No custom providers at all: recreate a minimal section so Codex can boot.
-  const baseUrl =
-    parseTomlString(text, "openai_base_url") ||
-    (provider === "codex_local_access" ? "http://localhost:3310/v1" : "") ||
-    "http://localhost:3310/v1";
-  const block = [
-    "",
-    `[model_providers.${provider}]`,
-    `name = "${provider}"`,
-    `base_url = "${baseUrl}"`,
-    `wire_api = "responses"`,
-    "requires_openai_auth = true",
-    ""
-  ].join("\n");
-  const insertAt = text.search(/\n\[(?!model_providers\.)/);
-  const next =
-    insertAt >= 0 ? `${text.slice(0, insertAt)}\n${block}${text.slice(insertAt + 1)}` : `${text.trimEnd()}\n${block}`;
+  if (!BUILTIN_CODEX_PROVIDERS.has(provider) && !hasModelProviderSection(next, provider)) {
+    const customs = listCustomModelProviders(next);
+    const fallback =
+      customs.find((name) => name.toLowerCase() === "custom") ||
+      customs.find((name) => name.toLowerCase() !== "codex_local_access") ||
+      customs[0];
+
+    if (fallback && fallback !== provider) {
+      const rewritten = next.replace(
+        /(?:^|\n)\s*model_provider\s*=\s*"[^"]*"/i,
+        (m) => m.replace(/=\s*"[^"]*"/, `= "${fallback}"`)
+      );
+      if (rewritten !== next) {
+        next = rewritten;
+        details.push(`model_provider ${provider} missing section → switched to ${fallback}`);
+      }
+    } else {
+      next = ensureProviderSection(next, provider, fallbackBaseUrl);
+      details.push(`recreated [model_providers.${provider}] base_url=${fallbackBaseUrl}`);
+    }
+  }
+
+  if (next === text) {
+    return { repaired: false, detail: details[0] || `provider ${provider} ok` };
+  }
   await fs.writeFile(configPath, next, "utf8");
-  return {
-    repaired: true,
-    detail: `recreated [model_providers.${provider}] base_url=${baseUrl}`
-  };
+  return { repaired: true, detail: details.join("; ") };
 }
 
 function probeTcp(host: string, port: number, timeoutMs: number): Promise<boolean> {

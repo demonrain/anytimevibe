@@ -249,7 +249,130 @@ let reconnectAttempt = 0;
 /** Permanent auth failures must not flap reconnect forever. */
 let reconnectBlockedReason: string | null = null;
 const pendingPrompts = new Map<string, string>();
-const pendingRequestTypes = new Map<string, "command" | "file" | "permission" | "input" | "plan" | "question">();
+const pendingRequestTypes = new Map<string, "command" | "file" | "permission" | "input" | "plan" | "question" | "elicitation">();
+
+/** Protocol question shape (structured options rendered by web ApprovalCard). */
+type ApprovalQuestionOut = { id: string; prompt: string; options: Array<{ id: string; label: string }>; allowMultiple?: boolean };
+
+/**
+ * Map Codex `item/tool/requestUserInput` questions into structured options.
+ * RequestUserInputQuestion = { header?, question, isOther?, isSecret?, options: [{ label }] }.
+ * We answer with the selected option label(s) keyed by question id.
+ */
+function codexInputQuestionsToApproval(rawQuestions: unknown): {
+  questions: ApprovalQuestionOut[];
+  optionLabelById: Map<string, string>;
+} {
+  const questions: ApprovalQuestionOut[] = [];
+  const optionLabelById = new Map<string, string>();
+  const list = Array.isArray(rawQuestions) ? rawQuestions : [];
+  list.forEach((rawQ, qIndex) => {
+    if (!rawQ || typeof rawQ !== "object") return;
+    const q = rawQ as Record<string, any>;
+    const qid = String(q.id ?? q.questionId ?? q.name ?? `q${qIndex}`);
+    const promptParts = [q.header, q.question ?? q.prompt ?? q.text].filter((v) => typeof v === "string" && v.trim());
+    const prompt = promptParts.join("\n") || `问题 ${qIndex + 1}`;
+    const rawOptions = Array.isArray(q.options) ? q.options : [];
+    const options: Array<{ id: string; label: string }> = [];
+    rawOptions.forEach((rawOpt: unknown, oIndex: number) => {
+      const label =
+        typeof rawOpt === "string"
+          ? rawOpt
+          : String((rawOpt as Record<string, any>)?.label ?? (rawOpt as Record<string, any>)?.value ?? "").trim();
+      if (!label) return;
+      const oid = `${qid}::opt${oIndex}`;
+      options.push({ id: oid, label });
+      optionLabelById.set(oid, label);
+    });
+    // "Other" free-form fallback keeps the picker usable even without preset options.
+    if (q.isOther || !options.length) {
+      const oid = `${qid}::other`;
+      const label = q.isOther ? "其他（自定义）" : "确认";
+      options.push({ id: oid, label });
+      optionLabelById.set(oid, label);
+    }
+    questions.push({ id: qid, prompt, options, ...(q.allowMultiple ? { allowMultiple: true } : {}) });
+  });
+  return { questions, optionLabelById };
+}
+
+/**
+ * Map an MCP elicitation `requestedSchema` (single/multi-select enum, or object of
+ * such properties) into structured questions. Returns per-question metadata used to
+ * reconstruct the MCP `content` object when the user answers.
+ */
+type ElicitationField = {
+  questionId: string;
+  propertyKey: string;
+  multiple: boolean;
+  optionValueById: Map<string, string>;
+};
+function mcpElicitationToApproval(params: Record<string, any>): {
+  questions: ApprovalQuestionOut[];
+  fields: ElicitationField[];
+  message: string;
+} {
+  const message = String(params.message ?? params.title ?? "需要你的确认").trim();
+  const schema = (params.requestedSchema ?? params.schema ?? {}) as Record<string, any>;
+  const questions: ApprovalQuestionOut[] = [];
+  const fields: ElicitationField[] = [];
+
+  const enumFromSchema = (node: Record<string, any>): { values: string[]; labels: string[] } | null => {
+    const values = Array.isArray(node.enum) ? node.enum.map((v: unknown) => String(v)) : [];
+    if (!values.length && Array.isArray(node.oneOf)) {
+      const vs = node.oneOf.map((o: any) => String(o?.const ?? o?.value ?? o?.title ?? "")).filter(Boolean);
+      const ls = node.oneOf.map((o: any) => String(o?.title ?? o?.const ?? o?.value ?? ""));
+      if (vs.length) return { values: vs, labels: ls };
+    }
+    if (!values.length) return null;
+    const labels = Array.isArray(node.enumNames) && node.enumNames.length === values.length
+      ? node.enumNames.map((v: unknown) => String(v))
+      : values;
+    return { values, labels };
+  };
+
+  const buildQuestion = (
+    key: string,
+    node: Record<string, any>,
+    index: number
+  ): boolean => {
+    const enumInfo = enumFromSchema(node);
+    if (!enumInfo) return false;
+    const isArray = String(node.type ?? "").toLowerCase() === "array" || Array.isArray(node.items?.enum);
+    const arrEnum = isArray && node.items ? enumFromSchema(node.items as Record<string, any>) : null;
+    const info = arrEnum ?? enumInfo;
+    const qid = `field${index}:${key}`;
+    const optionValueById = new Map<string, string>();
+    const options = info.values.map((value, oIndex) => {
+      const oid = `${qid}::opt${oIndex}`;
+      optionValueById.set(oid, value);
+      return { id: oid, label: info.labels[oIndex] || value };
+    });
+    const prompt = String(node.title ?? node.description ?? key);
+    questions.push({ id: qid, prompt, options, ...(isArray ? { allowMultiple: true } : {}) });
+    fields.push({ questionId: qid, propertyKey: key, multiple: isArray, optionValueById });
+    return true;
+  };
+
+  const properties = (schema.properties && typeof schema.properties === "object")
+    ? (schema.properties as Record<string, any>)
+    : null;
+  if (properties) {
+    Object.entries(properties).forEach(([key, node], index) => {
+      if (node && typeof node === "object") buildQuestion(key, node as Record<string, any>, index);
+    });
+  } else {
+    // Schema itself is a single enum select.
+    buildQuestion("value", schema, 0);
+  }
+  return { questions, fields, message };
+}
+
+/** Metadata to translate a web answer back into a Codex/MCP response payload. */
+type PendingAnswerMeta =
+  | { kind: "input"; optionLabelById: Map<string, string> }
+  | { kind: "elicitation"; fields: ElicitationField[] };
+const pendingAnswerMeta = new Map<string, PendingAnswerMeta>();
 /** Cursor createPlan / askQuestion awaiting Web resolve (print mode → --resume follow-up). */
 type PendingCursorApproval = {
   threadId: string;
@@ -3040,6 +3163,11 @@ function scheduleReconnect(detail: string): void {
 async function ensureCodex(): Promise<void> {
   if (codex) return;
   await applyLoginPathToProcess();
+  // Ensure historical Cockpit provider sections exist before app-server loads config.toml.
+  const providerRepair = await repairCodexModelProviderConfig();
+  if (providerRepair.repaired) {
+    logWarn("启动 Codex 前已修复 model_provider 配置", providerRepair.detail);
+  }
   if (!isCodexCompatibleVersion(codexVersion)) {
     const environment = await detectEnvironment();
     updateState({ environment });
@@ -4083,14 +4211,37 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         return;
       }
       await ensureCodex();
+      const answerMeta = pendingAnswerMeta.get(requestId);
+      pendingAnswerMeta.delete(requestId);
       if (requestType === "input") {
+        // Codex requestUserInput expects answers keyed by question id → selected option label(s).
         const answers: Record<string, unknown> = {};
+        const labelById = answerMeta?.kind === "input" ? answerMeta.optionLabelById : undefined;
         if (command.answers?.length) {
           for (const answer of command.answers) {
-            answers[answer.questionId] = answer.selectedOptionIds;
+            const labels = answer.selectedOptionIds.map((oid) => labelById?.get(oid) ?? oid);
+            // Single-select questions answer with a scalar; keep arrays for multi-select.
+            answers[answer.questionId] = labels.length === 1 ? labels[0] : labels;
           }
         }
         codex!.respond(command.requestId, { answers });
+      } else if (requestType === "elicitation") {
+        // MCP elicitation → ElicitResult { action, content }.
+        if (command.decision !== "accept") {
+          codex!.respond(command.requestId, { action: command.decision === "decline" ? "decline" : "cancel" });
+        } else {
+          const content: Record<string, unknown> = {};
+          const fields = answerMeta?.kind === "elicitation" ? answerMeta.fields : [];
+          if (command.answers?.length) {
+            for (const answer of command.answers) {
+              const field = fields.find((f) => f.questionId === answer.questionId);
+              if (!field) continue;
+              const values = answer.selectedOptionIds.map((oid) => field.optionValueById.get(oid) ?? oid);
+              content[field.propertyKey] = field.multiple ? values : values[0];
+            }
+          }
+          codex!.respond(command.requestId, { action: "accept", content });
+        }
       } else if (requestType === "permission") codex!.respondError(command.requestId, "Declined by remote user");
       else codex!.respond(command.requestId, { decision: command.decision });
       return;
@@ -4390,6 +4541,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   }
   if (message.method === "serverRequest/resolved") {
     pendingRequestTypes.delete(String(message.params.requestId));
+    pendingAnswerMeta.delete(String(message.params.requestId));
     await publish({ type: "request.resolved", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), requestId: message.params.requestId, threadId: message.params.threadId }, true);
   }
   if (message.id !== undefined && message.method === "item/commandExecution/requestApproval") {
@@ -4415,10 +4567,33 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   if (message.id !== undefined && message.method === "item/tool/requestUserInput") {
     pendingRequestTypes.set(String(message.id), "input");
     const params = message.params;
+    const { questions, optionLabelById } = codexInputQuestionsToApproval(params.questions);
+    pendingAnswerMeta.set(String(message.id), { kind: "input", optionLabelById });
+    const detail = questions.length
+      ? questions.map((q) => q.prompt).join("\n\n")
+      : JSON.stringify(params.questions, null, 2);
     await publish({
       type: "approval.requested", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), requestId: message.id,
       threadId: params.threadId, turnId: params.turnId, itemId: params.itemId, approvalType: "input",
-      title: "Codex 需要补充信息", detail: JSON.stringify(params.questions, null, 2), availableDecisions: ["cancel"]
+      title: "Codex 需要补充信息", detail,
+      availableDecisions: questions.length ? ["accept", "cancel"] : ["cancel"],
+      ...(questions.length ? { questions } : {})
+    }, true, "approval");
+  }
+  if (message.id !== undefined && message.method === "mcpServer/elicitation/request") {
+    pendingRequestTypes.set(String(message.id), "elicitation");
+    const params = (message.params ?? {}) as Record<string, any>;
+    const { questions, fields, message: elicitMessage } = mcpElicitationToApproval(params);
+    pendingAnswerMeta.set(String(message.id), { kind: "elicitation", fields });
+    const serverName = String(params.serverName ?? params.server ?? params.name ?? "MCP");
+    await publish({
+      type: "approval.requested", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), requestId: message.id,
+      threadId: String(params.threadId ?? ""), turnId: String(params.turnId ?? ""), itemId: String(params.itemId ?? params.elicitationId ?? message.id),
+      approvalType: "question",
+      title: `${serverName} 请求确认`,
+      detail: elicitMessage || JSON.stringify(params.requestedSchema ?? {}, null, 2),
+      availableDecisions: ["accept", "decline", "cancel"],
+      ...(questions.length ? { questions } : {})
     }, true, "approval");
   }
   if (message.id !== undefined && message.method === "item/permissions/requestApproval") {
@@ -4607,7 +4782,14 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   let codexTasks: AgentTask[] = [];
   try {
     if (!codex) await ensureCodex();
-    const response = await codex!.request("thread/list", { limit: listLimit, sortDirection: "desc", sortKey: "updated_at" });
+    // Codex ≥0.147 defaults thread/list to the active model_provider only.
+    // Empty modelProviders = all providers (needed after Cockpit/provider switches).
+    const response = await codex!.request("thread/list", {
+      limit: listLimit,
+      sortDirection: "desc",
+      sortKey: "updated_at",
+      modelProviders: []
+    });
     let threads: Array<Record<string, any>> = extractCodexThreadList(response);
     threads = [...threads].sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0));
     codexTasks = threads.map((thread) => ({
@@ -4700,6 +4882,8 @@ async function listCodexThreadsForSync(options: {
       limit: pageLimit,
       sortDirection: "desc",
       sortKey: "updated_at",
+      // Empty array: list across every model_provider (openai / custom / local-access, …).
+      modelProviders: [],
       ...(cursor ? { cursor } : {})
     });
     const batch = extractCodexThreadList(response);
@@ -5004,6 +5188,15 @@ async function relayTaskToCli(threadId: string): Promise<void> {
       : "codex",
     accessCwd
   );
+
+  // Old Codex threads may still reference codex_local_access; ensure the section exists
+  // before CLI `codex resume` loads config.toml.
+  if (engine === "codex") {
+    const providerRepair = await repairCodexModelProviderConfig();
+    if (providerRepair.repaired) {
+      logWarn("接力前已修复 Codex model_provider 配置", providerRepair.detail);
+    }
+  }
 
   if (engine === "claude") {
     const binary = await resolveEngineBinary("claude");
