@@ -205,21 +205,29 @@ export function extractCodexTurnError(turn: JsonObject | undefined | null): stri
 export function explainCodexUpstreamError(message: string): string {
   const raw = String(message || "").trim();
   if (!raw) return raw;
+  if (/auth_unavailable|no auth available/i.test(raw)) {
+    return [
+      raw,
+      "",
+      "说明：本机 Cockpit 网关在线，但账号池当前没有可调度账号（冷却、授权失效或额度受限）。",
+      "处理：到 Cockpit Tools → API 服务页检查 / 刷新 Codex 账号授权；随码不会改写或重启 Cockpit 服务。"
+    ].join("\n");
+  }
   if (/status\s*499|Client Closed Request/i.test(raw)) {
     return [
       raw,
       "",
       "说明：HTTP 499 表示「客户端」在上游还没回完时就断开了连接（nginx 记法）。",
-      "你当前链路一般是：Codex app-server → localhost:3310（Cockpit）→ store.demonrain.top。",
-      "最常见根因：Cockpit sidecar 被重置为 stream-idle-timeout-ms=60s，或强制 responses_websockets；长推理静默时网关先掐流，上游就记 499。",
-      "处理：保持 Cockpit Local Access 运行；更新随码客户端（会在任务前自动加固 sidecar 超时并清 WS beta）；仍失败则降低 reasoning effort，并确认 Agent 未给 localhost 套 HTTP_PROXY。"
+      "链路一般是：Codex app-server → 本机 Cockpit 网关 → 上游。",
+      "常见根因：Cockpit sidecar 流空闲超时过短、强制 responses_websockets、或代理干扰本机长连接。",
+      "处理：在 Cockpit Tools 自行调整 Local Access / 流超时；降低 reasoning effort；确认 Agent 未给 localhost 套 HTTP_PROXY。随码不会改写或重启 Cockpit。"
     ].join("\n");
   }
   if (/ECONNREFUSED|connection refused|Failed to connect|tcp connect error|网关不可达/i.test(raw)) {
     return [
       raw,
       "",
-      "说明：连不上模型供应商地址。若使用 codex_local_access（localhost:3310），请先启动本机网关（Cockpit Tools / cockpit-cliproxy）后再从随码下发任务。"
+      "说明：连不上模型供应商地址。若使用 codex_local_access（本机 Cockpit 网关），请先在 Cockpit Tools 启动 Local Access / API 服务后再从随码下发任务。"
     ].join("\n");
   }
   return raw;
