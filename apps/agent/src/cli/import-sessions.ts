@@ -59,6 +59,21 @@ export function isEphemeralImportCwd(cwd: string | undefined | null): boolean {
   if (posix === "/tmp" || posix.startsWith("/tmp/")) return true;
   if (posix.startsWith("/var/folders/")) return true; // macOS mktemp
   if (/\/t\/tmp\//i.test(posix)) return true;
+  // AnytimeVibe / agent probe workspaces (even if not under Temp).
+  const base = path.basename(raw).toLowerCase();
+  if (/^av-grok-(proxy-test|probe)/i.test(base)) return true;
+  if (/^anytimevibe-grok-/i.test(base)) return true;
+  return false;
+}
+
+/** Smoke / connectivity probes left by local CLI testing — not real user sessions. */
+function isGrokSmokePrompt(text: string | undefined | null): boolean {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  if (/^reply with exactly ok\.?$/i.test(raw)) return true;
+  if (/^respond with exactly[:\s]+ok\.?$/i.test(raw)) return true;
+  if (/^ping$/i.test(raw)) return true;
+  if (/^say\s+["']?ok["']?\.?$/i.test(raw)) return true;
   return false;
 }
 
@@ -86,6 +101,23 @@ export function isJunkCursorImportTask(task: {
   // Fallback title "Cursor ab12cd34" with no real user ask
   if (/^cursor\s+[0-9a-f]{8}$/i.test(title)) return true;
   return true;
+}
+
+/** Grok Temp/probe/smoke sessions — skip sync so Web only shows real chats. */
+export function isJunkGrokImportTask(task: {
+  cwd?: string;
+  title?: string;
+  messages?: HistoryMessage[];
+}): boolean {
+  if (isEphemeralImportCwd(task.cwd)) return true;
+  const title = String(task.title || "").trim();
+  if (isGrokSmokePrompt(title)) return true;
+  const userTexts = (task.messages || [])
+    .filter((message) => message.role === "user")
+    .map((message) => String(message.text || "").trim())
+    .filter(Boolean);
+  if (userTexts.length && userTexts.every((text) => isGrokSmokePrompt(text))) return true;
+  return false;
 }
 
 function titleFromCursorPromptHistory(history: string[]): string | undefined {
@@ -385,6 +417,13 @@ export function listJunkCursorImportThreadIds(store: TaskStore): string[] {
     .map((task) => task.threadId);
 }
 
+/** Grok Temp/probe imports already in the local index — caller should tombstone + delete. */
+export function listJunkGrokImportThreadIds(store: TaskStore): string[] {
+  return store.list(1000)
+    .filter((task) => task.engine === "grok" && isJunkGrokImportTask(task))
+    .map((task) => task.threadId);
+}
+
 async function removeOrphanNativeDuplicate(
   store: TaskStore,
   providerSessionId: string,
@@ -506,6 +545,9 @@ async function walkSessionDirs(root: string, depth: number, hits: Array<{ id: st
       hits.push({ id: entry, dir: full, mtime: st.mtimeMs / 1000 });
       continue;
     }
+    // Project buckets are URL-encoded cwd paths — skip Temp/probe trees entirely.
+    const decodedProject = decodeGrokProjectDir(entry);
+    if (decodedProject && isEphemeralImportCwd(decodedProject)) continue;
     await walkSessionDirs(full, depth + 1, hits);
   }
 }
@@ -627,7 +669,16 @@ async function importGrokSessions(store: TaskStore, limit: number): Promise<numb
   }
 
   let added = 0;
-  for (const hit of hits.slice(0, limit)) {
+  const scanCap = Math.min(hits.length, Math.max(limit * 10, 80));
+  for (const hit of hits.slice(0, scanCap)) {
+    if (added >= limit) break;
+
+    // Skip known Temp/probe project trees before reading chat_history (noise + slow).
+    if (hit.dir) {
+      const parentDecoded = decodeGrokProjectDir(path.basename(path.dirname(hit.dir)));
+      if (parentDecoded && isEphemeralImportCwd(parentDecoded)) continue;
+    }
+
     const existing = resolveExistingForProviderSession(store, hit.id, "grok");
     let meta: Awaited<ReturnType<typeof readGrokSessionDir>> = { messages: [] };
     if (hit.dir) {
@@ -637,23 +688,29 @@ async function importGrokSessions(store: TaskStore, limit: number): Promise<numb
       const found: Array<{ id: string; dir: string; mtime: number }> = [];
       await walkSessionDirs(root, 0, found);
       const match = found.find((item) => item.id === hit.id);
-      if (match) meta = await readGrokSessionDir(match.dir, hit.id);
+      if (match) {
+        const parentDecoded = decodeGrokProjectDir(path.basename(path.dirname(match.dir)));
+        if (parentDecoded && isEphemeralImportCwd(parentDecoded)) continue;
+        meta = await readGrokSessionDir(match.dir, hit.id);
+      }
     }
 
+    const cwd = meta.cwd || existing?.cwd || "";
     const importedMessages = meta.messages.length ? meta.messages : [];
     const messages = importedMessages.length >= (existing?.messages?.length ?? 0)
       ? importedMessages
       : (existing?.messages || importedMessages);
+    const title = existing?.title || meta.title || `Grok ${hit.id.slice(0, 8)}`;
+    if (isJunkGrokImportTask({ cwd, title, messages })) continue;
+
     // Keep AnytimeVibe threadId (UUID) when this native session was already bound to a web task.
     const threadId = existing?.threadId || hit.id;
     const task: StoredTask = {
       threadId,
       engine: "grok",
       providerSessionId: hit.id,
-      cwd: (meta.cwd || existing?.cwd)
-        ? path.resolve(meta.cwd || existing?.cwd || "")
-        : (existing?.cwd || ""),
-      title: existing?.title || meta.title || `Grok ${hit.id.slice(0, 8)}`,
+      cwd: cwd ? path.resolve(cwd) : "",
+      title,
       status: mergeImportStatus(existing),
       createdAt: existing?.createdAt ?? hit.mtime,
       updatedAt: Math.max(existing?.updatedAt ?? 0, meta.updatedAt ?? 0, hit.mtime),
@@ -1023,7 +1080,7 @@ export async function importLocalCliSessions(
   store: TaskStore,
   limit = 10,
   allowedRoots: string[] = []
-): Promise<{ grok: number; claude: number; cursor: number; junkCursorIds: string[] }> {
+): Promise<{ grok: number; claude: number; cursor: number; junkCursorIds: string[]; junkGrokIds: string[] }> {
   const [grok, claude, cursor] = await Promise.all([
     importGrokSessions(store, limit),
     importClaudeSessions(store, limit, allowedRoots),
@@ -1035,5 +1092,6 @@ export async function importLocalCliSessions(
     // ignore
   }
   const junkCursorIds = listJunkCursorImportThreadIds(store);
-  return { grok, claude, cursor, junkCursorIds };
+  const junkGrokIds = listJunkGrokImportThreadIds(store);
+  return { grok, claude, cursor, junkCursorIds, junkGrokIds };
 }
