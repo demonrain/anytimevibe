@@ -58,6 +58,7 @@ import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn, normalizeSystemErrorText } from "./cli/headless-runner";
 import { importLocalCliSessions } from "./cli/import-sessions";
 import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
+import { startEngineConfigWatch } from "./cli/engine-config-watch";
 import { appendEngineDiffChunk, buildTurnDiff, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
 import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
@@ -3306,7 +3307,50 @@ async function maybeReloadCodexAppServerWhenIdle(): Promise<void> {
   if (hasActiveCodexTurn()) return;
   const reason = pendingCodexAppServerReload;
   pendingCodexAppServerReload = null;
-  await reloadCodexAppServer(`空闲后应用目录信任：${reason}`);
+  await reloadCodexAppServer(`空闲后应用：${reason}`);
+}
+
+function scheduleCodexCredentialReload(reason: string): void {
+  if (!codex && !publicState.environment.codexCompatible && !publicState.environment.codexInstalled) {
+    void publishHostStatus().catch(() => undefined);
+    return;
+  }
+  if (hasActiveCodexTurn()) {
+    pendingCodexAppServerReload = reason;
+    logWarn("检测到切号/配置变更，Codex 空闲后重载 app-server", reason);
+    for (const threadId of activeTurnByThread.keys()) {
+      if (isHeadlessThreadActive(threadId)) continue;
+      const engine = resolveActivityEngine(threadId);
+      if (engine && engine !== "codex") continue;
+      appendLocalActivityStage(threadId, "ℹ 检测到本机切号/配置变更；当前回合不中断，空闲后自动重载 Codex");
+    }
+    return;
+  }
+  void reloadCodexAppServer(reason)
+    .then(() => publishHostStatus())
+    .catch(handleError);
+}
+
+let stopEngineConfigWatch: (() => void) | null = null;
+let capabilityRefreshInFlight = false;
+
+function startEngineCredentialAndCatalogWatch(): void {
+  stopEngineConfigWatch?.();
+  stopEngineConfigWatch = startEngineConfigWatch({
+    onCodexCredentialChanged: (reason) => {
+      scheduleCodexCredentialReload(`切号/凭证变更:${reason}`);
+    },
+    onCapabilitySourcesChanged: (reason) => {
+      if (capabilityRefreshInFlight) return;
+      capabilityRefreshInFlight = true;
+      logInfo("检测到引擎目录/配置变更，刷新模型与 effort", reason);
+      void publishHostStatus()
+        .catch(handleError)
+        .finally(() => {
+          capabilityRefreshInFlight = false;
+        });
+    }
+  });
 }
 
 async function ensureCodexTrustedAndReady(cwd: string): Promise<void> {
@@ -3601,6 +3645,7 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     } catch {
       // ignore
     }
+    void maybeReloadCodexAppServerWhenIdle().catch(handleError);
   }
 }
 
@@ -3827,6 +3872,7 @@ async function runHeadlessTaskTurn(options: {
   if (!threadHasPendingCursorApproval(options.threadId)) {
     scheduleDrainTurnQueue(options.threadId);
   }
+  void maybeReloadCodexAppServerWhenIdle().catch(handleError);
 }
 
 async function handleCommand(command: ClientCommand): Promise<void> {
@@ -6174,6 +6220,7 @@ app.whenReady().then(async () => {
     if (process.platform === "win32") showWindow();
   });
   createWindow();
+  startEngineCredentialAndCatalogWatch();
   // Defer update check so first paint / IPC is never delayed by network download.
   setTimeout(() => {
     void checkForAgentUpdate().catch((error) => updateState({ update: { status: "error", message: error.message } }));
@@ -6250,6 +6297,8 @@ app.whenReady().then(async () => {
 app.on("window-all-closed", () => undefined);
 app.on("before-quit", () => {
   quitting = true;
+  stopEngineConfigWatch?.();
+  stopEngineConfigWatch = null;
   if (installingUpdate) {
     // prepareForUpdateQuit already cleaned resources; avoid double-kill races.
     return;

@@ -193,8 +193,8 @@ function effortOptionsFromHost(
     : engine === "claude"
       ? (["low", "medium", "high", "xhigh", "max"] as ReasoningEffort[])
       : engine === "grok"
-        ? (["low", "medium", "high"] as ReasoningEffort[])
-        : (["low", "medium", "high", "xhigh"] as ReasoningEffort[]);
+        ? (["low", "medium", "high", "xhigh"] as ReasoningEffort[])
+        : (["low", "medium", "high", "xhigh", "max"] as ReasoningEffort[]);
   if (currentEffort && !base.includes(currentEffort)) base.unshift(currentEffort);
   return base;
 }

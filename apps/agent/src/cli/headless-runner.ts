@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/protocol";
@@ -6,6 +8,7 @@ import { cloudProxyChildEnv, ensureCursorHttp1ForProxy, collectLocalProxyEnv } f
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
 import { formatCursorModelArg, parseCursorModelRef } from "./model-catalog";
+import { explainGrokSerializationError, prepareGrokResponsesCompat } from "./grok-responses-compat";
 import { headlessPermissionArgs } from "./permission-args";
 import type { ApprovalPlan, ApprovalQuestion, BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
 import { ensureWorkspaceTrusted } from "./workspace-trust";
@@ -92,11 +95,22 @@ function parseCursorModelHints(model: string | undefined): {
   };
 }
 
-function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
+function buildArgs(
+  engine: CliEngine,
+  options: HeadlessRunOptions,
+  childEnv: NodeJS.ProcessEnv = process.env
+): string[] {
   const args: string[] = [];
   if (engine === "claude") {
     // Prefer per-task model; fall back to env; never force offline "sonnet" aliases.
-    const model = (options.model || process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || "").trim();
+    const model = (
+      options.model
+      || childEnv.CLAUDE_MODEL
+      || childEnv.ANTHROPIC_MODEL
+      || process.env.CLAUDE_MODEL
+      || process.env.ANTHROPIC_MODEL
+      || ""
+    ).trim();
     args.push(
       "-p", options.prompt,
       "--output-format", "stream-json",
@@ -106,7 +120,8 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
     if (model) args.push("--model", model);
     if (options.reasoningEffort) args.push("--effort", options.reasoningEffort);
     // Only use --bare when API key is present (bare skips keychain/OAuth).
-    if (process.env.ANTHROPIC_API_KEY) args.push("--bare");
+    // Prefer per-turn settings.json env (CCSwitch / Cockpit) over stale process.env.
+    if (childEnv.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY) args.push("--bare");
     if (options.providerSessionId) args.push("--resume", options.providerSessionId);
     args.push(...headlessPermissionArgs(engine, options.permissionMode));
     return args;
@@ -144,11 +159,10 @@ function buildArgs(engine: CliEngine, options: HeadlessRunOptions): string[] {
     "--cwd", options.cwd
   );
   if (model) args.push("--model", model);
-  if (options.reasoningEffort && options.reasoningEffort !== "max") {
-    // Grok uses --reasoning-effort; "max" maps to high for compatibility
-    args.push("--reasoning-effort", options.reasoningEffort === "xhigh" ? "high" : options.reasoningEffort);
-  } else if (options.reasoningEffort === "max" || options.reasoningEffort === "xhigh") {
-    args.push("--reasoning-effort", "high");
+  if (options.reasoningEffort) {
+    // Grok Build accepts low|medium|high|xhigh. Map legacy "max" → xhigh.
+    const effort = options.reasoningEffort === "max" ? "xhigh" : options.reasoningEffort;
+    args.push("--reasoning-effort", effort);
   }
   if (options.providerSessionId) args.push("--resume", options.providerSessionId);
   args.push(...headlessPermissionArgs(engine, options.permissionMode));
@@ -677,7 +691,12 @@ function handleGrokLine(
     return;
   }
   if (type === "error") {
-    emitHeadlessErrorOnce(state, onEvent, options, String(parsed.message || "Grok 运行失败"));
+    emitHeadlessErrorOnce(
+      state,
+      onEvent,
+      options,
+      explainGrokSerializationError(String(parsed.message || "Grok 运行失败"))
+    );
     return;
   }
   if (parsed.sessionId && !state.sessionId) state.sessionId = String(parsed.sessionId);
@@ -754,14 +773,6 @@ export async function runHeadlessTurn(
     // ignore
   }
 
-  const args = [...cursorPrefixArgs, ...buildArgs(engine, options)];
-  // On Windows, npm global CLIs are often `claude.cmd` / extensionless shims.
-  // CreateProcess cannot spawn those directly → ENOENT; always go through cmd.exe.
-  // Cursor prefers node.exe+index.js (prefixArgs set) so the shim is usually skipped.
-  const useCmdShim = cursorPrefixArgs.length === 0 && windowsNeedsCmdShim(command);
-  const executable = useCmdShim ? (process.env.ComSpec ?? "cmd.exe") : command;
-  const finalArgs = useCmdShim ? windowsCmdArguments(command, args) : args;
-
   const proxy = await collectLocalProxyEnv();
   if (engine === "cursor") {
     try {
@@ -774,11 +785,55 @@ export async function runHeadlessTurn(
     }
   }
   // Cursor/Claude/Grok must egress via proxy (IP region gates Cursor model list).
-  const env = await cloudProxyChildEnv({
+  let env = await cloudProxyChildEnv({
     CI: process.env.CI || "1",
     TERM: process.env.TERM || "dumb",
     NO_COLOR: process.env.NO_COLOR || "1"
   });
+
+  // CCSwitch / Cockpit rewrite ~/.claude/settings.json env on account switch.
+  // Merge into the child so this turn uses the new key/base_url without restarting AnytimeVibe.
+  if (engine === "claude") {
+    try {
+      const settingsRaw = await fs.readFile(path.join(os.homedir(), ".claude", "settings.json"), "utf8");
+      const settings = JSON.parse(settingsRaw) as { env?: Record<string, string> };
+      if (settings.env && typeof settings.env === "object") {
+        for (const [key, value] of Object.entries(settings.env)) {
+          if (typeof value === "string" && value.trim()) env[key] = value;
+        }
+      }
+    } catch {
+      // optional
+    }
+  }
+
+  // Third-party Responses gateways often omit fields Grok CLI requires.
+  let grokCompat: Awaited<ReturnType<typeof prepareGrokResponsesCompat>> = null;
+  if (engine === "grok") {
+    try {
+      grokCompat = await prepareGrokResponsesCompat(env);
+      if (grokCompat) {
+        env = { ...env, ...grokCompat.env };
+        emitDelta(
+          safeOnEvent,
+          options,
+          "stage:grok-compat",
+          "stage",
+          "\n… 已启用 Grok Responses 兼容代理（补齐 created_at 等字段）\n"
+        );
+      }
+    } catch (error) {
+      console.warn("[headless] prepareGrokResponsesCompat failed:", error);
+    }
+  }
+
+  const args = [...cursorPrefixArgs, ...buildArgs(engine, options, env)];
+  // On Windows, npm global CLIs are often `claude.cmd` / extensionless shims.
+  // CreateProcess cannot spawn those directly → ENOENT; always go through cmd.exe.
+  // Cursor prefers node.exe+index.js (prefixArgs set) so the shim is usually skipped.
+  const useCmdShim = cursorPrefixArgs.length === 0 && windowsNeedsCmdShim(command);
+  const executable = useCmdShim ? (process.env.ComSpec ?? "cmd.exe") : command;
+  const finalArgs = useCmdShim ? windowsCmdArguments(command, args) : args;
 
   if (!options.cursorResumeRetried) {
     safeOnEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
@@ -832,7 +887,9 @@ export async function runHeadlessTurn(
     lineCount: 0
   };
 
-  const result = await new Promise<HeadlessRunResult>((resolve) => {
+  let result: HeadlessRunResult;
+  try {
+  result = await new Promise<HeadlessRunResult>((resolve) => {
     let settled = false;
     let resultGraceTimer: ReturnType<typeof setTimeout> | null = null;
     const startedAt = Date.now();
@@ -844,6 +901,7 @@ export async function runHeadlessTurn(
       if (stallWatch) clearInterval(stallWatch);
       if (resultGraceTimer) clearTimeout(resultGraceTimer);
       activeByThread.delete(options.threadId);
+      void grokCompat?.cleanup().catch(() => undefined);
       resolve({
         providerSessionId: state.sessionId || options.providerSessionId || options.threadId,
         status,
@@ -1067,6 +1125,9 @@ export async function runHeadlessTurn(
   });
   await eventChain;
   return result;
+  } finally {
+    void grokCompat?.cleanup().catch(() => undefined);
+  }
 }
 
 export function interruptHeadlessThread(threadId: string): boolean {

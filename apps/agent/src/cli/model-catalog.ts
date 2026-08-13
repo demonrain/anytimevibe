@@ -24,8 +24,70 @@ function parseTomlString(content: string, key: string): string | undefined {
 function normalizeEffort(value: string | undefined): ReasoningEffort | undefined {
   if (!value) return undefined;
   const v = value.toLowerCase().trim();
+  // Cockpit / Codex catalogs may expose "ultra"; map to max for the shared schema.
+  if (v === "ultra") return "max";
   if (v === "low" || v === "medium" || v === "high" || v === "xhigh" || v === "max") return v;
   return undefined;
+}
+
+function parseCatalogEffortList(raw: unknown): ReasoningEffort[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ReasoningEffort[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    const id = normalizeEffort(
+      String(
+        (item && typeof item === "object"
+          ? (item as Record<string, unknown>).effort
+            ?? (item as Record<string, unknown>).level
+            ?? (item as Record<string, unknown>).id
+            ?? (item as Record<string, unknown>).value
+          : item) ?? ""
+      )
+    );
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function ingestCodexCatalogRows(
+  rows: Array<Record<string, any>> | undefined,
+  models: EngineModelOption[],
+  seen: Set<string>,
+  effortUnion: Set<ReasoningEffort>
+): void {
+  for (const row of rows || []) {
+    const id = String(row.slug || row.id || row.model || "").trim();
+    if (!id) continue;
+    const label = String(row.display_name || row.name || id).trim() || id;
+    const contextWindow = Number(row.context_window || row.max_context_window || 0) || undefined;
+    const modelEfforts = parseCatalogEffortList(
+      row.supported_reasoning_levels || row.reasoning_efforts || row.supported_efforts
+    );
+    for (const effort of modelEfforts) effortUnion.add(effort);
+
+    if (seen.has(id)) {
+      const existing = models.find((item) => item.id === id);
+      if (!existing) continue;
+      if (modelEfforts.length) {
+        const merged = [...new Set([...(existing.reasoningEfforts || []), ...modelEfforts])];
+        const order: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
+        existing.reasoningEfforts = order.filter((effort) => merged.includes(effort));
+      }
+      if (!existing.contextWindow && contextWindow) existing.contextWindow = contextWindow;
+      if (existing.label === existing.id && label !== id) existing.label = label;
+      continue;
+    }
+    seen.add(id);
+    models.push({
+      id,
+      label,
+      ...(contextWindow ? { contextWindow } : {}),
+      ...(modelEfforts.length ? { reasoningEfforts: modelEfforts } : {})
+    });
+  }
 }
 
 async function readText(filePath: string): Promise<string | null> {
@@ -43,7 +105,7 @@ async function discoverCodexCapability(): Promise<EngineCapability> {
   const seen = new Set<string>();
   let currentModel: string | undefined;
   let currentReasoningEffort: ReasoningEffort | undefined;
-  let reasoningEfforts: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
+  const effortUnion = new Set<ReasoningEffort>(["low", "medium", "high", "xhigh"]);
 
   const configText = await readText(path.join(codexHome, "config.toml"));
   if (configText) {
@@ -51,25 +113,29 @@ async function discoverCodexCapability(): Promise<EngineCapability> {
     currentReasoningEffort = normalizeEffort(parseTomlString(configText, "model_reasoning_effort"));
   }
 
-  const catalogRaw = await readText(path.join(codexHome, "cc-switch-model-catalog.json"));
-  if (catalogRaw) {
+  // Prefer live Codex cache + Cockpit Local Access catalog; CCSwitch is a fallback.
+  const catalogFiles = [
+    "models_cache.json",
+    "cockpit-local-access-model-catalog.json",
+    "cc-switch-model-catalog.json"
+  ];
+  for (const fileName of catalogFiles) {
+    const catalogRaw = await readText(path.join(codexHome, fileName));
+    if (!catalogRaw) continue;
     try {
-      const catalog = JSON.parse(catalogRaw) as { models?: Array<Record<string, any>> };
-      for (const row of catalog.models || []) {
-        const id = String(row.slug || row.id || row.model || "").trim();
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        const label = String(row.display_name || row.name || id).trim();
-        const contextWindow = Number(row.context_window || row.max_context_window || 0) || undefined;
-        models.push({ id, label, ...(contextWindow ? { contextWindow } : {}) });
-        const levels = row.supported_reasoning_levels;
-        if (Array.isArray(levels) && levels.length) {
-          const mapped = levels
-            .map((item) => normalizeEffort(String(item?.level || item?.id || item || "")))
-            .filter((item): item is ReasoningEffort => Boolean(item));
-          if (mapped.length) reasoningEfforts = [...new Set(mapped)];
-        }
-      }
+      const catalog = JSON.parse(catalogRaw) as {
+        models?: Array<Record<string, any>> | Record<string, any>;
+      };
+      const rows = Array.isArray(catalog.models)
+        ? catalog.models
+        : catalog.models && typeof catalog.models === "object"
+          ? Object.entries(catalog.models).map(([id, value]) => {
+              const row = (value && typeof value === "object" ? value : {}) as Record<string, any>;
+              const info = (row.info && typeof row.info === "object" ? row.info : row) as Record<string, any>;
+              return { slug: id, ...info, ...row };
+            })
+          : [];
+      ingestCodexCatalogRows(rows, models, seen, effortUnion);
     } catch {
       // ignore
     }
@@ -79,10 +145,16 @@ async function discoverCodexCapability(): Promise<EngineCapability> {
     models.unshift({ id: currentModel, label: currentModel });
   }
 
+  const order: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
+  const reasoningEfforts = order.filter((effort) => effortUnion.has(effort));
+  if (currentReasoningEffort && !reasoningEfforts.includes(currentReasoningEffort)) {
+    reasoningEfforts.unshift(currentReasoningEffort);
+  }
+
   return {
     engine: "codex",
     models,
-    reasoningEfforts,
+    reasoningEfforts: reasoningEfforts.length ? reasoningEfforts : ["low", "medium", "high", "xhigh"],
     ...(currentModel ? { currentModel } : {}),
     ...(currentReasoningEffort ? { currentReasoningEffort } : {})
   };
@@ -110,14 +182,17 @@ async function discoverClaudeCapability(): Promise<EngineCapability> {
       const candidates: Array<[string, string]> = [
         ["opus", env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME || env.ANTHROPIC_DEFAULT_OPUS_MODEL || "opus"],
         ["sonnet", env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME || env.ANTHROPIC_DEFAULT_SONNET_MODEL || "sonnet"],
-        ["haiku", env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME || env.ANTHROPIC_DEFAULT_HAIKU_MODEL || "haiku"]
+        ["haiku", env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME || env.ANTHROPIC_DEFAULT_HAIKU_MODEL || "haiku"],
+        ["fable", env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME || env.ANTHROPIC_DEFAULT_FABLE_MODEL || ""]
       ];
       for (const [alias, full] of candidates) {
-        const id = String(full || alias).replace(/\[.*?\]/g, "").trim();
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        models.push({ id, label: alias === id ? id : `${alias} (${id})` });
-        if (!seen.has(alias) && alias !== id) {
+        const id = String(full || "").replace(/\[.*?\]/g, "").trim();
+        if (!id) continue;
+        if (!seen.has(id)) {
+          seen.add(id);
+          models.push({ id, label: alias === id ? id : `${alias} (${id})` });
+        }
+        if (alias && alias !== id && !seen.has(alias)) {
           seen.add(alias);
           models.push({ id: alias, label: alias });
         }
@@ -155,6 +230,34 @@ async function discoverClaudeCapability(): Promise<EngineCapability> {
   };
 }
 
+function parseGrokEffortList(raw: unknown): ReasoningEffort[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ReasoningEffort[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    const id = normalizeEffort(
+      String(
+        (item && typeof item === "object"
+          ? (item as Record<string, unknown>).value
+            ?? (item as Record<string, unknown>).id
+            ?? (item as Record<string, unknown>).level
+          : item) ?? ""
+      )
+    );
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+/**
+ * Grok Build ≥1.0 stores catalog in models_cache.json and defaults in:
+ *   [models]
+ *   default = "grok-4.6"
+ *   default_reasoning_effort = "xhigh"
+ * Older flat keys (model / reasoning_effort) are still accepted.
+ */
 async function discoverGrokCapability(): Promise<EngineCapability> {
   const home = os.homedir();
   const grokHome = process.env.GROK_HOME || path.join(home, ".grok");
@@ -162,7 +265,8 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
   const seen = new Set<string>();
   let currentModel: string | undefined;
   let currentReasoningEffort: ReasoningEffort | undefined;
-  const reasoningEfforts: ReasoningEffort[] = ["low", "medium", "high"];
+  let reasoningEfforts: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
+  const effortUnion = new Set<ReasoningEffort>(reasoningEfforts);
 
   const cacheRaw = await readText(path.join(grokHome, "models_cache.json"));
   if (cacheRaw) {
@@ -170,11 +274,28 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
       const cache = JSON.parse(cacheRaw) as { models?: Record<string, any> };
       for (const [id, value] of Object.entries(cache.models || {})) {
         if (!id || seen.has(id)) continue;
-        seen.add(id);
         const info = value?.info || value || {};
+        if (info.hidden === true) continue;
+        seen.add(id);
         const label = String(info.name || info.system_prompt_label || id);
         const contextWindow = Number(info.context_window || 0) || undefined;
-        models.push({ id, label, ...(contextWindow ? { contextWindow } : {}) });
+        const modelEfforts = parseGrokEffortList(info.reasoning_efforts);
+        if (modelEfforts.length) {
+          for (const effort of modelEfforts) effortUnion.add(effort);
+        } else if (info.supports_reasoning_effort) {
+          // Catalog claims effort support but omitted list — keep engine defaults.
+          for (const effort of reasoningEfforts) effortUnion.add(effort);
+        }
+        const defaultEffort = normalizeEffort(
+          String(info.reasoning_effort || info.default_reasoning_effort || "")
+        );
+        models.push({
+          id,
+          label,
+          ...(contextWindow ? { contextWindow } : {}),
+          ...(modelEfforts.length ? { reasoningEfforts: modelEfforts } : {})
+        });
+        if (!currentReasoningEffort && defaultEffort) currentReasoningEffort = defaultEffort;
       }
     } catch {
       // ignore
@@ -183,12 +304,29 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
 
   const configRaw = await readText(path.join(grokHome, "config.toml"));
   if (configRaw) {
-    currentModel = parseTomlString(configRaw, "model") || parseTomlString(configRaw, "default_model");
-    currentReasoningEffort = normalizeEffort(
-      parseTomlString(configRaw, "reasoning_effort")
-      || parseTomlString(configRaw, "effort")
-      || parseTomlString(configRaw, "model_reasoning_effort")
-    );
+    // New Grok Build layout: [models] default / default_reasoning_effort
+    const modelsSection = configRaw.match(/\[models\]([\s\S]*?)(?=\n\[|$)/i)?.[1] ?? "";
+    currentModel =
+      parseTomlString(modelsSection, "default")
+      || parseTomlString(configRaw, "model")
+      || parseTomlString(configRaw, "default_model")
+      || currentModel;
+    currentReasoningEffort =
+      normalizeEffort(parseTomlString(modelsSection, "default_reasoning_effort"))
+      || normalizeEffort(parseTomlString(configRaw, "reasoning_effort"))
+      || normalizeEffort(parseTomlString(configRaw, "effort"))
+      || normalizeEffort(parseTomlString(configRaw, "model_reasoning_effort"))
+      || currentReasoningEffort;
+
+    // Also surface any explicitly configured [model."id"] blocks.
+    const modelBlockRe = /\[model\."([^"]+)"\]/gi;
+    let match: RegExpExecArray | null;
+    while ((match = modelBlockRe.exec(configRaw))) {
+      const id = match[1]?.trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      models.push({ id, label: id });
+    }
   }
   if (process.env.GROK_MODEL) currentModel = process.env.GROK_MODEL.trim();
   if (process.env.XAI_MODEL) currentModel = process.env.XAI_MODEL.trim();
@@ -196,6 +334,10 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
   if (currentModel && !seen.has(currentModel)) {
     models.unshift({ id: currentModel, label: currentModel });
   }
+
+  const order: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
+  reasoningEfforts = order.filter((effort) => effortUnion.has(effort));
+  if (!reasoningEfforts.length) reasoningEfforts = ["low", "medium", "high", "xhigh"];
 
   return {
     engine: "grok",
@@ -612,6 +754,8 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
   const seen = new Set<string>();
   let liveCount = 0;
   cursorLiveSlugSet = new Set();
+  let currentModel: string | undefined;
+  let currentReasoningEffort: ReasoningEffort | undefined;
 
   try {
     const { resolveEngineBinary } = await import("./detect");
@@ -660,6 +804,44 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
     }
   }
 
+  // Sync selected model / effort from Cursor CLI config (updated by account / UI switches).
+  try {
+    const cliRaw = await readText(path.join(os.homedir(), ".cursor", "cli-config.json"));
+    if (cliRaw) {
+      const cli = JSON.parse(cliRaw) as {
+        selectedModel?: { modelId?: string; parameters?: Array<{ id?: string; value?: string }> };
+        model?: { modelId?: string; displayModelId?: string };
+        modelParameters?: Record<string, Array<{ id?: string; value?: string }>>;
+      };
+      const selectedId = String(
+        cli.selectedModel?.modelId
+        || cli.model?.displayModelId
+        || cli.model?.modelId
+        || ""
+      ).trim();
+      if (selectedId && !/^default$/i.test(selectedId)) {
+        currentModel = normalizeCursorBaseId(/^auto$/i.test(selectedId) ? "auto" : selectedId);
+      } else if (/^auto$/i.test(String(cli.model?.displayModelId || ""))) {
+        currentModel = "auto";
+      }
+      const paramKey = selectedId && !/^default$/i.test(selectedId) ? selectedId : (currentModel || "");
+      const params = [
+        ...(cli.selectedModel?.parameters || []),
+        ...((paramKey && cli.modelParameters?.[paramKey]) || [])
+      ];
+      for (const param of params) {
+        if (!/reasoning|effort/i.test(String(param.id || ""))) continue;
+        const effort = normalizeEffort(String(param.value || ""));
+        if (effort) {
+          currentReasoningEffort = effort;
+          break;
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
   models.sort((a, b) => {
     const rank = (id: string) => {
       if (id === "composer-2.5") return 0;
@@ -676,7 +858,8 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
 
   const envModel = process.env.CURSOR_MODEL?.trim();
   const envBase = envModel ? parseCursorModelRef(envModel).base : "";
-  const currentModel = envBase
+  currentModel = envBase
+    || currentModel
     || (models.some((m) => m.id === "composer-2.5") ? "composer-2.5" : models[0]?.id)
     || "auto";
   if (currentModel && !seen.has(currentModel)) {
@@ -689,7 +872,8 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
     engine: "cursor",
     models,
     reasoningEfforts,
-    currentModel
+    currentModel,
+    ...(currentReasoningEffort ? { currentReasoningEffort } : {})
   };
 }
 
