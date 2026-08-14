@@ -727,6 +727,12 @@ async function main(): Promise<void> {
           }));
           return;
         }
+        // Offline catch-up: agent reconnects and asks relay to fire Web Push without a full envelope.
+        if (parsed.type === "agent.push_hint") {
+          const hint = z.enum(["approval", "completed"]).parse(parsed.hint);
+          await sendPush(host.userId, hint);
+          return;
+        }
         const envelope = encryptedEnvelopeSchema.parse(parsed);
         if (envelope.hostId !== host.id) throw new Error("host mismatch");
         if (envelope.persist) {

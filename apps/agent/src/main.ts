@@ -86,6 +86,16 @@ type StoredPairing = {
   expiresAt: number;
 };
 
+/**
+ * A push hint that could not be delivered because the relay socket was down when
+ * the task completed / needed approval. Persisted so a transient disconnect (sleep,
+ * network flap, closed laptop) never permanently loses a completion/approval push.
+ */
+type PendingPushHint = {
+  hint: "approval" | "completed";
+  occurredAt: string;
+};
+
 type AgentConfig = {
   relayUrl: string;
   agentId: string;
@@ -99,6 +109,8 @@ type AgentConfig = {
   workspaces: Workspace[];
   workspaceBookmarks?: Record<string, string>;
   sequence: number;
+  /** Undelivered push hints, flushed to the relay on reconnect. */
+  pendingPushHints?: PendingPushHint[];
 };
 
 type PublicState = {
@@ -1903,6 +1915,18 @@ async function loadConfig(): Promise<void> {
   config.workspaces ??= [];
   config.workspaceBookmarks ??= {};
   config.sequence ??= 0;
+  // Sanitize offline push queue from disk (ignore corrupt entries).
+  if (Array.isArray(config.pendingPushHints)) {
+    config.pendingPushHints = config.pendingPushHints
+      .filter((item): item is PendingPushHint =>
+        Boolean(item)
+        && (item.hint === "approval" || item.hint === "completed")
+        && typeof item.occurredAt === "string"
+      )
+      .slice(-50);
+  } else {
+    config.pendingPushHints = [];
+  }
   if (dirty) await saveConfig();
   publicState = {
     ...publicState,
@@ -3062,6 +3086,12 @@ async function connect(force = false): Promise<void> {
         if (generation === connectGeneration && socket === connection) await publishHostStatus();
       } catch {
         // ignore; connect path continues
+      }
+      // Offline completion/approval pushes queued while the socket was down.
+      try {
+        if (generation === connectGeneration && socket === connection) await flushPendingPushHints();
+      } catch {
+        // ignore; next reconnect retries
       }
       // Codex is optional; failures must not mark the host offline or block the UI.
       // Skip ensureCodex entirely when Codex is absent so Claude/Grok-only hosts stay clean.
@@ -5367,11 +5397,64 @@ async function relayTaskToCli(threadId: string): Promise<void> {
 
 async function publish(event: AgentEvent, persist: boolean, hint?: "approval" | "completed"): Promise<void> {
   agentEventSchema.parse(event);
-  if (!socket || socket.readyState !== WebSocket.OPEN || !config.hostId || !syncKey) return;
+  if (!socket || socket.readyState !== WebSocket.OPEN || !config.hostId || !syncKey) {
+    // Socket down (sleep / network flap / closed laptop). The encrypted event is lost,
+    // but a completion/approval push must NOT be: persist the hint and flush on reconnect
+    // so the phone still gets notified once the agent comes back online.
+    if (hint) await enqueuePushHint(hint, event.occurredAt);
+    return;
+  }
   config.sequence += 1;
   await saveConfig();
   const envelope = await createEnvelope(config.hostId, config.sequence, syncKey, event, { persist, ...(hint ? { hint } : {}) });
-  socket.send(JSON.stringify(envelope));
+  try {
+    socket.send(JSON.stringify(envelope));
+  } catch (error) {
+    // send() can still throw if the socket died between the readyState check and here.
+    if (hint) await enqueuePushHint(hint, event.occurredAt);
+    throw error;
+  }
+}
+
+/** Cap the queue so a long offline stretch cannot grow the config file unbounded. */
+const MAX_PENDING_PUSH_HINTS = 50;
+
+async function enqueuePushHint(hint: "approval" | "completed", occurredAt: string): Promise<void> {
+  const queue = config.pendingPushHints ?? [];
+  queue.push({ hint, occurredAt });
+  // Keep only the most recent hints; older ones are stale by the time we reconnect.
+  config.pendingPushHints = queue.slice(-MAX_PENDING_PUSH_HINTS);
+  await saveConfig().catch(() => undefined);
+  logInfo("推送提醒已入队（离线），将于重连后补发", `hint=${hint} queue=${config.pendingPushHints.length}`);
+}
+
+/**
+ * Deliver push hints that piled up while the relay socket was down. Uses a lightweight
+ * unencrypted control message (like agent.meta) — the relay only needs the hint kind to
+ * fan out Web Push; no task content ever leaves the agent.
+ */
+async function flushPendingPushHints(): Promise<void> {
+  const queue = config.pendingPushHints;
+  if (!queue?.length) return;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  // Collapse to at most one push per kind: a burst of completions should not spam the phone.
+  const kinds = [...new Set(queue.map((item) => item.hint))];
+  config.pendingPushHints = [];
+  await saveConfig().catch(() => undefined);
+  const remaining: PendingPushHint[] = [];
+  for (const hint of kinds) {
+    try {
+      socket.send(JSON.stringify({ type: "agent.push_hint", hint }));
+      logInfo("已补发离线期间的推送提醒", `hint=${hint}`);
+    } catch (error) {
+      remaining.push({ hint, occurredAt: new Date().toISOString() });
+      handleError(error);
+    }
+  }
+  if (remaining.length) {
+    config.pendingPushHints = [...(config.pendingPushHints ?? []), ...remaining].slice(-MAX_PENDING_PUSH_HINTS);
+    await saveConfig().catch(() => undefined);
+  }
 }
 
 async function addWorkspace(): Promise<PublicState> {
