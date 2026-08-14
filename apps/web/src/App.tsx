@@ -407,6 +407,18 @@ function taskStatusMeta(status: string): { label: string; tone: string } {
   return { label: statusType || "未知状态", tone: "unknown" };
 }
 
+function isInProgressTaskStatus(status: string | undefined): boolean {
+  let statusType = String(status || "");
+  try {
+    const parsed = JSON.parse(statusType) as { type?: unknown };
+    if (typeof parsed.type === "string") statusType = parsed.type;
+  } catch {
+    // Plain string statuses are expected for turn events.
+  }
+  const normalized = statusType.toLowerCase().replace(/[\s_-]/g, "");
+  return ["active", "running", "inprogress", "processing"].includes(normalized);
+}
+
 function isFailedTaskStatus(status: string | undefined): boolean {
   const normalized = String(status || "").toLowerCase().replace(/[\s_-]/g, "");
   if (!normalized) return false;
@@ -2741,7 +2753,8 @@ function TaskConversation({
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const previousThreadRef = useRef(task.threadId);
-  const running = Boolean(task.activeTurnId);
+  // After a page refresh, snapshots often omit activeTurnId while status is still 进行中.
+  const running = Boolean(task.activeTurnId) || isInProgressTaskStatus(task.status);
   const permissionOptions = useMemo(
     () => permissionOptionsForEngine(taskEngine, locale),
     [taskEngine, locale]

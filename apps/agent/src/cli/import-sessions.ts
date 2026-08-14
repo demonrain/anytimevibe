@@ -438,17 +438,42 @@ async function removeOrphanNativeDuplicate(
   }
 }
 
-function textFromContent(content: unknown): string {
+function textFromContent(content: unknown, options: { includeToolResult?: boolean } = {}): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   const parts: string[] = [];
   for (const block of content) {
     if (!block || typeof block !== "object") continue;
-    const row = block as { type?: string; text?: string; content?: string };
+    const row = block as { type?: string; text?: string; content?: unknown };
+    // Claude marks tool I/O as role=user + tool_result — never treat that as a human YOU bubble.
+    if (row.type === "tool_result") {
+      if (!options.includeToolResult) continue;
+      if (typeof row.content === "string" && row.content) parts.push(row.content);
+      else if (Array.isArray(row.content)) {
+        for (const inner of row.content) {
+          if (inner && typeof inner === "object" && typeof (inner as { text?: string }).text === "string") {
+            parts.push(String((inner as { text: string }).text));
+          } else if (typeof inner === "string") {
+            parts.push(inner);
+          }
+        }
+      }
+      continue;
+    }
     if (typeof row.text === "string" && row.text) parts.push(row.text);
-    else if (typeof row.content === "string" && row.content) parts.push(row.content);
+    else if (typeof row.content === "string" && row.content && row.type !== "tool_use") {
+      parts.push(row.content);
+    }
   }
   return parts.join("\n");
+}
+
+/** True when a Claude "user" row is only tool output (not a human prompt). */
+function isClaudeToolResultOnly(content: unknown): boolean {
+  if (!Array.isArray(content) || !content.length) return false;
+  return content.every(
+    (block) => block && typeof block === "object" && (block as { type?: string }).type === "tool_result"
+  );
 }
 
 function extractUserQuery(text: string): string {
@@ -469,6 +494,9 @@ function isNoiseTranscriptText(text: string): boolean {
   ) {
     return true;
   }
+  // Tool-result leftovers that slipped past block typing
+  if (/^\[tool_result\]/i.test(t)) return true;
+  if (/^tool_use_id\b/i.test(t)) return true;
   // Pure environment / git / system blocks with no user ask
   if (/^<user_info>[\s\S]*<\/user_info>\s*$/i.test(t)) return true;
   if (/^<git_status>[\s\S]*<\/git_status>\s*$/i.test(t)) return true;
@@ -984,8 +1012,10 @@ async function importClaudeSessions(
           if (row.type && row.type !== "user" && row.type !== "assistant") continue;
           const role = row.message?.role || row.role || (row.type === "user" || row.type === "assistant" ? row.type : undefined);
           if (role !== "user" && role !== "assistant") continue;
-          let text = "";
           const content = row.message?.content ?? row.content;
+          // Claude stream/jsonl uses role=user for tool_result payloads — those are process I/O, not YOU.
+          if (role === "user" && isClaudeToolResultOnly(content)) continue;
+          let text = "";
           if (typeof content === "string") text = content;
           else text = textFromContent(content);
           const cleaned = cleanImportedMessageText(role, text);

@@ -398,7 +398,23 @@ function handleClaudeLine(
   }
 
   if (type === "stream_event") {
-    const delta = parsed.event?.delta;
+    const event = parsed.event || {};
+    const eventType = String(event.type || "");
+    // Tool / thinking progress → process stream (not YOU).
+    if (eventType === "content_block_start") {
+      const block = event.content_block || {};
+      if (block.type === "tool_use" && block.name) {
+        const name = String(block.name);
+        emitDelta(onEvent, options, `stage:tool:${name}`, "stage", `\n▶ 调用工具 ${name}\n`);
+      } else if (block.type === "thinking") {
+        if (!state.sawThoughtStage) {
+          state.sawThoughtStage = true;
+          emitDelta(onEvent, options, "stage:thinking", "stage", "\n… Claude 思考中\n");
+        }
+      }
+      return;
+    }
+    const delta = event.delta;
     if (delta?.type === "text_delta" && delta.text) {
       state.text += String(delta.text);
       state.sawAssistant = true;
@@ -412,19 +428,68 @@ function handleClaudeLine(
     emitDelta(onEvent, options, "assistant", "assistant", String(parsed.delta.text));
     return;
   }
+
+  // Claude marks tool outputs as type=user + tool_result. Never treat as human YOU bubbles.
+  if (type === "user") {
+    const content = parsed.message?.content;
+    if (Array.isArray(content) && content.some((block: any) => block?.type === "tool_result")) {
+      const preview = content
+        .filter((block: any) => block?.type === "tool_result")
+        .map((block: any) => {
+          const raw = typeof block.content === "string"
+            ? block.content
+            : Array.isArray(block.content)
+              ? block.content.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join("")
+              : "";
+          return String(raw || "").trim().slice(0, 240);
+        })
+        .filter(Boolean)
+        .join("\n");
+      if (preview) {
+        emitDelta(
+          onEvent,
+          options,
+          "cli-log",
+          "cli-log",
+          `\n${preview}${preview.length >= 240 ? "…" : ""}\n`
+        );
+      } else {
+        emitDelta(onEvent, options, "stage:tool-result", "stage", "\n✓ 工具已返回\n");
+      }
+    }
+    return;
+  }
+
   if (type === "assistant" && parsed.message?.content) {
     for (const block of parsed.message.content) {
-      if (block?.type === "text" && block.text && !state.sawAssistant) {
+      if (block?.type === "tool_use" && block.name) {
+        emitDelta(
+          onEvent,
+          options,
+          `stage:tool:${String(block.name)}`,
+          "stage",
+          `\n▶ 调用工具 ${String(block.name)}\n`
+        );
+        continue;
+      }
+      if (block?.type === "thinking" && !state.sawThoughtStage) {
+        state.sawThoughtStage = true;
+        emitDelta(onEvent, options, "stage:thinking", "stage", "\n… Claude 思考中\n");
+        continue;
+      }
+      if (block?.type === "text" && block.text) {
         const text = String(block.text);
         // Synthetic assistant error payloads (auth / model offline)
         if (parsed.message?.model === "<synthetic>" || /API Error:|not logged in|已下线/i.test(text)) {
           // Claude may emit the same synthetic error on each api_retry — publish once.
           emitHeadlessErrorOnce(state, onEvent, options, text);
-        } else {
-          state.text += text;
-          state.sawAssistant = true;
-          emitDelta(onEvent, options, "assistant", "assistant", text);
+          continue;
         }
+        // Skip exact duplicates already streamed via text_delta; keep later tool-turn replies.
+        if (state.sawAssistant && (state.text === text || state.text.endsWith(text))) continue;
+        state.text += (state.sawAssistant && state.text && !state.text.endsWith("\n") ? "\n" : "") + text;
+        state.sawAssistant = true;
+        emitDelta(onEvent, options, "assistant", "assistant", text);
       }
     }
     return;

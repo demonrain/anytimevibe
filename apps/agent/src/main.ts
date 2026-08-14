@@ -3735,6 +3735,7 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     cliEngine: task.engine,
+    ...(activeTurnByThread.get(task.threadId) ? { activeTurnId: activeTurnByThread.get(task.threadId) } : {}),
     ...(task.providerSessionId ? { providerSessionId: task.providerSessionId } : {}),
     ...(task.model ? { model: task.model } : {}),
     ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
@@ -4833,7 +4834,10 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     ...(stored?.model ? { model: stored.model } : {}),
     ...(stored?.reasoningEffort ? { reasoningEffort: stored.reasoningEffort } : {}),
     ...(stored?.lastDiff ? { diff: stored.lastDiff } : {}),
-    ...(stored?.providerSessionId ? { providerSessionId: stored.providerSessionId } : { providerSessionId: threadId })
+    ...(stored?.providerSessionId ? { providerSessionId: stored.providerSessionId } : { providerSessionId: threadId }),
+    ...(snapshot.activeTurnId || activeTurnByThread.get(threadId)
+      ? { activeTurnId: snapshot.activeTurnId || activeTurnByThread.get(threadId) }
+      : {})
   }, true);
 }
 
