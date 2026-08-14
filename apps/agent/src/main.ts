@@ -51,7 +51,8 @@ import {
   normalizeUnixSeconds,
   threadResumeParams,
   threadStartParams,
-  threadToSnapshot
+  threadToSnapshot,
+  mergeSnapshotUserPrompts
 } from "./codex-adapter";
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
@@ -903,6 +904,18 @@ function syncActivitiesState(nextActivities: ActivityState[], selectedThreadId?:
   } catch {
     // ignore
   }
+}
+
+async function appendStoredUserPrompt(threadId: string, prompt: string): Promise<void> {
+  const text = String(prompt || "").trim();
+  if (!text) return;
+  const stored = taskStore.get(threadId);
+  if (!stored) return;
+  const already = stored.messages.some((message) => message.role === "user" && message.text.trim() === text);
+  if (already) return;
+  stored.messages.push({ id: crypto.randomUUID(), role: "user", text });
+  stored.updatedAt = Date.now() / 1000;
+  await taskStore.upsert(stored);
 }
 
 function startLocalActivity(threadId: string, prompt: string, title = "远程任务", engine?: CliEngine): void {
@@ -4045,6 +4058,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         ...(command.model ? { model: command.model } : {}),
         ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {})
       });
+      await appendStoredUserPrompt(thread.id, command.prompt);
       await publishThread(thread.id);
       startLocalActivity(thread.id, command.prompt, command.title || command.prompt.slice(0, 80), "codex");
       const turnPayload: Record<string, unknown> = {
@@ -4156,6 +4170,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
           await taskStore.upsert(stored);
         }
         await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
+        await appendStoredUserPrompt(command.threadId, command.prompt);
         startLocalActivity(command.threadId, command.prompt, "继续远程任务", "codex");
         if (stored && (command.model || command.reasoningEffort)) {
           if (command.model) stored.model = command.model;
@@ -4426,6 +4441,14 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       commandId: command.commandId,
       ...("threadId" in command ? { threadId: command.threadId } : {})
     }, true);
+    const snapshotThreadId = localThreadId || ("threadId" in command ? command.threadId : undefined);
+    if (snapshotThreadId) {
+      try {
+        await publishThread(snapshotThreadId, { touch: true });
+      } catch {
+        try { await publishStoredTaskSnapshot(snapshotThreadId); } catch { /* ignore */ }
+      }
+    }
   }
 }
 
@@ -4805,6 +4828,7 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
   const result = await codex!.request("thread/read", { threadId, includeTurns: true });
   const snapshot = threadToSnapshot(result.thread);
   const stored = taskStore.get(threadId);
+  const messages = mergeSnapshotUserPrompts(snapshot.messages, stored?.messages || []);
   const cwd = preferTaskCwd(snapshot.cwd, stored?.cwd);
   if (stored && cwd && stored.cwd !== cwd) {
     stored.cwd = cwd;
@@ -4833,6 +4857,7 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     eventId: crypto.randomUUID(),
     occurredAt: new Date().toISOString(),
     ...snapshot,
+    messages,
     cwd,
     updatedAt,
     cliEngine: "codex",

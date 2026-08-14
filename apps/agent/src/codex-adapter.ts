@@ -252,6 +252,79 @@ export function isTerminalTurnStatus(status: string): boolean {
   );
 }
 
+function normalizeCodexItemType(type: unknown): string {
+  return String(type ?? "").toLowerCase().replace(/[_-\s]/g, "");
+}
+
+function textFromCodexContent(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const part of content) {
+    if (typeof part === "string" && part.trim()) {
+      parts.push(part);
+      continue;
+    }
+    if (!part || typeof part !== "object") continue;
+    const row = part as JsonObject;
+    const kind = String(row.type ?? "").toLowerCase();
+    if (kind && kind !== "text" && kind !== "input_text" && kind !== "output_text") continue;
+    const text = String(row.text ?? row.content ?? "").trim();
+    if (text) parts.push(text);
+  }
+  return parts.join("\n").trim();
+}
+
+function isCodexUserItem(item: JsonObject): boolean {
+  const type = normalizeCodexItemType(item.type);
+  if (type === "usermessage" || type === "user") return true;
+  if (type === "message") {
+    return String(item.role ?? item.sender ?? "").toLowerCase() === "user";
+  }
+  return false;
+}
+
+function textFromCodexUserItem(item: JsonObject): string {
+  return textFromCodexContent(item.content)
+    || String(item.text ?? item.message ?? "").trim();
+}
+
+/**
+ * Keep user prompts that live in our store / live web transcript when Codex
+ * thread/read omits them (common on systemerror / fail-fast turns).
+ */
+export function mergeSnapshotUserPrompts<T extends { id: string; role: string; text: string }>(
+  incoming: T[],
+  extra: Array<{ id?: string; role: string; text: string }>
+): T[] {
+  if (!extra.length) return incoming;
+  const seen = new Set(
+    incoming
+      .filter((message) => message.role === "user")
+      .map((message) => message.text.trim())
+      .filter(Boolean)
+  );
+  const missing = extra.filter((message) => {
+    if (message.role !== "user") return false;
+    const text = message.text.trim();
+    if (!text || seen.has(text)) return false;
+    seen.add(text);
+    return true;
+  });
+  if (!missing.length) return incoming;
+  const out: T[] = [...incoming];
+  for (const message of missing) {
+    let insertAt = out.length;
+    while (insertAt > 0 && out[insertAt - 1]?.role === "system") insertAt -= 1;
+    out.splice(insertAt, 0, {
+      id: message.id || `user:${insertAt}`,
+      role: "user",
+      text: message.text
+    } as T);
+  }
+  return out;
+}
+
 export function threadToSnapshot(thread: JsonObject) {
   const messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string; createdAt?: number }> = [];
   const turns = thread.turns ?? [];
@@ -266,23 +339,28 @@ export function threadToSnapshot(thread: JsonObject) {
     if (turnStatus) lastTurnStatus = turnStatus;
     const turnError = extractCodexTurnError(turn);
     if (turnError) lastTurnError = turnError;
+    let turnHadUser = false;
     for (const item of turn.items ?? []) {
-      if (item.type === "userMessage") {
-        const text = (item.content ?? []).filter((content: JsonObject) => content.type === "text").map((content: JsonObject) => content.text).join("\n");
+      if (isCodexUserItem(item)) {
+        const text = textFromCodexUserItem(item);
         if (text) {
+          turnHadUser = true;
           messages.push({
-            id: item.id,
+            id: String(item.id || `user:${messages.length}`),
             role: "user",
             text,
             ...(started ? { createdAt: started } : {})
           });
         }
       }
-      if (item.type === "agentMessage" && item.text) {
+      const agentText = item.type === "agentMessage"
+        ? (String(item.text ?? "").trim() || textFromCodexContent(item.content))
+        : "";
+      if (agentText) {
         messages.push({
           id: item.id,
           role: "assistant",
-          text: item.text,
+          text: agentText,
           ...(completed || started ? { createdAt: completed || started } : {})
         });
       }
@@ -298,6 +376,17 @@ export function threadToSnapshot(thread: JsonObject) {
             ...(completed || started ? { createdAt: completed || started } : {})
           });
         }
+      }
+    }
+    if (!turnHadUser) {
+      const inputText = textFromCodexContent(turn.input) || String(turn.userMessage ?? turn.prompt ?? "").trim();
+      if (inputText) {
+        messages.push({
+          id: `turn-input:${String(turn.id || messages.length)}`,
+          role: "user",
+          text: inputText,
+          ...(started ? { createdAt: started } : {})
+        });
       }
     }
     // Surface terminal failure when Codex only sets turn.status without an error item.

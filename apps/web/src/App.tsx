@@ -675,6 +675,39 @@ function sanitizeTranscriptMessages<T extends { role: string; text: string }>(me
   });
 }
 
+/** Keep live/store YOU bubbles when a later snapshot omitted the failed turn's user item. */
+function mergeSnapshotUserPrompts<T extends { id: string; role: string; text: string }>(
+  incoming: T[],
+  extra: Array<{ id?: string; role: string; text: string }>
+): T[] {
+  if (!extra.length) return incoming;
+  const seen = new Set(
+    incoming
+      .filter((message) => message.role === "user")
+      .map((message) => message.text.trim())
+      .filter(Boolean)
+  );
+  const missing = extra.filter((message) => {
+    if (message.role !== "user") return false;
+    const text = message.text.trim();
+    if (!text || seen.has(text)) return false;
+    seen.add(text);
+    return true;
+  });
+  if (!missing.length) return incoming;
+  const out: T[] = [...incoming];
+  for (const message of missing) {
+    let insertAt = out.length;
+    while (insertAt > 0 && out[insertAt - 1]?.role === "system") insertAt -= 1;
+    out.splice(insertAt, 0, {
+      id: message.id || `user:${insertAt}`,
+      role: "user",
+      text: message.text
+    } as T);
+  }
+  return out;
+}
+
 /**
  * Local / host filesystem paths must not become <a href> on the web UI.
  * Markdown often emits [text](H:/git/foo.md); browsers then treat `H:` as a URL scheme or
@@ -842,6 +875,7 @@ const ChatMessageStream = memo(function ChatMessageStream({
   processLabel,
   pendingPrompt,
   showPendingBubble,
+  pendingFailed,
   running,
   processingLabel,
   processingHint,
@@ -875,6 +909,7 @@ const ChatMessageStream = memo(function ChatMessageStream({
   processLabel: string;
   pendingPrompt: string;
   showPendingBubble: boolean;
+  pendingFailed: boolean;
   running: boolean;
   processingLabel: string;
   processingHint: string;
@@ -931,12 +966,12 @@ const ChatMessageStream = memo(function ChatMessageStream({
         />
       ))}
       {showPendingBubble && (
-        <article className="message user pending">
-          <span>YOU · 发送中</span>
+        <article className={`message user${pendingFailed ? "" : " pending"}`}>
+          <span>{pendingFailed ? "YOU" : "YOU · 发送中"}</span>
           <pre>{sanitizeDisplayText(pendingPrompt)}</pre>
         </article>
       )}
-      {(running || showPendingBubble) && (
+      {(running || (showPendingBubble && !pendingFailed)) && (
         <article className="processing-card">
           <span className="processing-spinner" />
           <div>
@@ -1472,8 +1507,11 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const activeTurnId = terminalStatus
       ? undefined
       : (event.activeTurnId || existing?.activeTurnId);
+    const incomingMessages = event.messages?.length ? event.messages : [];
     const rawMessages = sanitizeTranscriptMessages(
-      event.messages?.length ? event.messages : (existing?.messages ?? [])
+      incomingMessages.length
+        ? mergeSnapshotUserPrompts(incomingMessages, existing?.messages ?? [])
+        : (existing?.messages ?? [])
     );
     // Prefer the more specific absolute cwd (task subdir over bare workspace root when both known).
     const nextCwd = (() => {
@@ -2810,6 +2848,8 @@ function TaskConversation({
     )
   );
   const showPendingBubble = Boolean(pendingPrompt && !pendingAlreadyCommitted);
+  const pendingFailed = Boolean(showPendingBubble && isFailedTaskStatus(task.status) && !task.activeTurnId);
+  const sendingPrompt = pendingFailed ? "" : pendingPrompt;
 
   useEffect(() => {
     if (!permissionOptions.some((item) => item.value === permissionMode)) {
@@ -2983,8 +3023,11 @@ function TaskConversation({
 
   /** Last user message eligible for resend after failure / stop. */
   const lastUserPrompt = useMemo(
-    () => [...task.messages].reverse().find((message) => message.role === "user")?.text?.trim() || "",
-    [task.messages]
+    () => {
+      if (pendingFailed) return pendingPrompt.trim();
+      return [...task.messages].reverse().find((message) => message.role === "user")?.text?.trim() || "";
+    },
+    [task.messages, pendingFailed, pendingPrompt]
   );
   const lastSystemError = useMemo(() => findLastSystemErrorText(task.messages), [task.messages]);
   const statusFailed = isFailedTaskStatus(task.status);
@@ -2993,7 +3036,7 @@ function TaskConversation({
     lastUserPrompt
     && online === true
     && !running
-    && !pendingPrompt
+    && !sendingPrompt
     && statusFailed
   );
   // Only when status is actually failed/stopped — never because a system/plan message exists.
@@ -3005,7 +3048,7 @@ function TaskConversation({
     [task.messages]
   );
   const showFailureBanner = !running
-    && !pendingPrompt
+    && !sendingPrompt
     && statusFailed
     && !statusCompleted
     && (Boolean(lastSystemError) || !hasLongNonErrorSystem);
@@ -3130,12 +3173,12 @@ function TaskConversation({
     }
   }, [pendingPrompt, task.messages]);
 
-  // Clear optimistic "sending" when the turn ends in failure before a user bubble lands.
+  // Keep the optimistic YOU bubble on failure. Codex fail-fast snapshots often omit
+  // userMessage; clearing pending here made the prompt vanish from history.
   useEffect(() => {
     if (!pendingPrompt) return;
     if (isFailedTaskStatus(task.status) && !task.activeTurnId) {
       submittingRef.current = false;
-      setPendingPrompt("");
     }
   }, [pendingPrompt, task.status, task.activeTurnId]);
 
@@ -3256,6 +3299,7 @@ function TaskConversation({
         processLabel={t("replyProcess")}
         pendingPrompt={pendingPrompt}
         showPendingBubble={showPendingBubble}
+        pendingFailed={pendingFailed}
         running={running}
         processingLabel={t("processing")}
         processingHint={t("processingHint")}
@@ -3292,7 +3336,7 @@ function TaskConversation({
       threadId={task.threadId}
       online={online}
       running={running}
-      pendingPrompt={pendingPrompt}
+      pendingPrompt={sendingPrompt}
       draftClearNonce={draftClearNonce}
       model={model}
       modelOptions={modelOptions}
