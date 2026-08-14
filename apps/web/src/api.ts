@@ -17,6 +17,7 @@ const ERROR_LABELS: Record<string, string> = {
   username_taken: "用户名或邮箱已被占用",
   invalid_setup_token: "设置令牌不正确",
   already_initialized: "服务已初始化",
+  rate_limited: "尝试过于频繁，请稍后再试",
   internal_error: "服务器内部错误"
 };
 
@@ -51,11 +52,16 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.body !== undefined && init.body !== null && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
-  const response = await fetch(path, {
-    ...init,
-    credentials: "same-origin",
-    headers
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...init,
+      credentials: "same-origin",
+      headers
+    });
+  } catch {
+    throw new Error("无法连接服务器。本地请打开 http://127.0.0.1:4173，并确认已运行 pnpm dev:stack");
+  }
   const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
   if (!response.ok) throw new Error(formatApiError(body, response.status));
   return body as T;

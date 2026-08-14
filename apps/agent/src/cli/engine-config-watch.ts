@@ -19,6 +19,7 @@ export function startEngineConfigWatch(handlers: EngineConfigWatchHandlers): () 
   const grokHome = process.env.GROK_HOME?.trim() || path.join(home, ".grok");
   const claudeHome = path.join(home, ".claude");
   const cursorHome = path.join(home, ".cursor");
+  const antigravityHome = path.join(home, ".gemini", "antigravity-cli");
 
   const credentialFiles = new Set([
     path.join(codexHome, "auth.json"),
@@ -35,10 +36,11 @@ export function startEngineConfigWatch(handlers: EngineConfigWatchHandlers): () 
     path.join(grokHome, "config.toml"),
     path.join(grokHome, "auth.json"),
     path.join(claudeHome, "settings.json"),
-    path.join(cursorHome, "cli-config.json")
+    path.join(cursorHome, "cli-config.json"),
+    path.join(antigravityHome, "settings.json")
   ].map((p) => path.normalize(p).toLowerCase()));
 
-  const watchDirs = [codexHome, grokHome, claudeHome, cursorHome];
+  const watchDirs = [codexHome, grokHome, claudeHome, cursorHome, antigravityHome];
   const watchers: FSWatcher[] = [];
   let credentialTimer: ReturnType<typeof setTimeout> | null = null;
   let capabilityTimer: ReturnType<typeof setTimeout> | null = null;

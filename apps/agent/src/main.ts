@@ -62,7 +62,7 @@ import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-c
 import { startEngineConfigWatch } from "./cli/engine-config-watch";
 import { appendEngineDiffChunk, buildTurnDiff, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
 import { TaskStore } from "./cli/task-store";
-import { normalizeCliEngine, type BackendStreamEvent } from "./cli/types";
+import { normalizeCliEngine, isHeadlessCliEngine, type BackendStreamEvent } from "./cli/types";
 import { handoffPermissionArgs, normalizePermissionMode } from "./cli/permission-args";
 import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
 import { assertCodexLocalGatewayReady, repairCodexModelProviderConfig } from "./cli/codex-gateway";
@@ -815,6 +815,39 @@ async function pruneJunkCliImports(junkIds: string[]): Promise<void> {
   }
 }
 
+/**
+ * Drop native CLI imports outside the per-engine recent window.
+ * Do not tombstone — they may re-enter the window on a later sync.
+ */
+async function evictStaleNativeCliImports(threadIds: string[]): Promise<void> {
+  for (const threadId of threadIds) {
+    if (!threadId || isThreadDeleted(threadId)) continue;
+    try {
+      await taskStore.remove(threadId);
+      updateState({
+        tasks: publicState.tasks.filter((item) => item.threadId !== threadId)
+      });
+      await publish({
+        type: "thread.deleted",
+        eventId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(),
+        threadId
+      }, true);
+    } catch {
+      // ignore single eviction failure
+    }
+  }
+}
+
+async function pruneImportedCliSessions(imported: {
+  junkCursorIds?: string[];
+  junkGrokIds?: string[];
+  staleNativeIds?: string[];
+}): Promise<void> {
+  await pruneJunkCliImports([...(imported.junkCursorIds || []), ...(imported.junkGrokIds || [])]);
+  await evictStaleNativeCliImports(imported.staleNativeIds || []);
+}
+
 function scheduleDrainTurnQueue(threadId: string): void {
   setImmediate(() => {
     void drainTurnQueue(threadId).catch(handleError);
@@ -1262,15 +1295,22 @@ function rendererHtml(): string {
   // Snapshot state into the page so UI never depends solely on first IPC round-trip.
   const initialStateJson = JSON.stringify(publicState).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
   const vendorLogo = (name: string): string => {
-    const candidates = [
-      path.join(__dirname, "..", "assets", "vendors", `${name}.png`),
-      path.join(process.resourcesPath, "assets", "vendors", `${name}.png`)
+    const bases = [
+      path.join(__dirname, "..", "assets", "vendors"),
+      path.join(process.resourcesPath, "assets", "vendors")
     ];
-    for (const file of candidates) {
+    for (const dir of bases) {
       try {
-        return `data:image/png;base64,${readFileSync(file).toString("base64")}`;
+        const png = path.join(dir, `${name}.png`);
+        return `data:image/png;base64,${readFileSync(png).toString("base64")}`;
       } catch {
-        // try next
+        // try svg
+      }
+      try {
+        const svg = readFileSync(path.join(dir, `${name}.svg`), "utf8");
+        return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+      } catch {
+        // try next dir
       }
     }
     return "";
@@ -1279,7 +1319,8 @@ function rendererHtml(): string {
     codex: vendorLogo("codex"),
     claude: vendorLogo("claude"),
     grok: vendorLogo("grok"),
-    cursor: vendorLogo("cursor")
+    cursor: vendorLogo("cursor"),
+    antigravity: vendorLogo("antigravity")
   }).replace(/</g, "\\u003c");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>随码</title><style>
   :root{font-family:"Bahnschrift","Aptos","Segoe UI",sans-serif;color:#17211b}
@@ -1466,11 +1507,12 @@ function rendererHtml(): string {
     if(/^\\[claude\\]/i.test(title)) return 'claude';
     if(/^\\[grok\\]/i.test(title)) return 'grok';
     if(/^\\[cursor\\]/i.test(title)) return 'cursor';
+    if(/^\\[antigravity\\]/i.test(title)) return 'antigravity';
     return 'codex';
   }
   var I18N={
-    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',logs:'日志',logTitle:'运行日志',logRefresh:'刷新',logCopy:'复制',logClear:'清空',logOpenFile:'打开文件',logClose:'关闭',logEmpty:'暂无日志',logFooter:'最近运行记录 · 便于排查连接与任务问题',logCopied:'已复制到剪贴板',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',expand:'展开',collapse:'收起',open:'接力',tabGuide:'指引',tabEnv:'环境',tabPair:'配对',tabWs:'工作区',tabTasks:'任务',guideTitle:'快速上手',guideTip:'按下面步骤完成后，即可在网页端远程下发任务到本机编码引擎。',envTitle:'本机环境',envHint:'先安装 Node（Codex 需要）与至少一个编码引擎 CLI，再去做配对。',pairTitle:'中继与配对',pairHint:'保存中继地址后生成配对码，在 Web 端输入即可绑定本机。',relayLabel:'中继服务器',nameLabel:'客户端名称',wsTitle:'允许的工作区',wsHint:'只有白名单目录可被远程任务读写。至少添加一个项目路径。',stepEnv:'安装前置环境',stepEnvDesc:'安装 Node.js（Codex 需要）以及 Codex / Claude / Grok / Cursor 中至少一个 CLI 并登录。',stepRelay:'配置中继服务器',stepRelayDesc:'确认中继地址正确并保存（默认体验站可用）。',stepPair:'生成配对码并绑定',stepPairDesc:'点击生成配对码，在网页「添加主机」中输入。码约 10 分钟有效。',stepWs:'添加工作区目录',stepWsDesc:'允许至少一个本机项目目录，远程任务才能在该路径执行。',stepReady:'开始使用',stepReadyDesc:'网页端在线后即可新建任务。本页「任务」可接力到本机终端。',goEnv:'去环境',goPair:'去配对',goWs:'去工作区',goTasks:'看任务',done:'完成',todo:'待办',onlineReady:'已在线，可在网页下发任务。'},
-    en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',logs:'Logs',logTitle:'Runtime logs',logRefresh:'Refresh',logCopy:'Copy',logClear:'Clear',logOpenFile:'Open file',logClose:'Close',logEmpty:'No logs yet',logFooter:'Recent runtime events for troubleshooting',logCopied:'Copied to clipboard',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',expand:'Expand',collapse:'Collapse',open:'Open',tabGuide:'Guide',tabEnv:'Setup',tabPair:'Pair',tabWs:'Folders',tabTasks:'Tasks',guideTitle:'Get started',guideTip:'Finish the steps below so the web app can send coding tasks to this machine.',envTitle:'Local environment',envHint:'Install Node (for Codex) and at least one coding CLI, then pair.',pairTitle:'Relay & pairing',pairHint:'Save the relay URL, generate a code, and enter it on the web.',relayLabel:'Relay server',nameLabel:'Client name',wsTitle:'Allowed workspaces',wsHint:'Only allowlisted folders can be used by remote tasks. Add at least one project path.',stepEnv:'Install prerequisites',stepEnvDesc:'Install Node.js (needed for Codex) and at least one of Codex / Claude / Grok / Cursor CLI, then sign in.',stepRelay:'Configure relay',stepRelayDesc:'Confirm and save the relay URL (public demo works by default).',stepPair:'Pair with the web app',stepPairDesc:'Generate a pairing code and enter it under Add host on the web. Codes expire in ~10 minutes.',stepWs:'Allow a workspace folder',stepWsDesc:'Add at least one local project directory for remote tasks to run in.',stepReady:'You are ready',stepReadyDesc:'When online, create tasks from the web. Use Tasks here to hand off to a local terminal.',goEnv:'Setup',goPair:'Pair',goWs:'Folders',goTasks:'Tasks',done:'Done',todo:'Todo',onlineReady:'Online — send tasks from the web.'}
+    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',logs:'日志',logTitle:'运行日志',logRefresh:'刷新',logCopy:'复制',logClear:'清空',logOpenFile:'打开文件',logClose:'关闭',logEmpty:'暂无日志',logFooter:'最近运行记录 · 便于排查连接与任务问题',logCopied:'已复制到剪贴板',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',expand:'展开',collapse:'收起',open:'接力',tabGuide:'指引',tabEnv:'环境',tabPair:'配对',tabWs:'工作区',tabTasks:'任务',guideTitle:'快速上手',guideTip:'按下面步骤完成后，即可在网页端远程下发任务到本机编码引擎。',envTitle:'本机环境',envHint:'先安装 Node（Codex 需要）与至少一个编码引擎 CLI，再去做配对。',pairTitle:'中继与配对',pairHint:'保存中继地址后生成配对码，在 Web 端输入即可绑定本机。',relayLabel:'中继服务器',nameLabel:'客户端名称',wsTitle:'允许的工作区',wsHint:'只有白名单目录可被远程任务读写。至少添加一个项目路径。',stepEnv:'安装前置环境',stepEnvDesc:'安装 Node.js（Codex 需要）以及 Codex / Claude / Grok / Cursor / Antigravity 中至少一个 CLI 并登录。',stepRelay:'配置中继服务器',stepRelayDesc:'确认中继地址正确并保存（默认体验站可用）。',stepPair:'生成配对码并绑定',stepPairDesc:'点击生成配对码，在网页「添加主机」中输入。码约 10 分钟有效。',stepWs:'添加工作区目录',stepWsDesc:'允许至少一个本机项目目录，远程任务才能在该路径执行。',stepReady:'开始使用',stepReadyDesc:'网页端在线后即可新建任务。本页「任务」可接力到本机终端。',goEnv:'去环境',goPair:'去配对',goWs:'去工作区',goTasks:'看任务',done:'完成',todo:'待办',onlineReady:'已在线，可在网页下发任务。'},
+    en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',logs:'Logs',logTitle:'Runtime logs',logRefresh:'Refresh',logCopy:'Copy',logClear:'Clear',logOpenFile:'Open file',logClose:'Close',logEmpty:'No logs yet',logFooter:'Recent runtime events for troubleshooting',logCopied:'Copied to clipboard',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',expand:'Expand',collapse:'Collapse',open:'Open',tabGuide:'Guide',tabEnv:'Setup',tabPair:'Pair',tabWs:'Folders',tabTasks:'Tasks',guideTitle:'Get started',guideTip:'Finish the steps below so the web app can send coding tasks to this machine.',envTitle:'Local environment',envHint:'Install Node (for Codex) and at least one coding CLI, then pair.',pairTitle:'Relay & pairing',pairHint:'Save the relay URL, generate a code, and enter it on the web.',relayLabel:'Relay server',nameLabel:'Client name',wsTitle:'Allowed workspaces',wsHint:'Only allowlisted folders can be used by remote tasks. Add at least one project path.',stepEnv:'Install prerequisites',stepEnvDesc:'Install Node.js (needed for Codex) and at least one of Codex / Claude / Grok / Cursor / Antigravity CLI, then sign in.',stepRelay:'Configure relay',stepRelayDesc:'Confirm and save the relay URL (public demo works by default).',stepPair:'Pair with the web app',stepPairDesc:'Generate a pairing code and enter it under Add host on the web. Codes expire in ~10 minutes.',stepWs:'Allow a workspace folder',stepWsDesc:'Add at least one local project directory for remote tasks to run in.',stepReady:'You are ready',stepReadyDesc:'When online, create tasks from the web. Use Tasks here to hand off to a local terminal.',goEnv:'Setup',goPair:'Pair',goWs:'Folders',goTasks:'Tasks',done:'Done',todo:'Todo',onlineReady:'Online — send tasks from the web.'}
   };
   var locale=(function(){try{return localStorage.getItem('anytimevibe-locale')==='en'?'en':'zh-CN';}catch(e){return 'zh-CN';}})();
   function t(key){return (I18N[locale]&&I18N[locale][key])||I18N.en[key]||key}
@@ -1617,7 +1659,7 @@ function rendererHtml(): string {
       var codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">'+(env.codexInstalled?'安装兼容版':'一键安装')+'</button>':'';
       if(environment){
         var engineExtra=engines.filter(function(item){return item.engine!=='codex';}).map(function(item){
-          var label=item.engine==='claude'?'Claude Code':(item.engine==='cursor'?'Cursor Agent':'Grok Build');
+          var label=item.engine==='claude'?'Claude Code':item.engine==='cursor'?'Cursor Agent':item.engine==='antigravity'?'Antigravity':'Grok Build';
           var action=!item.ready?'<button data-install="'+escapeHtml(item.engine)+'" class="secondary">一键安装</button>':'';
           return '<div class="check '+(item.ready?'ok':'')+'"><b>'+escapeHtml(label)+'</b><span>'+escapeHtml(item.version||item.detail||(item.ready?'就绪':'未安装'))+'</span>'+action+'</div>';
         }).join('');
@@ -1718,10 +1760,10 @@ function rendererHtml(): string {
       var hay=((task.title||'')+' '+(task.cwd||'')+' '+(task.status||'')+' '+(eng||'')).toLowerCase();
       return hay.indexOf(q)>=0;
     });
-    var counts={codex:0,claude:0,grok:0,cursor:0};
+    var counts={codex:0,claude:0,grok:0,cursor:0,antigravity:0};
     lastTasks.forEach(function(task){ var e=detectEngine(task); if(counts[e]!=null) counts[e]+=1; });
     var filterBar='<div class="engine-filter" role="toolbar" aria-label="engine filter">'
-      +['codex','claude','grok','cursor'].map(function(eng){
+      +['codex','claude','grok','cursor','antigravity'].map(function(eng){
         return '<button type="button" class="engine-filter-btn'+(engineFilter===eng?' active':'')+'" data-engine-filter="'+eng+'" title="'+eng+' · '+counts[eng]+'">'
           +engineLogo(eng)+'<span>'+counts[eng]+'</span></button>';
       }).join('')
@@ -1828,7 +1870,7 @@ function rendererHtml(): string {
     if((el=document.querySelector('#addWorkspace'))&&api) el.addEventListener('click',function(){api.addWorkspace();});
     if((el=document.querySelector('#recheck'))&&api) el.addEventListener('click',function(){
       el.disabled=true;
-      if(detail) detail.textContent=locale==='en'?'Detecting Node / Codex / Claude / Grok / Cursor…':'正在检测 Node / Codex / Claude / Grok / Cursor…';
+      if(detail) detail.textContent=locale==='en'?'Detecting Node / Codex / Claude / Grok / Cursor / Antigravity…':'正在检测 Node / Codex / Claude / Grok / Cursor / Antigravity…';
       Promise.resolve(api.checkEnvironment()).then(function(state){
         if(state) paint(state);
       }).catch(function(error){
@@ -2822,7 +2864,45 @@ echo "Install finished. Run: agent login"
   throw new Error("当前系统暂不支持一键安装 Cursor Agent CLI。");
 }
 
-async function installEnvironment(target: "node" | "codex" | "claude" | "grok" | "cursor"): Promise<void> {
+async function installAntigravity(): Promise<void> {
+  updateState({ detail: "正在打开 Antigravity CLI 安装窗口…" });
+  if (process.platform === "win32") {
+    const proxyLines = await proxyShellLines("win32");
+    await openWindowsVisibleConsole([
+      "echo ============================================",
+      "echo   AnytimeVibe - install Google Antigravity CLI",
+      "echo ============================================",
+      "echo.",
+      ...proxyLines,
+      "echo [1] Official installer (antigravity.google/cli) ...",
+      "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"irm 'https://antigravity.google/cli/install.ps1' | iex\"",
+      "echo.",
+      "set \"PATH=%LOCALAPPDATA%\\agy\\bin;%USERPROFILE%\\.local\\bin;%PATH%\"",
+      "where agy 2>nul",
+      "agy --version 2>nul",
+      "echo.",
+      "echo If agy is installed: run  agy  once to sign in",
+      "echo.",
+      "echo Done. Close this window and click 重新检测 in AnytimeVibe."
+    ]);
+    updateState({ detail: "已打开 Antigravity 安装窗口。完成后请运行一次 agy 登录并点「重新检测」。" });
+    return;
+  }
+  if (process.platform === "darwin") {
+    await openMacTerminalScript(`
+echo "Installing Google Antigravity CLI…"
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+agy --version || true
+echo "Install finished. Run: agy  (sign in)"
+`);
+    updateState({ detail: "已打开 Terminal 安装 Antigravity。完成后请运行 agy 登录并点「重新检测」。" });
+    return;
+  }
+  throw new Error("当前系统暂不支持一键安装 Antigravity CLI。");
+}
+
+async function installEnvironment(target: "node" | "codex" | "claude" | "grok" | "cursor" | "antigravity"): Promise<void> {
   if (target === "node") {
     if (process.platform === "win32") {
       await installNodeOnWindows();
@@ -2858,6 +2938,10 @@ async function installEnvironment(target: "node" | "codex" | "claude" | "grok" |
   }
   if (target === "cursor") {
     await installCursorAgent();
+    return;
+  }
+  if (target === "antigravity") {
+    await installAntigravity();
     return;
   }
   // Strict platform split: do not share install implementation across OS.
@@ -3884,7 +3968,9 @@ async function runHeadlessTaskTurn(options: {
           ? "错误：Claude 任务失败（已保留上方模型输出）。请检查登录与模型配置。"
           : options.engine === "cursor"
             ? "错误：Cursor 任务失败（已保留上方模型输出）。请确认 agent 登录 / CURSOR_API_KEY。"
-            : "错误：Grok 任务失败（已保留上方模型输出）。请检查本机 Grok CLI 状态。";
+            : options.engine === "antigravity"
+              ? "错误：Antigravity 任务失败（已保留上方模型输出）。请确认 agy 已登录。"
+              : "错误：Grok 任务失败（已保留上方模型输出）。请检查本机 Grok CLI 状态。";
         const fallbackNorm = normalizeSystemErrorText(fallback).toLowerCase();
         const hasAnySystemError = latest.messages.some(
           (message) => message.role === "system" && isErrorLookingSystemText(message.text)
@@ -3910,7 +3996,9 @@ async function runHeadlessTaskTurn(options: {
           ? "错误：Claude 任务失败。请确认本机已安装 Claude Code 并登录；若提示模型已下线，请设置环境变量 CLAUDE_MODEL（例如 claude-opus-4-7）或在 Claude CLI 中切换模型。"
           : options.engine === "cursor"
             ? "错误：Cursor 任务失败。请确认已安装 Cursor Agent CLI（agent）并登录（agent login 或设置 CURSOR_API_KEY）；勿与 Grok 的 agent 命令混淆。"
-            : "错误：Grok 任务失败。请确认本机已安装 Grok Build 并已登录。"
+            : options.engine === "antigravity"
+              ? "错误：Antigravity 任务失败。请确认本机已安装 agy 并登录（先运行一次交互式 agy）。"
+              : "错误：Grok 任务失败。请确认本机已安装 Grok Build 并已登录。"
       });
     }
   }
@@ -3932,7 +4020,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     await publishHostStatus();
     try {
       const imported = await importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT, workspaceAllowRoots());
-      await pruneJunkCliImports([...(imported.junkCursorIds || []), ...(imported.junkGrokIds || [])]);
+      await pruneImportedCliSessions(imported);
       await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
     } catch {
       // optional
@@ -4006,7 +4094,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       const mode = command.permissionMode ?? "ask-for-approval";
       if (!command.cliEngine) throw new Error("请在网页端选择编码引擎后再下发任务");
       const engine = normalizeCliEngine(command.cliEngine);
-      if (engine === "claude" || engine === "grok" || engine === "cursor") {
+      if (isHeadlessCliEngine(engine)) {
         const threadId = crypto.randomUUID();
         localThreadId = threadId;
         await ensureWorkspaceTrusted(engine, accessCwd);
@@ -4107,7 +4195,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         logInfo("开始执行 turn.start", `thread=${command.threadId.slice(0, 8)} prompt=${command.prompt.slice(0, 80)}`);
         const mode = command.permissionMode ?? "ask-for-approval";
         const stored = taskStore.get(command.threadId);
-        if (stored && (stored.engine === "claude" || stored.engine === "grok" || stored.engine === "cursor")) {
+        if (stored && isHeadlessCliEngine(stored.engine)) {
           // Persist UI-selected model/effort/permission before the turn so handoff/refresh keep them.
           stored.permissionMode = mode;
           const outboundModel = command.model || stored.model;
@@ -4372,7 +4460,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       const multiCliPromise = (async () => {
         try {
           const imported = await importLocalCliSessions(taskStore, syncLimit, workspaceAllowRoots());
-          await pruneJunkCliImports([...(imported.junkCursorIds || []), ...(imported.junkGrokIds || [])]);
+          await pruneImportedCliSessions(imported);
           // Drop any re-imported sessions the user already deleted.
           for (const task of taskStore.list(Math.max(syncLimit * 20, 100))) {
             if (
@@ -4875,9 +4963,10 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
 async function refreshLocalTasks(limit = 50): Promise<void> {
   const listLimit = Math.min(100, Math.max(1, limit));
   // Pull sessions created by local Claude/Grok CLIs into the index so web sync can see them.
+  // Always the per-engine recent window (10), even when the local 接力 list asks for more rows.
   try {
-    const imported = await importLocalCliSessions(taskStore, listLimit, workspaceAllowRoots());
-    await pruneJunkCliImports([...(imported.junkCursorIds || []), ...(imported.junkGrokIds || [])]);
+    const imported = await importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT, workspaceAllowRoots());
+    await pruneImportedCliSessions(imported);
   } catch {
     // ignore import failures
   }
@@ -4929,7 +5018,7 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   updateState({ tasks });
 }
 
-/** Recent tasks to fully sync per coding engine (Codex / Claude / Grok / Cursor each). */
+/** Recent tasks to fully sync per coding engine (Codex / Claude / Grok / Cursor / Antigravity each). */
 const DEFAULT_SYNC_LIMIT = 10;
 /** Codex thread/list page size / max matches published for one search. */
 const SEARCH_LIST_LIMIT = 100;
@@ -5020,13 +5109,18 @@ async function listCodexThreadsForSync(options: {
 /** Publish up to `limit` recent non-Codex tasks for each multi-CLI engine. */
 async function publishRecentMultiCliSnapshots(limit: number, query?: string): Promise<number> {
   const q = query?.trim().toLowerCase() ?? "";
-  const counts: Record<"claude" | "grok" | "cursor", number> = { claude: 0, grok: 0, cursor: 0 };
+  const counts: Record<"claude" | "grok" | "cursor" | "antigravity", number> = {
+    claude: 0,
+    grok: 0,
+    cursor: 0,
+    antigravity: 0
+  };
   const toPublish: string[] = [];
-  // Search may scan a wider local index; plain sync stays on a small recent window.
-  const scanWindow = q ? 1_000 : Math.max(limit * 10, 50);
+  // Scan enough of the index to fill `limit` per engine; publish still caps per engine.
+  const scanWindow = q ? 1_000 : Math.max(limit * 20, 200);
   const perEngineCap = q ? SEARCH_LIST_LIMIT : limit;
   for (const task of taskStore.list(scanWindow)) {
-    if (task.engine !== "claude" && task.engine !== "grok" && task.engine !== "cursor") continue;
+    if (!isHeadlessCliEngine(task.engine)) continue;
     if (isThreadDeleted(task.threadId) || (task.providerSessionId && isThreadDeleted(task.providerSessionId))) {
       continue;
     }
@@ -5292,12 +5386,7 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   const permissionMode = normalizePermissionMode(stored?.permissionMode);
 
   // Pre-accept directory trust prompts before opening an interactive handoff terminal.
-  await ensureWorkspaceTrusted(
-    engine === "claude" || engine === "grok" || engine === "codex" || engine === "cursor"
-      ? engine
-      : "codex",
-    accessCwd
-  );
+  await ensureWorkspaceTrusted(engine, accessCwd);
 
   // Old Codex threads may still reference codex_local_access; ensure the section exists
   // before CLI `codex resume` loads config.toml.
@@ -5387,6 +5476,30 @@ async function relayTaskToCli(threadId: string): Promise<void> {
           ...(model ? ["--model", shellQuote(model)] : []),
           "--workspace", shellQuote(accessCwd)
         ].join(" "),
+        "inject"
+      );
+    }
+    return;
+  }
+
+  if (engine === "antigravity") {
+    const binary = await resolveEngineBinary("antigravity");
+    if (!binary) throw new Error("未找到 Antigravity CLI（agy），无法接力。请安装 https://antigravity.google/docs/cli 并登录");
+    const { formatAgySpawnArgs } = await import("./cli/model-catalog");
+    const spawn = formatAgySpawnArgs(stored?.model || process.env.AGY_MODEL || process.env.ANTIGRAVITY_MODEL, stored?.reasoningEffort);
+    const args = [
+      ...handoffPermissionArgs("antigravity", permissionMode),
+      ...(providerSessionId ? ["--conversation", providerSessionId] : []),
+      ...(spawn.model ? ["--model", spawn.model] : []),
+      ...(spawn.effort ? ["--effort", spawn.effort] : [])
+    ];
+    console.log(`[relay] antigravity permission=${permissionMode}`);
+    if (process.platform === "win32") {
+      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
+    } else {
+      await openExternalTerminal(
+        accessCwd,
+        [shellQuote(binary), ...args.map((part) => (part.startsWith("-") ? part : shellQuote(part)))].join(" "),
         "inject"
       );
     }
@@ -6165,7 +6278,7 @@ function registerIpc(): void {
       codexVersion: environment.codexVersion || publicState.codexVersion,
       status: statusForEngineAvailability({ environment, engines: availableEngines, paired }),
       detail: !ready
-        ? "未检测到可用编码引擎。请安装 Codex / Claude Code / Grok Build 任意一种后重试。"
+        ? "未检测到可用编码引擎。请安装 Codex / Claude Code / Grok Build / Cursor / Antigravity 任意一种后重试。"
         : `环境检测完成：${readyLabels || "就绪"}${paired ? "。主机引擎能力已同步到网页。" : "。"}${
           !environment.codexCompatible ? "（未安装 Codex 也可连接中继）" : ""
         }`
@@ -6184,8 +6297,8 @@ function registerIpc(): void {
     }
     return publicState;
   });
-  ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex" | "claude" | "grok" | "cursor") => {
-    if (target !== "node" && target !== "codex" && target !== "claude" && target !== "grok" && target !== "cursor") {
+  ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex" | "claude" | "grok" | "cursor" | "antigravity") => {
+    if (target !== "node" && target !== "codex" && target !== "claude" && target !== "grok" && target !== "cursor" && target !== "antigravity") {
       throw new Error("未知的安装目标");
     }
     try {
@@ -6232,7 +6345,7 @@ function registerIpc(): void {
     setTimeout(() => {
       void importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT, workspaceAllowRoots())
         .then(async (imported) => {
-          await pruneJunkCliImports([...(imported.junkCursorIds || []), ...(imported.junkGrokIds || [])]);
+          await pruneImportedCliSessions(imported);
           await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
         })
         .catch(() => undefined);

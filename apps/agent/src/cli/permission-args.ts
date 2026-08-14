@@ -36,6 +36,11 @@ export function headlessPermissionArgs(engine: CliEngine, mode: PermissionMode):
     }
     return ["--force", ...common];
   }
+  if (engine === "antigravity") {
+    // Project / Shared with Antigravity / Global are merged config scopes,
+    // not --sandbox / --mode flags. Headless honors settings.json policies.
+    return [];
+  }
   if (engine === "codex") {
     // Codex remote path uses app-server RPC, not these CLI flags.
     return [];
@@ -76,6 +81,10 @@ export function handoffPermissionArgs(engine: CliEngine, mode: PermissionMode | 
       return ["--force", ...common, "--sandbox", "disabled"];
     }
     return ["--force", ...common];
+  }
+  if (engine === "antigravity") {
+    // Same as headless: scopes live in merged permission configs, not CLI flags.
+    return [];
   }
   // grok
   if (normalized === "read-only") {

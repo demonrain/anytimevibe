@@ -86,6 +86,20 @@ export type HeadlessRunResult = {
 };
 
 export function normalizeCliEngine(value: string | null | undefined): CliEngine {
-  if (value === "claude" || value === "grok" || value === "codex" || value === "cursor") return value;
+  if (value === "claude" || value === "grok" || value === "codex" || value === "cursor" || value === "antigravity") {
+    return value;
+  }
   return "codex";
+}
+
+export function isHeadlessCliEngine(engine: CliEngine): engine is Exclude<CliEngine, "codex"> {
+  return engine !== "codex";
+}
+
+export function cliEngineDisplayName(engine: CliEngine): string {
+  if (engine === "claude") return "Claude Code";
+  if (engine === "grok") return "Grok Build";
+  if (engine === "cursor") return "Cursor Agent";
+  if (engine === "antigravity") return "Antigravity";
+  return "Codex";
 }

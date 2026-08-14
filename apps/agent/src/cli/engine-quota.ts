@@ -549,6 +549,40 @@ async function queryGrokQuota(binary: string): Promise<EngineQuota> {
   };
 }
 
+// ── Antigravity (agy) ───────────────────────────────────────────────────
+
+async function queryAntigravityQuota(binary: string): Promise<EngineQuota> {
+  const chunks: string[] = [];
+  const version = await runCliText(binary, ["--version"], { timeoutMs: 12_000 });
+  if (version.text) chunks.push(`# agy --version\n${version.text}`);
+  try {
+    const settingsPath = path.join(os.homedir(), ".gemini", "antigravity-cli", "settings.json");
+    if (await pathExists(settingsPath)) {
+      const raw = await fs.readFile(settingsPath, "utf8");
+      const settings = JSON.parse(raw) as Record<string, unknown>;
+      const model = typeof settings.model === "string" ? settings.model : "";
+      if (model) chunks.push(`settings.model: ${model}`);
+    }
+  } catch {
+    // ignore
+  }
+  const parsed = parseQuotaFromText("antigravity", chunks.join("\n"), "Antigravity");
+  if (parsed && (parsed.remainingPercent != null || parsed.amountRemaining != null || parsed.remaining != null)) {
+    return parsed;
+  }
+  return {
+    engine: "antigravity",
+    label: "Antigravity",
+    detail: compactDetail(
+      [
+        chunks.join("\n\n") || "已检测 Antigravity CLI。",
+        "agy 无稳定 usage 子命令；Google AI / Antigravity 额度请见账号页。"
+      ].join("\n")
+    ),
+    checkedAt: nowIso()
+  };
+}
+
 // ── Public entry ────────────────────────────────────────────────────────
 
 export async function queryEngineQuotas(
@@ -557,7 +591,7 @@ export async function queryEngineQuotas(
 ): Promise<EngineQuota[]> {
   const engines: CliEngine[] = filter
     ? [filter]
-    : ["codex", "claude", "grok", "cursor"];
+    : ["codex", "claude", "grok", "cursor", "antigravity"];
   const results: EngineQuota[] = [];
 
   for (const engine of engines) {
@@ -580,6 +614,7 @@ export async function queryEngineQuotas(
       if (engine === "cursor") results.push(sanitizeEngineQuota(await queryCursorQuota(binary)));
       else if (engine === "claude") results.push(sanitizeEngineQuota(await queryClaudeQuota(binary)));
       else if (engine === "grok") results.push(sanitizeEngineQuota(await queryGrokQuota(binary)));
+      else if (engine === "antigravity") results.push(sanitizeEngineQuota(await queryAntigravityQuota(binary)));
     } catch (error) {
       results.push(sanitizeEngineQuota({
         engine,

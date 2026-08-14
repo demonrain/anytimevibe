@@ -99,6 +99,7 @@ function enrichedPathEnv(): NodeJS.ProcessEnv {
   const extras = process.platform === "win32"
     ? [
         path.join(process.env.LOCALAPPDATA || "", "cursor-agent"),
+        path.join(process.env.LOCALAPPDATA || "", "agy", "bin"),
         path.join(home, ".cursor", "bin"),
         path.join(home, ".local", "bin"),
         path.join(process.env.LOCALAPPDATA || "", "Programs", "claude"),
@@ -253,6 +254,8 @@ export async function resolveCommandPath(command: string): Promise<string | null
         path.join(home, ".grok", "bin", "grok.exe"),
         path.join(home, ".grok", "bin", `${command}.exe`),
         path.join(process.env.LOCALAPPDATA || "", "Programs", "claude", "claude.exe"),
+        path.join(process.env.LOCALAPPDATA || "", "agy", "bin", `${command}.exe`),
+        path.join(process.env.LOCALAPPDATA || "", "agy", "bin", `${command}.cmd`),
         path.join(home, ".local", "bin", command),
         path.join(home, ".grok", "bin", command)
       ]
@@ -341,6 +344,18 @@ function parseGrokVersion(raw: string | null): string | undefined {
   return match?.[1] ?? text.slice(0, 80);
 }
 
+function parseAntigravityVersion(raw: string | null): string | undefined {
+  if (!raw) return undefined;
+  const text = raw.trim();
+  if (/cursor\s*agent|claude\s*code|^grok\s+/i.test(text) && !/antigravity|\bagy\b/i.test(text)) {
+    return undefined;
+  }
+  const match = text.match(/(\d+\.\d+\.\d+(?:[-\w.]*)?)/)
+    || text.match(/(\d+\.\d+(?:[-\w.]*)?)/)
+    || text.match(/(?:agy|antigravity)[^\d]*([0-9][^\s]*)/i);
+  return match?.[1] ?? text.slice(0, 80);
+}
+
 function parseCursorVersion(raw: string | null): string | undefined {
   if (!raw) return undefined;
   const text = raw.trim();
@@ -356,19 +371,35 @@ function parseCursorVersion(raw: string | null): string | undefined {
 }
 
 /** Reject binaries that clearly belong to another coding engine. */
-function isCrossEngineBinary(engine: "claude" | "grok" | "cursor", command: string): boolean {
+function isAntigravityInstallPath(command: string): boolean {
+  const n = command.replace(/\\/g, "/").toLowerCase();
+  const base = path.basename(n);
+  if (n.includes("/agy/bin/") || n.includes("/antigravity-cli/") || n.includes("/.gemini/")) return true;
+  return base === "agy" || base === "agy.exe" || base === "agy.cmd" || base === "agy.bat";
+}
+
+function isCrossEngineBinary(engine: "claude" | "grok" | "cursor" | "antigravity", command: string): boolean {
   const n = command.replace(/\\/g, "/").toLowerCase();
   const base = path.basename(n);
   if (engine === "claude") {
     if (n.includes("/.grok/") || n.includes("/.cursor/") || base.includes("cursor-agent")) return true;
     if (base === "agent" || base === "agent.exe" || base === "grok" || base === "grok.exe") return true;
+    if (isAntigravityInstallPath(command)) return true;
   }
   if (engine === "grok") {
     if (n.includes("/.cursor/") || n.includes("/cursor-agent/") || base.includes("cursor-agent") || base.includes("claude")) return true;
+    if (isAntigravityInstallPath(command)) return true;
   }
   if (engine === "cursor") {
     if (isGrokInstallPath(command) || base === "grok" || base === "grok.exe") return true;
     if (base.includes("claude") || n.includes("claudecode") || n.includes("/.claude/")) return true;
+    if (isAntigravityInstallPath(command)) return true;
+  }
+  if (engine === "antigravity") {
+    if (isGrokInstallPath(command) || isCursorInstallPath(command) || looksLikeClaudePath(command)) return true;
+    if (base === "agent" || base === "agent.exe" || base.includes("cursor-agent") || base.includes("claude") || base === "grok" || base === "grok.exe") {
+      return true;
+    }
   }
   return false;
 }
@@ -387,6 +418,7 @@ async function looksLikeCursorAgent(command: string): Promise<boolean> {
   // Hard path excludes — never trust Grok's identically named agent.exe.
   if (isGrokInstallPath(command)) return false;
   if (looksLikeClaudePath(command)) return false;
+  if (isAntigravityInstallPath(command)) return false;
   if (isCrossEngineBinary("cursor", command)) return false;
 
   const help = await runCommandText(command, ["--help"]);
@@ -443,6 +475,7 @@ export async function detectAvailableEngines(options: {
   let claudePath = await resolveEngineBinary("claude");
   let grokPath = await resolveEngineBinary("grok");
   let cursorPath = await resolveEngineBinary("cursor");
+  let antigravityPath = await resolveEngineBinary("antigravity");
   // Claude path/name is authoritative — do not run Cursor fingerprinting on it.
   if (claudePath && isCrossEngineBinary("claude", claudePath)) {
     claudePath = null;
@@ -458,13 +491,18 @@ export async function detectAvailableEngines(options: {
   if (cursorPath && !(await looksLikeCursorAgent(cursorPath))) {
     cursorPath = null;
   }
+  if (antigravityPath && isCrossEngineBinary("antigravity", antigravityPath)) {
+    antigravityPath = null;
+  }
 
   const claudeRaw = claudePath ? await runVersion(claudePath, ["--version"]) : null;
   const grokRaw = grokPath ? await runVersion(grokPath, ["--version"]) : null;
   const cursorRaw = cursorPath ? await runVersion(cursorPath, ["--version"]) : null;
+  const antigravityRaw = antigravityPath ? await runVersion(antigravityPath, ["--version"]) : null;
   const claudeVersion = parseClaudeVersion(claudeRaw);
   const grokVersion = parseGrokVersion(grokRaw);
   const cursorVersion = parseCursorVersion(cursorRaw);
+  const antigravityVersion = parseAntigravityVersion(antigravityRaw);
 
   return [
     {
@@ -505,6 +543,17 @@ export async function detectAvailableEngines(options: {
           detail: cursorPath
             ? (cursorRaw ? `cursor agent 已找到（版本原文：${String(cursorRaw).slice(0, 60)}）` : "cursor agent 已找到但无法读取版本")
             : "未检测到 Cursor Agent CLI（agent / cursor-agent），请安装并登录"
+        })
+    },
+    {
+      engine: "antigravity",
+      ready: Boolean(antigravityPath),
+      ...(antigravityVersion
+        ? { version: antigravityVersion }
+        : {
+          detail: antigravityPath
+            ? (antigravityRaw ? `agy 已找到（版本原文：${String(antigravityRaw).slice(0, 60)}）` : "agy 已找到但无法读取版本")
+            : "未检测到 Antigravity CLI（agy），请安装并登录"
         })
     }
   ];
@@ -580,6 +629,19 @@ export async function resolveEngineBinary(engine: Exclude<CliEngine, "codex">): 
     }
     return null;
   }
+  if (engine === "antigravity") {
+    const forced = process.env.AGY_COMMAND || process.env.ANTIGRAVITY_COMMAND;
+    if (forced) {
+      const hit = await resolveCommandPath(forced);
+      if (hit && !isCrossEngineBinary("antigravity", hit)) return hit;
+    }
+    const home = os.homedir();
+    return (await resolveCommandPath("agy"))
+      || (await resolveCommandPath("agy.exe"))
+      || (await resolveCommandPath("agy.cmd"))
+      || (await resolveCommandPath(path.join(process.env.LOCALAPPDATA || "", "agy", "bin", process.platform === "win32" ? "agy.exe" : "agy")))
+      || (await resolveCommandPath(path.join(home, ".local", "bin", process.platform === "win32" ? "agy.exe" : "agy")));
+  }
   if (process.env.GROK_COMMAND) return resolveCommandPath(process.env.GROK_COMMAND);
   // Prefer the dedicated `grok` binary — never the shared `agent` name (Cursor collision).
   return (await resolveCommandPath("grok"))
@@ -597,6 +659,11 @@ export function resolveEngineCommand(engine: Exclude<CliEngine, "codex">): strin
     return process.env.CURSOR_COMMAND
       || process.env.CURSOR_AGENT_COMMAND
       || (process.platform === "win32" ? "cursor-agent.exe" : "cursor-agent");
+  }
+  if (engine === "antigravity") {
+    return process.env.AGY_COMMAND
+      || process.env.ANTIGRAVITY_COMMAND
+      || (process.platform === "win32" ? "agy.exe" : "agy");
   }
   return process.env.GROK_COMMAND || (process.platform === "win32" ? "grok.exe" : "grok");
 }

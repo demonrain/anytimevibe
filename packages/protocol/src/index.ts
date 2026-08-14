@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.78";
+export const PRODUCT_VERSION = "0.4.79";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -92,8 +92,13 @@ export const permissionModeSchema = z.enum([
 export type PermissionMode = z.infer<typeof permissionModeSchema>;
 
 /** Local coding CLI backend used by the desktop agent. */
-export const cliEngineSchema = z.enum(["codex", "claude", "grok", "cursor"]);
+export const cliEngineSchema = z.enum(["codex", "claude", "grok", "cursor", "antigravity"]);
 export type CliEngine = z.infer<typeof cliEngineSchema>;
+export const CLI_ENGINES = cliEngineSchema.options;
+/** Headless print-mode CLIs (everything except Codex app-server). */
+export function isHeadlessCliEngine(engine: CliEngine): engine is Exclude<CliEngine, "codex"> {
+  return engine !== "codex";
+}
 
 export const cliEngineInfoSchema = z.object({
   engine: cliEngineSchema,

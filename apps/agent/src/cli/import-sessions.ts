@@ -31,7 +31,7 @@ function mergeImportStatus(existing: StoredTask | undefined): string {
 function resolveExistingForProviderSession(
   store: TaskStore,
   providerSessionId: string,
-  engine: "claude" | "grok" | "cursor"
+  engine: "claude" | "grok" | "cursor" | "antigravity"
 ): StoredTask | undefined {
   return store.findByProviderSession(providerSessionId, engine) || store.get(providerSessionId);
 }
@@ -373,9 +373,10 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
       ? imported.agentName
       : undefined;
     const title = existing?.title || agentTitle || titleFromUser || titleFromHistory || `Cursor ${hit.id.slice(0, 8)}`;
-    const cwd = (hit.cwd || existing?.cwd)
+    const baseCwd = (hit.cwd || existing?.cwd)
       ? path.resolve(hit.cwd || existing?.cwd || "")
       : (existing?.cwd || "");
+    const cwd = preferLongestPath(baseCwd, existing?.cwd) || baseCwd;
     // Skip empty Cursor subagents with no cwd / transcript (parent chat is the useful one).
     if (hit.isSubagent && !cwd && !hasUsefulTranscript(messages) && !titleFromHistory) {
       continue;
@@ -505,6 +506,8 @@ export function sanitizeTranscriptMessages<T extends { role: string; text: strin
 }
 
 function extractUserQuery(text: string): string {
+  const agy = text.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i);
+  if (agy?.[1]?.trim()) return agy[1].trim();
   const match = text.match(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/i);
   if (match?.[1]?.trim()) return match[1].trim();
   return text.trim();
@@ -549,6 +552,8 @@ function cleanImportedMessageText(role: "user" | "assistant" | "system", raw: st
       .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
       .replace(/<agent_skills>[\s\S]*?<\/agent_skills>/gi, "")
       .replace(/<executing_actions_with_care>[\s\S]*?<\/executing_actions_with_care>/gi, "")
+      .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "")
+      .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, "")
       .trim();
     if (looksLikeToolIoUserText(text)) return null;
   }
@@ -945,17 +950,23 @@ async function pickBestTaskCwd(
         return item;
       }
     });
+  const existing: string[] = [];
   for (const candidate of resolved) {
-    if (await pathIsDirectory(candidate, allowedRoots)) return candidate;
+    if (await pathIsDirectory(candidate, allowedRoots)) existing.push(candidate);
   }
-  // On macOS do not fs.stat TCC paths — return first candidate as metadata only.
-  return resolved[0] || "";
+  // Most-specific path wins (workspace root vs task subdirectory).
+  const rank = (list: string[]) => [...list].sort((a, b) => b.length - a.length || a.localeCompare(b));
+  if (existing.length) return rank(existing)[0]!;
+  // On macOS do not fs.stat TCC paths — return longest candidate as metadata only.
+  return resolved.length ? rank(resolved)[0]! : "";
 }
 
-/** Claude jsonl often embeds the real cwd; prefer it over lossy folder-name decode. */
+/** Collect absolute cwds from Claude jsonl; prefer the most specific (longest) path. */
 function extractCwdFromClaudeJsonl(raw: string): string {
-  // Scan a limited prefix — cwd appears early in most transcripts.
-  const head = raw.slice(0, 256_000);
+  // Scan a limited prefix — cwd appears early in most transcripts, but may appear again
+  // when the session later moves into a subdirectory.
+  const head = raw.slice(0, 512_000);
+  const found: string[] = [];
   for (const line of head.split(/\r?\n/)) {
     if (!line.includes("cwd")) continue;
     try {
@@ -967,13 +978,19 @@ function extractCwdFromClaudeJsonl(raw: string): string {
       };
       const value = String(row.cwd || row.cwd_path || row.workdir || row.message?.cwd || "").trim();
       if (value && (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith("/"))) {
-        return value;
+        try {
+          found.push(path.resolve(value));
+        } catch {
+          found.push(value);
+        }
       }
     } catch {
       // ignore
     }
   }
-  return "";
+  if (!found.length) return "";
+  found.sort((a, b) => b.length - a.length || a.localeCompare(b));
+  return found[0]!;
 }
 
 async function importClaudeSessions(
@@ -1089,6 +1106,231 @@ async function importClaudeSessions(
   return added;
 }
 
+function preferLongestPath(...candidates: Array<string | undefined | null>): string {
+  const resolved = candidates
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .map((item) => {
+      try {
+        return path.resolve(item);
+      } catch {
+        return item;
+      }
+    });
+  if (!resolved.length) return "";
+  resolved.sort((a, b) => b.length - a.length || a.localeCompare(b));
+  return resolved[0]!;
+}
+
+function fileUriToPath(uri: string): string {
+  const raw = String(uri || "").trim();
+  if (!raw) return "";
+  if (!/^file:/i.test(raw)) return raw;
+  let p = decodeURIComponent(raw.replace(/^file:\/\//i, ""));
+  if (/^\/[a-zA-Z]:/.test(p)) p = p.slice(1);
+  return process.platform === "win32" ? p.replace(/\//g, "\\") : p;
+}
+
+function parseIsoToUnix(value: string | undefined): number {
+  if (!value) return 0;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms / 1000 : 0;
+}
+
+async function readAntigravityTranscript(conversationId: string): Promise<HistoryMessage[]> {
+  const file = path.join(
+    os.homedir(),
+    ".gemini",
+    "antigravity-cli",
+    "brain",
+    conversationId,
+    ".system_generated",
+    "logs",
+    "transcript.jsonl"
+  );
+  let raw = "";
+  try {
+    raw = await fs.readFile(file, "utf8");
+  } catch {
+    return [];
+  }
+  const messages: HistoryMessage[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line) as { type?: string; source?: string; content?: string };
+      const type = String(row.type || "").toUpperCase();
+      const content = typeof row.content === "string" ? row.content : "";
+      if (!content) continue;
+      if (type === "USER_INPUT") {
+        const cleaned = cleanImportedMessageText("user", content);
+        if (cleaned) messages.push({ id: crypto.randomUUID(), role: "user", text: cleaned });
+        continue;
+      }
+      if (type === "PLANNER_RESPONSE" || type === "MODEL" || type === "AGENT_RESPONSE") {
+        const cleaned = cleanImportedMessageText("assistant", content);
+        if (cleaned) messages.push({ id: crypto.randomUUID(), role: "assistant", text: cleaned });
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return sanitizeTranscriptMessages(messages);
+}
+
+async function listAgyBrainIds(): Promise<string[]> {
+  const root = path.join(os.homedir(), ".gemini", "antigravity-cli", "brain");
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory() && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(entry.name))
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+async function readAgyHistoryIndex(): Promise<Map<string, { cwd: string; title: string; mtime: number }>> {
+  const map = new Map<string, { cwd: string; title: string; mtime: number }>();
+  const file = path.join(os.homedir(), ".gemini", "antigravity-cli", "history.jsonl");
+  let raw = "";
+  try {
+    raw = await fs.readFile(file, "utf8");
+  } catch {
+    return map;
+  }
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line) as {
+        display?: string;
+        timestamp?: number;
+        workspace?: string;
+        conversationId?: string;
+        type?: string;
+      };
+      const id = String(row.conversationId || "").trim();
+      if (!id) continue;
+      const cwd = String(row.workspace || "").trim();
+      const mtime = msToUnixSeconds(row.timestamp);
+      const display = String(row.display || "").trim();
+      const isSlash = String(row.type || "") === "slash_command" || display.startsWith("/");
+      const prev = map.get(id);
+      const title = !isSlash && display && !isGrokSmokePrompt(display)
+        ? display.slice(0, 80)
+        : (prev?.title || "");
+      map.set(id, {
+        // Keep the most specific workspace seen for this conversation.
+        cwd: preferLongestPath(cwd, prev?.cwd),
+        title: title || prev?.title || "",
+        mtime: Math.max(prev?.mtime ?? 0, mtime)
+      });
+    } catch {
+      // ignore
+    }
+  }
+  return map;
+}
+
+async function importAntigravitySessions(store: TaskStore, limit: number): Promise<number> {
+  const brainIds = await listAgyBrainIds();
+  if (!brainIds.length) return 0;
+  const history = await readAgyHistoryIndex();
+  const metaPath = path.join(os.homedir(), ".gemini", "antigravity-cli", "cache", "conversation_metadata.json");
+  let conversations: Record<string, {
+    is_internal?: boolean;
+    last_modified_time?: string;
+    summary?: {
+      Title?: string;
+      Preview?: string;
+      WorkspaceURIs?: string[];
+      UpdatedAt?: string;
+      AppDataDir?: string;
+    };
+  }> = {};
+  try {
+    const raw = JSON.parse(await fs.readFile(metaPath, "utf8")) as {
+      conversations?: Record<string, typeof conversations[string]>;
+    };
+    conversations = raw.conversations || {};
+  } catch {
+    conversations = {};
+  }
+
+  type Hit = { id: string; cwd: string; title: string; mtime: number };
+  const hits: Hit[] = [];
+  for (const id of brainIds) {
+    const hist = history.get(id);
+    const row = conversations[id];
+    if (row?.is_internal) continue;
+    const summary = row?.summary || {};
+    // GUI Antigravity (`AppDataDir: "antigravity"`) lives elsewhere; CLI chats are brain/<id>.
+    // Prefer the most specific workspace path among history + WorkspaceURIs.
+    const cwd = preferLongestPath(
+      hist?.cwd,
+      ...(summary.WorkspaceURIs || []).map((uri) => fileUriToPath(uri || ""))
+    );
+    if (isEphemeralImportCwd(cwd)) continue;
+    let mtime = hist?.mtime || 0;
+    if (!mtime) {
+      try {
+        const st = await fs.stat(path.join(
+          os.homedir(),
+          ".gemini",
+          "antigravity-cli",
+          "brain",
+          id,
+          ".system_generated",
+          "logs",
+          "transcript.jsonl"
+        ));
+        mtime = st.mtimeMs / 1000;
+      } catch {
+        mtime = parseIsoToUnix(row?.last_modified_time) || parseIsoToUnix(summary.UpdatedAt) || Date.now() / 1000;
+      }
+    }
+    const title = hist?.title || String(summary.Title || summary.Preview || "").trim() || `Antigravity ${id.slice(0, 8)}`;
+    hits.push({ id, cwd, title, mtime });
+  }
+  hits.sort((a, b) => b.mtime - a.mtime);
+
+  let added = 0;
+  // Over-scan so empty/smoke chats do not starve the recent window of `limit`.
+  for (const hit of hits.slice(0, Math.max(limit * 5, limit))) {
+    const existing = resolveExistingForProviderSession(store, hit.id, "antigravity");
+    const importedMessages = await readAntigravityTranscript(hit.id);
+    if (!hasUsefulTranscript(importedMessages)) continue;
+    const userTexts = importedMessages
+      .filter((message) => message.role === "user")
+      .map((message) => message.text.trim())
+      .filter(Boolean);
+    if (userTexts.length && userTexts.every((text) => isGrokSmokePrompt(text))) continue;
+    if (added >= limit) break;
+    const existingMessages = sanitizeTranscriptMessages(existing?.messages || []);
+    const mergedMessages = importedMessages.length ? importedMessages : existingMessages;
+    const titleFromUser = mergedMessages.find((m) => m.role === "user")?.text?.slice(0, 80);
+    const threadId = existing?.threadId || hit.id;
+    const task: StoredTask = {
+      threadId,
+      engine: "antigravity",
+      providerSessionId: hit.id,
+      cwd: hit.cwd || existing?.cwd || "",
+      title: existing?.title || titleFromUser || hit.title,
+      status: mergeImportStatus(existing),
+      createdAt: existing?.createdAt ?? hit.mtime,
+      updatedAt: Math.max(existing?.updatedAt ?? 0, hit.mtime),
+      messages: mergedMessages.slice(-80),
+      ...(existing?.model ? { model: existing.model } : {}),
+      ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
+      ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})
+    };
+    await store.upsert(task);
+    await removeOrphanNativeDuplicate(store, hit.id, threadId);
+    added += 1;
+  }
+  return added;
+}
+
 /**
  * Collapse Claude/Grok/Cursor duplicates: same engine + provider session should be one task.
  * Prefer the AnytimeVibe UUID record; keep failed/interrupted over a stale "completed" clone.
@@ -1097,7 +1339,7 @@ export async function dedupeMultiCliTasks(store: TaskStore): Promise<number> {
   const groups = new Map<string, StoredTask[]>();
   // list(1000) is enough for agent index size; import only keeps a recent window anyway.
   for (const task of store.list(1000)) {
-    if (task.engine !== "claude" && task.engine !== "grok" && task.engine !== "cursor") continue;
+    if (task.engine !== "claude" && task.engine !== "grok" && task.engine !== "cursor" && task.engine !== "antigravity") continue;
     const native = (task.providerSessionId || task.threadId || "").trim();
     if (!native) continue;
     const key = `${task.engine}:${native}`;
@@ -1136,16 +1378,47 @@ export async function dedupeMultiCliTasks(store: TaskStore): Promise<number> {
   return removed;
 }
 
+/** Native CLI import (threadId is the vendor session). Web-created UUID tasks are kept. */
+function isNativeKeyedCliImport(task: StoredTask): boolean {
+  if (task.engine === "codex") return false;
+  const native = (task.providerSessionId || task.threadId || "").trim();
+  if (!native) return false;
+  if (task.providerSessionId && task.threadId !== task.providerSessionId) return false;
+  return true;
+}
+
+/**
+ * Native-keyed CLI imports older than the per-engine recent window.
+ * Do not tombstone these — they may re-enter the window later.
+ */
+export function listStaleNativeImportThreadIds(store: TaskStore, limit: number): string[] {
+  const cap = Math.max(1, limit);
+  const byEngine = new Map<string, StoredTask[]>();
+  for (const task of store.list(1000)) {
+    if (!isNativeKeyedCliImport(task)) continue;
+    const list = byEngine.get(task.engine) ?? [];
+    list.push(task);
+    byEngine.set(task.engine, list);
+  }
+  const stale: string[] = [];
+  for (const list of byEngine.values()) {
+    list.sort((a, b) => b.updatedAt - a.updatedAt);
+    for (const extra of list.slice(cap)) stale.push(extra.threadId);
+  }
+  return stale;
+}
+
 /** Import local Claude/Grok/Cursor CLI sessions into the agent task index for web sync. */
 export async function importLocalCliSessions(
   store: TaskStore,
   limit = 10,
   allowedRoots: string[] = []
-): Promise<{ grok: number; claude: number; cursor: number; junkCursorIds: string[]; junkGrokIds: string[] }> {
-  const [grok, claude, cursor] = await Promise.all([
+): Promise<{ grok: number; claude: number; cursor: number; antigravity: number; junkCursorIds: string[]; junkGrokIds: string[]; staleNativeIds: string[] }> {
+  const [grok, claude, cursor, antigravity] = await Promise.all([
     importGrokSessions(store, limit),
     importClaudeSessions(store, limit, allowedRoots),
-    importCursorSessions(store, limit)
+    importCursorSessions(store, limit),
+    importAntigravitySessions(store, limit)
   ]);
   try {
     await dedupeMultiCliTasks(store);
@@ -1154,5 +1427,9 @@ export async function importLocalCliSessions(
   }
   const junkCursorIds = listJunkCursorImportThreadIds(store);
   const junkGrokIds = listJunkGrokImportThreadIds(store);
-  return { grok, claude, cursor, junkCursorIds, junkGrokIds };
+  const staleNativeIds = listStaleNativeImportThreadIds(store, limit);
+  for (const id of staleNativeIds) {
+    await store.remove(id);
+  }
+  return { grok, claude, cursor, antigravity, junkCursorIds, junkGrokIds, staleNativeIds };
 }

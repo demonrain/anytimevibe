@@ -877,6 +877,244 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
   };
 }
 
+const AGY_EFFORTS: Array<"low" | "medium" | "high"> = ["low", "medium", "high"];
+
+const ANTIGRAVITY_FALLBACK_MODELS: EngineModelOption[] = [
+  { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", reasoningEfforts: ["low", "medium", "high"] },
+  { id: "gemini-3.6-flash", label: "Gemini 3.6 Flash", reasoningEfforts: ["low", "medium", "high"] },
+  { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", reasoningEfforts: ["low", "medium", "high"] },
+  { id: "gemini-3.1-pro", label: "Gemini 3.1 Pro", reasoningEfforts: ["low", "high"] },
+  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 (Thinking)" },
+  { id: "claude-opus-4-6-thinking", label: "Claude Opus 4.6 (Thinking)" },
+  { id: "gpt-oss-120b", label: "GPT-OSS 120B", reasoningEfforts: ["medium"] }
+];
+
+/** Label/id → family id, filled by the last `agy models` discovery. */
+const agyLabelToFamily = new Map<string, string>();
+const agyFamilyEfforts = new Map<string, Array<"low" | "medium" | "high">>();
+
+function rememberAgyCatalog(models: EngineModelOption[]): void {
+  agyLabelToFamily.clear();
+  agyFamilyEfforts.clear();
+  for (const model of models) {
+    agyLabelToFamily.set(model.id.toLowerCase(), model.id);
+    agyLabelToFamily.set(model.label.toLowerCase(), model.id);
+    const efforts = (model.reasoningEfforts || []).filter((item): item is "low" | "medium" | "high" => (
+      item === "low" || item === "medium" || item === "high"
+    ));
+    if (efforts.length) {
+      agyFamilyEfforts.set(model.id, efforts);
+      for (const effort of efforts) {
+        agyLabelToFamily.set(`${model.id}-${effort}`.toLowerCase(), model.id);
+        agyLabelToFamily.set(`${model.label} (${effort})`.toLowerCase(), model.id);
+      }
+    }
+  }
+}
+rememberAgyCatalog(ANTIGRAVITY_FALLBACK_MODELS);
+
+export function splitAgyEffortSuffix(id: string): { base: string; effort?: "low" | "medium" | "high" } {
+  const trimmed = id.trim();
+  const match = trimmed.match(/^(.*)-(low|medium|high)$/i);
+  if (!match?.[1] || !match[2]) return { base: trimmed };
+  return { base: match[1], effort: match[2].toLowerCase() as "low" | "medium" | "high" };
+}
+
+function parseAgyDisplayName(raw: string): { label: string; effort?: "low" | "medium" | "high" } {
+  const match = raw.trim().match(/^(.*?)\s*\((low|medium|high)\)$/i);
+  if (match?.[1] && match[2]) {
+    return { label: match[1].trim(), effort: match[2].toLowerCase() as "low" | "medium" | "high" };
+  }
+  return { label: raw.trim() };
+}
+
+function mapAgyEffortValue(effort?: ReasoningEffort | string | null): "low" | "medium" | "high" | undefined {
+  if (effort === "low" || effort === "medium" || effort === "high") return effort;
+  if (effort === "xhigh" || effort === "max") return "high";
+  return undefined;
+}
+
+/**
+ * agy `--model` 要 CLI id（如 gemini-3.7-flash），`--effort` 单独传。
+ * 显示名 "Gemini 3.7 Flash (High)" 或已带后缀的 id 都不能再叠 `--effort`。
+ */
+export function formatAgySpawnArgs(
+  model?: string,
+  effort?: ReasoningEffort
+): { model?: string; effort?: "low" | "medium" | "high" } {
+  let raw = (model || "").trim();
+  let fromName: "low" | "medium" | "high" | undefined;
+  if (raw && /\s/.test(raw)) {
+    const display = parseAgyDisplayName(raw);
+    fromName = display.effort;
+    raw = agyLabelToFamily.get(raw.toLowerCase())
+      || agyLabelToFamily.get(display.label.toLowerCase())
+      || "";
+  } else if (raw) {
+    const split = splitAgyEffortSuffix(raw);
+    fromName = split.effort;
+    raw = agyLabelToFamily.get(raw.toLowerCase())
+      || agyLabelToFamily.get(split.base.toLowerCase())
+      || split.base;
+  }
+  const split = raw ? splitAgyEffortSuffix(raw) : { base: "" };
+  const base = split.base;
+  const familyEfforts = base ? agyFamilyEfforts.get(base) : undefined;
+  const catalogReady = agyFamilyEfforts.size > 0 || agyLabelToFamily.size > 0;
+  const supportsEffort = catalogReady
+    ? Boolean(familyEfforts?.length)
+    : Boolean(fromName || split.effort || mapAgyEffortValue(effort));
+  const chosen = mapAgyEffortValue(effort) || fromName || split.effort;
+  if (!base) {
+    return chosen && supportsEffort ? { effort: chosen } : {};
+  }
+  if (!supportsEffort) return { model: base };
+  const allowed = familyEfforts?.length ? familyEfforts : AGY_EFFORTS;
+  const next = chosen && allowed.includes(chosen) ? chosen : allowed[0];
+  return next ? { model: base, effort: next } : { model: base };
+}
+
+function parseAgyModelsOutput(raw: string): Array<{ id: string; label: string }> {
+  const out: Array<{ id: string; label: string }> = [];
+  const seen = new Set<string>();
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.replace(/^[-*•]\s*/, "").trim();
+    if (!trimmed) continue;
+    if (/^fetching\b|^available models|^usage\b|^error:/i.test(trimmed)) continue;
+    const m = trimmed.match(/^([a-z0-9][\w./+-]*)\s{1,}(.+)$/i)
+      || trimmed.match(/^([a-z0-9][\w./+-]+)\s*$/i);
+    if (!m?.[1]) continue;
+    const id = m[1].trim();
+    if (!id || seen.has(id) || id.includes(" ")) continue;
+    seen.add(id);
+    out.push({ id, label: (m[2] || id).trim() || id });
+  }
+  return out;
+}
+
+function ingestAgyModelRow(
+  id: string,
+  label: string,
+  models: EngineModelOption[],
+  seen: Set<string>
+): void {
+  const split = splitAgyEffortSuffix(id);
+  const display = parseAgyDisplayName(label);
+  const familyId = split.effort ? split.base : id;
+  const familyLabel = display.effort ? display.label : (label || familyId);
+  let row = models.find((item) => item.id === familyId);
+  if (!row) {
+    if (seen.has(familyId)) return;
+    seen.add(familyId);
+    row = { id: familyId, label: familyLabel };
+    models.push(row);
+  }
+  const effort = split.effort || display.effort;
+  if (!effort) return;
+  const list = row.reasoningEfforts ? [...row.reasoningEfforts] : [];
+  if (!list.includes(effort)) list.push(effort);
+  row.reasoningEfforts = AGY_EFFORTS.filter((item) => list.includes(item));
+}
+
+async function runAgyModelsList(command: string): Promise<string | null> {
+  try {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+    const isWindows = process.platform === "win32";
+    const { windowsCmdArguments } = await import("../windows-command");
+    const { cloudProxyChildEnv } = await import("../local-proxy");
+    const env = await cloudProxyChildEnv();
+    const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
+    const finalArgs = isWindows ? windowsCmdArguments(command, ["models"]) : ["models"];
+    const { stdout, stderr } = await execFileAsync(executable, finalArgs, {
+      timeout: 15_000,
+      windowsHide: true,
+      windowsVerbatimArguments: isWindows,
+      env,
+      maxBuffer: 512_000
+    });
+    const text = `${stdout || ""}\n${stderr || ""}`.trim();
+    if (text && !/unknown command|unrecognized|error:/i.test(text.slice(0, 200))) return text;
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+async function discoverAntigravityCapability(): Promise<EngineCapability> {
+  const models: EngineModelOption[] = [];
+  const seen = new Set<string>();
+  let currentModel: string | undefined;
+  let currentReasoningEffort: ReasoningEffort | undefined;
+
+  try {
+    const { resolveEngineBinary } = await import("./detect");
+    const binary = await resolveEngineBinary("antigravity");
+    if (binary) {
+      const raw = await runAgyModelsList(binary);
+      if (raw) {
+        for (const item of parseAgyModelsOutput(raw)) {
+          ingestAgyModelRow(item.id, item.label, models, seen);
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  if (!models.length) {
+    for (const item of ANTIGRAVITY_FALLBACK_MODELS) {
+      models.push({
+        id: item.id,
+        label: item.label,
+        ...(item.reasoningEfforts ? { reasoningEfforts: [...item.reasoningEfforts] } : {})
+      });
+      seen.add(item.id);
+    }
+  }
+
+  const settingsRaw = await readText(path.join(os.homedir(), ".gemini", "antigravity-cli", "settings.json"));
+  let settingsLabel = "";
+  if (settingsRaw) {
+    try {
+      const settings = JSON.parse(settingsRaw) as { model?: string };
+      settingsLabel = String(settings.model || "").trim();
+    } catch {
+      // ignore
+    }
+  }
+  rememberAgyCatalog(models);
+  if (settingsLabel) {
+    const display = parseAgyDisplayName(settingsLabel);
+    const family = agyLabelToFamily.get(settingsLabel.toLowerCase())
+      || agyLabelToFamily.get(display.label.toLowerCase())
+      || models.find((item) => item.label.toLowerCase() === display.label.toLowerCase())?.id
+      || models.find((item) => item.id.toLowerCase() === settingsLabel.toLowerCase())?.id;
+    if (family) {
+      currentModel = family;
+      const allowed = agyFamilyEfforts.get(family) || [];
+      currentReasoningEffort = display.effort && allowed.includes(display.effort)
+        ? display.effort
+        : allowed[0];
+    }
+  }
+
+  const effortUnion = new Set<ReasoningEffort>();
+  for (const model of models) {
+    for (const effort of model.reasoningEfforts || []) effortUnion.add(effort);
+  }
+  const reasoningEfforts = AGY_EFFORTS.filter((item) => effortUnion.has(item));
+
+  return {
+    engine: "antigravity",
+    models,
+    reasoningEfforts,
+    ...(currentModel ? { currentModel } : {}),
+    ...(currentReasoningEffort ? { currentReasoningEffort } : {})
+  };
+}
+
 /**
  * Build Cursor CLI `--model` slug from base id + effort + optional fast flag.
  * Emits `gpt-5.6-sol-medium-fast`, never legacy `gpt-5.6-sol[fast=true]`.
@@ -904,11 +1142,12 @@ export function formatCursorModelArg(
 
 /** Collect model + effort options from local CLI configs/caches on this machine. */
 export async function discoverEngineCapabilities(): Promise<EngineCapability[]> {
-  const [codex, claude, grok, cursor] = await Promise.all([
+  const [codex, claude, grok, cursor, antigravity] = await Promise.all([
     discoverCodexCapability(),
     discoverClaudeCapability(),
     discoverGrokCapability(),
-    discoverCursorCapability()
+    discoverCursorCapability(),
+    discoverAntigravityCapability()
   ]);
-  return [codex, claude, grok, cursor];
+  return [codex, claude, grok, cursor, antigravity];
 }

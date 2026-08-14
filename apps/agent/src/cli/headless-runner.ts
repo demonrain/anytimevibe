@@ -4,10 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/protocol";
-import { cloudProxyChildEnv, ensureCursorHttp1ForProxy, collectLocalProxyEnv } from "../local-proxy";
+import { cloudProxyChildEnv, collectLocalProxyEnv, ensureCursorHttp1ForProxy, stripProxyFromEnv } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
-import { formatCursorModelArg, parseCursorModelRef } from "./model-catalog";
+import { formatAgySpawnArgs, formatCursorModelArg, parseCursorModelRef } from "./model-catalog";
 import { explainGrokSerializationError, prepareGrokResponsesCompat } from "./grok-responses-compat";
 import { headlessPermissionArgs } from "./permission-args";
 import type { ApprovalPlan, ApprovalQuestion, BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
@@ -41,7 +41,7 @@ const CURSOR_STALL_MS = Number(process.env.ANYTIMEVIBE_CURSOR_STALL_MS || 120_00
 
 /**
  * Kill the CLI process tree. On Windows headless spawns go through cmd.exe — bare
- * child.kill() only ends the shell and leaves claude/grok/cursor running.
+ * child.kill() only ends the shell and leaves claude/grok/cursor/agy running.
  */
 function killChildTree(child: ChildProcess): void {
   const pid = child.pid;
@@ -151,6 +151,23 @@ function buildArgs(
     args.push(options.prompt);
     return args;
   }
+  if (engine === "antigravity") {
+    const printTimeout = formatAgyPrintTimeout(HEADLESS_MAX_TIMEOUT_MS);
+    const spawn = formatAgySpawnArgs(
+      options.model || process.env.AGY_MODEL || process.env.ANTIGRAVITY_MODEL,
+      options.reasoningEffort
+    );
+    args.push(
+      "-p", options.prompt,
+      "--output-format", "stream-json",
+      "--print-timeout", printTimeout
+    );
+    if (spawn.model) args.push("--model", spawn.model);
+    if (spawn.effort) args.push("--effort", spawn.effort);
+    if (options.providerSessionId) args.push("--conversation", options.providerSessionId);
+    args.push(...headlessPermissionArgs(engine, options.permissionMode));
+    return args;
+  }
   // Grok Build CLI (distinct binary: grok, not agent)
   const model = (options.model || process.env.GROK_MODEL || process.env.XAI_MODEL || "").trim();
   args.push(
@@ -167,6 +184,12 @@ function buildArgs(
   if (options.providerSessionId) args.push("--resume", options.providerSessionId);
   args.push(...headlessPermissionArgs(engine, options.permissionMode));
   return args;
+}
+
+function formatAgyPrintTimeout(ms: number): string {
+  const minutes = Math.max(1, Math.ceil(ms / 60_000));
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
 }
 
 function usageFromUnknown(raw: unknown, contextWindow?: number): ContextUsage | undefined {
@@ -237,6 +260,10 @@ type ParseState = {
   emittedApprovalIds?: Set<string>;
   /** Pause/kill headless Cursor so Web can answer createPlan / askQuestion. */
   pauseForApproval?: boolean;
+  /** Last assistant snapshot from Antigravity (for cumulative text_delta / result.response). */
+  agyJsonBuf?: string;
+  /** Antigravity tool step keys already announced. */
+  agySeenTools?: Set<string>;
 };
 
 /** Strip UI prefixes so "错误：API Error" and "API Error" dedupe as one. */
@@ -274,18 +301,27 @@ function asRecord(value: unknown): Record<string, any> | null {
 function normalizeApprovalQuestions(raw: unknown): ApprovalQuestion[] {
   if (!Array.isArray(raw)) return [];
   const out: ApprovalQuestion[] = [];
-  for (const item of raw) {
+  for (const [index, item] of raw.entries()) {
     const row = asRecord(item);
     if (!row) continue;
-    const id = String(row.id || "").trim();
-    const prompt = String(row.prompt || row.question || row.text || "").trim();
-    const optionsRaw = Array.isArray(row.options) ? row.options : [];
+    const id = String(row.id || row.questionId || row.question_id || `q${index + 1}`).trim();
+    const prompt = String(
+      row.prompt || row.question || row.text || row.title || row.header || ""
+    ).trim();
+    const optionsRaw = Array.isArray(row.options)
+      ? row.options
+      : (Array.isArray(row.choices) ? row.choices : []);
     const options: Array<{ id: string; label: string }> = [];
-    for (const opt of optionsRaw) {
+    for (const [optIndex, opt] of optionsRaw.entries()) {
+      if (typeof opt === "string" && opt.trim()) {
+        const label = opt.trim();
+        options.push({ id: label, label });
+        continue;
+      }
       const o = asRecord(opt);
       if (!o) continue;
-      const oid = String(o.id || o.value || "").trim();
-      const label = String(o.label || o.text || o.title || oid).trim();
+      const label = String(o.label || o.text || o.title || o.name || o.value || "").trim();
+      const oid = String(o.id || o.value || o.name || label || `opt${optIndex + 1}`).trim();
       if (!oid || !label) continue;
       options.push({ id: oid, label });
     }
@@ -294,7 +330,7 @@ function normalizeApprovalQuestions(raw: unknown): ApprovalQuestion[] {
       id,
       prompt,
       options,
-      ...(row.allowMultiple === true ? { allowMultiple: true } : {})
+      ...(row.allowMultiple === true || row.allow_multiple === true ? { allowMultiple: true } : {})
     });
   }
   return out;
@@ -338,7 +374,13 @@ function emitCursorInteractiveApproval(
   payload: { plan?: ApprovalPlan; questions?: ApprovalQuestion[]; title: string; detail: string }
 ): void {
   if (!state.emittedApprovalIds) state.emittedApprovalIds = new Set();
-  if (state.emittedApprovalIds.has(callId)) return;
+  const already = state.emittedApprovalIds.has(callId);
+  // Allow a richer completed payload to replace a sparse started emission.
+  if (already) {
+    const richerQuestion = kind === "question" && (payload.questions?.length || 0) > 0;
+    const richerPlan = kind === "plan" && Boolean(payload.plan?.plan);
+    if (!richerQuestion && !richerPlan) return;
+  }
   state.emittedApprovalIds.add(callId);
   state.pauseForApproval = true;
   onEvent({
@@ -627,8 +669,15 @@ function handleCursorLine(
       if (!questions.length) {
         questions = normalizeApprovalQuestions(asRecord(args.success)?.questions);
       }
-      if (questions.length && (subtype === "started" || subtype === "completed")) {
-        const title = String(args.title || "Cursor 需要你选择选项").trim() || "Cursor 需要你选择选项";
+      if (!questions.length) {
+        questions = normalizeApprovalQuestions(askNode.questions);
+      }
+      // Prefer completed (full args). Emit on started only when questions are already complete —
+      // empty started + immediate kill was leaving the Web card with title and no options.
+      const ready = questions.length > 0;
+      if (ready && (subtype === "completed" || subtype === "started")) {
+        const title = String(args.title || askNode.title || "Cursor 需要你选择选项").trim()
+          || "Cursor 需要你选择选项";
         const detail = questions
           .map((q) => `${q.prompt}\n${q.options.map((o) => `  - ${o.label}`).join("\n")}`)
           .join("\n\n")
@@ -644,6 +693,39 @@ function handleCursorLine(
           `stage:tool:${callId}`,
           "stage",
           subtype === "started" ? `\n▶ 提问选项（等待 Web 选择）\n` : `\n✓ 选项已就绪（等待 Web 选择）\n`
+        );
+        return;
+      }
+      if (subtype === "started") {
+        emitDelta(
+          onEvent,
+          options,
+          `stage:tool:${callId}`,
+          "stage",
+          `\n▶ 提问选项（等待完整选项…）\n`
+        );
+        return;
+      }
+      // completed without parseable questions (e.g. headless synthetic skip) — still surface a card.
+      if (subtype === "completed") {
+        const title = String(args.title || askNode.title || "Cursor 需要你选择选项").trim()
+          || "Cursor 需要你选择选项";
+        const detail = String(
+          args.prompt
+          || asRecord(args.success)?.message
+          || asRecord(askNode.result)?.message
+          || ""
+        ).trim() || "未能解析选项列表。请拒绝后在终端确认，或换一种提问方式重试。";
+        emitCursorInteractiveApproval(options, state, onEvent, callId, "question", {
+          title,
+          detail
+        });
+        emitDelta(
+          onEvent,
+          options,
+          `stage:tool:${callId}`,
+          "stage",
+          `\n⚠ 提问选项未完整解析（等待 Web 确认）\n`
         );
         return;
       }
@@ -772,6 +854,132 @@ function handleGrokLine(
   }
 }
 
+function agyStepText(step: Record<string, unknown>): string {
+  for (const key of ["text_delta", "text", "content", "response"]) {
+    const value = step[key];
+    if (typeof value === "string" && value) return value;
+  }
+  return "";
+}
+
+function isAgyNoiseLog(line: string): boolean {
+  return /codex_models_manager|failed to refresh available models|failed to decode models response/i.test(line);
+}
+
+/** Stream incremental tokens; if agy later sends a fuller snapshot, only emit the missing suffix. */
+function emitAgyAssistantText(
+  state: ParseState,
+  options: HeadlessRunOptions,
+  onEvent: (event: BackendStreamEvent) => void,
+  incoming: string
+): void {
+  if (!incoming) return;
+  if (incoming === state.text) return;
+  if (state.text && incoming.startsWith(state.text)) {
+    const extra = incoming.slice(state.text.length);
+    state.text = incoming;
+    state.sawAssistant = true;
+    if (extra) emitDelta(onEvent, options, "assistant", "assistant", extra);
+    return;
+  }
+  if (state.text && state.text.startsWith(incoming)) return;
+  const previous = state.text.replace(/\uFFFD+$/g, "");
+  if (previous && incoming.startsWith(previous) && incoming.length > previous.length) {
+    const extra = incoming.slice(previous.length);
+    state.text = incoming;
+    state.sawAssistant = true;
+    if (extra) emitDelta(onEvent, options, "assistant", "assistant", extra);
+    return;
+  }
+  state.text += incoming;
+  state.sawAssistant = true;
+  emitDelta(onEvent, options, "assistant", "assistant", incoming);
+}
+
+function handleAntigravityLine(
+  line: string,
+  options: HeadlessRunOptions,
+  state: ParseState,
+  onEvent: (event: BackendStreamEvent) => void
+): void {
+  state.lastProgressAt = Date.now();
+  const combined = `${state.agyJsonBuf || ""}${line}`.trim();
+  let parsed: any;
+  try {
+    parsed = JSON.parse(combined);
+    state.agyJsonBuf = "";
+  } catch {
+    if (combined.startsWith("{") && combined.length < 2_000_000) {
+      state.agyJsonBuf = combined;
+      return;
+    }
+    state.agyJsonBuf = "";
+    if (isAgyNoiseLog(line)) return;
+    emitDelta(onEvent, options, "cli-log", "cli-log", `${line}\n`);
+    return;
+  }
+
+  const eventName = String(parsed.event || "");
+  if (eventName === "init") {
+    const init = parsed.init && typeof parsed.init === "object" ? parsed.init : parsed;
+    const conversationId = parsed.conversation_id || init.conversation_id;
+    if (conversationId) state.sessionId = String(conversationId);
+    if (typeof init.model === "string" && init.model.trim()) state.model = init.model.trim();
+    return;
+  }
+
+  if (eventName === "step_update") {
+    const step = parsed.step_update && typeof parsed.step_update === "object" ? parsed.step_update : parsed;
+    const conversationId = step.conversation_id || parsed.conversation_id;
+    if (conversationId) state.sessionId = String(conversationId);
+    const stepType = String(step.step_type || "").toLowerCase();
+    const usage = usageFromUnknown(step.usage);
+    if (usage) {
+      state.contextUsage = usage;
+      onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
+    }
+    if (stepType === "user_input" || stepType === "checkpoint") return;
+    if (stepType === "tool") {
+      const name = String(step.tool_name || step.tool_info?.name || "tool");
+      const stepIndex = String(step.step_index ?? name);
+      const toolKey = `${stepIndex}:${name}`;
+      if (!state.agySeenTools) state.agySeenTools = new Set();
+      if (state.agySeenTools.has(toolKey)) return;
+      state.agySeenTools.add(toolKey);
+      emitDelta(onEvent, options, `stage:tool:${name}`, "stage", `\n▶ 调用 ${name}\n`);
+      return;
+    }
+    const incoming = agyStepText(step);
+    if (incoming) emitAgyAssistantText(state, options, onEvent, incoming);
+    return;
+  }
+
+  const result = eventName === "result"
+    ? (parsed.result && typeof parsed.result === "object" ? parsed.result : parsed)
+    : (parsed.status && parsed.conversation_id ? parsed : null);
+  if (result) {
+    state.gotResult = true;
+    if (result.conversation_id) state.sessionId = String(result.conversation_id);
+    const usage = usageFromUnknown(result.usage);
+    if (usage) {
+      state.contextUsage = usage;
+      onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
+    }
+    const status = String(result.status || "").toUpperCase();
+    if (status === "ERROR" || status === "INVALID") {
+      emitHeadlessErrorOnce(
+        state,
+        onEvent,
+        options,
+        String(result.error || result.response || "Antigravity 运行失败")
+      );
+      return;
+    }
+    const finalText = typeof result.response === "string" ? result.response : agyStepText(result);
+    if (finalText) emitAgyAssistantText(state, options, onEvent, finalText);
+  }
+}
+
 export async function runHeadlessTurn(
   engine: Exclude<CliEngine, "codex">,
   options: HeadlessRunOptions,
@@ -823,7 +1031,9 @@ export async function runHeadlessTurn(
       ? "未找到 Claude Code CLI，请安装并确保 claude 在 PATH 中"
       : engine === "cursor"
         ? "未找到 Cursor Agent CLI（agent / cursor-agent）。请执行官方安装脚本并登录：irm https://cursor.com/install?win32=true | iex"
-        : "未找到 Grok Build CLI，请安装并确保 grok 在 PATH 中";
+        : engine === "antigravity"
+          ? "未找到 Antigravity CLI（agy）。请安装：irm https://antigravity.google/cli/install.ps1 | iex"
+          : "未找到 Grok Build CLI，请安装并确保 grok 在 PATH 中";
     safeOnEvent({ type: "error", threadId: options.threadId, message });
     safeOnEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
     safeOnEvent({ type: "turn.completed", threadId: options.threadId, turnId: options.turnId, status: "failed" });
@@ -850,11 +1060,20 @@ export async function runHeadlessTurn(
     }
   }
   // Cursor/Claude/Grok must egress via proxy (IP region gates Cursor model list).
-  let env = await cloudProxyChildEnv({
-    CI: process.env.CI || "1",
-    TERM: process.env.TERM || "dumb",
-    NO_COLOR: process.env.NO_COLOR || "1"
-  });
+  // Antigravity (agy) talks to Google; injecting the local Codex/Cursor gateway as HTTP_PROXY
+  // makes agy hit /v1/models (gpt-5.6-sol) and truncates UTF-8 streams.
+  let env = engine === "antigravity"
+    ? stripProxyFromEnv({
+      ...process.env,
+      CI: process.env.CI || "1",
+      TERM: process.env.TERM || "dumb",
+      NO_COLOR: process.env.NO_COLOR || "1"
+    })
+    : await cloudProxyChildEnv({
+      CI: process.env.CI || "1",
+      TERM: process.env.TERM || "dumb",
+      NO_COLOR: process.env.NO_COLOR || "1"
+    });
 
   // CCSwitch / Cockpit rewrite ~/.claude/settings.json env on account switch.
   // Merge into the child so this turn uses the new key/base_url without restarting AnytimeVibe.
@@ -907,7 +1126,9 @@ export async function runHeadlessTurn(
     ? "Claude Code"
     : engine === "cursor"
       ? "Cursor Agent"
-      : "Grok Build";
+      : engine === "antigravity"
+        ? "Antigravity"
+        : "Grok Build";
   emitDelta(
     safeOnEvent,
     options,
@@ -915,7 +1136,7 @@ export async function runHeadlessTurn(
     "stage",
     `\n▶ 使用 ${engineLabel} 执行\n`
   );
-  if (Object.keys(proxy).length) {
+  if (Object.keys(proxy).length && engine !== "antigravity") {
     const proxyNote = engine === "cursor"
       ? "\n… 已注入本机代理环境（NODE_USE_ENV_PROXY + HTTP/1.1 fallback）\n"
       : "\n… 已注入本机代理环境\n";
@@ -1046,9 +1267,11 @@ export async function runHeadlessTurn(
       : null;
 
     if (child.stdout) {
-      createInterface({ input: child.stdout }).on("line", (line) => {
+      child.stdout.setEncoding("utf8");
+      createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (line) => {
         if (engine === "claude") handleClaudeLine(line, options, state, safeOnEvent);
         else if (engine === "cursor") handleCursorLine(line, options, state, safeOnEvent);
+        else if (engine === "antigravity") handleAntigravityLine(line, options, state, safeOnEvent);
         else handleGrokLine(line, options, state, safeOnEvent);
         if (state.sessionId && state.sessionId !== options.providerSessionId) {
           safeOnEvent({ type: "session", threadId: options.threadId, providerSessionId: state.sessionId });
@@ -1085,9 +1308,11 @@ export async function runHeadlessTurn(
       });
     }
     if (child.stderr) {
-      createInterface({ input: child.stderr }).on("line", (line) => {
+      child.stderr.setEncoding("utf8");
+      createInterface({ input: child.stderr, crlfDelay: Infinity }).on("line", (line) => {
         state.lastProgressAt = Date.now();
-        if (line.trim()) emitDelta(safeOnEvent, options, "cli-log", "cli-log", `${line}\n`);
+        if (!line.trim() || (engine === "antigravity" && isAgyNoiseLog(line))) return;
+        emitDelta(safeOnEvent, options, "cli-log", "cli-log", `${line}\n`);
       });
     }
     child.on("error", (error) => {
@@ -1150,7 +1375,9 @@ export async function runHeadlessTurn(
               ? `Claude 退出码 ${code ?? "unknown"}（模型不可用时请设置 CLAUDE_MODEL，或在 Claude CLI 中切换模型；未登录请执行 claude auth login）`
               : engine === "cursor"
                 ? `Cursor 退出码 ${code ?? "unknown"}（请确认已登录：agent login 或设置 CURSOR_API_KEY${cursorBinaryLabel ? `；实际二进制：${cursorBinaryLabel}` : ""}）`
-                : `Grok 退出码 ${code ?? "unknown"}`
+                : engine === "antigravity"
+                  ? `Antigravity 退出码 ${code ?? "unknown"}（请先运行 agy 完成登录；模型请用 agy models）`
+                  : `Grok 退出码 ${code ?? "unknown"}`
           );
         }
         finish("failed");

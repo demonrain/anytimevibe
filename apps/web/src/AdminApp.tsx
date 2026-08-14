@@ -394,7 +394,7 @@ export function AdminApp() {
           </div>
         </header>
         <p className="admin-hint" style={{ margin: "0 0 12px" }}>
-          「客户端」与「编码引擎」版本由桌面 Agent 上线后自动上报（Codex / Claude / Grok / Cursor）。「撤销」仅禁用配对；「删除」永久移除主机与同步密文。
+          「客户端」与「编码引擎」版本由桌面 Agent 上线后自动上报（Codex / Claude / Grok / Cursor / Antigravity）。「撤销」仅禁用配对；「删除」永久移除主机与同步密文。
         </p>
         <div className="admin-table-wrap">
           <table className="admin-table">

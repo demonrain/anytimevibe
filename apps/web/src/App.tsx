@@ -166,6 +166,10 @@ function modelOptionsFromHost(
   return models;
 }
 
+function usesPerModelEffort(engine: CliEngine): boolean {
+  return engine === "cursor" || engine === "antigravity";
+}
+
 function effortOptionsFromHost(
   capabilities: EngineCapability[] | undefined,
   engine: CliEngine,
@@ -177,24 +181,22 @@ function effortOptionsFromHost(
   const modelMeta = baseId
     ? cap?.models.find((item) => item.id === baseId)
     : undefined;
-  // Cursor (and engines with per-model catalogs): prefer model-specific efforts.
-  if (modelMeta?.reasoningEfforts?.length) {
-    const base = [...modelMeta.reasoningEfforts];
-    if (currentEffort && !base.includes(currentEffort)) base.unshift(currentEffort);
-    return base;
-  }
-  // Cursor models without effort (Composer / Auto / Grok) → no dropdown.
-  // Do NOT keep a stale currentEffort here: switching GPT→Auto must clear the picker.
-  if (engine === "cursor") {
+  // Cursor / Antigravity: per-model effort. Models without a list → no dropdown.
+  if (usesPerModelEffort(engine)) {
+    if (modelMeta?.reasoningEfforts?.length) {
+      const base = [...modelMeta.reasoningEfforts];
+      if (currentEffort && !base.includes(currentEffort)) base.unshift(currentEffort);
+      return base;
+    }
     return [];
   }
   const base = cap?.reasoningEfforts?.length
     ? [...cap.reasoningEfforts]
     : engine === "claude"
       ? (["low", "medium", "high", "xhigh", "max"] as ReasoningEffort[])
-      : engine === "grok"
-        ? (["low", "medium", "high", "xhigh"] as ReasoningEffort[])
-        : (["low", "medium", "high", "xhigh", "max"] as ReasoningEffort[]);
+        : engine === "grok"
+          ? (["low", "medium", "high", "xhigh"] as ReasoningEffort[])
+          : (["low", "medium", "high", "xhigh", "max"] as ReasoningEffort[]);
   if (currentEffort && !base.includes(currentEffort)) base.unshift(currentEffort);
   return base;
 }
@@ -485,7 +487,9 @@ function scrollWindowTop(): void {
 }
 
 function normalizeCliEngine(value: string | null | undefined): CliEngine {
-  if (value === "claude" || value === "grok" || value === "codex" || value === "cursor") return value;
+  if (value === "claude" || value === "grok" || value === "codex" || value === "cursor" || value === "antigravity") {
+    return value;
+  }
   return "codex";
 }
 
@@ -493,6 +497,7 @@ function cliEngineLabel(engine: CliEngine): string {
   if (engine === "claude") return "Claude Code";
   if (engine === "grok") return "Grok Build";
   if (engine === "cursor") return "Cursor";
+  if (engine === "antigravity") return "Antigravity";
   return "Codex";
 }
 
@@ -501,6 +506,7 @@ function assistantEngineBadge(engine: CliEngine): string {
   if (engine === "claude") return "CLAUDE";
   if (engine === "grok") return "GROK";
   if (engine === "cursor") return "CURSOR";
+  if (engine === "antigravity") return "AGY";
   return "CODEX";
 }
 
@@ -563,6 +569,14 @@ function permissionOptionsForEngine(engine: CliEngine, locale: "zh-CN" | "en"): 
           { value: "ask-for-approval", label: "允许改文件 (--force)" },
           { value: "full-access", label: "全自动写盘 (--force)" }
         ];
+  }
+  if (engine === "antigravity") {
+    // agy `/permissions` Scope Picker: Project / Shared with Antigravity / Global
+    return [
+      { value: "ask-for-approval", label: "Project" },
+      { value: "approve-for-me", label: "Shared with Antigravity" },
+      { value: "full-access", label: "Global" }
+    ];
   }
   // codex
   return locale === "en"
@@ -1054,15 +1068,19 @@ const ApprovalActionCard = memo(function ApprovalActionCard({
 }) {
   const questions = approval.questions ?? [];
   const plan = approval.plan;
+  const hasPlan = Boolean(plan?.plan?.trim());
+  const renderableQuestions = questions.filter((question) =>
+    Boolean(question.prompt?.trim()) && (question.options?.length ?? 0) > 0
+  );
   const [selected, setSelected] = useState<Record<string, string[]>>(() => {
     const init: Record<string, string[]> = {};
-    for (const question of questions) {
+    for (const question of renderableQuestions) {
       init[question.id] = [];
     }
     return init;
   });
 
-  const allAnswered = questions.length === 0 || questions.every((question) => {
+  const allAnswered = renderableQuestions.length === 0 || renderableQuestions.every((question) => {
     const picks = selected[question.id] || [];
     return picks.length > 0;
   });
@@ -1081,7 +1099,7 @@ const ApprovalActionCard = memo(function ApprovalActionCard({
   }
 
   function resolve(decision: "accept" | "decline" | "cancel") {
-    const answers = questions.map((question) => ({
+    const answers = renderableQuestions.map((question) => ({
       questionId: question.id,
       selectedOptionIds: selected[question.id] || []
     })).filter((item) => item.selectedOptionIds.length > 0);
@@ -1094,22 +1112,24 @@ const ApprovalActionCard = memo(function ApprovalActionCard({
     });
   }
 
-  const acceptLabel = plan
+  const acceptLabel = hasPlan
     ? "批准并执行"
-    : questions.length
+    : renderableQuestions.length
       ? "确认选择"
       : allowOnceLabel;
+  const detailText = sanitizeDisplayText(approval.detail || "");
+  const showDetailFallback = !hasPlan && renderableQuestions.length === 0;
 
   return (
     <article className="approval-card">
       <div className="approval-label">{actionRequiredLabel}</div>
-      <h3>{approval.title}</h3>
-      {plan ? (
+      <h3>{approval.title || "需要确认"}</h3>
+      {hasPlan ? (
         <div className="approval-plan">
-          {plan.name ? <strong className="approval-plan-name">{plan.name}</strong> : null}
-          {plan.overview ? <p className="approval-plan-overview">{sanitizeDisplayText(plan.overview)}</p> : null}
-          <pre>{sanitizeDisplayText(plan.plan || approval.detail)}</pre>
-          {plan.todos && plan.todos.length > 0 ? (
+          {plan?.name ? <strong className="approval-plan-name">{plan.name}</strong> : null}
+          {plan?.overview ? <p className="approval-plan-overview">{sanitizeDisplayText(plan.overview)}</p> : null}
+          <pre>{sanitizeDisplayText(plan?.plan || approval.detail)}</pre>
+          {plan?.todos && plan.todos.length > 0 ? (
             <ul className="approval-todos">
               {plan.todos.map((todo) => (
                 <li key={todo.id}>
@@ -1120,12 +1140,10 @@ const ApprovalActionCard = memo(function ApprovalActionCard({
             </ul>
           ) : null}
         </div>
-      ) : questions.length === 0 ? (
-        <pre>{sanitizeDisplayText(approval.detail)}</pre>
       ) : null}
-      {questions.length > 0 && (
+      {renderableQuestions.length > 0 && (
         <div className="approval-questions">
-          {questions.map((question) => (
+          {renderableQuestions.map((question) => (
             <div className="approval-question" key={question.id}>
               <p>{sanitizeDisplayText(question.prompt)}</p>
               <div className="approval-options">
@@ -1147,12 +1165,15 @@ const ApprovalActionCard = memo(function ApprovalActionCard({
           ))}
         </div>
       )}
+      {showDetailFallback ? (
+        <pre>{detailText || "未解析到可选项。请拒绝后重试，或在电脑端终端中确认。"}</pre>
+      ) : null}
       <div className="approval-actions">
         <button type="button" onClick={() => resolve("decline")}>{declineLabel}</button>
         <button
           type="button"
           className="approve"
-          disabled={questions.length > 0 && !allAnswered}
+          disabled={renderableQuestions.length > 0 && !allAnswered}
           onClick={() => resolve("accept")}
         >
           {acceptLabel}
@@ -1319,12 +1340,12 @@ const ConversationComposer = memo(function ConversationComposer({
             </label>
           )}
           <label className="composer-permission">
-            {taskEngine === "cursor" ? "Effort" : "推理强度"}
+            {taskEngine === "cursor" || taskEngine === "antigravity" ? "Effort" : "推理强度"}
             <select
               value={reasoningEffort}
               onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
               disabled={!effortOptions.length}
-              title={taskEngine === "cursor" && !effortOptions.length ? "当前模型不支持 effort" : undefined}
+              title={usesPerModelEffort(taskEngine) && !effortOptions.length ? "当前模型不支持 --effort" : undefined}
             >
               {!effortOptions.length && <option value="">—</option>}
               {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
@@ -1520,9 +1541,12 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       if (incoming && prev) {
         const a = incoming.replace(/[\\/]+$/, "").toLowerCase();
         const b = prev.replace(/[\\/]+$/, "").toLowerCase();
+        if (a === b) return incoming.length >= prev.length ? incoming : prev;
         if (a.startsWith(b + "\\") || a.startsWith(b + "/") || b.startsWith(a + "\\") || b.startsWith(a + "/")) {
           return incoming.length >= prev.length ? incoming : prev;
         }
+        // Unrelated paths: prefer the longer absolute path (usually the real project dir).
+        return incoming.length >= prev.length ? incoming : prev;
       }
       return incoming || prev || "";
     })();
@@ -1704,7 +1728,11 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     }
   }
   if (event.type === "diff.updated") task.diff = event.diff;
-  if (event.type === "approval.requested") task.approvals.push(event);
+  if (event.type === "approval.requested") {
+    // Replace same requestId so a richer completed payload can upgrade a sparse started card.
+    task.approvals = task.approvals.filter((item) => item.requestId !== event.requestId);
+    task.approvals.push(event);
+  }
   return next;
 }
 
@@ -1729,14 +1757,15 @@ const featuredEngines: Array<{ engine: CliEngine; vendor: string; product: strin
   { engine: "codex", vendor: "OpenAI", product: "Codex" },
   { engine: "claude", vendor: "Anthropic", product: "Claude Code" },
   { engine: "grok", vendor: "xAI", product: "Grok Build" },
-  { engine: "cursor", vendor: "Cursor", product: "Cursor Agent" }
+  { engine: "cursor", vendor: "Cursor", product: "Cursor Agent" },
+  { engine: "antigravity", vendor: "Google", product: "Antigravity" }
 ];
 
 function FeaturedEngines() {
   return <section className="featured-engines" aria-label="支持的 AI 编程引擎">
     <div className="featured-engines-head">
       <span>主流模型厂商</span>
-      <strong>四款均已支持 · 一台主机自由选择</strong>
+      <strong>五款均已支持 · 一台主机自由选择</strong>
     </div>
     <div className="featured-engine-grid" role="list">
       {featuredEngines.map((item) => <article className={`featured-engine featured-engine-${item.engine}`} role="listitem" key={item.engine}>
@@ -1780,7 +1809,7 @@ function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticat
     <section className="auth-story">
       <p className="eyebrow">随码 · 随时续码</p>
       <h1><span>随时随地，</span><span>灵感不断。</span></h1>
-      <p>随时从手机发起或继续电脑上的 AI 编程任务。Codex、Claude Code、Grok Build 与 Cursor Agent 在你的 Windows 或 macOS 主机上运行；云端仅转发加密消息，源码、凭据与工作区始终留在本机。</p>
+      <p>随时从手机发起或继续电脑上的 AI 编程任务。Codex、Claude Code、Grok Build、Cursor Agent 与 Google Antigravity 在你的 Windows 或 macOS 主机上运行；云端仅转发加密消息，源码、凭据与工作区始终留在本机。</p>
       <FeaturedEngines />
       <div className="signal-line"><span />端到端加密 · 本机执行</div>
       <ClientDownloads downloads={health.clientDownloads} />
@@ -2427,7 +2456,7 @@ export function App() {
           <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? t("hostOnline") : activeRuntime.online === false ? t("hostOffline") : t("hostChecking")}</div>
           {activeHost && keyAuthorizationStatus[activeHost.id] && <div className="key-authorization-note"><div><strong>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "正在授权此浏览器" : "此浏览器尚未取得主机密钥"}</strong><span>{activeRuntime.online === true ? "电脑端会自动完成端到端密钥授权。" : "请先让电脑端客户端上线，再重新授权。"}</span></div><button disabled={keyAuthorizationStatus[activeHost.id] === "authorizing" || activeRuntime.online !== true} onClick={() => authorizeExistingHost(activeHost.id).catch((authorizationError) => setError(authorizationError.message))}>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "授权中…" : "授权此浏览器"}</button></div>}
           <div className="engine-filter" role="toolbar" aria-label="按编码引擎筛选任务">
-            {(["codex", "claude", "grok", "cursor"] as CliEngine[]).map((engine) => {
+            {(["codex", "claude", "grok", "cursor", "antigravity"] as CliEngine[]).map((engine) => {
               const count = tasks.filter((task) => normalizeCliEngine(task.cliEngine) === engine).length;
               const active = engineFilter === engine;
               return (
@@ -2882,7 +2911,7 @@ function TaskConversation({
     if (task.reasoningEffort) {
       const baseModel = (task.model || prefs.model || model || "").split("[")[0] || "";
       const supported = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, baseModel);
-      if (taskEngine === "cursor" && supported.length === 0) {
+      if (usesPerModelEffort(taskEngine) && supported.length === 0) {
         // Task snapshot may still carry an old GPT effort after switching to Auto.
         setReasoningEffort("");
         saveTaskUiPrefs(task.threadId, { reasoningEffort: null });
@@ -2893,7 +2922,7 @@ function TaskConversation({
     } else if (prefs.reasoningEffort) {
       const baseModel = (task.model || prefs.model || model || "").split("[")[0] || "";
       const supported = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, baseModel);
-      if (taskEngine === "cursor" && supported.length === 0) {
+      if (usesPerModelEffort(taskEngine) && supported.length === 0) {
         setReasoningEffort("");
         saveTaskUiPrefs(task.threadId, { reasoningEffort: null });
       } else {
@@ -2901,7 +2930,7 @@ function TaskConversation({
       }
     } else {
       setReasoningEffort((current) => {
-        if (taskEngine === "cursor" && effortOptions.length === 0) return "";
+        if (usesPerModelEffort(taskEngine) && effortOptions.length === 0) return "";
         return current || cap?.currentReasoningEffort || effortOptions[0] || "";
       });
     }
@@ -2910,7 +2939,7 @@ function TaskConversation({
 
   // When model changes on Cursor, reset effort to first option for that model (or clear).
   useEffect(() => {
-    if (taskEngine !== "cursor") return;
+    if (!usesPerModelEffort(taskEngine)) return;
     const nextEfforts = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, model);
     setReasoningEffort((current) => {
       if (current && nextEfforts.includes(current as ReasoningEffort)) return current;
@@ -3353,7 +3382,7 @@ function TaskConversation({
       sendLabel={t("send")}
       stopLabel={t("stop")}
       resendLabel={t("resend")}
-      currentPermissionLabel={t("currentPermission")}
+      currentPermissionLabel={taskEngine === "antigravity" ? (locale === "en" ? "Scope" : "权限范围") : t("currentPermission")}
       agentReplyDetailLabel={t("agentReplyDetail")}
       replyConciseLabel={t("replyConcise")}
       replyDetailedLabel={t("replyDetailed")}
@@ -3626,7 +3655,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
     <div className="engine-picker">
       <span className="engine-picker-label">编码引擎</span>
       <div className="engine-picker-grid" role="radiogroup" aria-label="编码引擎">
-        {(["codex", "claude", "grok", "cursor"] as CliEngine[]).map((item) => {
+        {(["codex", "claude", "grok", "cursor", "antigravity"] as CliEngine[]).map((item) => {
           const info = availableEngines.find((entry) => entry.engine === item);
           const isReady = Boolean(info?.ready);
           const selected = engine === item;
@@ -3669,13 +3698,13 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
         <small style={{ color: "#6f756e" }}>部分模型（如 Composer / GPT）支持更快但更浅的推理</small>
       </label>
     )}
-    <label>{engineId === "cursor" ? "Effort（按模型）" : "推理强度"}
+    <label>{engineId === "cursor" || engineId === "antigravity" ? "Effort（--effort）" : "推理强度"}
       <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)} disabled={!engine || !effortOptions.length}>
-        {!effortOptions.length && <option value="">{engineId === "cursor" ? "当前模型无 effort" : "—"}</option>}
+        {!effortOptions.length && <option value="">{usesPerModelEffort(engineId) ? "当前模型无 --effort" : "—"}</option>}
         {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
       </select>
     </label>
-    <label>权限模式
+    <label>{engineId === "antigravity" ? "权限范围" : "权限模式"}
       <select value={taskPermission} onChange={(event) => setTaskPermission(normalizePermissionMode(event.target.value))} disabled={!engine}>
         {permissionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
       </select>
