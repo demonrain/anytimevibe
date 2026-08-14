@@ -56,7 +56,7 @@ import {
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn, normalizeSystemErrorText } from "./cli/headless-runner";
-import { importLocalCliSessions } from "./cli/import-sessions";
+import { importLocalCliSessions, sanitizeTranscriptMessages } from "./cli/import-sessions";
 import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
 import { startEngineConfigWatch } from "./cli/engine-config-watch";
 import { appendEngineDiffChunk, buildTurnDiff, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
@@ -3711,6 +3711,11 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     task.cwd = cwd;
     await taskStore.upsert(task);
   }
+  const messages = sanitizeTranscriptMessages(task.messages);
+  if (messages.length !== task.messages.length) {
+    task.messages = messages;
+    await taskStore.upsert(task);
+  }
   const agentTask: AgentTask = {
     threadId: task.threadId,
     title: task.title,
@@ -3741,7 +3746,7 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
     ...(task.lastDiff ? { diff: task.lastDiff } : {}),
-    messages: task.messages
+    messages: messages
   }, true);
 }
 

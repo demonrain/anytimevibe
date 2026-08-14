@@ -476,6 +476,34 @@ function isClaudeToolResultOnly(content: unknown): boolean {
   );
 }
 
+/**
+ * Claude TUI / jsonl tool I/O that must never become a YOU bubble.
+ * Edit/Read results are stored as role=user; after 接力 they get imported as "我的".
+ */
+export function looksLikeToolIoUserText(text: string | undefined | null): boolean {
+  const t = String(text || "").trim();
+  if (!t) return true;
+  if (/has been updated successfully/i.test(t)) return true;
+  if (/file state is current in your context/i.test(t)) return true;
+  if (/^The file .+ has been (updated|written|created)/i.test(t)) return true;
+  if (/^●\s*(Update|Write|Read|Edit|Bash|Deleted|Create|NotebookEdit)\(/m.test(t)) return true;
+  if (/^Added \d+ lines, removed \d+/m.test(t)) return true;
+  if (/^\[tool_result\]/i.test(t) || /^tool_use_id\b/i.test(t)) return true;
+  const lines = t.split(/\r?\n/).filter((line) => line.trim());
+  if (lines.length >= 8) {
+    const numbered = lines.filter((line) => /^\d+\t/.test(line)).length;
+    if (numbered / lines.length >= 0.7) return true;
+  }
+  return false;
+}
+
+export function sanitizeTranscriptMessages<T extends { role: string; text: string }>(messages: T[]): T[] {
+  return messages.filter((message) => {
+    if (message.role !== "user") return true;
+    return !looksLikeToolIoUserText(message.text);
+  });
+}
+
 function extractUserQuery(text: string): string {
   const match = text.match(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/i);
   if (match?.[1]?.trim()) return match[1].trim();
@@ -522,6 +550,7 @@ function cleanImportedMessageText(role: "user" | "assistant" | "system", raw: st
       .replace(/<agent_skills>[\s\S]*?<\/agent_skills>/gi, "")
       .replace(/<executing_actions_with_care>[\s\S]*?<\/executing_actions_with_care>/gi, "")
       .trim();
+    if (looksLikeToolIoUserText(text)) return null;
   }
   if (!text || isNoiseTranscriptText(text)) return null;
   return text.slice(0, 20_000);
@@ -1028,9 +1057,11 @@ async function importClaudeSessions(
       // ignore
     }
     const titleFromUser = [...messages].reverse().find((m) => m.role === "user")?.text?.slice(0, 80);
-    const mergedMessages = messages.length >= (existing?.messages?.length ?? 0)
-      ? messages
-      : (existing?.messages || messages);
+    // jsonl is source of truth after 接力. Do not keep a longer dirty store
+    // (old imports treated tool_result as YOU, so existing.length was inflated).
+    const importedMessages = sanitizeTranscriptMessages(messages);
+    const existingMessages = sanitizeTranscriptMessages(existing?.messages || []);
+    const mergedMessages = importedMessages.length ? importedMessages : existingMessages;
     // Keep AnytimeVibe threadId (UUID) when this native session was already bound to a web task.
     const threadId = existing?.threadId || hit.id;
     // Order: transcript cwd → filesystem-resolved project dir → existing store.

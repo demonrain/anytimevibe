@@ -648,6 +648,34 @@ function sanitizeDisplayText(text: string): string {
 }
 
 /**
+ * Claude stores Edit/Read tool_result as role=user. Those must not render as YOU / 我的.
+ * Keep this in sync with apps/agent/src/cli/import-sessions.ts looksLikeToolIoUserText.
+ */
+function looksLikeToolIoUserText(text: string | undefined | null): boolean {
+  const t = String(text || "").trim();
+  if (!t) return true;
+  if (/has been updated successfully/i.test(t)) return true;
+  if (/file state is current in your context/i.test(t)) return true;
+  if (/^The file .+ has been (updated|written|created)/i.test(t)) return true;
+  if (/^●\s*(Update|Write|Read|Edit|Bash|Deleted|Create|NotebookEdit)\(/m.test(t)) return true;
+  if (/^Added \d+ lines, removed \d+/m.test(t)) return true;
+  if (/^\[tool_result\]/i.test(t) || /^tool_use_id\b/i.test(t)) return true;
+  const lines = t.split(/\r?\n/).filter((line) => line.trim());
+  if (lines.length >= 8) {
+    const numbered = lines.filter((line) => /^\d+\t/.test(line)).length;
+    if (numbered / lines.length >= 0.7) return true;
+  }
+  return false;
+}
+
+function sanitizeTranscriptMessages<T extends { role: string; text: string }>(messages: T[]): T[] {
+  return messages.filter((message) => {
+    if (message.role !== "user") return true;
+    return !looksLikeToolIoUserText(message.text);
+  });
+}
+
+/**
  * Local / host filesystem paths must not become <a href> on the web UI.
  * Markdown often emits [text](H:/git/foo.md); browsers then treat `H:` as a URL scheme or
  * resolve a bare `/git/...` against the site origin (e.g. https://vibe.demonrain.top/).
@@ -876,9 +904,10 @@ const ChatMessageStream = memo(function ChatMessageStream({
 }) {
   const visibleMessages = useMemo(
     () => dedupeAdjacentUserMessages(
-      replyDetail === "detailed"
+      (replyDetail === "detailed"
         ? messages
         : messages.filter((message) => !isProcessStreamMessage(message))
+      ).filter((message) => message.role !== "user" || !looksLikeToolIoUserText(message.text))
     ),
     [messages, replyDetail]
   );
@@ -1443,7 +1472,9 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const activeTurnId = terminalStatus
       ? undefined
       : (event.activeTurnId || existing?.activeTurnId);
-    const rawMessages = event.messages?.length ? event.messages : (existing?.messages ?? []);
+    const rawMessages = sanitizeTranscriptMessages(
+      event.messages?.length ? event.messages : (existing?.messages ?? [])
+    );
     // Prefer the more specific absolute cwd (task subdir over bare workspace root when both known).
     const nextCwd = (() => {
       const incoming = String(event.cwd || "").trim();
