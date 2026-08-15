@@ -131,20 +131,15 @@ function titleFromCursorPromptHistory(history: string[]): string | undefined {
   return undefined;
 }
 
-function userPromptSet(messages: HistoryMessage[]): Set<string> {
-  const out = new Set<string>();
-  for (const message of messages) {
-    if (message.role !== "user") continue;
-    const text = String(message.text || "").trim();
-    if (text) out.add(text);
-  }
-  return out;
-}
-
 /**
  * Web-created Cursor tasks own their transcript via headless streaming.
  * Blindly preferring a longer store.db / prompt_history dump re-injects older
  * chats into the live task whenever sync runs at turn start/end.
+ *
+ * Never replace a web-bound transcript that already has real turns — even after
+ * the turn completes. "User-set equality" enrichment was still unsafe: identical
+ * re-sent prompts (or cleaned import subsets) let an older store.db win and
+ * surface previous YOU bubbles when the final snapshot lands.
  */
 function pickCursorMessagesForUpsert(
   existing: StoredTask | undefined,
@@ -152,37 +147,19 @@ function pickCursorMessagesForUpsert(
   imported: HistoryMessage[],
   historyMessages: HistoryMessage[]
 ): HistoryMessage[] {
-  let candidate = imported.length >= (existing?.messages?.length ?? 0)
-    ? imported
-    : (existing?.messages || imported);
-  if (!hasUsefulTranscript(candidate) && historyMessages.length) {
-    candidate = historyMessages;
-  } else if (!hasUsefulTranscript(candidate) && historyMessages.length > candidate.length) {
-    candidate = historyMessages;
-  }
-
   const existingMessages = existing?.messages || [];
   const isWebBound = Boolean(existing && existing.threadId !== nativeSessionId);
-  if (!isWebBound || !hasUsefulTranscript(existingMessages)) {
-    return candidate.length ? candidate : existingMessages;
-  }
-
-  const status = String(existing?.status || "").toLowerCase();
-  if (status === "active" || status === "running" || status === "processing") {
+  if (isWebBound && hasUsefulTranscript(existingMessages)) {
     return existingMessages;
   }
 
-  const webUsers = userPromptSet(existingMessages);
-  const importUsers = userPromptSet(candidate);
-  // Reject transcripts that introduce user turns AnytimeVibe never sent.
-  for (const text of importUsers) {
-    if (!webUsers.has(text)) return existingMessages;
+  let candidate = imported.length >= existingMessages.length
+    ? imported
+    : (existingMessages.length ? existingMessages : imported);
+  if (!hasUsefulTranscript(candidate) && historyMessages.length) {
+    candidate = historyMessages;
   }
-  // Allow assistant-only enrichment when import covers every web user prompt.
-  for (const text of webUsers) {
-    if (!importUsers.has(text)) return existingMessages;
-  }
-  return candidate.length >= existingMessages.length ? candidate : existingMessages;
+  return candidate.length ? candidate : existingMessages;
 }
 
 function messagesFromCursorPromptHistory(history: string[]): HistoryMessage[] {
@@ -279,7 +256,8 @@ async function readCursorSessionMessages(dbPath: string): Promise<{
     const { stdout } = await execFileAsync(py, ["-c", script], {
       timeout: 45_000,
       windowsHide: true,
-      maxBuffer: 16_000_000
+      maxBuffer: 16_000_000,
+      env: { ...process.env, PYTHONIOENCODING: "utf-8" }
     });
     const parsed = JSON.parse(String(stdout || "{}")) as {
       agentName?: string;
@@ -1240,6 +1218,79 @@ async function listAgyBrainIds(): Promise<string[]> {
   }
 }
 
+const AGY_CONVERSATION_ID_RE = /"conversationId"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/gi;
+
+/** Child conversation ids spawned via invoke_subagent — must not appear as top-level synced tasks. */
+function extractAgySubagentIdsFromTranscript(raw: string): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    // Fast reject: most transcript lines are unrelated.
+    if (!/INVOKE_SUBAGENT|subagent/i.test(line)) continue;
+    try {
+      const row = JSON.parse(line) as { type?: string; content?: unknown };
+      const type = String(row.type || "").toUpperCase();
+      const content = typeof row.content === "string" ? row.content : "";
+      if (!content) continue;
+      if (type !== "INVOKE_SUBAGENT" && !/subagent/i.test(content)) continue;
+      AGY_CONVERSATION_ID_RE.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = AGY_CONVERSATION_ID_RE.exec(content))) {
+        const id = match[1]!;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        ids.push(id);
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return ids;
+}
+
+async function loadAgySubagentConversationIds(brainIds: string[]): Promise<Set<string>> {
+  const ids = new Set<string>();
+  await Promise.all(brainIds.map(async (brainId) => {
+    const file = path.join(
+      os.homedir(),
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      brainId,
+      ".system_generated",
+      "logs",
+      "transcript.jsonl"
+    );
+    let raw = "";
+    try {
+      raw = await fs.readFile(file, "utf8");
+    } catch {
+      return;
+    }
+    for (const id of extractAgySubagentIdsFromTranscript(raw)) {
+      // A conversation is never its own subagent parent record.
+      if (id !== brainId) ids.add(id);
+    }
+  }));
+  return ids;
+}
+
+/** Already-imported Antigravity subagent sessions that should be dropped from the web list. */
+export function listAgySubagentImportThreadIds(store: TaskStore, subagentIds: Set<string>): string[] {
+  if (!subagentIds.size) return [];
+  return store.list(1000)
+    .filter((task) => {
+      if (task.engine !== "antigravity") return false;
+      const native = (task.providerSessionId || task.threadId || "").trim();
+      if (!native || !subagentIds.has(native)) return false;
+      // Keep AnytimeVibe web-bound tasks even if the native id somehow collides.
+      if (task.providerSessionId && task.threadId !== task.providerSessionId) return false;
+      return true;
+    })
+    .map((task) => task.threadId);
+}
+
 async function readAgyHistoryIndex(): Promise<Map<string, { cwd: string; title: string; mtime: number }>> {
   const map = new Map<string, { cwd: string; title: string; mtime: number }>();
   const file = path.join(os.homedir(), ".gemini", "antigravity-cli", "history.jsonl");
@@ -1282,10 +1333,14 @@ async function readAgyHistoryIndex(): Promise<Map<string, { cwd: string; title: 
   return map;
 }
 
-async function importAntigravitySessions(store: TaskStore, limit: number): Promise<number> {
+async function importAntigravitySessions(store: TaskStore, limit: number): Promise<{
+  added: number;
+  junkSubagentIds: string[];
+}> {
   const brainIds = await listAgyBrainIds();
-  if (!brainIds.length) return 0;
+  if (!brainIds.length) return { added: 0, junkSubagentIds: [] };
   const history = await readAgyHistoryIndex();
+  const subagentIds = await loadAgySubagentConversationIds(brainIds);
   const metaPath = path.join(os.homedir(), ".gemini", "antigravity-cli", "cache", "conversation_metadata.json");
   let conversations: Record<string, {
     is_internal?: boolean;
@@ -1310,6 +1365,9 @@ async function importAntigravitySessions(store: TaskStore, limit: number): Promi
   type Hit = { id: string; cwd: string; title: string; mtime: number };
   const hits: Hit[] = [];
   for (const id of brainIds) {
+    // Parent agents spawn research/coding subagents as separate brain/<id> chats —
+    // those must not appear as top-level synced sessions in the web list.
+    if (subagentIds.has(id)) continue;
     const hist = history.get(id);
     const row = conversations[id];
     if (row?.is_internal) continue;
@@ -1378,7 +1436,10 @@ async function importAntigravitySessions(store: TaskStore, limit: number): Promi
     await removeOrphanNativeDuplicate(store, hit.id, threadId);
     added += 1;
   }
-  return added;
+  return {
+    added,
+    junkSubagentIds: listAgySubagentImportThreadIds(store, subagentIds)
+  };
 }
 
 /**
@@ -1463,8 +1524,17 @@ export async function importLocalCliSessions(
   store: TaskStore,
   limit = 10,
   allowedRoots: string[] = []
-): Promise<{ grok: number; claude: number; cursor: number; antigravity: number; junkCursorIds: string[]; junkGrokIds: string[]; staleNativeIds: string[] }> {
-  const [grok, claude, cursor, antigravity] = await Promise.all([
+): Promise<{
+  grok: number;
+  claude: number;
+  cursor: number;
+  antigravity: number;
+  junkCursorIds: string[];
+  junkGrokIds: string[];
+  junkAgyIds: string[];
+  staleNativeIds: string[];
+}> {
+  const [grok, claude, cursor, agy] = await Promise.all([
     importGrokSessions(store, limit),
     importClaudeSessions(store, limit, allowedRoots),
     importCursorSessions(store, limit),
@@ -1477,9 +1547,19 @@ export async function importLocalCliSessions(
   }
   const junkCursorIds = listJunkCursorImportThreadIds(store);
   const junkGrokIds = listJunkGrokImportThreadIds(store);
+  const junkAgyIds = agy.junkSubagentIds;
   const staleNativeIds = listStaleNativeImportThreadIds(store, limit);
   for (const id of staleNativeIds) {
     await store.remove(id);
   }
-  return { grok, claude, cursor, antigravity, junkCursorIds, junkGrokIds, staleNativeIds };
+  return {
+    grok,
+    claude,
+    cursor,
+    antigravity: agy.added,
+    junkCursorIds,
+    junkGrokIds,
+    junkAgyIds,
+    staleNativeIds
+  };
 }

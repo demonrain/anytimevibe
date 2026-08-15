@@ -290,38 +290,33 @@ function textFromCodexUserItem(item: JsonObject): string {
 }
 
 /**
- * Keep user prompts that live in our store / live web transcript when Codex
- * thread/read omits them (common on systemerror / fail-fast turns).
+ * Keep the latest user prompt from our store / live transcript when Codex
+ * thread/read omits it (common on systemerror / fail-fast turns).
+ * Only restore the most recent missing YOU — merging every missing user from
+ * `extra` can re-inject stale prompts after a clean snapshot lands.
  */
 export function mergeSnapshotUserPrompts<T extends { id: string; role: string; text: string }>(
   incoming: T[],
   extra: Array<{ id?: string; role: string; text: string }>
 ): T[] {
   if (!extra.length) return incoming;
-  const seen = new Set(
-    incoming
-      .filter((message) => message.role === "user")
-      .map((message) => message.text.trim())
-      .filter(Boolean)
+  const lastExtraUser = [...extra]
+    .reverse()
+    .find((message) => message.role === "user" && message.text.trim());
+  if (!lastExtraUser) return incoming;
+  const text = lastExtraUser.text.trim();
+  const already = incoming.some(
+    (message) => message.role === "user" && message.text.trim() === text
   );
-  const missing = extra.filter((message) => {
-    if (message.role !== "user") return false;
-    const text = message.text.trim();
-    if (!text || seen.has(text)) return false;
-    seen.add(text);
-    return true;
-  });
-  if (!missing.length) return incoming;
+  if (already) return incoming;
   const out: T[] = [...incoming];
-  for (const message of missing) {
-    let insertAt = out.length;
-    while (insertAt > 0 && out[insertAt - 1]?.role === "system") insertAt -= 1;
-    out.splice(insertAt, 0, {
-      id: message.id || `user:${insertAt}`,
-      role: "user",
-      text: message.text
-    } as T);
-  }
+  let insertAt = out.length;
+  while (insertAt > 0 && out[insertAt - 1]?.role === "system") insertAt -= 1;
+  out.splice(insertAt, 0, {
+    id: lastExtraUser.id || `user:${insertAt}`,
+    role: "user",
+    text: lastExtraUser.text
+  } as T);
   return out;
 }
 

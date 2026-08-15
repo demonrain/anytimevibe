@@ -857,9 +857,14 @@ async function evictStaleNativeCliImports(threadIds: string[]): Promise<void> {
 async function pruneImportedCliSessions(imported: {
   junkCursorIds?: string[];
   junkGrokIds?: string[];
+  junkAgyIds?: string[];
   staleNativeIds?: string[];
 }): Promise<void> {
-  await pruneJunkCliImports([...(imported.junkCursorIds || []), ...(imported.junkGrokIds || [])]);
+  await pruneJunkCliImports([
+    ...(imported.junkCursorIds || []),
+    ...(imported.junkGrokIds || []),
+    ...(imported.junkAgyIds || [])
+  ]);
   await evictStaleNativeCliImports(imported.staleNativeIds || []);
 }
 

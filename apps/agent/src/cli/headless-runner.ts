@@ -920,25 +920,25 @@ function emitAgyAssistantText(
 ): void {
   if (!incoming) return;
   if (incoming === state.text) return;
-  if (state.text && incoming.startsWith(state.text)) {
-    const extra = incoming.slice(state.text.length);
-    state.text = incoming;
+  // Strip trailing replacement characters from accumulated text — they indicate
+  // a multi-byte UTF-8 sequence was split across chunks and will be completed
+  // by the next chunk.
+  const cleanPrevious = state.text.replace(/\uFFFD+$/g, "");
+  // Strip leading replacement characters from incoming — leftover partial bytes
+  // from the previous chunk's incomplete multi-byte sequence.
+  const cleanIncoming = incoming.replace(/^\uFFFD+/, "");
+  if (cleanPrevious && cleanIncoming.startsWith(cleanPrevious)) {
+    const extra = cleanIncoming.slice(cleanPrevious.length);
+    state.text = cleanIncoming;
     state.sawAssistant = true;
     if (extra) emitDelta(onEvent, options, "assistant", "assistant", extra);
     return;
   }
-  if (state.text && state.text.startsWith(incoming)) return;
-  const previous = state.text.replace(/\uFFFD+$/g, "");
-  if (previous && incoming.startsWith(previous) && incoming.length > previous.length) {
-    const extra = incoming.slice(previous.length);
-    state.text = incoming;
-    state.sawAssistant = true;
-    if (extra) emitDelta(onEvent, options, "assistant", "assistant", extra);
-    return;
-  }
-  state.text += incoming;
+  if (cleanPrevious && cleanPrevious.startsWith(cleanIncoming)) return;
+  state.text = cleanIncoming || incoming;
   state.sawAssistant = true;
-  emitDelta(onEvent, options, "assistant", "assistant", incoming);
+  const delta = cleanIncoming || incoming;
+  if (delta) emitDelta(onEvent, options, "assistant", "assistant", delta);
 }
 
 function handleAntigravityLine(

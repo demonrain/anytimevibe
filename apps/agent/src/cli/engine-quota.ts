@@ -37,13 +37,15 @@ export async function runCliText(
     const env = options?.useProxy === false
       ? process.env
       : await cloudProxyChildEnv();
+    const windowsUtf8Env = isWindows ? { PYTHONIOENCODING: "utf-8" } : {};
     const { stdout, stderr } = await execFileAsync(executable, finalArgs, {
       timeout: timeoutMs,
       windowsHide: true,
       windowsVerbatimArguments: isWindows,
-      env,
+      env: { ...env, ...windowsUtf8Env },
       cwd: options?.cwd || process.cwd(),
-      maxBuffer: 1_000_000
+      maxBuffer: 1_000_000,
+      encoding: "utf8"
     });
     const text = `${stdout || ""}\n${stderr || ""}`.trim();
     return { ok: true, text, code: 0 };

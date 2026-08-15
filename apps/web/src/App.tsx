@@ -715,36 +715,33 @@ function sanitizeTranscriptMessages<T extends { role: string; text: string }>(me
   });
 }
 
-/** Keep live/store YOU bubbles when a later snapshot omitted the failed turn's user item. */
+/**
+ * Keep the latest live YOU bubble when a later snapshot omitted the failed turn's user item.
+ * Only restore the most recent missing user prompt — merging *all* missing users from
+ * `extra` re-injected older task prompts after Cursor completion snapshots landed clean.
+ */
 function mergeSnapshotUserPrompts<T extends { id: string; role: string; text: string }>(
   incoming: T[],
   extra: Array<{ id?: string; role: string; text: string }>
 ): T[] {
   if (!extra.length) return incoming;
-  const seen = new Set(
-    incoming
-      .filter((message) => message.role === "user")
-      .map((message) => message.text.trim())
-      .filter(Boolean)
+  const lastExtraUser = [...extra]
+    .reverse()
+    .find((message) => message.role === "user" && message.text.trim());
+  if (!lastExtraUser) return incoming;
+  const text = lastExtraUser.text.trim();
+  const already = incoming.some(
+    (message) => message.role === "user" && message.text.trim() === text
   );
-  const missing = extra.filter((message) => {
-    if (message.role !== "user") return false;
-    const text = message.text.trim();
-    if (!text || seen.has(text)) return false;
-    seen.add(text);
-    return true;
-  });
-  if (!missing.length) return incoming;
+  if (already) return incoming;
   const out: T[] = [...incoming];
-  for (const message of missing) {
-    let insertAt = out.length;
-    while (insertAt > 0 && out[insertAt - 1]?.role === "system") insertAt -= 1;
-    out.splice(insertAt, 0, {
-      id: message.id || `user:${insertAt}`,
-      role: "user",
-      text: message.text
-    } as T);
-  }
+  let insertAt = out.length;
+  while (insertAt > 0 && out[insertAt - 1]?.role === "system") insertAt -= 1;
+  out.splice(insertAt, 0, {
+    id: lastExtraUser.id || `user:${insertAt}`,
+    role: "user",
+    text: lastExtraUser.text
+  } as T);
   return out;
 }
 

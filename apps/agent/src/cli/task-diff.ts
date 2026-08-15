@@ -60,11 +60,11 @@ export function extractFileChangeDiff(item: Record<string, any>): string {
 
 async function runGit(cwd: string, args: string[]): Promise<string> {
   try {
-    const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], {
+    const { stdout } = await execFileAsync("git", ["-c", "core.quotepath=false", "-C", cwd, ...args], {
       timeout: 20_000,
       maxBuffer: 8 * 1024 * 1024,
       windowsHide: true,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" }
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C.UTF-8" }
     });
     return String(stdout ?? "");
   } catch {
