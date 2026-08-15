@@ -37,9 +37,17 @@ export function headlessPermissionArgs(engine: CliEngine, mode: PermissionMode):
     return ["--force", ...common];
   }
   if (engine === "antigravity") {
-    // Project / Shared with Antigravity / Global are merged config scopes,
-    // not --sandbox / --mode flags. Headless honors settings.json policies.
-    return [];
+    // agy headless has no TTY — tool Ask prompts abort the -p run and the web
+    // shows a premature "completed". Map UI modes to real CLI flags:
+    //   --sandbox | --mode plan | --mode accept-edits | --dangerously-skip-permissions
+    // Project / Shared / Global are /permissions config scopes, not session flags.
+    if (normalized === "read-only") return ["--sandbox"];
+    if (normalized === "ask-for-approval") return ["--mode", "plan"];
+    // accept-edits alone still prompts on shell/MCP; skip so remote turns can finish.
+    if (normalized === "approve-for-me") {
+      return ["--mode", "accept-edits", "--dangerously-skip-permissions"];
+    }
+    return ["--dangerously-skip-permissions"];
   }
   if (engine === "codex") {
     // Codex remote path uses app-server RPC, not these CLI flags.
@@ -83,8 +91,10 @@ export function handoffPermissionArgs(engine: CliEngine, mode: PermissionMode | 
     return ["--force", ...common];
   }
   if (engine === "antigravity") {
-    // Same as headless: scopes live in merged permission configs, not CLI flags.
-    return [];
+    if (normalized === "read-only") return ["--sandbox"];
+    if (normalized === "ask-for-approval") return ["--mode", "plan"];
+    if (normalized === "approve-for-me") return ["--mode", "accept-edits"];
+    return ["--dangerously-skip-permissions"];
   }
   // grok
   if (normalized === "read-only") {

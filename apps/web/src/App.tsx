@@ -589,12 +589,20 @@ function permissionOptionsForEngine(engine: CliEngine, locale: "zh-CN" | "en"): 
         ];
   }
   if (engine === "antigravity") {
-    // agy `/permissions` Scope Picker: Project / Shared with Antigravity / Global
-    return [
-      { value: "ask-for-approval", label: "Project" },
-      { value: "approve-for-me", label: "Shared with Antigravity" },
-      { value: "full-access", label: "Global" }
-    ];
+    // Session execution modes (CLI flags) — not /permissions Project|Shared|Global scopes.
+    return locale === "en"
+      ? [
+          { value: "read-only", label: "Sandbox (--sandbox)" },
+          { value: "ask-for-approval", label: "Plan (--mode plan)" },
+          { value: "approve-for-me", label: "Accept edits (--mode accept-edits)" },
+          { value: "full-access", label: "Skip permissions (--dangerously-skip-permissions)" }
+        ]
+      : [
+          { value: "read-only", label: "沙箱 (--sandbox)" },
+          { value: "ask-for-approval", label: "计划模式 (--mode plan)" },
+          { value: "approve-for-me", label: "接受编辑 (--mode accept-edits)" },
+          { value: "full-access", label: "跳过权限确认 (--dangerously-skip-permissions)" }
+        ];
   }
   // codex
   return locale === "en"
@@ -3453,7 +3461,7 @@ function TaskConversation({
       sendLabel={t("send")}
       stopLabel={t("stop")}
       resendLabel={t("resend")}
-      currentPermissionLabel={taskEngine === "antigravity" ? (locale === "en" ? "Scope" : "权限范围") : t("currentPermission")}
+      currentPermissionLabel={t("currentPermission")}
       agentReplyDetailLabel={t("agentReplyDetail")}
       replyConciseLabel={t("replyConcise")}
       replyDetailedLabel={t("replyDetailed")}
@@ -3809,7 +3817,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
         {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
       </select>
     </label>
-    <label>{engineId === "antigravity" ? "权限范围" : "权限模式"}
+    <label>权限模式
       <select value={taskPermission} onChange={(event) => setTaskPermission(normalizePermissionMode(event.target.value))} disabled={!engine}>
         {permissionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
       </select>

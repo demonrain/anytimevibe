@@ -131,6 +131,60 @@ function titleFromCursorPromptHistory(history: string[]): string | undefined {
   return undefined;
 }
 
+function userPromptSet(messages: HistoryMessage[]): Set<string> {
+  const out = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== "user") continue;
+    const text = String(message.text || "").trim();
+    if (text) out.add(text);
+  }
+  return out;
+}
+
+/**
+ * Web-created Cursor tasks own their transcript via headless streaming.
+ * Blindly preferring a longer store.db / prompt_history dump re-injects older
+ * chats into the live task whenever sync runs at turn start/end.
+ */
+function pickCursorMessagesForUpsert(
+  existing: StoredTask | undefined,
+  nativeSessionId: string,
+  imported: HistoryMessage[],
+  historyMessages: HistoryMessage[]
+): HistoryMessage[] {
+  let candidate = imported.length >= (existing?.messages?.length ?? 0)
+    ? imported
+    : (existing?.messages || imported);
+  if (!hasUsefulTranscript(candidate) && historyMessages.length) {
+    candidate = historyMessages;
+  } else if (!hasUsefulTranscript(candidate) && historyMessages.length > candidate.length) {
+    candidate = historyMessages;
+  }
+
+  const existingMessages = existing?.messages || [];
+  const isWebBound = Boolean(existing && existing.threadId !== nativeSessionId);
+  if (!isWebBound || !hasUsefulTranscript(existingMessages)) {
+    return candidate.length ? candidate : existingMessages;
+  }
+
+  const status = String(existing?.status || "").toLowerCase();
+  if (status === "active" || status === "running" || status === "processing") {
+    return existingMessages;
+  }
+
+  const webUsers = userPromptSet(existingMessages);
+  const importUsers = userPromptSet(candidate);
+  // Reject transcripts that introduce user turns AnytimeVibe never sent.
+  for (const text of importUsers) {
+    if (!webUsers.has(text)) return existingMessages;
+  }
+  // Allow assistant-only enrichment when import covers every web user prompt.
+  for (const text of webUsers) {
+    if (!importUsers.has(text)) return existingMessages;
+  }
+  return candidate.length >= existingMessages.length ? candidate : existingMessages;
+}
+
 function messagesFromCursorPromptHistory(history: string[]): HistoryMessage[] {
   const out: HistoryMessage[] = [];
   for (const item of history) {
@@ -357,16 +411,12 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
       // meta/prompt-history only
     }
     const historyMessages = messagesFromCursorPromptHistory(promptHistory);
-    let messages = imported.messages.length >= (existing?.messages?.length ?? 0)
-      ? imported.messages
-      : (existing?.messages || imported.messages);
-    // If sqlite yielded nothing useful (timeout / protobuf-heavy), fall back to prompt history.
-    if (!hasUsefulTranscript(messages) && historyMessages.length) {
-      messages = historyMessages;
-    } else if (messages.length < historyMessages.length && historyMessages.length > 0) {
-      // Keep richer DB transcript when present; otherwise history is better than empty.
-      if (!hasUsefulTranscript(messages)) messages = historyMessages;
-    }
+    const messages = pickCursorMessagesForUpsert(
+      existing,
+      hit.id,
+      imported.messages,
+      historyMessages
+    );
     const titleFromUser = messages.find((m) => m.role === "user")?.text?.slice(0, 80);
     const titleFromHistory = titleFromCursorPromptHistory(promptHistory);
     const agentTitle = imported.agentName && imported.agentName !== "New Agent"

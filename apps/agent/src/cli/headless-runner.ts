@@ -1266,6 +1266,11 @@ export async function runHeadlessTurn(
           providerSessionId = resolveAgyConversationResumeId(options.providerSessionId, options.threadId) || "";
           if (!providerSessionId && options.providerSessionId) clearProviderSession = true;
         }
+      } else if (engine === "cursor") {
+        // Never persist the AnytimeVibe web thread UUID as a Cursor --resume id.
+        const raw = captured || options.providerSessionId || "";
+        providerSessionId = raw && raw !== options.threadId ? raw : (captured || "");
+        if (options.providerSessionId && !providerSessionId) clearProviderSession = true;
       } else {
         providerSessionId = captured || options.providerSessionId || options.threadId;
       }
