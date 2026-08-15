@@ -27,6 +27,13 @@ artifacts/**/CLAUDE.md
 .env.local
 .env.*.local
 .local/
+artifacts/**/AGENTS.md
+artifacts/**/CLAUDE.md
+
+# Local test env / agent userdata / scratch (never commit)
+.env.local
+.env.*.local
+.local/
 *.local.json
 *.local.yaml
 *.local.yml
@@ -43,4 +50,4 @@ debug/
 .idea/
 .vscode/*
 !.vscode/extensions.json
-
+.cunzhi-memory/

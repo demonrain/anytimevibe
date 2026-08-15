@@ -87,25 +87,29 @@ pnpm --filter @anytimevibe/agent package:mac
 
 输出位于 `apps/agent/release/`，包含 DMG 和 ZIP。当前构建未配置 Apple Developer ID 签名和公证，公开分发前必须增加签名、公证和自动更新。
 
-- 手册版本：`v0.3`
-- 适用产品：随码（AnytimeVibe）MVP
-- 适用 Codex：`codex-cli 0.144.x` / `0.145.x`
+- 手册版本：`v0.6`
+- 适用产品：随码（AnytimeVibe）
+- 支持引擎：Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity
 
 ## 1. 使用前准备
 
 随码由三个部分组成：
 
-- VPS 服务：提供网页、中继、数据库和 Push。
-- 随码桌面代理：安装在运行 Codex 的电脑上。
+- VPS 服务：提供网页、中继、数据库和 Web Push。
+- 随码桌面代理：安装在运行开发环境的电脑上（Windows / macOS）。
 - PWA：在手机或其他浏览器中访问。
 
 开始前请确认：
 
 - 已有一个可以通过 HTTPS 访问的随码服务地址。
-- Windows 电脑已安装并登录 Codex CLI。
-- `codex --version` 输出为 `0.144.x` 或 `0.145.x`。
-- Windows 电脑能够主动访问随码服务地址。
-- Windows 用户会保持登录；锁屏可以，注销或关机会使代理离线。
+- 开发电脑已安装并登录至少一种支持的 AI 编码 CLI：
+  - OpenAI Codex CLI (`codex`)
+  - Anthropic Claude Code CLI (`claude`)
+  - xAI Grok Build CLI (`grok`)
+  - Cursor Agent CLI (`agent` / `cursor-agent`)
+  - Google Antigravity CLI (`agy`)
+- 开发电脑能够主动访问随码服务地址。
+- 系统用户会保持登录；锁屏可以，注销或关机会使代理离线。
 
 ## 2. 服务端部署
 
