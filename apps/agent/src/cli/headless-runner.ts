@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/protocol";
-import { cloudProxyChildEnv, collectLocalProxyEnv, ensureCursorHttp1ForProxy, stripProxyFromEnv } from "../local-proxy";
+import { cloudProxyChildEnv, collectLocalProxyEnv, ensureCursorHttp1ForProxy } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
 import { formatAgySpawnArgs, formatCursorModelArg, parseCursorModelRef } from "./model-catalog";
@@ -86,12 +86,14 @@ function parseCursorModelHints(model: string | undefined): {
   model: string;
   fast?: boolean;
   reasoningEffort?: import("@anytimevibe/protocol").ReasoningEffort;
+  thinking?: boolean;
 } {
   const parsed = parseCursorModelRef(model);
   return {
     model: parsed.base,
     ...(parsed.fast !== undefined ? { fast: parsed.fast } : {}),
-    ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {})
+    ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {}),
+    ...(parsed.thinking !== undefined ? { thinking: parsed.thinking } : {})
   };
 }
 
@@ -132,11 +134,13 @@ function buildArgs(
     // https://cursor.com/docs/cli/headless
     // Always rewrite to suffix slugs (gpt-5.6-sol-medium-fast). Never pass legacy [fast=…] brackets.
     const hints = parseCursorModelHints(options.model);
+    const wantThinking = options.thinking ?? hints.thinking;
     const modelArg = formatCursorModelArg(hints.model, {
       ...(options.reasoningEffort || hints.reasoningEffort
         ? { reasoningEffort: options.reasoningEffort || hints.reasoningEffort }
         : {}),
-      ...(hints.fast !== undefined ? { fast: hints.fast } : {})
+      ...(hints.fast !== undefined ? { fast: hints.fast } : {}),
+      ...(wantThinking !== undefined ? { thinking: wantThinking } : {})
     });
     args.push(
       "--print",
@@ -1114,21 +1118,20 @@ export async function runHeadlessTurn(
       console.warn("[headless] ensureCursorHttp1ForProxy failed:", error);
     }
   }
-  // Cursor/Claude/Grok must egress via proxy (IP region gates Cursor model list).
-  // Antigravity (agy) talks to Google; injecting the local Codex/Cursor gateway as HTTP_PROXY
-  // makes agy hit /v1/models (gpt-5.6-sol) and truncates UTF-8 streams.
-  let env = engine === "antigravity"
-    ? stripProxyFromEnv({
-      ...process.env,
-      CI: process.env.CI || "1",
-      TERM: process.env.TERM || "dumb",
-      NO_COLOR: process.env.NO_COLOR || "1"
-    })
-    : await cloudProxyChildEnv({
-      CI: process.env.CI || "1",
-      TERM: process.env.TERM || "dumb",
-      NO_COLOR: process.env.NO_COLOR || "1"
-    });
+  // All headless cloud CLIs must egress via the system/Clash proxy:
+  // - Cursor/Claude/Grok: egress IP gates Cursor's model catalog (China → kimi/glm).
+  // - Antigravity (agy): OAuth token refresh + API talk to accounts.google.com /
+  //   oauth2.googleapis.com, which are unreachable without the proxy in CN networks.
+  //   Stripping the proxy made agy print "Authentication required" and fail headless
+  //   turns with "authentication failed or timed out" (while handoff terminals — which
+  //   inherit the system proxy — logged in fine). The AnytimeVibe local LLM gateway is
+  //   wired through Codex's config.toml base_url, NOT HTTP_PROXY, so passing the system
+  //   proxy here never routes agy at our loopback gateway.
+  let env = await cloudProxyChildEnv({
+    CI: process.env.CI || "1",
+    TERM: process.env.TERM || "dumb",
+    NO_COLOR: process.env.NO_COLOR || "1"
+  });
 
   // CCSwitch / Cockpit rewrite ~/.claude/settings.json env on account switch.
   // Merge into the child so this turn uses the new key/base_url without restarting AnytimeVibe.
@@ -1191,10 +1194,12 @@ export async function runHeadlessTurn(
     "stage",
     `\n▶ 使用 ${engineLabel} 执行\n`
   );
-  if (Object.keys(proxy).length && engine !== "antigravity") {
+  if (Object.keys(proxy).length) {
     const proxyNote = engine === "cursor"
       ? "\n… 已注入本机代理环境（NODE_USE_ENV_PROXY + HTTP/1.1 fallback）\n"
-      : "\n… 已注入本机代理环境\n";
+      : engine === "antigravity"
+        ? "\n… 已注入本机代理环境（用于连接 Google 登录/接口）\n"
+        : "\n… 已注入本机代理环境\n";
     emitDelta(safeOnEvent, options, "stage:proxy", "stage", proxyNote);
   }
   console.log(`[headless] spawn ${executable} ${finalArgs.map((a) => (a.includes(" ") ? JSON.stringify(a) : a)).join(" ")}`);

@@ -426,6 +426,21 @@ function threadHasPendingCursorApproval(threadId: string): boolean {
   return (pendingCursorApprovalsByThread.get(threadId)?.size ?? 0) > 0;
 }
 
+/**
+ * Drop every stale Cursor approval for a thread. A headless turn that finishes as
+ * completed/failed (not an approval pause) means the CLI already exited — any lingering
+ * approval can never be answered, so it must not keep the task "active" forever
+ * (front-end would spin "远程主机正在处理" indefinitely).
+ */
+function clearThreadCursorApprovals(threadId: string): void {
+  const set = pendingCursorApprovalsByThread.get(threadId);
+  if (!set || !set.size) return;
+  for (const requestId of [...set]) {
+    pendingCursorApprovals.delete(requestId);
+  }
+  pendingCursorApprovalsByThread.delete(threadId);
+}
+
 function buildCursorApprovalFollowUp(
   pending: PendingCursorApproval,
   decision: "accept" | "decline" | "cancel",
@@ -3642,6 +3657,10 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
         permissionMode: event.permissionMode || "ask-for-approval"
       });
     }
+    console.log(
+      `[approval] publish type=${event.approvalType} requestId=${String(event.requestId)} `
+      + `questions=${event.questions?.length ?? 0} plan=${event.plan?.plan ? "yes" : "no"}`
+    );
     await publish({
       type: "approval.requested",
       eventId: crypto.randomUUID(),
@@ -3712,9 +3731,14 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
   }
   if (event.type === "turn.completed") {
     await flushRemoteDeltas();
+    // Only a genuine approval pause is "interrupted while a card is pending". A turn that
+    // reports completed/failed has fully exited the CLI, so any lingering approval is stale
+    // and must be dropped — otherwise the task stays "active" and the web UI spins forever.
+    const isApprovalPause = event.status === "interrupted" && threadHasPendingCursorApproval(event.threadId);
+    if (!isApprovalPause) clearThreadCursorApprovals(event.threadId);
     // Keep store status "active" while Web still needs to answer Cursor plan/question cards.
-    const waitingApproval = threadHasPendingCursorApproval(event.threadId);
-    const statusForStore = waitingApproval && event.status === "interrupted" ? "active" : event.status;
+    const waitingApproval = isApprovalPause;
+    const statusForStore = waitingApproval ? "active" : event.status;
     activeTurnByThread.delete(event.threadId);
     finishLocalActivity(event.threadId, statusForStore);
     await taskStore.setStatus(event.threadId, statusForStore);
@@ -3841,6 +3865,7 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     ...(task.providerSessionId ? { providerSessionId: task.providerSessionId } : {}),
     ...(task.model ? { model: task.model } : {}),
     ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
+    ...(task.thinking !== undefined ? { thinking: task.thinking } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
     ...(task.lastDiff ? { diff: task.lastDiff } : {}),
     messages: messages
@@ -3857,6 +3882,7 @@ async function runHeadlessTaskTurn(options: {
   isNew: boolean;
   model?: string;
   reasoningEffort?: ReasoningEffort;
+  thinking?: boolean;
 }): Promise<void> {
   const turnId = crypto.randomUUID();
   const now = Date.now() / 1000;
@@ -3875,7 +3901,8 @@ async function runHeadlessTaskTurn(options: {
       messages: [],
       permissionMode: options.permissionMode,
       ...(options.model ? { model: options.model } : {}),
-      ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {})
+      ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+      ...(options.thinking !== undefined ? { thinking: options.thinking } : {})
     };
   } else if (absoluteCwd) {
     // Keep the real absolute working dir (subdir under a workspace root stays full path).
@@ -3887,12 +3914,19 @@ async function runHeadlessTaskTurn(options: {
       stored.model = isCursorAutoModel(options.model)
         ? "auto"
         : (cursorPersistedModelId(options.model) || options.model);
-      if (isCursorAutoModel(options.model)) delete stored.reasoningEffort;
+      if (isCursorAutoModel(options.model)) {
+        delete stored.reasoningEffort;
+        delete stored.thinking;
+      }
     } else {
       stored.model = options.model;
     }
   }
   if (options.reasoningEffort) stored.reasoningEffort = options.reasoningEffort;
+  // Thinking is Cursor-only; persist explicit choices so follow-up turns keep the variant.
+  if (options.engine === "cursor" && options.thinking !== undefined) {
+    stored.thinking = options.thinking;
+  }
   stored.permissionMode = options.permissionMode;
   stored.messages.push({ id: crypto.randomUUID(), role: "user", text: options.prompt });
   stored.status = "active";
@@ -3931,6 +3965,9 @@ async function runHeadlessTaskTurn(options: {
     ...(options.model || stored.model ? { model: options.model || stored.model } : {}),
     ...(options.reasoningEffort || stored.reasoningEffort
       ? { reasoningEffort: options.reasoningEffort || stored.reasoningEffort }
+      : {}),
+    ...(options.engine === "cursor" && (options.thinking ?? stored.thinking) !== undefined
+      ? { thinking: options.thinking ?? stored.thinking }
       : {})
   }, async (event) => {
     // Must await so publish sequence numbers and delta flush stay ordered.
@@ -4021,6 +4058,18 @@ async function runHeadlessTaskTurn(options: {
               ? "错误：Antigravity 任务失败。请确认本机已安装 agy 并登录（先运行一次交互式 agy）。"
               : "错误：Grok 任务失败。请确认本机已安装 Grok Build 并已登录。"
       });
+    }
+  }
+  // Defensive: unless this turn is genuinely paused on an approval card, guarantee the
+  // active-turn marker and any lingering approval are cleared so the web UI cannot get
+  // stuck on "远程主机正在处理" if a turn.completed event was ever missed/racy.
+  const stillPausedForApproval = latest.status === "active"
+    && result.status === "interrupted"
+    && threadHasPendingCursorApproval(options.threadId);
+  if (!stillPausedForApproval) {
+    clearThreadCursorApprovals(options.threadId);
+    if (activeTurnByThread.get(options.threadId) === turnId) {
+      activeTurnByThread.delete(options.threadId);
     }
   }
   await taskStore.upsert(latest);
@@ -4128,7 +4177,8 @@ async function handleCommand(command: ClientCommand): Promise<void> {
           permissionMode: mode,
           isNew: true,
           ...(command.model ? { model: command.model } : {}),
-          ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {})
+          ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {}),
+          ...(command.thinking !== undefined ? { thinking: command.thinking } : {})
         });
         return;
       }
@@ -4228,12 +4278,16 @@ async function handleCommand(command: ClientCommand): Promise<void> {
               stored.model = cursorPersistedModelId(outboundModel) || "auto";
             }
             let useEffort = command.reasoningEffort || stored.reasoningEffort;
+            let useThinking = command.thinking ?? stored.thinking;
             if (isCursorAutoModel(outboundModel) || isCursorAutoModel(stored.model)) {
               stored.model = "auto";
               delete stored.reasoningEffort;
+              delete stored.thinking;
               useEffort = undefined;
-            } else if (command.reasoningEffort) {
-              stored.reasoningEffort = command.reasoningEffort;
+              useThinking = undefined;
+            } else {
+              if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+              if (command.thinking !== undefined) stored.thinking = command.thinking;
             }
             await taskStore.upsert(stored);
             await ensureWorkspaceTrusted(stored.engine, stored.cwd);
@@ -4246,7 +4300,8 @@ async function handleCommand(command: ClientCommand): Promise<void> {
               permissionMode: mode,
               isNew: false,
               ...(outboundModel ? { model: isCursorAutoModel(outboundModel) ? "auto" : outboundModel } : {}),
-              ...(useEffort ? { reasoningEffort: useEffort } : {})
+              ...(useEffort ? { reasoningEffort: useEffort } : {}),
+              ...(useThinking !== undefined ? { thinking: useThinking } : {})
             });
             return;
           }
@@ -5476,7 +5531,8 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     if (!binary) throw new Error("未找到 Cursor Agent CLI（cursor-agent / agent），无法接力。请安装 https://cursor.com/cn/cli 并登录（agent login）");
     const { formatCursorModelArg } = await import("./cli/model-catalog");
     const model = formatCursorModelArg(stored?.model, {
-      ...(stored?.reasoningEffort ? { reasoningEffort: stored.reasoningEffort } : {})
+      ...(stored?.reasoningEffort ? { reasoningEffort: stored.reasoningEffort } : {}),
+      ...(stored?.thinking !== undefined ? { thinking: stored.thinking } : {})
     });
     const args = [
       ...handoffPermissionArgs("cursor", permissionMode),

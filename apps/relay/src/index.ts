@@ -147,7 +147,19 @@ async function main(): Promise<void> {
 
   const app = Fastify({ logger: { level: config.NODE_ENV === "production" ? "info" : "debug" } });
   await app.register(cookie, { secret: config.COOKIE_SECRET });
-  await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
+  const isProd = config.NODE_ENV === "production";
+  await app.register(rateLimit, {
+    max: isProd ? 120 : 1000,
+    timeWindow: "1 minute",
+    errorResponseBuilder: (_request, context) => {
+      const minutes = Math.max(1, Math.ceil(context.ttl / 60_000));
+      return {
+        statusCode: 429,
+        error: "rate_limited",
+        message: `尝试过于频繁，请 ${minutes} 分钟后再试`
+      };
+    }
+  });
   await app.register(websocket, { options: { maxPayload: 2 * 1024 * 1024 } });
 
   app.addHook("onRequest", async (request, reply) => {
@@ -232,7 +244,7 @@ async function main(): Promise<void> {
 
   app.get("/api/agent/config", async () => ({ updateFeedUrl: config.UPDATE_FEED_URL ?? null }));
 
-  app.post("/api/setup", { config: { rateLimit: { max: 5, timeWindow: "15 minutes" } } }, async (request, reply) => {
+  app.post("/api/setup", { config: { rateLimit: { max: isProd ? 5 : 50, timeWindow: "15 minutes" } } }, async (request, reply) => {
     const body = setupBody.parse(request.body);
     const countRows = await sql<Array<{ count: number }>>`SELECT count(*)::int AS count FROM users`;
     const count = countRows[0]?.count ?? 0;
@@ -251,7 +263,7 @@ async function main(): Promise<void> {
     return { user: { id: userId, username: body.username, isAdmin: true } };
   });
 
-  app.post("/api/auth/login", { config: { rateLimit: { max: 8, timeWindow: "15 minutes" } } }, async (request, reply) => {
+  app.post("/api/auth/login", { config: { rateLimit: { max: isProd ? 8 : 100, timeWindow: isProd ? "15 minutes" : "1 minute" } } }, async (request, reply) => {
     const body = loginBody.parse(request.body);
     const rows = await sql<Array<{ id: string; username: string; passwordHash: string; isAdmin: boolean; disabledAt: string | null }>>`
       SELECT id, username, password_hash, is_admin, disabled_at FROM users WHERE lower(username) = lower(${body.username}) LIMIT 1
@@ -272,7 +284,7 @@ async function main(): Promise<void> {
     return { user: { id: user.id, username: user.username, isAdmin: user.isAdmin } };
   });
 
-  app.post("/api/auth/register", { config: { rateLimit: { max: 5, timeWindow: "1 hour" } } }, async (request, reply) => {
+  app.post("/api/auth/register", { config: { rateLimit: { max: isProd ? 5 : 50, timeWindow: isProd ? "1 hour" : "15 minutes" } } }, async (request, reply) => {
     const policy = await resolveRegistrationPolicy(sql, config.REGISTRATION_ENABLED, config.MAX_USERS);
     if (!policy.registrationEnabled) {
       return reply.code(403).send({ error: "registration_disabled", message: "当前未开放注册" });

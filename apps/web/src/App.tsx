@@ -97,6 +97,8 @@ type Task = {
   providerSessionId?: string;
   model?: string;
   reasoningEffort?: ReasoningEffort;
+  /** Cursor: extended-thinking variant active for this thread. */
+  thinking?: boolean;
   contextUsage?: ContextUsage;
   /** Follow-up prompts waiting on the agent (not yet started). */
   queuedTurns?: QueuedTurnItem[];
@@ -174,7 +176,8 @@ function effortOptionsFromHost(
   capabilities: EngineCapability[] | undefined,
   engine: CliEngine,
   currentEffort?: ReasoningEffort,
-  modelId?: string
+  modelId?: string,
+  thinking?: boolean
 ): ReasoningEffort[] {
   const cap = capabilityForEngine(capabilities, engine);
   const baseId = cursorModelBaseId(modelId);
@@ -183,8 +186,12 @@ function effortOptionsFromHost(
     : undefined;
   // Cursor / Antigravity: per-model effort. Models without a list → no dropdown.
   if (usesPerModelEffort(engine)) {
-    if (modelMeta?.reasoningEfforts?.length) {
-      const base = [...modelMeta.reasoningEfforts];
+    // Cursor thinking has its own effort set (differs from non-thinking).
+    const perModel = engine === "cursor" && thinking && modelMeta?.thinkingEfforts?.length
+      ? modelMeta.thinkingEfforts
+      : modelMeta?.reasoningEfforts;
+    if (perModel?.length) {
+      const base = [...perModel];
       if (currentEffort && !base.includes(currentEffort)) base.unshift(currentEffort);
       return base;
     }
@@ -209,6 +216,16 @@ function modelOptionMeta(
   const baseId = cursorModelBaseId(modelId);
   if (!baseId) return undefined;
   return capabilityForEngine(capabilities, engine)?.models.find((item) => item.id === baseId);
+}
+
+/** Cursor: does the selected model base expose an extended-thinking variant? */
+function modelSupportsThinking(
+  capabilities: EngineCapability[] | undefined,
+  engine: CliEngine,
+  modelId?: string
+): boolean {
+  if (engine !== "cursor") return false;
+  return Boolean(modelOptionMeta(capabilities, engine, modelId)?.supportsThinking);
 }
 
 /**
@@ -264,7 +281,7 @@ function taskPrefsKey(threadId: string): string {
   return `task-prefs:${threadId}`;
 }
 
-type TaskUiPrefs = { model?: string; reasoningEffort?: ReasoningEffort; fast?: boolean };
+type TaskUiPrefs = { model?: string; reasoningEffort?: ReasoningEffort; fast?: boolean; thinking?: boolean };
 
 function loadTaskUiPrefs(threadId: string): TaskUiPrefs {
   try {
@@ -277,7 +294,7 @@ function loadTaskUiPrefs(threadId: string): TaskUiPrefs {
   }
 }
 
-function saveTaskUiPrefs(threadId: string, prefs: TaskUiPrefs & { reasoningEffort?: ReasoningEffort | null }): void {
+function saveTaskUiPrefs(threadId: string, prefs: Omit<TaskUiPrefs, "reasoningEffort"> & { reasoningEffort?: ReasoningEffort | null }): void {
   try {
     const current = loadTaskUiPrefs(threadId);
     const next: TaskUiPrefs = { ...current };
@@ -290,7 +307,8 @@ function saveTaskUiPrefs(threadId: string, prefs: TaskUiPrefs & { reasoningEffor
       else delete next.reasoningEffort;
     }
     if (prefs.fast !== undefined) next.fast = prefs.fast;
-    if (!next.model && !next.reasoningEffort && next.fast === undefined) {
+    if (prefs.thinking !== undefined) next.thinking = prefs.thinking;
+    if (!next.model && !next.reasoningEffort && next.fast === undefined && next.thinking === undefined) {
       localStorage.removeItem(taskPrefsKey(threadId));
     } else {
       localStorage.setItem(taskPrefsKey(threadId), JSON.stringify(next));
@@ -1200,6 +1218,8 @@ const ConversationComposer = memo(function ConversationComposer({
   reasoningEffort,
   effortOptions,
   fastMode,
+  thinkingMode,
+  supportsThinking,
   permissionMode,
   permissionOptions,
   replyDetail,
@@ -1216,6 +1236,7 @@ const ConversationComposer = memo(function ConversationComposer({
   onModelChange,
   onReasoningEffortChange,
   onFastModeChange,
+  onThinkingModeChange,
   onPermissionModeChange,
   onReplyDetailChange,
   onSubmitPrompt,
@@ -1234,6 +1255,8 @@ const ConversationComposer = memo(function ConversationComposer({
   reasoningEffort: ReasoningEffort | "";
   effortOptions: ReasoningEffort[];
   fastMode: boolean;
+  thinkingMode: boolean;
+  supportsThinking: boolean;
   permissionMode: PermissionMode;
   permissionOptions: Array<{ value: PermissionMode; label: string }>;
   replyDetail: ReplyDetail;
@@ -1250,6 +1273,7 @@ const ConversationComposer = memo(function ConversationComposer({
   onModelChange(model: string): void;
   onReasoningEffortChange(effort: ReasoningEffort): void;
   onFastModeChange(fast: boolean): void;
+  onThinkingModeChange(thinking: boolean): void;
   onPermissionModeChange(mode: PermissionMode): void;
   onReplyDetailChange(detail: ReplyDetail): void;
   onSubmitPrompt(text: string): void;
@@ -1336,6 +1360,16 @@ const ConversationComposer = memo(function ConversationComposer({
                 type="checkbox"
                 checked={fastMode}
                 onChange={(event) => onFastModeChange(event.target.checked)}
+              />
+            </label>
+          )}
+          {taskEngine === "cursor" && supportsThinking && (
+            <label className="composer-permission composer-fast-toggle">
+              Thinking
+              <input
+                type="checkbox"
+                checked={thinkingMode}
+                onChange={(event) => onThinkingModeChange(event.target.checked)}
               />
             </label>
           )}
@@ -2560,7 +2594,7 @@ export function App() {
       engineCapabilities={activeRuntime.engineCapabilities ?? []}
       onClose={() => setComposerOpen(false)}
       onRefreshWorkspaces={() => sendCommand(activeHost.id, { type: "host.refresh", commandId: randomUuid() })}
-      onCreate={async (cwd, prompt, title, engine, mode, model, reasoningEffort) => {
+      onCreate={async (cwd, prompt, title, engine, mode, model, reasoningEffort, thinking) => {
         setPermissionMode(mode);
         localStorage.setItem("permission-mode", mode);
         // Remember existing threads so the first new threadId from the host is selected.
@@ -2580,7 +2614,8 @@ export function App() {
           cliEngine: engine,
           ...(title ? { title } : {}),
           ...(model ? { model } : {}),
-          ...(reasoningEffort ? { reasoningEffort } : {})
+          ...(reasoningEffort ? { reasoningEffort } : {}),
+          ...(thinking !== undefined ? { thinking } : {})
         });
         setComposerOpen(false);
       }}
@@ -2827,14 +2862,22 @@ function TaskConversation({
     () => modelOptionMeta(engineCapabilities, taskEngine, model),
     [engineCapabilities, taskEngine, model]
   );
+  const supportsThinking = Boolean(taskEngine === "cursor" && modelMeta?.supportsThinking);
+  const [thinkingMode, setThinkingMode] = useState<boolean>(() => {
+    if (taskEngine !== "cursor") return false;
+    if (task.thinking !== undefined) return task.thinking;
+    if (uiPrefs.thinking !== undefined) return uiPrefs.thinking;
+    return Boolean(cap?.currentThinking);
+  });
   const effortOptions = useMemo(
     () => effortOptionsFromHost(
       engineCapabilities,
       taskEngine,
       task.reasoningEffort || uiPrefs.reasoningEffort || cap?.currentReasoningEffort,
-      model
+      model,
+      thinkingMode
     ),
-    [engineCapabilities, taskEngine, task.reasoningEffort, uiPrefs.reasoningEffort, cap?.currentReasoningEffort, model]
+    [engineCapabilities, taskEngine, task.reasoningEffort, uiPrefs.reasoningEffort, cap?.currentReasoningEffort, model, thinkingMode]
   );
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(
     () => task.reasoningEffort || uiPrefs.reasoningEffort || cap?.currentReasoningEffort || effortOptions[0] || ""
@@ -2940,7 +2983,7 @@ function TaskConversation({
   // When model changes on Cursor, reset effort to first option for that model (or clear).
   useEffect(() => {
     if (!usesPerModelEffort(taskEngine)) return;
-    const nextEfforts = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, model);
+    const nextEfforts = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, model, thinkingMode);
     setReasoningEffort((current) => {
       if (current && nextEfforts.includes(current as ReasoningEffort)) return current;
       const next = nextEfforts[0] || "";
@@ -2954,7 +2997,7 @@ function TaskConversation({
       setFastMode(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model, taskEngine]);
+  }, [model, taskEngine, thinkingMode]);
 
   function resolveOutboundModel(): string | undefined {
     if (!model) return undefined;
@@ -2974,7 +3017,8 @@ function TaskConversation({
       prompt: text,
       permissionMode,
       ...(outboundModel ? { model: outboundModel } : {}),
-      ...(effort ? { reasoningEffort: effort as ReasoningEffort } : {})
+      ...(effort ? { reasoningEffort: effort as ReasoningEffort } : {}),
+      ...(supportsThinking ? { thinking: thinkingMode } : {})
     };
   }
 
@@ -3002,6 +3046,8 @@ function TaskConversation({
     model,
     modelMeta,
     fastMode,
+    thinkingMode,
+    supportsThinking,
     taskEngine,
     effortOptions.length,
     reasoningEffort,
@@ -3088,7 +3134,7 @@ function TaskConversation({
     submittingRef.current = true;
     setPendingPrompt(lastUserPrompt);
     onCommand(turnStartCommand(lastUserPrompt));
-  }, [canResend, lastUserPrompt, onCommand, model, modelMeta, fastMode, taskEngine, effortOptions.length, reasoningEffort, permissionMode, task.threadId]);
+  }, [canResend, lastUserPrompt, onCommand, model, modelMeta, fastMode, thinkingMode, supportsThinking, taskEngine, effortOptions.length, reasoningEffort, permissionMode, task.threadId]);
 
   const handleModelChange = useCallback((next: string) => {
     const normalized = cursorModelBaseId(next) || (next || "").split("[")[0]!.trim() || next;
@@ -3096,7 +3142,14 @@ function TaskConversation({
     if (normalized) saveTaskUiPrefs(task.threadId, { model: normalized });
     // Switching to Auto/Composer must drop prior GPT effort immediately (don't wait for effect).
     if (taskEngine === "cursor") {
-      const nextEfforts = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, normalized);
+      // Drop thinking when the new model has no thinking variant.
+      const nextSupportsThinking = Boolean(modelOptionMeta(engineCapabilities, taskEngine, normalized)?.supportsThinking);
+      const useThinking = nextSupportsThinking && thinkingMode;
+      if (!nextSupportsThinking && thinkingMode) {
+        setThinkingMode(false);
+        saveTaskUiPrefs(task.threadId, { thinking: false });
+      }
+      const nextEfforts = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, normalized, useThinking);
       if (!nextEfforts.length) {
         setReasoningEffort("");
         saveTaskUiPrefs(task.threadId, { reasoningEffort: null });
@@ -3105,7 +3158,7 @@ function TaskConversation({
         saveTaskUiPrefs(task.threadId, { reasoningEffort: nextEfforts[0] || null });
       }
     }
-  }, [task.threadId, taskEngine, engineCapabilities, reasoningEffort]);
+  }, [task.threadId, taskEngine, engineCapabilities, reasoningEffort, thinkingMode]);
 
   const handleReasoningEffortChange = useCallback((next: ReasoningEffort) => {
     setReasoningEffort(next);
@@ -3116,6 +3169,22 @@ function TaskConversation({
     setFastMode(next);
     saveTaskUiPrefs(task.threadId, { fast: next });
   }, [task.threadId]);
+
+  const handleThinkingModeChange = useCallback((next: boolean) => {
+    setThinkingMode(next);
+    saveTaskUiPrefs(task.threadId, { thinking: next });
+    // Thinking has its own effort set — re-clamp the current effort to the new list.
+    if (taskEngine === "cursor") {
+      const nextEfforts = effortOptionsFromHost(engineCapabilities, taskEngine, undefined, model, next);
+      if (!nextEfforts.length) {
+        setReasoningEffort("");
+        saveTaskUiPrefs(task.threadId, { reasoningEffort: null });
+      } else if (!reasoningEffort || !nextEfforts.includes(reasoningEffort as ReasoningEffort)) {
+        setReasoningEffort(nextEfforts[0] || "");
+        saveTaskUiPrefs(task.threadId, { reasoningEffort: nextEfforts[0] || null });
+      }
+    }
+  }, [task.threadId, taskEngine, engineCapabilities, model, reasoningEffort]);
 
   useEffect(() => {
     if (commandQueue.length === 0) {
@@ -3374,6 +3443,8 @@ function TaskConversation({
       reasoningEffort={reasoningEffort}
       effortOptions={effortOptions}
       fastMode={fastMode}
+      thinkingMode={thinkingMode}
+      supportsThinking={supportsThinking}
       permissionMode={permissionMode}
       permissionOptions={permissionOptions}
       replyDetail={replyDetail}
@@ -3390,6 +3461,7 @@ function TaskConversation({
       onModelChange={handleModelChange}
       onReasoningEffortChange={handleReasoningEffortChange}
       onFastModeChange={handleFastModeChange}
+      onThinkingModeChange={handleThinkingModeChange}
       onPermissionModeChange={onPermissionModeChange}
       onReplyDetailChange={onReplyDetailChange}
       onSubmitPrompt={submitPromptText}
@@ -3531,7 +3603,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
   engineCapabilities: EngineCapability[];
   onClose(): void;
   onRefreshWorkspaces(): Promise<void>;
-  onCreate(cwd: string, prompt: string, title: string, engine: CliEngine, permissionMode: PermissionMode, model?: string, reasoningEffort?: ReasoningEffort): Promise<void>;
+  onCreate(cwd: string, prompt: string, title: string, engine: CliEngine, permissionMode: PermissionMode, model?: string, reasoningEffort?: ReasoningEffort, thinking?: boolean): Promise<void>;
 }) {
   const { locale } = useI18n();
   const ready = readyEngines(availableEngines);
@@ -3549,11 +3621,16 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
     return raw.split("[")[0] || raw;
   });
   const modelMeta = modelOptionMeta(engineCapabilities, engineId, model);
+  const supportsThinking = Boolean(engineId === "cursor" && modelMeta?.supportsThinking);
+  const [thinkingMode, setThinkingMode] = useState<boolean>(
+    () => Boolean(engineId === "cursor" && cap?.currentThinking)
+  );
   const effortOptions = effortOptionsFromHost(
     engineCapabilities,
     engineId,
     cap?.currentReasoningEffort,
-    model
+    model,
+    thinkingMode
   );
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(
     cap?.currentReasoningEffort || effortOptions[0] || ""
@@ -3595,7 +3672,15 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
   }, [engine, engineCapabilities]);
 
   useEffect(() => {
-    const nextEfforts = effortOptionsFromHost(engineCapabilities, engineId, undefined, model);
+    const nextSupportsThinking = Boolean(
+      engineId === "cursor" && modelOptionMeta(engineCapabilities, engineId, model)?.supportsThinking
+    );
+    let useThinking = thinkingMode;
+    if (!nextSupportsThinking && thinkingMode) {
+      setThinkingMode(false);
+      useThinking = false;
+    }
+    const nextEfforts = effortOptionsFromHost(engineCapabilities, engineId, undefined, model, useThinking);
     setReasoningEffort((current) => {
       if (current && nextEfforts.includes(current as ReasoningEffort)) return current;
       return nextEfforts[0] || "";
@@ -3603,6 +3688,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
     if (engineId === "cursor") {
       setFastMode(/composer/i.test(model));
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model, engineId, engineCapabilities]);
 
   // Pull latest whitelist from the agent once when the dialog opens (avoid dep on unstable callback identity).
@@ -3642,7 +3728,8 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
         engine,
         taskPermission,
         outboundModel,
-        effort
+        effort,
+        supportsThinking ? thinkingMode : undefined
       );
     } catch (createError) {
       setError(createError instanceof Error ? createError.message : "任务创建失败");
@@ -3696,6 +3783,24 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
         <span>Fast 模式</span>
         <input type="checkbox" checked={fastMode} onChange={(event) => setFastMode(event.target.checked)} />
         <small style={{ color: "#6f756e" }}>部分模型（如 Composer / GPT）支持更快但更浅的推理</small>
+      </label>
+    )}
+    {supportsThinking && (
+      <label className="composer-fast-toggle" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span>Thinking 模式</span>
+        <input
+          type="checkbox"
+          checked={thinkingMode}
+          onChange={(event) => {
+            const next = event.target.checked;
+            setThinkingMode(next);
+            const nextEfforts = effortOptionsFromHost(engineCapabilities, engineId, undefined, model, next);
+            setReasoningEffort((current) => (
+              current && nextEfforts.includes(current as ReasoningEffort) ? current : (nextEfforts[0] || "")
+            ));
+          }}
+        />
+        <small style={{ color: "#6f756e" }}>启用模型的扩展思考变体（如 Claude Thinking）</small>
       </label>
     )}
     <label>{engineId === "cursor" || engineId === "antigravity" ? "Effort（--effort）" : "推理强度"}

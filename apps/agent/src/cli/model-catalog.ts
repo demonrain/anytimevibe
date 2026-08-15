@@ -12,6 +12,8 @@ export type EngineCapability = {
   /** Current default on this machine (from local CLI config). */
   currentModel?: string;
   currentReasoningEffort?: ReasoningEffort;
+  /** Cursor: whether the currently selected model has thinking enabled. */
+  currentThinking?: boolean;
 };
 
 function parseTomlString(content: string, key: string): string | undefined {
@@ -366,18 +368,24 @@ const CURSOR_FALLBACK_MODELS: EngineModelOption[] = [
     id: "claude-opus-4-8",
     label: "Claude Opus 4.8",
     supportsFast: true,
-    reasoningEfforts: ["low", "medium", "high", "xhigh"]
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+    supportsThinking: true,
+    thinkingEfforts: ["low", "medium", "high", "xhigh", "max"]
   },
   {
-    id: "claude-opus-5-thinking",
-    label: "Claude Opus 5 Thinking",
+    id: "claude-opus-5",
+    label: "Claude Opus 5",
     supportsFast: true,
-    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]
+    reasoningEfforts: ["low", "medium", "high"],
+    supportsThinking: true,
+    thinkingEfforts: ["low", "medium", "high", "xhigh", "max"]
   },
   {
     id: "claude-fable-5",
     label: "Claude Fable 5",
-    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+    supportsThinking: true,
+    thinkingEfforts: ["low", "medium", "max"]
   },
   {
     id: "gpt-5.6-sol",
@@ -403,20 +411,21 @@ const CURSOR_FALLBACK_MODELS: EngineModelOption[] = [
     id: "claude-sonnet-5",
     label: "Claude Sonnet 5",
     supportsFast: true,
-    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+    supportsThinking: true,
+    thinkingEfforts: ["low", "medium", "max"]
   }
 ];
 
 /** Live CLI slugs from the last successful `agent models` probe (used to pick valid --model). */
 let cursorLiveSlugSet: Set<string> = new Set();
 
-/** Effort tokens that appear as `-{token}` before optional `-fast` in Cursor CLI slugs. */
+/**
+ * Effort tokens that appear as `-{token}` in Cursor CLI slugs.
+ * NOTE: `thinking` is a SEPARATE dimension and is stripped before matching these
+ * (Cursor emits e.g. `claude-opus-5-thinking-high` = base + thinking + effort).
+ */
 const CURSOR_EFFORT_TOKENS = [
-  "thinking-max",
-  "thinking-xhigh",
-  "thinking-high",
-  "thinking-medium",
-  "thinking-low",
   "extra-high",
   "none",
   "low",
@@ -433,37 +442,58 @@ function reasoningToEffortToken(effort: ReasoningEffort): CursorEffortToken {
   return effort;
 }
 
-function effortTokenToReasoning(token: CursorEffortToken): ReasoningEffort | undefined {
-  if (token === "none") return undefined;
+function effortTokenToReasoning(token: CursorEffortToken | undefined): ReasoningEffort | undefined {
+  if (!token || token === "none") return undefined;
   if (token === "extra-high") return "xhigh";
-  if (token.startsWith("thinking-")) {
-    const inner = token.slice("thinking-".length) as ReasoningEffort | "xhigh";
-    if (inner === "low" || inner === "medium" || inner === "high" || inner === "xhigh" || inner === "max") {
-      return inner;
-    }
-    return undefined;
-  }
   if (token === "low" || token === "medium" || token === "high" || token === "xhigh" || token === "max") {
     return token;
   }
   return undefined;
 }
 
-function splitCursorSlug(id: string): { base: string; effortToken?: CursorEffortToken; fast: boolean } {
+/**
+ * Split a Cursor slug into base + thinking flag + effort + fast.
+ *
+ * Cursor uses two thinking placements, both supported here:
+ *   - infix:  `claude-opus-5-thinking-high`        (base + thinking + effort)
+ *   - suffix: `claude-4.6-sonnet-medium-thinking`  (base + effort + thinking)
+ *             `claude-4.5-sonnet-thinking`         (base + thinking, no effort)
+ */
+function splitCursorSlug(id: string): {
+  base: string;
+  effortToken?: CursorEffortToken;
+  fast: boolean;
+  thinking: boolean;
+} {
   let rest = id.trim();
-  if (!rest) return { base: "", fast: false };
+  if (!rest) return { base: "", fast: false, thinking: false };
   let fast = false;
   if (rest.endsWith("-fast")) {
     fast = true;
     rest = rest.slice(0, -5);
   }
+  let thinking = false;
+  // Suffix thinking: `...-thinking` (possibly after effort).
+  if (rest.endsWith("-thinking")) {
+    thinking = true;
+    rest = rest.slice(0, -"-thinking".length);
+  }
+  // Effort token (now free of trailing thinking/fast).
+  let effortToken: CursorEffortToken | undefined;
   for (const token of CURSOR_EFFORT_TOKENS) {
     const suffix = `-${token}`;
     if (rest.endsWith(suffix) && rest.length > suffix.length) {
-      return { base: rest.slice(0, -suffix.length), effortToken: token, fast };
+      effortToken = token;
+      rest = rest.slice(0, -suffix.length);
+      break;
     }
   }
-  return { base: rest, fast };
+  // Infix thinking: `base-thinking-<effort>` leaves `base-thinking` here.
+  if (!thinking && rest.endsWith("-thinking")) {
+    thinking = true;
+    rest = rest.slice(0, -"-thinking".length);
+  }
+  return { base: rest, ...(effortToken ? { effortToken } : {}), fast, thinking };
 }
 
 /** Normalize Cursor model family ids (CLI may print `Auto` as a label-looking line). */
@@ -507,6 +537,10 @@ type CursorFamily = {
   label: string;
   supportsFast: boolean;
   reasoningEfforts: ReasoningEffort[];
+  /** Model exposes an extended-thinking variant. */
+  supportsThinking: boolean;
+  /** Efforts available when thinking is enabled (may differ from reasoningEfforts). */
+  thinkingEfforts: ReasoningEffort[];
   /** All live slugs belonging to this family. */
   slugs: string[];
 };
@@ -515,36 +549,50 @@ function groupCursorLiveSlugs(ids: string[]): CursorFamily[] {
   const byBase = new Map<string, {
     slugs: string[];
     efforts: Set<ReasoningEffort>;
+    thinkingEfforts: Set<ReasoningEffort>;
     supportsFast: boolean;
+    supportsThinking: boolean;
     hasBare: boolean;
   }>();
 
   for (const id of ids) {
     const split = splitCursorSlug(id);
     const base = normalizeCursorBaseId(split.base);
-    const { effortToken, fast } = split;
+    const { effortToken, fast, thinking } = split;
     if (!base || base.includes("[")) continue;
     let row = byBase.get(base);
     if (!row) {
-      row = { slugs: [], efforts: new Set(), supportsFast: false, hasBare: false };
+      row = {
+        slugs: [],
+        efforts: new Set(),
+        thinkingEfforts: new Set(),
+        supportsFast: false,
+        supportsThinking: false,
+        hasBare: false
+      };
       byBase.set(base, row);
     }
     row.slugs.push(id);
     if (fast) row.supportsFast = true;
-    if (!effortToken) row.hasBare = true;
-    const effort = effortToken ? effortTokenToReasoning(effortToken) : undefined;
-    if (effort) row.efforts.add(effort);
+    if (thinking) row.supportsThinking = true;
+    if (!effortToken && !thinking) row.hasBare = true;
+    const effort = effortTokenToReasoning(effortToken);
+    if (effort) {
+      if (thinking) row.thinkingEfforts.add(effort);
+      else row.efforts.add(effort);
+    }
   }
 
+  const order: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
   const families: CursorFamily[] = [];
   for (const [base, row] of byBase) {
-    const order: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
-    const reasoningEfforts = order.filter((e) => row.efforts.has(e));
     families.push({
       base,
       label: humanizeCursorBase(base),
       supportsFast: row.supportsFast,
-      reasoningEfforts,
+      reasoningEfforts: order.filter((e) => row.efforts.has(e)),
+      supportsThinking: row.supportsThinking,
+      thinkingEfforts: order.filter((e) => row.thinkingEfforts.has(e)),
       slugs: row.slugs
     });
   }
@@ -630,12 +678,49 @@ async function runCursorModelsList(command: string): Promise<string | null> {
   return null;
 }
 
+/** Build the ordered `thinking` segment candidates for a slug (infix + suffix forms). */
+function cursorSlugCandidates(
+  base: string,
+  effort: ReasoningEffort | undefined,
+  thinking: boolean,
+  fast: boolean
+): string[] {
+  const effortTokens: string[] = [];
+  if (effort) {
+    effortTokens.push(reasoningToEffortToken(effort));
+    if (effort === "xhigh") effortTokens.push("extra-high");
+  }
+
+  // Core forms (without fast), most-specific first.
+  const cores: string[] = [];
+  if (thinking) {
+    // Infix: base-thinking-<effort>
+    for (const token of effortTokens) cores.push(`${base}-thinking-${token}`);
+    // Suffix: base-<effort>-thinking
+    for (const token of effortTokens) cores.push(`${base}-${token}-thinking`);
+    // Thinking without effort: base-thinking
+    cores.push(`${base}-thinking`);
+  }
+  for (const token of effortTokens) cores.push(`${base}-${token}`);
+  cores.push(base);
+
+  const out: string[] = [];
+  for (const core of cores) {
+    if (fast) out.push(`${core}-fast`);
+    out.push(core);
+  }
+  if (fast) out.push(`${base}-fast`);
+  out.push(base);
+  return out;
+}
+
 function pickCursorSlug(
   base: string,
-  options?: { reasoningEffort?: ReasoningEffort; fast?: boolean },
+  options?: { reasoningEffort?: ReasoningEffort; fast?: boolean; thinking?: boolean },
   live?: Set<string>
 ): string {
   const fast = options?.fast === true;
+  const thinking = options?.thinking === true;
   let effort = options?.reasoningEffort;
 
   // Bare base (e.g. gpt-5.6-sol) is often not a valid CLI id — default to medium when live set known.
@@ -643,38 +728,17 @@ function pickCursorSlug(
     const fallbacks: ReasoningEffort[] = ["medium", "high", "low", "xhigh", "max"];
     for (const candidate of fallbacks) {
       const token = reasoningToEffortToken(candidate);
-      const slug = fast ? `${base}-${token}-fast` : `${base}-${token}`;
-      const alt = candidate === "xhigh"
-        ? (fast ? `${base}-extra-high-fast` : `${base}-extra-high`)
-        : null;
-      if (live.has(slug) || (alt && live.has(alt))) {
+      const probes = thinking
+        ? [`${base}-thinking-${token}`, `${base}-${token}-thinking`]
+        : [`${base}-${token}`, candidate === "xhigh" ? `${base}-extra-high` : ""];
+      if (probes.some((slug) => slug && (live.has(slug) || live.has(`${slug}-fast`)))) {
         effort = candidate;
         break;
       }
     }
   }
 
-  const tokens: Array<string | undefined> = [];
-  if (effort) {
-    const primary = reasoningToEffortToken(effort);
-    tokens.push(primary);
-    if (effort === "xhigh") tokens.push("extra-high");
-    if (base.endsWith("-thinking") || /(?:^|-)thinking$/i.test(base)) {
-      tokens.unshift(`thinking-${effort === "xhigh" ? "xhigh" : effort}`);
-    }
-  } else {
-    tokens.push(undefined);
-  }
-
-  const candidates: string[] = [];
-  for (const token of tokens) {
-    const core = token ? `${base}-${token}` : base;
-    if (fast) candidates.push(`${core}-fast`);
-    candidates.push(core);
-  }
-  if (fast) candidates.push(`${base}-fast`);
-  candidates.push(base);
-
+  const candidates = cursorSlugCandidates(base, effort, thinking, fast);
   const seen = new Set<string>();
   const ordered = candidates.filter((id) => {
     if (!id || seen.has(id)) return false;
@@ -686,17 +750,23 @@ function pickCursorSlug(
     for (const id of ordered) {
       if (live.has(id)) return id;
     }
-    if (effort) {
-      const want = reasoningToEffortToken(effort);
-      for (const slug of live) {
-        const parts = splitCursorSlug(slug);
-        if (parts.base !== base) continue;
-        if (parts.fast !== fast) continue;
-        if (parts.effortToken === want || (want === "xhigh" && parts.effortToken === "extra-high")) {
-          return slug;
-        }
-      }
+    // Fallback: scan live set for a slug matching base + effort + thinking (+fast when possible).
+    const want = effort ? reasoningToEffortToken(effort) : undefined;
+    let fastMatch = "";
+    let anyMatch = "";
+    for (const slug of live) {
+      const parts = splitCursorSlug(slug);
+      if (parts.base !== base) continue;
+      if (parts.thinking !== thinking) continue;
+      const effortOk = !want
+        ? true
+        : parts.effortToken === want || (want === "xhigh" && parts.effortToken === "extra-high");
+      if (!effortOk) continue;
+      if (parts.fast === fast && !fastMatch) fastMatch = slug;
+      if (!anyMatch) anyMatch = slug;
     }
+    if (fastMatch) return fastMatch;
+    if (anyMatch) return anyMatch;
   }
 
   return ordered[0] || base;
@@ -709,6 +779,7 @@ export function parseCursorModelRef(model: string | undefined): {
   base: string;
   fast?: boolean;
   reasoningEffort?: ReasoningEffort;
+  thinking?: boolean;
 } {
   const raw = (model || "").trim();
   if (!raw) return { base: "composer-2.5" };
@@ -719,10 +790,12 @@ export function parseCursorModelRef(model: string | undefined): {
     if (base === "auto") return { base: "auto" };
     let fast: boolean | undefined;
     let reasoningEffort: ReasoningEffort | undefined;
+    let thinking: boolean | undefined;
     for (const part of (bracket[2] || "").split(",")) {
       const [k, v] = part.split("=").map((s) => s.trim());
       if (!k) continue;
       if (k === "fast") fast = v === "true" || v === "1";
+      if (k === "thinking") thinking = v === "true" || v === "1";
       if (k === "effort") {
         const mapped = v === "extra_high" || v === "extra-high" ? "xhigh" : v;
         if (mapped === "low" || mapped === "medium" || mapped === "high" || mapped === "xhigh" || mapped === "max") {
@@ -730,19 +803,27 @@ export function parseCursorModelRef(model: string | undefined): {
         }
       }
     }
-    return { base, ...(fast !== undefined ? { fast } : {}), ...(reasoningEffort ? { reasoningEffort } : {}) };
+    return {
+      base,
+      ...(fast !== undefined ? { fast } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(thinking !== undefined ? { thinking } : {})
+    };
   }
 
-  // Already a live slug like gpt-5.6-sol-medium-fast
-  if (!raw.includes("[") && (raw.includes("-fast") || CURSOR_EFFORT_TOKENS.some((t) => raw.endsWith(`-${t}`)))) {
+  // Already a live slug like gpt-5.6-sol-medium-fast / claude-opus-5-thinking-high
+  const looksLikeSlug = !raw.includes("[")
+    && (raw.includes("-fast") || raw.includes("-thinking") || CURSOR_EFFORT_TOKENS.some((t) => raw.endsWith(`-${t}`)));
+  if (looksLikeSlug) {
     const parts = splitCursorSlug(raw);
     const base = normalizeCursorBaseId(parts.base);
     if (base === "auto") return { base: "auto" };
-    const effort = parts.effortToken ? effortTokenToReasoning(parts.effortToken) : undefined;
+    const effort = effortTokenToReasoning(parts.effortToken);
     return {
       base,
-      ...(parts.fast ? { fast: true } : { fast: false }),
-      ...(effort ? { reasoningEffort: effort } : {})
+      fast: Boolean(parts.fast),
+      ...(effort ? { reasoningEffort: effort } : {}),
+      ...(parts.thinking ? { thinking: true } : {})
     };
   }
 
@@ -756,6 +837,7 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
   cursorLiveSlugSet = new Set();
   let currentModel: string | undefined;
   let currentReasoningEffort: ReasoningEffort | undefined;
+  let currentThinking: boolean | undefined;
 
   try {
     const { resolveEngineBinary } = await import("./detect");
@@ -777,7 +859,9 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
             id: family.base,
             label: family.label,
             ...(family.supportsFast ? { supportsFast: true } : {}),
-            ...(family.reasoningEfforts.length ? { reasoningEfforts: family.reasoningEfforts } : {})
+            ...(family.reasoningEfforts.length ? { reasoningEfforts: family.reasoningEfforts } : {}),
+            ...(family.supportsThinking ? { supportsThinking: true } : {}),
+            ...(family.thinkingEfforts.length ? { thinkingEfforts: family.thinkingEfforts } : {})
           });
         }
       }
@@ -800,6 +884,10 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
       if (row.reasoningEfforts?.length && !existing.reasoningEfforts?.length) {
         existing.reasoningEfforts = row.reasoningEfforts;
       }
+      if (row.supportsThinking && existing.supportsThinking === undefined) existing.supportsThinking = true;
+      if (row.thinkingEfforts?.length && !existing.thinkingEfforts?.length) {
+        existing.thinkingEfforts = row.thinkingEfforts;
+      }
       if (row.label && existing.label === existing.id) existing.label = row.label;
     }
   }
@@ -820,7 +908,15 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
         || ""
       ).trim();
       if (selectedId && !/^default$/i.test(selectedId)) {
-        currentModel = normalizeCursorBaseId(/^auto$/i.test(selectedId) ? "auto" : selectedId);
+        if (/^auto$/i.test(selectedId)) {
+          currentModel = "auto";
+        } else {
+          // selectedId may be a full slug (claude-opus-5-thinking-high) — split to base + thinking + effort.
+          const ref = parseCursorModelRef(selectedId);
+          currentModel = normalizeCursorBaseId(ref.base);
+          if (ref.thinking) currentThinking = true;
+          if (!currentReasoningEffort && ref.reasoningEffort) currentReasoningEffort = ref.reasoningEffort;
+        }
       } else if (/^auto$/i.test(String(cli.model?.displayModelId || ""))) {
         currentModel = "auto";
       }
@@ -873,7 +969,8 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
     models,
     reasoningEfforts,
     currentModel,
-    ...(currentReasoningEffort ? { currentReasoningEffort } : {})
+    ...(currentReasoningEffort ? { currentReasoningEffort } : {}),
+    ...(currentThinking ? { currentThinking: true } : {})
   };
 }
 
@@ -1121,7 +1218,7 @@ async function discoverAntigravityCapability(): Promise<EngineCapability> {
  */
 export function formatCursorModelArg(
   model: string | undefined,
-  options?: { reasoningEffort?: ReasoningEffort; fast?: boolean }
+  options?: { reasoningEffort?: ReasoningEffort; fast?: boolean; thinking?: boolean }
 ): string {
   const parsed = parseCursorModelRef(model);
   // Auto is a bare CLI id — never append effort/fast (would become Auto-xhigh).
@@ -1129,12 +1226,14 @@ export function formatCursorModelArg(
 
   const fast = options?.fast ?? parsed.fast;
   const reasoningEffort = options?.reasoningEffort ?? parsed.reasoningEffort;
+  const thinking = options?.thinking ?? parsed.thinking;
 
   return pickCursorSlug(
     normalizeCursorBaseId(parsed.base),
     {
       ...(reasoningEffort ? { reasoningEffort } : {}),
-      ...(fast !== undefined ? { fast } : {})
+      ...(fast !== undefined ? { fast } : {}),
+      ...(thinking !== undefined ? { thinking } : {})
     },
     cursorLiveSlugSet.size ? cursorLiveSlugSet : undefined
   );

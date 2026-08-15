@@ -49,6 +49,8 @@ export type StoredTask = {
   updatedAt: number;
   model?: string;
   reasoningEffort?: ReasoningEffort;
+  /** Cursor: extended-thinking variant enabled for this thread. */
+  thinking?: boolean;
   /** Last web permission mode — reused by interactive CLI handoff. */
   permissionMode?: PermissionMode;
   contextUsage?: ContextUsage;
@@ -69,6 +71,8 @@ export type HeadlessRunOptions = {
   preferredSessionId?: string;
   model?: string;
   reasoningEffort?: ReasoningEffort;
+  /** Cursor: enable the model's extended-thinking variant when the base supports it. */
+  thinking?: boolean;
   /**
    * Internal: Cursor stall retry without --resume already attempted.
    * Skips a second turn.started so the web does not duplicate the user bubble.

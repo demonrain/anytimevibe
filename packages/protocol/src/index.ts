@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.80";
+export const PRODUCT_VERSION = "0.4.81";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -126,8 +126,19 @@ export const engineModelOptionSchema = z.object({
   /**
    * Per-model reasoning/effort levels. When set, UI should prefer these over
    * the engine-level `reasoningEfforts` list for this model only.
+   * For Cursor these are the efforts available WITHOUT thinking.
    */
-  reasoningEfforts: z.array(reasoningEffortSchema).optional()
+  reasoningEfforts: z.array(reasoningEffortSchema).optional(),
+  /**
+   * Cursor: model exposes an extended-thinking variant (e.g.
+   * `claude-opus-5-thinking-high`). UI should show a "Thinking" toggle.
+   */
+  supportsThinking: z.boolean().optional(),
+  /**
+   * Cursor: reasoning/effort levels available WHEN thinking is enabled
+   * (may differ from `reasoningEfforts`). Empty = thinking has no effort variants.
+   */
+  thinkingEfforts: z.array(reasoningEffortSchema).optional()
 });
 export type EngineModelOption = z.infer<typeof engineModelOptionSchema>;
 
@@ -137,7 +148,9 @@ export const engineCapabilitySchema = z.object({
   models: z.array(engineModelOptionSchema),
   reasoningEfforts: z.array(reasoningEffortSchema),
   currentModel: z.string().optional(),
-  currentReasoningEffort: reasoningEffortSchema.optional()
+  currentReasoningEffort: reasoningEffortSchema.optional(),
+  /** Cursor: whether the currently selected model has thinking enabled. */
+  currentThinking: z.boolean().optional()
 });
 export type EngineCapability = z.infer<typeof engineCapabilitySchema>;
 
@@ -199,7 +212,9 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     /** Optional model id / alias for the selected engine. */
     model: z.string().trim().min(1).max(120).optional(),
     /** Optional reasoning effort (Codex/Claude/Grok naming mapped server-side). */
-    reasoningEffort: reasoningEffortSchema.optional()
+    reasoningEffort: reasoningEffortSchema.optional(),
+    /** Cursor: enable the model's extended-thinking variant when available. */
+    thinking: z.boolean().optional()
   }),
   commandBase.extend({
     type: z.literal("thread.resume"),
@@ -211,7 +226,9 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     prompt: z.string().min(1),
     permissionMode: permissionModeSchema.optional(),
     model: z.string().trim().min(1).max(120).optional(),
-    reasoningEffort: reasoningEffortSchema.optional()
+    reasoningEffort: reasoningEffortSchema.optional(),
+    /** Cursor: enable the model's extended-thinking variant when available. */
+    thinking: z.boolean().optional()
   }),
   commandBase.extend({
     type: z.literal("turn.steer"),
@@ -336,6 +353,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     providerSessionId: z.string().optional(),
     model: z.string().optional(),
     reasoningEffort: reasoningEffortSchema.optional(),
+    /** Cursor: whether the extended-thinking variant is active for this thread. */
+    thinking: z.boolean().optional(),
     contextUsage: contextUsageSchema.optional(),
     /** Unified diff / git status for the task Diff tab (optional; may be large). */
     diff: z.string().max(500_000).optional(),
