@@ -283,6 +283,8 @@ async function readCursorSessionMessages(dbPath: string): Promise<{
     "  role=obj.get('role')",
     "  if role not in ('user','assistant'):",
     "    continue",
+    "  if obj.get('subagent_id') or obj.get('agent_type')=='background' or obj.get('is_subagent') or obj.get('agentId'):",
+    "    continue",
     "  content=obj.get('content')",
     "  parts=[]",
     "  if isinstance(content,str):",
@@ -294,8 +296,9 @@ async function readCursorSessionMessages(dbPath: string): Promise<{
     "  text='\\n'.join(parts).strip()",
     "  if not text:",
     "    continue",
-    "  if role=='user' and ide_re.search(text):",
+    "  if ide_re.search(text):",
     "    ide_transcript=True",
+    "    continue",
     "  msgs.append({'role':role,'text':text[:20000],'rowid':rowid})",
     // Newest-first → chronological
     "msgs.reverse()",
@@ -629,11 +632,12 @@ function isNoiseTranscriptText(text: string): boolean {
   // Tool-result leftovers that slipped past block typing
   if (/^\[tool_result\]/i.test(t)) return true;
   if (/^tool_use_id\b/i.test(t)) return true;
-  // Pure environment / git / system blocks with no user ask
+  // Pure environment / git / system / transcript blocks with no user ask
   if (/^<user_info>[\s\S]*<\/user_info>\s*$/i.test(t)) return true;
   if (/^<git_status>[\s\S]*<\/git_status>\s*$/i.test(t)) return true;
   if (/^<system-reminder>[\s\S]*<\/system-reminder>\s*$/i.test(t)) return true;
   if (/^<agent_skills>[\s\S]*<\/agent_skills>\s*$/i.test(t)) return true;
+  if (/<agent_transcripts>/i.test(t) || /Agent transcripts\s*\(\s*past chats\s*\)\s*live in/i.test(t)) return true;
   if (/DO NOT respond to these messages/i.test(t) && t.length < 800) return true;
   // Grok/Claude session bootstrap dumps
   if (/^You are Grok\b/i.test(t) && t.length > 400) return true;

@@ -710,10 +710,20 @@ function looksLikeToolIoUserText(text: string | undefined | null): boolean {
   return false;
 }
 
+function isCursorIdeAgentTranscriptNoise(text: string | undefined | null): boolean {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (/<agent_transcripts>/i.test(t)) return true;
+  if (/Agent transcripts\s*\(\s*past chats\s*\)\s*live in/i.test(t)) return true;
+  return false;
+}
+
 function sanitizeTranscriptMessages<T extends { role: string; text: string }>(messages: T[]): T[] {
   return messages.filter((message) => {
     if (message.role !== "user") return true;
-    return !looksLikeToolIoUserText(message.text);
+    if (looksLikeToolIoUserText(message.text)) return false;
+    if (isCursorIdeAgentTranscriptNoise(message.text)) return false;
+    return true;
   });
 }
 
@@ -981,7 +991,9 @@ const ChatMessageStream = memo(function ChatMessageStream({
       (replyDetail === "detailed"
         ? messages
         : messages.filter((message) => !isProcessStreamMessage(message))
-      ).filter((message) => message.role !== "user" || !looksLikeToolIoUserText(message.text))
+      ).filter(
+        (message) => message.role !== "user" || (!looksLikeToolIoUserText(message.text) && !isCursorIdeAgentTranscriptNoise(message.text))
+      )
     ),
     [messages, replyDetail]
   );

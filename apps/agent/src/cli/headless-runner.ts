@@ -9,6 +9,7 @@ import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
 import { formatAgySpawnArgs, formatCursorModelArg, parseCursorModelRef } from "./model-catalog";
 import { explainGrokSerializationError, prepareGrokResponsesCompat } from "./grok-responses-compat";
+import { isCodexModelsManagerNoise, stripAnsi } from "./log-noise";
 import { headlessPermissionArgs } from "./permission-args";
 import type { ApprovalPlan, ApprovalQuestion, BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
 import { ensureWorkspaceTrusted } from "./workspace-trust";
@@ -270,6 +271,12 @@ type ParseState = {
   agyJsonBuf?: string;
   /** Antigravity tool step keys already announced. */
   agySeenTools?: Set<string>;
+  /**
+   * Last actionable cause scraped from Antigravity stderr.
+   * Print mode often collapses real failures (401 / location) into
+   * "Agent execution terminated due to error."
+   */
+  agyLastCause?: string;
 };
 
 /** Strip UI prefixes so "错误：API Error" and "API Error" dedupe as one. */
@@ -614,7 +621,32 @@ function handleCursorLine(
     return;
   }
 
+  if (type === "agent_transcripts" || type === "transcript" || type === "subagent" || type === "background_agent_transcript") {
+    return;
+  }
+
   if (type === "assistant") {
+    // Skip subagent / background-agent transcript messages — they are internal
+    // Cursor sub-task communications, not the user-facing assistant reply.
+    const isSubagent = Boolean(
+      parsed.subagent_id
+      || parsed.agent_type === "background"
+      || parsed.is_subagent
+      || parsed.message?.agent_id
+      || parsed.message?.subagent_id
+    );
+    const content = parsed.message?.content;
+    const text = Array.isArray(content)
+      ? content.map((block: any) => (block?.type === "text" ? String(block.text || "") : "")).join("")
+      : "";
+    if (!text) return;
+    if (/<agent_transcripts>|Agent transcripts\s*\(\s*past chats\s*\)\s*live in/i.test(text)) {
+      return;
+    }
+    if (isSubagent) {
+      emitDelta(onEvent, options, "stage:subagent", "stage", `\n… [子任务进度] ${text.slice(0, 160)}\n`);
+      return;
+    }
     // Cursor stream-json + --stream-partial-output (docs):
     // - timestamp_ms present, model_call_id absent → streaming delta (use)
     // - both present → pre-tool buffered flush (skip)
@@ -623,11 +655,6 @@ function handleCursorLine(
     const hasTs = Object.prototype.hasOwnProperty.call(parsed, "timestamp_ms");
     const hasMc = Object.prototype.hasOwnProperty.call(parsed, "model_call_id");
     if (hasTs && hasMc) return;
-    const content = parsed.message?.content;
-    const text = Array.isArray(content)
-      ? content.map((block: any) => (block?.type === "text" ? String(block.text || "") : "")).join("")
-      : "";
-    if (!text) return;
     if (!hasTs && !hasMc && state.sawAssistant && state.text.includes(text)) return;
     state.text += text;
     state.sawAssistant = true;
@@ -869,13 +896,108 @@ function agyStepText(step: Record<string, unknown>): string {
 }
 
 function isAgyNoiseLog(line: string): boolean {
-  return /codex_models_manager|failed to refresh available models|failed to decode models response/i.test(line);
+  const value = stripAnsi(line);
+  if (isCodexModelsManagerNoise(value)) return true;
+  // agy glog spam — info/warn prefixed as "ERROR: logging before google.Init"
+  // Keep real agent executor failures (handled separately via noteAgyStderrCause).
+  if (/^ERROR:\s*logging before google\.Init:/i.test(value.trim())) {
+    if (/agent executor error|error in generator|error encountered while processing planner|UNAUTHENTICATED|FAILED_PRECONDITION|User location is not supported|RESOURCE_EXHAUSTED|Individual quota|authentication required|not logged into Antigravity/i.test(value)) {
+      return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 /** True when Antigravity's grep_search cannot find the Unix `grep` binary (common on Windows). */
 function isAgyMissingGrepError(line: string): boolean {
-  return /CORTEX_STEP_TYPE_GREP_SEARCH|grep_search/i.test(line)
-    && /exec:\s*"grep"|grep["']?:\s*executable file not found|not found in %PATH%/i.test(line);
+  const value = stripAnsi(line);
+  return /CORTEX_STEP_TYPE_GREP_SEARCH|grep_search/i.test(value)
+    && /exec:\s*"grep"|grep["']?:\s*executable file not found|not found in %PATH%/i.test(value);
+}
+
+function isAgyTrajectoryNotFound(text: string | undefined | null): boolean {
+  const value = String(text || "");
+  return /trajectory not found|conversation .+ not found|conversation_id.+not found/i.test(value);
+}
+
+function isAgyAuthError(text: string | undefined | null): boolean {
+  const value = stripAnsi(String(text || ""));
+  return /UNAUTHENTICATED|invalid authentication credentials|authentication (required|failed|timed out)|not logged in|not logged into Antigravity|please run \/login|please visit the url to log in|oauth 2 access token/i.test(value);
+}
+
+function isAgyLocationError(text: string | undefined | null): boolean {
+  const value = stripAnsi(String(text || ""));
+  return /user location is not supported|FAILED_PRECONDITION.*location|location is not supported for the API/i.test(value);
+}
+
+function isAgyQuotaError(text: string | undefined | null): boolean {
+  const value = String(text || "");
+  return /individual quota reached|quota reached|resource_exhausted|upgrade your subscription to increase your limits/i.test(value);
+}
+
+function isAgyGenericTerminated(text: string | undefined | null): boolean {
+  const value = String(text || "");
+  return /agent execution terminated due to error/i.test(value);
+}
+
+/** Pull the actionable Google/agy error out of a stderr/glog line. */
+function extractAgyStderrCause(line: string): string | undefined {
+  const value = stripAnsi(line);
+  if (!value.trim()) return undefined;
+  if (isAgyAuthError(value)) {
+    return "Antigravity 登录凭证失效（UNAUTHENTICATED 401）。请在本机终端运行一次交互式 agy 重新登录后再试。";
+  }
+  if (isAgyLocationError(value)) {
+    return "Antigravity API 拒绝当前出口地区（User location is not supported）。请切换代理到受支持地区后重试。";
+  }
+  if (isAgyQuotaError(value)) {
+    const m = value.match(/Individual quota reached[^.]*\.?/i);
+    return m?.[0] || "Antigravity 配额不足";
+  }
+  const executor = value.match(/agent executor error:\s*(.+)$/i)
+    || value.match(/error in generator:\s*(.+)$/i)
+    || value.match(/error encountered while processing planner output:\s*(.+)$/i);
+  if (executor?.[1]) {
+    const detail = executor[1].replace(/\s+/g, " ").trim();
+    if (detail && !isAgyGenericTerminated(detail)) return detail.slice(0, 500);
+  }
+  return undefined;
+}
+
+function noteAgyStderrCause(state: ParseState, line: string): void {
+  const cause = extractAgyStderrCause(line);
+  if (cause) state.agyLastCause = cause;
+}
+
+function explainAgyFailure(
+  errorText: string,
+  state: ParseState,
+  resultConversationId?: string,
+  providerSessionId?: string
+): string {
+  const combined = [errorText, state.agyLastCause].filter(Boolean).join("\n");
+  if (isAgyTrajectoryNotFound(combined)) {
+    return `Antigravity 会话不存在（${resultConversationId || providerSessionId || "unknown"}）。将尝试新开会话。`;
+  }
+  if (isAgyLocationError(combined) || isAgyLocationError(state.agyLastCause)) {
+    return state.agyLastCause
+      || "Antigravity API 拒绝当前出口地区（User location is not supported）。请切换代理到受支持地区后重试。";
+  }
+  if (isAgyAuthError(combined) || isAgyAuthError(state.agyLastCause)) {
+    return state.agyLastCause
+      || "Antigravity 未登录或登录已过期。请在本机终端运行一次交互式 agy 完成登录后再试。";
+  }
+  if (isAgyQuotaError(combined)) {
+    return `Antigravity 配额不足：${errorText || state.agyLastCause || ""}`.trim();
+  }
+  if (isAgyGenericTerminated(errorText) && state.agyLastCause) {
+    return state.agyLastCause;
+  }
+  if (isAgyGenericTerminated(errorText)) {
+    return "Antigravity 执行中断（未返回具体原因）。常见原因：登录失效、出口地区不受支持、或配额耗尽。请查看本机 ~/.gemini/antigravity-cli/log 最新日志，或重新登录后再试。";
+  }
+  return errorText || state.agyLastCause || "Antigravity 运行失败";
 }
 
 /**
@@ -930,21 +1052,6 @@ export function resolveAgyConversationResumeId(
   if (webId && id === webId && !agyConversationExists(id)) return undefined;
   if (!agyConversationExists(id)) return undefined;
   return id;
-}
-
-function isAgyTrajectoryNotFound(text: string | undefined | null): boolean {
-  const value = String(text || "");
-  return /trajectory not found|conversation .+ not found|conversation_id.+not found/i.test(value);
-}
-
-function isAgyAuthError(text: string | undefined | null): boolean {
-  const value = String(text || "");
-  return /authentication (required|failed|timed out)|not logged in|please run \/login|please visit the url to log in/i.test(value);
-}
-
-function isAgyQuotaError(text: string | undefined | null): boolean {
-  const value = String(text || "");
-  return /individual quota reached|quota reached|resource_exhausted|upgrade your subscription to increase your limits/i.test(value);
 }
 
 /** Stream incremental tokens; if agy later sends a fuller snapshot, only emit the missing suffix. */
@@ -1056,23 +1163,22 @@ function handleAntigravityLine(
       } else if (resultConversationId && agyConversationExists(resultConversationId)) {
         state.sessionId = resultConversationId;
       }
-      // Quota errors after a full streamed reply: keep the answer, warn instead of wiping success.
-      if (isAgyQuotaError(errorText) && state.sawAssistant && state.text.trim()) {
-        const warn = errorText.startsWith("Antigravity")
-          ? errorText
-          : `Antigravity 配额不足（本轮已产出回复）：${errorText}`;
-        emitDelta(onEvent, options, "stage:agy-quota", "stage", `\n⚠ ${warn}\n`);
+      // Quota / auth / location errors after a full streamed reply: keep the answer, warn instead of wiping success.
+      if (
+        (isAgyQuotaError(errorText) || isAgyAuthError(errorText) || isAgyLocationError(errorText)
+          || isAgyGenericTerminated(errorText) || isAgyAuthError(state.agyLastCause) || isAgyLocationError(state.agyLastCause))
+        && state.sawAssistant
+        && state.text.trim()
+      ) {
+        const warn = explainAgyFailure(errorText, state, resultConversationId, options.providerSessionId);
+        emitDelta(onEvent, options, "stage:agy-soft-fail", "stage", `\n⚠ ${warn}\n`);
         const finalText = typeof result.response === "string" ? result.response : "";
-        if (finalText && finalText !== errorText) emitAgyAssistantText(state, options, onEvent, finalText);
+        if (finalText && finalText !== errorText && !isAgyGenericTerminated(finalText)) {
+          emitAgyAssistantText(state, options, onEvent, finalText);
+        }
         return;
       }
-      const message = isAgyTrajectoryNotFound(errorText)
-        ? `Antigravity 会话不存在（${resultConversationId || options.providerSessionId || "unknown"}）。将尝试新开会话。`
-        : isAgyAuthError(errorText)
-          ? "Antigravity 未登录或登录已过期。请在本机终端运行一次交互式 agy 完成登录后再试。"
-          : isAgyQuotaError(errorText)
-            ? `Antigravity 配额不足：${errorText}`
-            : (errorText || "Antigravity 运行失败");
+      const message = explainAgyFailure(errorText, state, resultConversationId, options.providerSessionId);
       emitHeadlessErrorOnce(state, onEvent, options, message);
       return;
     }
@@ -1454,21 +1560,31 @@ export async function runHeadlessTurn(
       createInterface({ input: child.stderr, crlfDelay: Infinity }).on("line", (line) => {
         state.lastProgressAt = Date.now();
         if (!line.trim()) return;
-        if (engine === "antigravity" && isAgyNoiseLog(line)) return;
-        if (engine === "antigravity" && isAgyMissingGrepError(line)) {
-          const warnKey = "agy-missing-grep";
-          if (!state.emittedErrors.has(warnKey)) {
-            state.emittedErrors.add(warnKey);
-            emitDelta(
-              safeOnEvent,
-              options,
-              "stage:agy-grep",
-              "stage",
-              "\n⚠ Antigravity 的 grep_search 需要本机 grep（Windows 请安装 Git for Windows，或把 Git\\usr\\bin 加入 PATH）。工具失败后可能长时间无 stream 进度…\n"
-            );
+        if (engine === "antigravity") {
+          noteAgyStderrCause(state, line);
+          if (isAgyNoiseLog(line)) return;
+          if (isAgyMissingGrepError(line)) {
+            const warnKey = "agy-missing-grep";
+            if (!state.emittedErrors.has(warnKey)) {
+              state.emittedErrors.add(warnKey);
+              emitDelta(
+                safeOnEvent,
+                options,
+                "stage:agy-grep",
+                "stage",
+                "\n⚠ Antigravity 的 grep_search 需要本机 grep（Windows 请安装 Git for Windows，或把 Git\\usr\\bin 加入 PATH）。工具失败后可能长时间无 stream 进度…\n"
+              );
+            }
+            return;
+          }
+          // Surface only actionable stderr causes; bury glog chatter.
+          const cause = extractAgyStderrCause(line);
+          if (cause) {
+            emitDelta(safeOnEvent, options, "cli-log", "cli-log", `\n… ${cause}\n`);
           }
           return;
         }
+        if (isCodexModelsManagerNoise(line)) return;
         emitDelta(safeOnEvent, options, "cli-log", "cli-log", `${line}\n`);
       });
     }

@@ -57,6 +57,7 @@ import {
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
 import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn, normalizeSystemErrorText } from "./cli/headless-runner";
+import { isCodexModelsManagerNoise } from "./cli/log-noise";
 import { importLocalCliSessions, sanitizeTranscriptMessages } from "./cli/import-sessions";
 import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
 import { startEngineConfigWatch } from "./cli/engine-config-watch";
@@ -4724,7 +4725,9 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   }
   if (message.method === "agent/log") {
     const line = String(message.params?.line ?? "").trim();
-    if (line) {
+    // Codex app-server stays alive across engines; its models-refresh noise must not
+    // bleed into Claude/Cursor/Grok/Antigravity transcripts.
+    if (line && !isCodexModelsManagerNoise(line)) {
       for (const threadId of activeTurnByThread.keys()) {
         appendLocalActivity(threadId, `\n${line}`);
         queueRemoteDelta(threadId, "cli-log", `\n${line}\n`);

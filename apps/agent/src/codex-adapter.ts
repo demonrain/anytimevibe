@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { windowsCmdArguments } from "./windows-command";
 import { localGatewayChildEnv } from "./local-proxy";
+import { isCodexModelsManagerNoise } from "./cli/log-noise";
 import type { PermissionMode } from "@anytimevibe/protocol";
 
 type RpcId = string | number;
@@ -84,7 +85,11 @@ export class CodexAdapter {
     this.process = child;
     createInterface({ input: child.stdout }).on("line", (line) => this.handleLine(line));
     createInterface({ input: child.stderr }).on("line", (line) => {
-      if (line.trim()) this.onServerMessage({ method: "agent/log", params: { line } });
+      if (!line.trim()) return;
+      // Custom /v1/models gateways often return OpenAI {"data":[...]} — Codex logs ERROR
+      // then falls back to cache. Do not forward that noise into active task transcripts.
+      if (isCodexModelsManagerNoise(line)) return;
+      this.onServerMessage({ method: "agent/log", params: { line } });
     });
     child.on("exit", (code, signal) => {
       this.process = null;
