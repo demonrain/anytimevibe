@@ -2232,7 +2232,10 @@ async function resolveWindowsPath(): Promise<string> {
     path.join(home, "AppData", "Local", "fnm"),
     path.join(home, ".fnm"),
     path.join(home, "scoop", "shims"),
-    path.join(home, "AppData", "Local", "Programs", "fnm")
+    path.join(home, "AppData", "Local", "Programs", "fnm"),
+    // Antigravity grep_search shells out to `grep`; Git for Windows ships it under usr\bin.
+    path.join(process.env.ProgramFiles || "C:\\Program Files", "Git", "usr", "bin"),
+    path.join(process.env.LOCALAPPDATA || "", "Programs", "Git", "usr", "bin")
   ]) {
     if (dir) parts.add(dir);
   }

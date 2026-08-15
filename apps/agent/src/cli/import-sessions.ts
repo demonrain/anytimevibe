@@ -80,8 +80,38 @@ function isGrokSmokePrompt(text: string | undefined | null): boolean {
 function hasUsefulTranscript(messages: HistoryMessage[]): boolean {
   return messages.some((message) => {
     if (message.role !== "user" && message.role !== "assistant") return false;
-    return Boolean(message.text?.trim());
+    const text = String(message.text || "").trim();
+    if (!text) return false;
+    // Cursor IDE injects this block as a fake user turn — not a real AnytimeVibe ask.
+    if (isCursorIdeAgentTranscriptNoise(text)) return false;
+    return true;
   });
+}
+
+/**
+ * Cursor IDE Agent / Composer chats inject an `<agent_transcripts>` preamble
+ * (and often use it as the first "user" blob / title). Those live under
+ * ~/.cursor/projects/.../agent-transcripts/ and share ~/.cursor/chats storage with
+ * Agent CLI — but they are not AnytimeVibe-issued tasks and must not sync.
+ */
+export function isCursorIdeAgentTranscriptNoise(text: string | undefined | null): boolean {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (/<agent_transcripts>/i.test(t)) return true;
+  if (/Agent transcripts\s*\(\s*past chats\s*\)\s*live in/i.test(t)) return true;
+  return false;
+}
+
+function isCursorIdeAgentTranscriptImport(task: {
+  title?: string;
+  messages?: HistoryMessage[];
+}): boolean {
+  if (isCursorIdeAgentTranscriptNoise(task.title)) return true;
+  for (const message of task.messages || []) {
+    if (message.role !== "user") continue;
+    if (isCursorIdeAgentTranscriptNoise(message.text)) return true;
+  }
+  return false;
 }
 
 /** Cursor sessions with no real chat, or only Temp/scratch cwd — skip sync/list noise. */
@@ -92,12 +122,23 @@ export function isJunkCursorImportTask(task: {
   providerSessionId?: string;
   threadId?: string;
 }): boolean {
+  // AnytimeVibe web-bound tasks own their transcript via headless streaming.
+  const webBound = Boolean(
+    task.providerSessionId
+    && task.threadId
+    && task.providerSessionId !== task.threadId
+  );
+  if (!webBound && isCursorIdeAgentTranscriptImport(task)) return true;
   if (isEphemeralImportCwd(task.cwd)) return true;
   const messages = task.messages || [];
   if (hasUsefulTranscript(messages)) return false;
   const title = String(task.title || "").trim();
   // Named agent / real title without Temp cwd is still worth listing after handoff.
-  if (title && !/^cursor\s+[0-9a-f]{8}$/i.test(title) && title !== "New Agent") return false;
+  if (title && !/^cursor\s+[0-9a-f]{8}$/i.test(title) && title !== "New Agent") {
+    // But never keep the IDE agent_transcripts boilerplate as a "real" title.
+    if (isCursorIdeAgentTranscriptNoise(title)) return true;
+    return false;
+  }
   // Fallback title "Cursor ab12cd34" with no real user ask
   if (/^cursor\s+[0-9a-f]{8}$/i.test(title)) return true;
   return true;
@@ -125,6 +166,7 @@ function titleFromCursorPromptHistory(history: string[]): string | undefined {
     const text = String(history[i] || "").trim();
     if (!text) continue;
     if (text.startsWith("/")) continue;
+    if (isCursorIdeAgentTranscriptNoise(text)) continue;
     if (text.length <= 2 && /^[A-Za-z0-9]+$/.test(text)) continue;
     return text.slice(0, 80);
   }
@@ -167,6 +209,7 @@ function messagesFromCursorPromptHistory(history: string[]): HistoryMessage[] {
   for (const item of history) {
     const text = String(item || "").trim();
     if (!text || text.startsWith("/")) continue;
+    if (isCursorIdeAgentTranscriptNoise(text)) continue;
     if (text.length <= 2 && /^[A-Za-z0-9]+$/.test(text)) continue;
     out.push({ id: crypto.randomUUID(), role: "user", text: text.slice(0, 20_000) });
   }
@@ -194,15 +237,19 @@ async function readCursorPromptHistory(sessionDir: string): Promise<string[]> {
 async function readCursorSessionMessages(dbPath: string): Promise<{
   messages: HistoryMessage[];
   agentName?: string;
+  /** Raw store.db contained Cursor IDE agent_transcripts preamble (not AnytimeVibe tasks). */
+  ideAgentTranscript?: boolean;
 }> {
   const py = process.platform === "win32" ? "python" : "python3";
   // Scan newest blobs first and cap rows — 133MB DBs finish in <100ms this way.
   const script = [
-    "import sqlite3,json,sys,binascii,os",
+    "import sqlite3,json,sys,binascii,os,re",
     `db=${JSON.stringify(dbPath)}`,
     "con=sqlite3.connect(db)",
     "cur=con.cursor()",
     "agent_name=''",
+    "ide_transcript=False",
+    "ide_re=re.compile(r'<agent_transcripts>|Agent transcripts\\s*\\(\\s*past chats\\s*\\)\\s*live in', re.I)",
     "try:",
     "  mv=cur.execute(\"select value from meta where key='0'\").fetchone()",
     "  if mv:",
@@ -247,10 +294,12 @@ async function readCursorSessionMessages(dbPath: string): Promise<{
     "  text='\\n'.join(parts).strip()",
     "  if not text:",
     "    continue",
+    "  if role=='user' and ide_re.search(text):",
+    "    ide_transcript=True",
     "  msgs.append({'role':role,'text':text[:20000],'rowid':rowid})",
     // Newest-first → chronological
     "msgs.reverse()",
-    "print(json.dumps({'agentName':agent_name,'messages':msgs},ensure_ascii=False))"
+    "print(json.dumps({'agentName':agent_name,'ideAgentTranscript':ide_transcript,'messages':msgs},ensure_ascii=False))"
   ].join("\n");
   try {
     const { stdout } = await execFileAsync(py, ["-c", script], {
@@ -261,18 +310,23 @@ async function readCursorSessionMessages(dbPath: string): Promise<{
     });
     const parsed = JSON.parse(String(stdout || "{}")) as {
       agentName?: string;
+      ideAgentTranscript?: boolean;
       messages?: Array<{ role?: string; text?: string }>;
     };
     const messages: HistoryMessage[] = [];
+    let ideAgentTranscript = Boolean(parsed.ideAgentTranscript);
     for (const row of parsed.messages || []) {
       const role = row.role === "assistant" ? "assistant" : row.role === "user" ? "user" : null;
       if (!role) continue;
-      const cleaned = cleanImportedMessageText(role, String(row.text || ""));
+      const rawText = String(row.text || "");
+      if (role === "user" && isCursorIdeAgentTranscriptNoise(rawText)) ideAgentTranscript = true;
+      const cleaned = cleanImportedMessageText(role, rawText);
       if (!cleaned) continue;
       messages.push({ id: crypto.randomUUID(), role, text: cleaned });
     }
     return {
       messages,
+      ...(ideAgentTranscript ? { ideAgentTranscript: true } : {}),
       ...(parsed.agentName?.trim() ? { agentName: parsed.agentName.trim() } : {})
     };
   } catch {
@@ -380,6 +434,7 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
     if (isEphemeralImportCwd(hit.cwd)) continue;
     const existing = resolveExistingForProviderSession(store, hit.id, "cursor");
     const promptHistory = await readCursorPromptHistory(hit.dir);
+    const historyIsIde = promptHistory.some((item) => isCursorIdeAgentTranscriptNoise(item));
     const dbPath = path.join(hit.dir, "store.db");
     let imported: Awaited<ReturnType<typeof readCursorSessionMessages>> = { messages: [] };
     try {
@@ -387,6 +442,12 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
       imported = await readCursorSessionMessages(dbPath);
     } catch {
       // meta/prompt-history only
+    }
+    const isWebBound = Boolean(existing && existing.threadId !== hit.id);
+    // Cursor IDE Agent/Composer chats share ~/.cursor/chats — never create native sync rows.
+    // Web-bound AnytimeVibe tasks may resume the same session id; keep updating those.
+    if (!isWebBound && (imported.ideAgentTranscript || historyIsIde)) {
+      continue;
     }
     const historyMessages = messagesFromCursorPromptHistory(promptHistory);
     const messages = pickCursorMessagesForUpsert(
@@ -409,7 +470,19 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
     if (hit.isSubagent && !cwd && !hasUsefulTranscript(messages) && !titleFromHistory) {
       continue;
     }
-    if (isJunkCursorImportTask({ cwd, title, messages })) {
+    const junkProbe = {
+      cwd,
+      title,
+      messages,
+      threadId: existing?.threadId || hit.id,
+      providerSessionId: hit.id
+    };
+    if (isCursorIdeAgentTranscriptImport({ title, messages })
+      || isCursorIdeAgentTranscriptNoise(titleFromHistory)
+      || isCursorIdeAgentTranscriptNoise(titleFromUser)) {
+      if (!isWebBound) continue;
+    }
+    if (isJunkCursorImportTask(junkProbe)) {
       // Still keep sessions Cursor itself marks as having a conversation when we at least
       // have a prompt history title — otherwise handoff chats never reach the web list.
       if (!(hit.hasConversation && (titleFromHistory || agentTitle))) {
@@ -579,11 +652,13 @@ function cleanImportedMessageText(role: "user" | "assistant" | "system", raw: st
       .replace(/<git_status>[\s\S]*?<\/git_status>/gi, "")
       .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
       .replace(/<agent_skills>[\s\S]*?<\/agent_skills>/gi, "")
+      .replace(/<agent_transcripts>[\s\S]*?<\/agent_transcripts>/gi, "")
       .replace(/<executing_actions_with_care>[\s\S]*?<\/executing_actions_with_care>/gi, "")
       .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "")
       .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, "")
       .trim();
     if (looksLikeToolIoUserText(text)) return null;
+    if (isCursorIdeAgentTranscriptNoise(text)) return null;
   }
   if (!text || isNoiseTranscriptText(text)) return null;
   return text.slice(0, 20_000);

@@ -872,6 +872,37 @@ function isAgyNoiseLog(line: string): boolean {
   return /codex_models_manager|failed to refresh available models|failed to decode models response/i.test(line);
 }
 
+/** True when Antigravity's grep_search cannot find the Unix `grep` binary (common on Windows). */
+function isAgyMissingGrepError(line: string): boolean {
+  return /CORTEX_STEP_TYPE_GREP_SEARCH|grep_search/i.test(line)
+    && /exec:\s*"grep"|grep["']?:\s*executable file not found|not found in %PATH%/i.test(line);
+}
+
+/**
+ * Antigravity (and some other CLIs) shell out to Unix tools like `grep`.
+ * On Windows, prepend Git for Windows' usr\bin when present so grep_search works.
+ */
+function withWindowsUnixToolPath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  if (process.platform !== "win32") return env;
+  const candidates = [
+    path.join(process.env.ProgramFiles || "C:\\Program Files", "Git", "usr", "bin"),
+    path.join(process.env.LOCALAPPDATA || "", "Programs", "Git", "usr", "bin")
+  ];
+  const extras = candidates.filter((dir) => {
+    try {
+      return fsExistsSync(path.join(dir, "grep.exe"));
+    } catch {
+      return false;
+    }
+  });
+  if (!extras.length) return env;
+  const sep = ";";
+  const current = env.PATH || env.Path || process.env.PATH || "";
+  const parts = current.split(sep).filter(Boolean);
+  const merged = [...extras.filter((dir) => !parts.some((p) => p.toLowerCase() === dir.toLowerCase())), ...parts];
+  return { ...env, PATH: merged.join(sep), Path: merged.join(sep) };
+}
+
 /** True when agy has a local brain/<id> directory for this conversation. */
 export function agyConversationExists(conversationId: string | undefined | null): boolean {
   const id = String(conversationId || "").trim();
@@ -1132,6 +1163,10 @@ export async function runHeadlessTurn(
     TERM: process.env.TERM || "dumb",
     NO_COLOR: process.env.NO_COLOR || "1"
   });
+  // Windows GUI PATH often omits Git usr\bin — Antigravity grep_search then hangs/fails on `grep`.
+  if (engine === "antigravity") {
+    env = withWindowsUnixToolPath(env);
+  }
 
   // CCSwitch / Cockpit rewrite ~/.claude/settings.json env on account switch.
   // Merge into the child so this turn uses the new key/base_url without restarting AnytimeVibe.
@@ -1292,11 +1327,14 @@ export async function runHeadlessTurn(
       const idleMs = Date.now() - state.lastProgressAt;
       const elapsedMs = Date.now() - startedAt;
       if (idleMs >= HEADLESS_IDLE_TIMEOUT_MS) {
+        const idleHint = engine === "antigravity"
+          ? "（常见原因：grep_search 在 Windows 找不到 grep、run_command 子进程卡住、或模型长时间无 stream-json 输出）"
+          : "";
         emitHeadlessErrorOnce(
           state,
           safeOnEvent,
           options,
-          `${engineLabel} 超过 ${Math.round(HEADLESS_IDLE_TIMEOUT_MS / 1000)}s 无进度输出，已终止`,
+          `${engineLabel} 超过 ${Math.round(HEADLESS_IDLE_TIMEOUT_MS / 1000)}s 无进度输出，已终止${idleHint}`,
           "stage:timeout"
         );
         killChildTree(child);
@@ -1398,7 +1436,22 @@ export async function runHeadlessTurn(
       child.stderr.setEncoding("utf8");
       createInterface({ input: child.stderr, crlfDelay: Infinity }).on("line", (line) => {
         state.lastProgressAt = Date.now();
-        if (!line.trim() || (engine === "antigravity" && isAgyNoiseLog(line))) return;
+        if (!line.trim()) return;
+        if (engine === "antigravity" && isAgyNoiseLog(line)) return;
+        if (engine === "antigravity" && isAgyMissingGrepError(line)) {
+          const warnKey = "agy-missing-grep";
+          if (!state.emittedErrors.has(warnKey)) {
+            state.emittedErrors.add(warnKey);
+            emitDelta(
+              safeOnEvent,
+              options,
+              "stage:agy-grep",
+              "stage",
+              "\n⚠ Antigravity 的 grep_search 需要本机 grep（Windows 请安装 Git for Windows，或把 Git\\usr\\bin 加入 PATH）。工具失败后可能长时间无 stream 进度…\n"
+            );
+          }
+          return;
+        }
         emitDelta(safeOnEvent, options, "cli-log", "cli-log", `${line}\n`);
       });
     }
