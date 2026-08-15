@@ -3925,14 +3925,23 @@ async function runHeadlessTaskTurn(options: {
       if (isCursorAutoModel(options.model)) {
         delete stored.reasoningEffort;
         delete stored.thinking;
+      } else {
+        // Explicit model without effort/thinking → do not keep prior model's flags.
+        if (options.reasoningEffort) stored.reasoningEffort = options.reasoningEffort;
+        else delete stored.reasoningEffort;
+        if (options.thinking !== undefined) stored.thinking = options.thinking;
+        else delete stored.thinking;
       }
     } else {
       stored.model = options.model;
+      if (options.reasoningEffort) stored.reasoningEffort = options.reasoningEffort;
+      else delete stored.reasoningEffort;
     }
+  } else if (options.reasoningEffort) {
+    stored.reasoningEffort = options.reasoningEffort;
   }
-  if (options.reasoningEffort) stored.reasoningEffort = options.reasoningEffort;
-  // Thinking is Cursor-only; persist explicit choices so follow-up turns keep the variant.
-  if (options.engine === "cursor" && options.thinking !== undefined) {
+  // Thinking is Cursor-only; persist when model was not re-specified this turn.
+  if (options.engine === "cursor" && !options.model && options.thinking !== undefined) {
     stored.thinking = options.thinking;
   }
   stored.permissionMode = options.permissionMode;
@@ -3971,11 +3980,19 @@ async function runHeadlessTaskTurn(options: {
     permissionMode: options.permissionMode,
     ...(resumeId ? { providerSessionId: resumeId } : {}),
     ...(options.model || stored.model ? { model: options.model || stored.model } : {}),
-    ...(options.reasoningEffort || stored.reasoningEffort
-      ? { reasoningEffort: options.reasoningEffort || stored.reasoningEffort }
-      : {}),
-    ...(options.engine === "cursor" && (options.thinking ?? stored.thinking) !== undefined
-      ? { thinking: options.thinking ?? stored.thinking }
+    // When this turn explicitly sets model, only apply effort/thinking from options
+    // (not a stale store entry from the previous model).
+    ...(options.model
+      ? (options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {})
+      : (options.reasoningEffort || stored.reasoningEffort
+        ? { reasoningEffort: options.reasoningEffort || stored.reasoningEffort }
+        : {})),
+    ...(options.engine === "cursor"
+      ? (options.model
+        ? (options.thinking !== undefined ? { thinking: options.thinking } : {})
+        : ((options.thinking ?? stored.thinking) !== undefined
+          ? { thinking: options.thinking ?? stored.thinking }
+          : {}))
       : {})
   }, async (event) => {
     // Must await so publish sequence numbers and delta flush stay ordered.
@@ -4285,14 +4302,25 @@ async function handleCommand(command: ClientCommand): Promise<void> {
             if (command.model || outboundModel) {
               stored.model = cursorPersistedModelId(outboundModel) || "auto";
             }
-            let useEffort = command.reasoningEffort || stored.reasoningEffort;
-            let useThinking = command.thinking ?? stored.thinking;
+            // Web omits effort/thinking when the selected model has no such options.
+            // Never reuse a previous model's effort/thinking after an explicit model switch.
+            let useEffort = command.model
+              ? command.reasoningEffort
+              : (command.reasoningEffort || stored.reasoningEffort);
+            let useThinking = command.model
+              ? command.thinking
+              : (command.thinking ?? stored.thinking);
             if (isCursorAutoModel(outboundModel) || isCursorAutoModel(stored.model)) {
               stored.model = "auto";
               delete stored.reasoningEffort;
               delete stored.thinking;
               useEffort = undefined;
               useThinking = undefined;
+            } else if (command.model) {
+              if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+              else delete stored.reasoningEffort;
+              if (command.thinking !== undefined) stored.thinking = command.thinking;
+              else delete stored.thinking;
             } else {
               if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
               if (command.thinking !== undefined) stored.thinking = command.thinking;
@@ -4313,8 +4341,18 @@ async function handleCommand(command: ClientCommand): Promise<void> {
             });
             return;
           }
-          if (command.model) stored.model = command.model;
-          if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+          if (command.model) {
+            stored.model = command.model;
+            // Explicit model without effort → drop stale effort from the prior model
+            // (Antigravity/Claude/Grok: same footgun as Cursor when UI clears the picker).
+            if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+            else delete stored.reasoningEffort;
+          } else if (command.reasoningEffort) {
+            stored.reasoningEffort = command.reasoningEffort;
+          }
+          const useEffort = command.model
+            ? command.reasoningEffort
+            : (command.reasoningEffort || stored.reasoningEffort);
           await taskStore.upsert(stored);
           await ensureWorkspaceTrusted(stored.engine, stored.cwd);
           await runHeadlessTaskTurn({
@@ -4326,9 +4364,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
             permissionMode: mode,
             isNew: false,
             ...(outboundModel ? { model: outboundModel } : {}),
-            ...(command.reasoningEffort || stored.reasoningEffort
-              ? { reasoningEffort: command.reasoningEffort || stored.reasoningEffort }
-              : {})
+            ...(useEffort ? { reasoningEffort: useEffort } : {})
           });
           return;
         }
@@ -4337,25 +4373,27 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         else await ensureCodex();
         if (stored) {
           stored.permissionMode = mode;
-          if (command.model) stored.model = command.model;
-          if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+          if (command.model) {
+            stored.model = command.model;
+            if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
+            else delete stored.reasoningEffort;
+          } else if (command.reasoningEffort) {
+            stored.reasoningEffort = command.reasoningEffort;
+          }
           await taskStore.upsert(stored);
         }
         await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
         await appendStoredUserPrompt(command.threadId, command.prompt);
         startLocalActivity(command.threadId, command.prompt, "继续远程任务", "codex");
-        if (stored && (command.model || command.reasoningEffort)) {
-          if (command.model) stored.model = command.model;
-          if (command.reasoningEffort) stored.reasoningEffort = command.reasoningEffort;
-          await taskStore.upsert(stored);
-        }
         const turnPayload: Record<string, unknown> = {
           threadId: command.threadId,
           clientUserMessageId: command.commandId,
           input: [{ type: "text", text: command.prompt, text_elements: [] }]
         };
         const model = command.model || stored?.model;
-        const effort = command.reasoningEffort || stored?.reasoningEffort;
+        const effort = command.model
+          ? command.reasoningEffort
+          : (command.reasoningEffort || stored?.reasoningEffort);
         if (model) turnPayload.model = model;
         if (effort) turnPayload.modelReasoningEffort = effort;
         let result: any;
@@ -4918,6 +4956,7 @@ function publishAgentMeta(fields: {
   claudeVersion?: string;
   grokVersion?: string;
   cursorVersion?: string;
+  antigravityVersion?: string;
   platform?: string;
   agentVersion?: string;
 } = {}): void {
@@ -4927,7 +4966,8 @@ function publishAgentMeta(fields: {
       || fields.codexVersion != null
       || fields.claudeVersion != null
       || fields.grokVersion != null
-      || fields.cursorVersion != null;
+      || fields.cursorVersion != null
+      || fields.antigravityVersion != null;
     socket.send(JSON.stringify({
       type: "agent.meta",
       name: fields.name ?? resolvedDisplayName(),
@@ -4938,7 +4978,8 @@ function publishAgentMeta(fields: {
           codexVersion: fields.codexVersion ?? resolveReportedEngineVersion("codex"),
           claudeVersion: fields.claudeVersion ?? resolveReportedEngineVersion("claude"),
           grokVersion: fields.grokVersion ?? resolveReportedEngineVersion("grok"),
-          cursorVersion: fields.cursorVersion ?? resolveReportedEngineVersion("cursor")
+          cursorVersion: fields.cursorVersion ?? resolveReportedEngineVersion("cursor"),
+          antigravityVersion: fields.antigravityVersion ?? resolveReportedEngineVersion("antigravity")
         }
         : {}),
       platform: fields.platform ?? `${process.platform} ${os.release()}`,

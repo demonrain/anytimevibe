@@ -942,6 +942,11 @@ function isAgyAuthError(text: string | undefined | null): boolean {
   return /authentication (required|failed|timed out)|not logged in|please run \/login|please visit the url to log in/i.test(value);
 }
 
+function isAgyQuotaError(text: string | undefined | null): boolean {
+  const value = String(text || "");
+  return /individual quota reached|quota reached|resource_exhausted|upgrade your subscription to increase your limits/i.test(value);
+}
+
 /** Stream incremental tokens; if agy later sends a fuller snapshot, only emit the missing suffix. */
 function emitAgyAssistantText(
   state: ParseState,
@@ -1051,11 +1056,23 @@ function handleAntigravityLine(
       } else if (resultConversationId && agyConversationExists(resultConversationId)) {
         state.sessionId = resultConversationId;
       }
+      // Quota errors after a full streamed reply: keep the answer, warn instead of wiping success.
+      if (isAgyQuotaError(errorText) && state.sawAssistant && state.text.trim()) {
+        const warn = errorText.startsWith("Antigravity")
+          ? errorText
+          : `Antigravity 配额不足（本轮已产出回复）：${errorText}`;
+        emitDelta(onEvent, options, "stage:agy-quota", "stage", `\n⚠ ${warn}\n`);
+        const finalText = typeof result.response === "string" ? result.response : "";
+        if (finalText && finalText !== errorText) emitAgyAssistantText(state, options, onEvent, finalText);
+        return;
+      }
       const message = isAgyTrajectoryNotFound(errorText)
         ? `Antigravity 会话不存在（${resultConversationId || options.providerSessionId || "unknown"}）。将尝试新开会话。`
         : isAgyAuthError(errorText)
           ? "Antigravity 未登录或登录已过期。请在本机终端运行一次交互式 agy 完成登录后再试。"
-          : (errorText || "Antigravity 运行失败");
+          : isAgyQuotaError(errorText)
+            ? `Antigravity 配额不足：${errorText}`
+            : (errorText || "Antigravity 运行失败");
       emitHeadlessErrorOnce(state, onEvent, options, message);
       return;
     }

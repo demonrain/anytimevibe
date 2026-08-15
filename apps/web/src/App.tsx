@@ -169,7 +169,9 @@ function modelOptionsFromHost(
 }
 
 function usesPerModelEffort(engine: CliEngine): boolean {
-  return engine === "cursor" || engine === "antigravity";
+  // Cursor / Antigravity / Grok / Codex expose per-model effort lists.
+  // Claude keeps a shared engine-level effort dropdown.
+  return engine === "cursor" || engine === "antigravity" || engine === "grok" || engine === "codex";
 }
 
 function effortOptionsFromHost(
@@ -184,7 +186,7 @@ function effortOptionsFromHost(
   const modelMeta = baseId
     ? cap?.models.find((item) => item.id === baseId)
     : undefined;
-  // Cursor / Antigravity: per-model effort. Models without a list → no dropdown.
+  // Cursor / Antigravity / Grok / Codex: per-model effort. Models without a list → no dropdown.
   if (usesPerModelEffort(engine)) {
     // Cursor thinking has its own effort set (differs from non-thinking).
     const perModel = engine === "cursor" && thinking && modelMeta?.thinkingEfforts?.length

@@ -295,7 +295,13 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
           id,
           label,
           ...(contextWindow ? { contextWindow } : {}),
-          ...(modelEfforts.length ? { reasoningEfforts: modelEfforts } : {})
+          ...(modelEfforts.length
+            ? { reasoningEfforts: modelEfforts }
+            // Catalog says effort is supported but omitted the list — use engine defaults
+            // so the web per-model picker still offers levels instead of clearing effort.
+            : info.supports_reasoning_effort
+              ? { reasoningEfforts: ["low", "medium", "high", "xhigh"] as ReasoningEffort[] }
+              : {})
         });
         if (!currentReasoningEffort && defaultEffort) currentReasoningEffort = defaultEffort;
       }
@@ -989,10 +995,17 @@ const ANTIGRAVITY_FALLBACK_MODELS: EngineModelOption[] = [
 /** Label/id → family id, filled by the last `agy models` discovery. */
 const agyLabelToFamily = new Map<string, string>();
 const agyFamilyEfforts = new Map<string, Array<"low" | "medium" | "high">>();
+/** Exact CLI `--model` ids from the last `agy models` probe (e.g. gemini-3.7-flash-high). */
+const agyLiveModelSlugs = new Set<string>();
 
-function rememberAgyCatalog(models: EngineModelOption[]): void {
+function rememberAgyCatalog(models: EngineModelOption[], liveSlugs: string[] = []): void {
   agyLabelToFamily.clear();
   agyFamilyEfforts.clear();
+  agyLiveModelSlugs.clear();
+  for (const slug of liveSlugs) {
+    const id = String(slug || "").trim();
+    if (id) agyLiveModelSlugs.add(id.toLowerCase());
+  }
   for (const model of models) {
     agyLabelToFamily.set(model.id.toLowerCase(), model.id);
     agyLabelToFamily.set(model.label.toLowerCase(), model.id);
@@ -1002,9 +1015,14 @@ function rememberAgyCatalog(models: EngineModelOption[]): void {
     if (efforts.length) {
       agyFamilyEfforts.set(model.id, efforts);
       for (const effort of efforts) {
-        agyLabelToFamily.set(`${model.id}-${effort}`.toLowerCase(), model.id);
+        const combined = `${model.id}-${effort}`;
+        agyLabelToFamily.set(combined.toLowerCase(), model.id);
         agyLabelToFamily.set(`${model.label} (${effort})`.toLowerCase(), model.id);
+        // Fallback catalog has no live probe — still treat combined ids as valid spawn slugs.
+        if (!liveSlugs.length) agyLiveModelSlugs.add(combined.toLowerCase());
       }
+    } else if (!liveSlugs.length) {
+      agyLiveModelSlugs.add(model.id.toLowerCase());
     }
   }
 }
@@ -1032,8 +1050,15 @@ function mapAgyEffortValue(effort?: ReasoningEffort | string | null): "low" | "m
 }
 
 /**
- * agy `--model` 要 CLI id（如 gemini-3.7-flash），`--effort` 单独传。
- * 显示名 "Gemini 3.7 Flash (High)" 或已带后缀的 id 都不能再叠 `--effort`。
+ * Build agy spawn model args.
+ *
+ * Current Antigravity CLI publishes combined slugs (`gemini-3.7-flash-high`,
+ * `gpt-oss-120b-medium`). Passing `--model gemini-3.7-flash --effort high` fails with
+ * "effort is not supported" and the session silently keeps the previous model (e.g. Claude),
+ * which is exactly how a UI switch to Flash still burns Claude quota.
+ *
+ * Always prefer a single `--model <slug>`; only emit separate `--effort` for true legacy CLIs
+ * that list the bare family id and accept the flag.
  */
 export function formatAgySpawnArgs(
   model?: string,
@@ -1048,6 +1073,10 @@ export function formatAgySpawnArgs(
       || agyLabelToFamily.get(display.label.toLowerCase())
       || "";
   } else if (raw) {
+    // Keep a full live slug if the user/UI already sent one (gemini-3.7-flash-high).
+    if (agyLiveModelSlugs.has(raw.toLowerCase())) {
+      return { model: raw };
+    }
     const split = splitAgyEffortSuffix(raw);
     fromName = split.effort;
     raw = agyLabelToFamily.get(raw.toLowerCase())
@@ -1056,19 +1085,36 @@ export function formatAgySpawnArgs(
   }
   const split = raw ? splitAgyEffortSuffix(raw) : { base: "" };
   const base = split.base;
-  const familyEfforts = base ? agyFamilyEfforts.get(base) : undefined;
-  const catalogReady = agyFamilyEfforts.size > 0 || agyLabelToFamily.size > 0;
-  const supportsEffort = catalogReady
-    ? Boolean(familyEfforts?.length)
-    : Boolean(fromName || split.effort || mapAgyEffortValue(effort));
-  const chosen = mapAgyEffortValue(effort) || fromName || split.effort;
-  if (!base) {
-    return chosen && supportsEffort ? { effort: chosen } : {};
+  if (!base) return {};
+
+  const familyEfforts = agyFamilyEfforts.get(base);
+  const chosen = mapAgyEffortValue(effort) || fromName || split.effort
+    || (familyEfforts?.length ? familyEfforts[0] : undefined);
+  const combined = chosen ? `${base}-${chosen}` : "";
+
+  // Current CLI: combined slug is the real --model id.
+  if (combined && agyLiveModelSlugs.has(combined.toLowerCase())) {
+    return { model: combined };
   }
-  if (!supportsEffort) return { model: base };
-  const allowed = familyEfforts?.length ? familyEfforts : AGY_EFFORTS;
-  const next = chosen && allowed.includes(chosen) ? chosen : allowed[0];
-  return next ? { model: base, effort: next } : { model: base };
+  if (agyLiveModelSlugs.has(base.toLowerCase())) {
+    // Bare id is live (claude-opus-4-6-thinking) — never attach --effort.
+    // Legacy only: bare family listed AND combined missing AND family has efforts.
+    if (
+      chosen
+      && familyEfforts?.includes(chosen)
+      && !agyLiveModelSlugs.has((combined || "").toLowerCase())
+      && !/-thinking$/i.test(base)
+    ) {
+      // If the live set contains only the bare family (unusual), keep legacy --effort.
+      const hasAnyCombinedLive = [...agyLiveModelSlugs].some((slug) => slug.startsWith(`${base.toLowerCase()}-`));
+      if (!hasAnyCombinedLive) return { model: base, effort: chosen };
+    }
+    return { model: base };
+  }
+
+  // No live probe / unknown catalog: prefer combined when UI has an effort dimension.
+  if (combined && familyEfforts?.length) return { model: combined };
+  return { model: base };
 }
 
 function parseAgyModelsOutput(raw: string): Array<{ id: string; label: string }> {
@@ -1151,9 +1197,11 @@ async function discoverAntigravityCapability(): Promise<EngineCapability> {
     if (binary) {
       const raw = await runAgyModelsList(binary);
       if (raw) {
-        for (const item of parseAgyModelsOutput(raw)) {
+        const parsed = parseAgyModelsOutput(raw);
+        for (const item of parsed) {
           ingestAgyModelRow(item.id, item.label, models, seen);
         }
+        rememberAgyCatalog(models, parsed.map((item) => item.id));
       }
     }
   } catch {
@@ -1169,6 +1217,7 @@ async function discoverAntigravityCapability(): Promise<EngineCapability> {
       });
       seen.add(item.id);
     }
+    rememberAgyCatalog(models);
   }
 
   const settingsRaw = await readText(path.join(os.homedir(), ".gemini", "antigravity-cli", "settings.json"));
@@ -1181,7 +1230,6 @@ async function discoverAntigravityCapability(): Promise<EngineCapability> {
       // ignore
     }
   }
-  rememberAgyCatalog(models);
   if (settingsLabel) {
     const display = parseAgyDisplayName(settingsLabel);
     const family = agyLabelToFamily.get(settingsLabel.toLowerCase())

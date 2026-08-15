@@ -44,7 +44,6 @@ button { color: inherit; }
 .featured-engine-logo { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 12px; background: #f2eadb; overflow: hidden; }
 .featured-engine-logo img { width: 30px; height: 30px; object-fit: contain; }
 .featured-engine-claude .featured-engine-logo { background: #f7e5da; }
-.featured-engine-antigravity .featured-engine-logo { background: #e8f0fe; }
 .featured-engine-copy { min-width: 0; display: grid; gap: 2px; }
 .featured-engine-copy strong { overflow: hidden; text-overflow: ellipsis; font-size: 13px; letter-spacing: .01em; white-space: nowrap; }
 .featured-engine-copy small { overflow: hidden; text-overflow: ellipsis; color: #687069; font-size: 10px; font-weight: 750; white-space: nowrap; }
@@ -1293,7 +1292,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .admin-table th, .admin-table td { padding: 12px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; }
 .admin-table th { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #6f756e; background: rgba(23,33,27,.04); }
 .admin-table tr:last-child td { border-bottom: 0; }
-.admin-engine-versions { display: grid; gap: 4px; min-width: 148px; }
+.admin-engine-versions { display: grid; gap: 4px; min-width: 168px; }
 .admin-engine-versions > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12px; }
 .admin-engine-versions span { color: #6f756e; font-weight: 700; flex: 0 0 auto; }
 .admin-engine-versions code { font-size: 11px; color: #17211b; background: rgba(23,33,27,.05); padding: 1px 6px; border-radius: 6px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

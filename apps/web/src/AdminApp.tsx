@@ -48,6 +48,7 @@ type AdminHost = {
   claudeVersion?: string | null;
   grokVersion?: string | null;
   cursorVersion?: string | null;
+  antigravityVersion?: string | null;
   agentVersion?: string | null;
   eventCount?: number;
   createdAt: string;
@@ -435,6 +436,7 @@ export function AdminApp() {
                       <div><span>Claude</span><code title={String(host.claudeVersion || "")}>{formatEngineVersion(host.claudeVersion)}</code></div>
                       <div><span>Grok</span><code title={String(host.grokVersion || "")}>{formatEngineVersion(host.grokVersion)}</code></div>
                       <div><span>Cursor</span><code title={String(host.cursorVersion || "")}>{formatEngineVersion(host.cursorVersion)}</code></div>
+                      <div><span>Antigravity</span><code title={String(host.antigravityVersion || "")}>{formatEngineVersion(host.antigravityVersion)}</code></div>
                     </div>
                   </td>
                   <td>{host.eventCount ?? 0}</td>
