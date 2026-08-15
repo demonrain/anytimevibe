@@ -3911,7 +3911,16 @@ async function runHeadlessTaskTurn(options: {
   clearEngineBinaryCache();
 
   // Resume only when we already have a provider-native session id from a prior turn.
-  const resumeId = stored.providerSessionId.trim() || undefined;
+  let resumeId = stored.providerSessionId.trim() || undefined;
+  if (options.engine === "antigravity" && resumeId) {
+    const { resolveAgyConversationResumeId } = await import("./cli/headless-runner");
+    resumeId = resolveAgyConversationResumeId(resumeId, options.threadId);
+    // Drop a stale web-UUID masquerading as an agy conversation id.
+    if (!resumeId && stored.providerSessionId) {
+      stored.providerSessionId = "";
+      await taskStore.upsert(stored);
+    }
+  }
   const result = await runHeadlessTurn(options.engine, {
     threadId: options.threadId,
     turnId,
@@ -3929,7 +3938,19 @@ async function runHeadlessTaskTurn(options: {
   });
 
   const latest = taskStore.get(options.threadId) ?? stored;
-  if (result.providerSessionId) latest.providerSessionId = result.providerSessionId;
+  if (result.clearProviderSession) {
+    latest.providerSessionId = "";
+  } else if (result.providerSessionId) {
+    // Never bind Antigravity to the AnytimeVibe web thread UUID.
+    if (
+      options.engine === "antigravity"
+      && result.providerSessionId === options.threadId
+    ) {
+      // keep prior / empty
+    } else {
+      latest.providerSessionId = result.providerSessionId;
+    }
+  }
   if (result.contextUsage) latest.contextUsage = result.contextUsage;
   if (result.model) latest.model = result.model;
   // Cursor plan/question pause ends as interrupted — keep task active until Web resolves.
@@ -5486,14 +5507,16 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     const binary = await resolveEngineBinary("antigravity");
     if (!binary) throw new Error("未找到 Antigravity CLI（agy），无法接力。请安装 https://antigravity.google/docs/cli 并登录");
     const { formatAgySpawnArgs } = await import("./cli/model-catalog");
+    const { resolveAgyConversationResumeId } = await import("./cli/headless-runner");
     const spawn = formatAgySpawnArgs(stored?.model || process.env.AGY_MODEL || process.env.ANTIGRAVITY_MODEL, stored?.reasoningEffort);
+    const conversationId = resolveAgyConversationResumeId(providerSessionId, threadId);
     const args = [
       ...handoffPermissionArgs("antigravity", permissionMode),
-      ...(providerSessionId ? ["--conversation", providerSessionId] : []),
+      ...(conversationId ? ["--conversation", conversationId] : []),
       ...(spawn.model ? ["--model", spawn.model] : []),
       ...(spawn.effort ? ["--effort", spawn.effort] : [])
     ];
-    console.log(`[relay] antigravity permission=${permissionMode}`);
+    console.log(`[relay] antigravity permission=${permissionMode} conversation=${conversationId || "(new)"}`);
     if (process.platform === "win32") {
       await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
     } else {

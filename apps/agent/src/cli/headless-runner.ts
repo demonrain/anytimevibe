@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, existsSync as fsExistsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -164,7 +164,9 @@ function buildArgs(
     );
     if (spawn.model) args.push("--model", spawn.model);
     if (spawn.effort) args.push("--effort", spawn.effort);
-    if (options.providerSessionId) args.push("--conversation", options.providerSessionId);
+    // Only resume real agy brain conversations — never the AnytimeVibe web thread UUID.
+    const conversationId = resolveAgyConversationResumeId(options.providerSessionId, options.threadId);
+    if (conversationId) args.push("--conversation", conversationId);
     args.push(...headlessPermissionArgs(engine, options.permissionMode));
     return args;
   }
@@ -866,6 +868,45 @@ function isAgyNoiseLog(line: string): boolean {
   return /codex_models_manager|failed to refresh available models|failed to decode models response/i.test(line);
 }
 
+/** True when agy has a local brain/<id> directory for this conversation. */
+export function agyConversationExists(conversationId: string | undefined | null): boolean {
+  const id = String(conversationId || "").trim();
+  if (!id || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    return false;
+  }
+  try {
+    return fsExistsSync(path.join(os.homedir(), ".gemini", "antigravity-cli", "brain", id));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resume id for `--conversation`. Never pass the AnytimeVibe web thread UUID —
+ * that produces `trajectory not found` / spurious login prompts in headless print mode.
+ */
+export function resolveAgyConversationResumeId(
+  providerSessionId: string | undefined | null,
+  threadId?: string | undefined | null
+): string | undefined {
+  const id = String(providerSessionId || "").trim();
+  if (!id) return undefined;
+  const webId = String(threadId || "").trim();
+  if (webId && id === webId && !agyConversationExists(id)) return undefined;
+  if (!agyConversationExists(id)) return undefined;
+  return id;
+}
+
+function isAgyTrajectoryNotFound(text: string | undefined | null): boolean {
+  const value = String(text || "");
+  return /trajectory not found|conversation .+ not found|conversation_id.+not found/i.test(value);
+}
+
+function isAgyAuthError(text: string | undefined | null): boolean {
+  const value = String(text || "");
+  return /authentication (required|failed|timed out)|not logged in|please run \/login|please visit the url to log in/i.test(value);
+}
+
 /** Stream incremental tokens; if agy later sends a fuller snapshot, only emit the missing suffix. */
 function emitAgyAssistantText(
   state: ParseState,
@@ -920,18 +961,22 @@ function handleAntigravityLine(
   }
 
   const eventName = String(parsed.event || "");
+  // stream-json puts conversation_id on the top-level envelope for init/result.
+  const topConversationId = String(parsed.conversation_id || "").trim();
+  if (topConversationId) state.sessionId = topConversationId;
+
   if (eventName === "init") {
     const init = parsed.init && typeof parsed.init === "object" ? parsed.init : parsed;
-    const conversationId = parsed.conversation_id || init.conversation_id;
-    if (conversationId) state.sessionId = String(conversationId);
+    const conversationId = topConversationId || String(init.conversation_id || "").trim();
+    if (conversationId) state.sessionId = conversationId;
     if (typeof init.model === "string" && init.model.trim()) state.model = init.model.trim();
     return;
   }
 
   if (eventName === "step_update") {
     const step = parsed.step_update && typeof parsed.step_update === "object" ? parsed.step_update : parsed;
-    const conversationId = step.conversation_id || parsed.conversation_id;
-    if (conversationId) state.sessionId = String(conversationId);
+    const conversationId = String(step.conversation_id || parsed.conversation_id || "").trim();
+    if (conversationId) state.sessionId = conversationId;
     const stepType = String(step.step_type || "").toLowerCase();
     const usage = usageFromUnknown(step.usage);
     if (usage) {
@@ -956,24 +1001,34 @@ function handleAntigravityLine(
 
   const result = eventName === "result"
     ? (parsed.result && typeof parsed.result === "object" ? parsed.result : parsed)
-    : (parsed.status && parsed.conversation_id ? parsed : null);
+    : (parsed.status && (parsed.conversation_id || parsed.error) ? parsed : null);
   if (result) {
     state.gotResult = true;
-    if (result.conversation_id) state.sessionId = String(result.conversation_id);
+    const resultConversationId = String(result.conversation_id || topConversationId || "").trim();
+    const status = String(result.status || "").toUpperCase();
+    const errorText = String(result.error || result.response || "").trim();
+    if (status === "ERROR" || status === "INVALID") {
+      // Do not persist a bogus resume id echoed back on trajectory-not-found errors.
+      if (isAgyTrajectoryNotFound(errorText)) {
+        if (options.providerSessionId && resultConversationId === options.providerSessionId) {
+          state.sessionId = "";
+        }
+      } else if (resultConversationId && agyConversationExists(resultConversationId)) {
+        state.sessionId = resultConversationId;
+      }
+      const message = isAgyTrajectoryNotFound(errorText)
+        ? `Antigravity 会话不存在（${resultConversationId || options.providerSessionId || "unknown"}）。将尝试新开会话。`
+        : isAgyAuthError(errorText)
+          ? "Antigravity 未登录或登录已过期。请在本机终端运行一次交互式 agy 完成登录后再试。"
+          : (errorText || "Antigravity 运行失败");
+      emitHeadlessErrorOnce(state, onEvent, options, message);
+      return;
+    }
+    if (resultConversationId) state.sessionId = resultConversationId;
     const usage = usageFromUnknown(result.usage);
     if (usage) {
       state.contextUsage = usage;
       onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
-    }
-    const status = String(result.status || "").toUpperCase();
-    if (status === "ERROR" || status === "INVALID") {
-      emitHeadlessErrorOnce(
-        state,
-        onEvent,
-        options,
-        String(result.error || result.response || "Antigravity 运行失败")
-      );
-      return;
     }
     const finalText = typeof result.response === "string" ? result.response : agyStepText(result);
     if (finalText) emitAgyAssistantText(state, options, onEvent, finalText);
@@ -1119,7 +1174,7 @@ export async function runHeadlessTurn(
   const executable = useCmdShim ? (process.env.ComSpec ?? "cmd.exe") : command;
   const finalArgs = useCmdShim ? windowsCmdArguments(command, args) : args;
 
-  if (!options.cursorResumeRetried) {
+  if (!options.cursorResumeRetried && !options.agyConversationRetried) {
     safeOnEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
   }
   const engineLabel = engine === "claude"
@@ -1161,7 +1216,10 @@ export async function runHeadlessTurn(
   activeByThread.set(options.threadId, runMeta);
 
   const state: ParseState = {
-    sessionId: options.providerSessionId || "",
+    // Do not seed Antigravity with an unverified resume id — ERROR echoes it back.
+    sessionId: engine === "antigravity"
+      ? (resolveAgyConversationResumeId(options.providerSessionId, options.threadId) || "")
+      : (options.providerSessionId || ""),
     text: "",
     failed: false,
     errorMessage: "",
@@ -1188,10 +1246,29 @@ export async function runHeadlessTurn(
       if (resultGraceTimer) clearTimeout(resultGraceTimer);
       activeByThread.delete(options.threadId);
       void grokCompat?.cleanup().catch(() => undefined);
+      const captured = String(state.sessionId || "").trim();
+      let providerSessionId = "";
+      let clearProviderSession = false;
+      if (engine === "antigravity") {
+        const isWebUuid = Boolean(captured && captured === options.threadId);
+        if (isWebUuid || isAgyTrajectoryNotFound(state.errorMessage || state.text)) {
+          clearProviderSession = Boolean(options.providerSessionId);
+          providerSessionId = "";
+        } else if (captured && (agyConversationExists(captured) || status === "completed")) {
+          // Trust agy-reported ids on success even if brain/ mkdir races slightly.
+          providerSessionId = captured;
+        } else {
+          providerSessionId = resolveAgyConversationResumeId(options.providerSessionId, options.threadId) || "";
+          if (!providerSessionId && options.providerSessionId) clearProviderSession = true;
+        }
+      } else {
+        providerSessionId = captured || options.providerSessionId || options.threadId;
+      }
       resolve({
-        providerSessionId: state.sessionId || options.providerSessionId || options.threadId,
+        providerSessionId,
         status,
         text: state.text || state.errorMessage,
+        ...(clearProviderSession ? { clearProviderSession: true } : {}),
         ...(state.contextUsage ? { contextUsage: state.contextUsage } : {}),
         ...(state.model || options.model ? { model: state.model || options.model } : {})
       });
@@ -1376,7 +1453,7 @@ export async function runHeadlessTurn(
               : engine === "cursor"
                 ? `Cursor 退出码 ${code ?? "unknown"}（请确认已登录：agent login 或设置 CURSOR_API_KEY${cursorBinaryLabel ? `；实际二进制：${cursorBinaryLabel}` : ""}）`
                 : engine === "antigravity"
-                  ? `Antigravity 退出码 ${code ?? "unknown"}（请先运行 agy 完成登录；模型请用 agy models）`
+                  ? `Antigravity 退出码 ${code ?? "unknown"}（若提示 trajectory/conversation not found，请清空错误会话后重试；未登录请在本机终端运行交互式 agy）`
                   : `Grok 退出码 ${code ?? "unknown"}`
           );
         }
@@ -1404,6 +1481,27 @@ export async function runHeadlessTurn(
     );
     const { providerSessionId: _ignored, ...rest } = options;
     const retry = await runHeadlessTurn(engine, { ...rest, cursorResumeRetried: true }, onEvent);
+    await eventChain;
+    return retry;
+  }
+
+  // Antigravity: bogus --conversation (web thread UUID / deleted brain) → retry as a new session.
+  if (
+    engine === "antigravity"
+    && result.status === "failed"
+    && options.providerSessionId
+    && !options.agyConversationRetried
+    && isAgyTrajectoryNotFound(result.text)
+  ) {
+    emitDelta(
+      safeOnEvent,
+      options,
+      "stage:retry",
+      "stage",
+      "\n… 会话 ID 无效，正在不带 --conversation 重试 Antigravity 任务\n"
+    );
+    const { providerSessionId: _ignored, ...rest } = options;
+    const retry = await runHeadlessTurn(engine, { ...rest, agyConversationRetried: true }, onEvent);
     await eventChain;
     return retry;
   }

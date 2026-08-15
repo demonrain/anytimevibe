@@ -74,15 +74,23 @@ export type HeadlessRunOptions = {
    * Skips a second turn.started so the web does not duplicate the user bubble.
    */
   cursorResumeRetried?: boolean;
+  /**
+   * Internal: Antigravity retry without --conversation already attempted
+   * (bogus AnytimeVibe thread UUID / deleted brain id → trajectory not found).
+   */
+  agyConversationRetried?: boolean;
 };
 
 export type HeadlessRunResult = {
+  /** Native CLI session id when known; empty string means "do not persist / clear". */
   providerSessionId: string;
   status: "completed" | "failed" | "interrupted";
   text: string;
   contextUsage?: ContextUsage;
   /** Model actually used by the CLI when reported. */
   model?: string;
+  /** When true, caller should clear a previously stored providerSessionId. */
+  clearProviderSession?: boolean;
 };
 
 export function normalizeCliEngine(value: string | null | undefined): CliEngine {
