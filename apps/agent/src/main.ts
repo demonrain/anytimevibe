@@ -3318,14 +3318,17 @@ async function ensureCodex(): Promise<void> {
   if (codex) return;
   await applyLoginPathToProcess();
   // Ensure historical Cockpit provider sections exist before app-server loads config.toml.
+  noteCodexCredentialSelfWrite();
   const providerRepair = await repairCodexModelProviderConfig();
   if (providerRepair.repaired) {
     logWarn("启动 Codex 前已修复 model_provider 配置", providerRepair.detail);
+    noteCodexCredentialSelfWrite();
   }
   try {
     const authRepair = await sanitizeCodexRelayAuth();
     if (authRepair.repaired) {
       logWarn("启动 Codex 前已切换为中转 API Key 登录态", authRepair.detail);
+      noteCodexCredentialSelfWrite();
     }
   } catch (error) {
     logWarn("启动 Codex 前同步中转 auth 失败", String(error));
@@ -3443,6 +3446,13 @@ async function recoverAfterCodexAppServerExit(detail: string): Promise<void> {
 
 /** Write project trust, then restart app-server if config changed so the new trust is loaded. */
 let pendingCodexAppServerReload: string | null = null;
+/** Ignore fs-watch credential events while we ourselves rewrite ~/.codex (avoids reload storms). */
+let ignoreCodexCredentialWatchUntilMs = 0;
+let codexReloadInFlight: Promise<void> | null = null;
+
+function noteCodexCredentialSelfWrite(ttlMs = 2_500): void {
+  ignoreCodexCredentialWatchUntilMs = Date.now() + ttlMs;
+}
 
 function hasActiveCodexTurn(): boolean {
   for (const threadId of activeTurnByThread.keys()) {
@@ -3469,31 +3479,46 @@ function hasRunningCodexTurn(): boolean {
 }
 
 async function reloadCodexAppServer(reason: string): Promise<void> {
-  // CCSwitch / Cockpit rewrite config.toml on account switch — often with
-  // requires_openai_auth=true on relay providers, and may preserve dead ChatGPT
-  // OAuth tokens in auth.json. Repair BEFORE restart so the new app-server does
-  // not keep auth_mode=Chatgpt (MCP codex_apps 401 / refresh_token_invalidated).
-  try {
-    const providerRepair = await repairCodexModelProviderConfig();
-    if (providerRepair.repaired) {
-      logWarn("切号重载前已修复 Codex provider 配置", providerRepair.detail);
-    }
-    const authRepair = await sanitizeCodexRelayAuth();
-    if (authRepair.repaired) {
-      logWarn("切号重载前已切换为中转 API Key 登录态", authRepair.detail);
-    }
-  } catch (error) {
-    logWarn("切号重载前修复 Codex provider/auth 失败", String(error));
+  if (codexReloadInFlight) {
+    await codexReloadInFlight;
+    return;
   }
-  logInfo("正在重载 Codex app-server", reason);
+  codexReloadInFlight = (async () => {
+    // CCSwitch / Cockpit rewrite config.toml on account switch — often with
+    // requires_openai_auth=true on relay providers, and may preserve dead ChatGPT
+    // OAuth tokens in auth.json. Repair BEFORE restart so the new app-server does
+    // not keep auth_mode=Chatgpt (MCP codex_apps 401 / refresh_token_invalidated).
+    try {
+      noteCodexCredentialSelfWrite();
+      const providerRepair = await repairCodexModelProviderConfig();
+      if (providerRepair.repaired) {
+        logWarn("切号重载前已修复 Codex provider 配置", providerRepair.detail);
+        noteCodexCredentialSelfWrite();
+      }
+      const authRepair = await sanitizeCodexRelayAuth();
+      if (authRepair.repaired) {
+        logWarn("切号重载前已切换为中转 API Key 登录态", authRepair.detail);
+        noteCodexCredentialSelfWrite();
+      }
+    } catch (error) {
+      logWarn("切号重载前修复 Codex provider/auth 失败", String(error));
+    }
+    logInfo("正在重载 Codex app-server", reason);
+    try {
+      codex?.stop({ intentional: true });
+    } catch {
+      // ignore
+    }
+    codex = null;
+    codexLoadedCredentialFingerprint = null;
+    noteCodexCredentialSelfWrite();
+    await ensureCodex();
+  })();
   try {
-    codex?.stop();
-  } catch {
-    // ignore
+    await codexReloadInFlight;
+  } finally {
+    codexReloadInFlight = null;
   }
-  codex = null;
-  codexLoadedCredentialFingerprint = null;
-  await ensureCodex();
 }
 
 async function maybeReloadCodexAppServerWhenIdle(): Promise<void> {
@@ -3505,8 +3530,15 @@ async function maybeReloadCodexAppServerWhenIdle(): Promise<void> {
 }
 
 function scheduleCodexCredentialReload(reason: string): void {
+  if (Date.now() < ignoreCodexCredentialWatchUntilMs) {
+    return;
+  }
   if (!codex && !publicState.environment.codexCompatible && !publicState.environment.codexInstalled) {
     void publishHostStatus().catch(() => undefined);
+    return;
+  }
+  if (codexReloadInFlight) {
+    pendingCodexAppServerReload = reason;
     return;
   }
   if (hasActiveCodexTurn()) {
@@ -5849,6 +5881,11 @@ async function addWorkspace(): Promise<PublicState> {
 
 function handleError(error: unknown): void {
   const detail = error instanceof Error ? error.message : String(error);
+  // Intentional app-server recycle must not flash as a user-facing failure.
+  if (/Codex app-server reloading/i.test(detail)) {
+    logInfo("Codex app-server 热重载中", detail);
+    return;
+  }
   logError("操作失败", error instanceof Error ? error : detail);
   if (quitting || installingUpdate) return;
   const connected = socket?.readyState === WebSocket.OPEN;

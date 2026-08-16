@@ -184,11 +184,15 @@ function upsertTopLevelTomlString(text: string, key: string, value: string): str
   return `${key} = "${value}"\n${text}`;
 }
 
-/** Normalize a previously corrupted `openai_base_url = "…"model =` glue line. */
+/** Normalize a previously corrupted `openai_base_url = "…"model =` glue on the SAME line. */
 function repairGluedOpenaiBaseUrlLine(text: string): string {
+  // Only match horizontal whitespace — never cross newlines, or a healthy
+  //   openai_base_url = "…"
+  //   model = "…"
+  // pair is treated as glued forever (write → watch → reload loop).
   return text.replace(
-    /^(\s*openai_base_url\s*=\s*"[^"]+")(\s*model\s*=)/im,
-    "$1\n$2"
+    /^(\s*openai_base_url\s*=\s*"[^"]+")([^\S\r\n]+)(model\s*=)/gim,
+    "$1\n$3"
   );
 }
 

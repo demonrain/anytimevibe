@@ -121,14 +121,17 @@ export class CodexAdapter {
     this.notify("initialized");
   }
 
-  stop(): void {
+  stop(options?: { intentional?: boolean }): void {
     const child = this.process;
     this.process = null;
     if (!child) return;
     child.removeAllListeners("exit");
     child.removeAllListeners("error");
+    const detail = options?.intentional
+      ? "Codex app-server reloading"
+      : "Codex app-server stopped";
     for (const pending of this.pending.values()) {
-      pending.reject(new Error("Codex app-server stopped"));
+      pending.reject(new Error(detail));
     }
     this.pending.clear();
     try {
