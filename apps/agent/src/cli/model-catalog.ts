@@ -646,24 +646,15 @@ function extractCursorModelIds(raw: string): string[] {
 
 async function runCursorModelsList(command: string): Promise<string | null> {
   try {
-    const { execFile } = await import("node:child_process");
-    const { promisify } = await import("node:util");
-    const execFileAsync = promisify(execFile);
-    const isWindows = process.platform === "win32";
-    const { windowsCmdArguments } = await import("../windows-command");
     const { collectLocalProxyEnv, cloudProxyChildEnv } = await import("../local-proxy");
+    const { execFileWithTreeKill } = await import("./exec-file-tree-kill");
     const proxy = await collectLocalProxyEnv();
     const env = await cloudProxyChildEnv();
     const attempts: string[][] = [["models"], ["--list-models"], ["models", "--json"]];
     for (const args of attempts) {
       try {
-        const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
-        const finalArgs = isWindows ? windowsCmdArguments(command, args) : args;
-        const { stdout, stderr } = await execFileAsync(executable, finalArgs, {
-          timeout: 20_000,
-          windowsHide: true,
-          windowsVerbatimArguments: isWindows,
-          // Must use proxy: Cursor model list is IP-region gated.
+        const { stdout, stderr } = await execFileWithTreeKill(command, args, {
+          timeoutMs: 20_000,
           env,
           maxBuffer: 1_000_000
         });
@@ -1161,26 +1152,20 @@ function ingestAgyModelRow(
 
 async function runAgyModelsList(command: string): Promise<string | null> {
   try {
-    const { execFile } = await import("node:child_process");
-    const { promisify } = await import("node:util");
-    const execFileAsync = promisify(execFile);
-    const isWindows = process.platform === "win32";
-    const { windowsCmdArguments } = await import("../windows-command");
     const { cloudProxyChildEnv } = await import("../local-proxy");
+    const { execFileWithTreeKill } = await import("./exec-file-tree-kill");
     const env = await cloudProxyChildEnv();
-    const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
-    const finalArgs = isWindows ? windowsCmdArguments(command, ["models"]) : ["models"];
-    const { stdout, stderr } = await execFileAsync(executable, finalArgs, {
-      timeout: 15_000,
-      windowsHide: true,
-      windowsVerbatimArguments: isWindows,
+    // Important on Windows: do not leave orphan `agy models` after timeout.
+    // Spawning via cmd.exe + execFile kill only ends cmd and used to leave dozens of hung agy.exe.
+    const { stdout, stderr } = await execFileWithTreeKill(command, ["models"], {
+      timeoutMs: 15_000,
       env,
       maxBuffer: 512_000
     });
     const text = `${stdout || ""}\n${stderr || ""}`.trim();
     if (text && !/unknown command|unrecognized|error:/i.test(text.slice(0, 200))) return text;
   } catch {
-    // ignore
+    // ignore (including timeout)
   }
   return null;
 }
