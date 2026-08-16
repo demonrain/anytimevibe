@@ -41,6 +41,41 @@ const CURSOR_RESULT_EXIT_GRACE_MS = Number(process.env.ANYTIMEVIBE_CURSOR_RESULT
 const CURSOR_STALL_MS = Number(process.env.ANYTIMEVIBE_CURSOR_STALL_MS || 120_000);
 
 /**
+ * Apply on-disk credentials for headless engines so CCSwitch/Cockpit account switches
+ * take effect on the next turn without restarting AnytimeVibe.
+ */
+async function applyHeadlessDiskCredentials(
+  engine: CliEngine,
+  env: NodeJS.ProcessEnv
+): Promise<NodeJS.ProcessEnv> {
+  const next = { ...env };
+  if (engine === "claude") {
+    try {
+      const settingsRaw = await fs.readFile(path.join(os.homedir(), ".claude", "settings.json"), "utf8");
+      const settings = JSON.parse(settingsRaw) as { env?: Record<string, string> };
+      if (settings.env && typeof settings.env === "object") {
+        for (const [key, value] of Object.entries(settings.env)) {
+          if (typeof value === "string" && value.trim()) next[key] = value;
+        }
+      }
+    } catch {
+      // optional
+    }
+    return next;
+  }
+  if (engine === "grok") {
+    // Prefer ~/.grok/config.toml api_key (copied into temp GROK_HOME by compat layer).
+    // Stale Agent process.env keys from a previous account would otherwise win.
+    for (const key of ["XAI_API_KEY", "GROK_API_KEY", "OPENAI_API_KEY"]) {
+      delete next[key];
+    }
+    return next;
+  }
+  // Cursor / Antigravity: each spawn reads ~/.cursor or ~/.gemini/antigravity-cli from disk.
+  return next;
+}
+
+/**
  * Kill the CLI process tree. On Windows headless spawns go through cmd.exe — bare
  * child.kill() only ends the shell and leaves claude/grok/cursor/agy running.
  */
@@ -1291,21 +1326,11 @@ export async function runHeadlessTurn(
     env = withWindowsUnixToolPath(env);
   }
 
-  // CCSwitch / Cockpit rewrite ~/.claude/settings.json env on account switch.
-  // Merge into the child so this turn uses the new key/base_url without restarting AnytimeVibe.
-  if (engine === "claude") {
-    try {
-      const settingsRaw = await fs.readFile(path.join(os.homedir(), ".claude", "settings.json"), "utf8");
-      const settings = JSON.parse(settingsRaw) as { env?: Record<string, string> };
-      if (settings.env && typeof settings.env === "object") {
-        for (const [key, value] of Object.entries(settings.env)) {
-          if (typeof value === "string" && value.trim()) env[key] = value;
-        }
-      }
-    } catch {
-      // optional
-    }
-  }
+  // Per-turn disk credentials (CCSwitch / Cockpit 切号无需重启 AnytimeVibe):
+  // - Claude: merge ~/.claude/settings.json env (ANTHROPIC_* / base_url)
+  // - Grok: prefer config.toml api_key — strip stale process.env API keys that would override
+  // - Cursor / Antigravity: fresh spawn reads ~/.cursor / ~/.gemini/antigravity-cli themselves
+  env = await applyHeadlessDiskCredentials(engine, env);
 
   // Third-party Responses gateways often omit fields Grok CLI requires.
   let grokCompat: Awaited<ReturnType<typeof prepareGrokResponsesCompat>> = null;

@@ -66,7 +66,7 @@ import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, isHeadlessCliEngine, type BackendStreamEvent } from "./cli/types";
 import { handoffPermissionArgs, normalizePermissionMode } from "./cli/permission-args";
 import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
-import { assertCodexLocalGatewayReady, repairCodexModelProviderConfig } from "./cli/codex-gateway";
+import { assertCodexLocalGatewayReady, readCodexCredentialFingerprint, repairCodexModelProviderConfig, sanitizeCodexRelayAuth, syncCodexRelayConfigForTurn } from "./cli/codex-gateway";
 import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt } from "./cli/macos-fs";
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix, proxyClearShellLines, stripProxyFromEnv, applyProcessProxyEnv, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
@@ -254,6 +254,8 @@ let socket: WebSocket | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let pairingTimer: NodeJS.Timeout | null = null;
 let codex: CodexAdapter | null = null;
+/** Fingerprint of config.toml/auth.json that the running app-server last loaded. */
+let codexLoadedCredentialFingerprint: string | null = null;
 let syncKey: CryptoKey | null = null;
 let quitting = false;
 /** True while quitAndInstall is in progress — suppress all UI/side-effect callbacks. */
@@ -3320,6 +3322,14 @@ async function ensureCodex(): Promise<void> {
   if (providerRepair.repaired) {
     logWarn("启动 Codex 前已修复 model_provider 配置", providerRepair.detail);
   }
+  try {
+    const authRepair = await sanitizeCodexRelayAuth();
+    if (authRepair.repaired) {
+      logWarn("启动 Codex 前已切换为中转 API Key 登录态", authRepair.detail);
+    }
+  } catch (error) {
+    logWarn("启动 Codex 前同步中转 auth 失败", String(error));
+  }
   if (!isCodexCompatibleVersion(codexVersion)) {
     const environment = await detectEnvironment();
     updateState({ environment });
@@ -3335,6 +3345,7 @@ async function ensureCodex(): Promise<void> {
     handleCodexMessage(message).catch(handleError);
   }, (detail) => {
     codex = null;
+    codexLoadedCredentialFingerprint = null;
     // Ignore exit noise while shutting down for update/quit — UI may already be destroyed.
     if (quitting || installingUpdate) return;
     // Do not tear down the relay socket when Codex exits; keep online for reconnect of Codex only.
@@ -3351,6 +3362,11 @@ async function ensureCodex(): Promise<void> {
     void recoverAfterCodexAppServerExit(detail).catch(handleError);
   });
   await codex.start();
+  try {
+    codexLoadedCredentialFingerprint = await readCodexCredentialFingerprint();
+  } catch {
+    codexLoadedCredentialFingerprint = null;
+  }
 }
 
 /**
@@ -3442,7 +3458,33 @@ function hasActiveCodexTurn(): boolean {
   return false;
 }
 
+/** True only when a Codex turn is already streaming — excludes the turn about to start. */
+function hasRunningCodexTurn(): boolean {
+  for (const threadId of activeTurnByThread.keys()) {
+    if (isHeadlessThreadActive(threadId)) continue;
+    const engine = resolveActivityEngine(threadId);
+    if (!engine || engine === "codex") return true;
+  }
+  return false;
+}
+
 async function reloadCodexAppServer(reason: string): Promise<void> {
+  // CCSwitch / Cockpit rewrite config.toml on account switch — often with
+  // requires_openai_auth=true on relay providers, and may preserve dead ChatGPT
+  // OAuth tokens in auth.json. Repair BEFORE restart so the new app-server does
+  // not keep auth_mode=Chatgpt (MCP codex_apps 401 / refresh_token_invalidated).
+  try {
+    const providerRepair = await repairCodexModelProviderConfig();
+    if (providerRepair.repaired) {
+      logWarn("切号重载前已修复 Codex provider 配置", providerRepair.detail);
+    }
+    const authRepair = await sanitizeCodexRelayAuth();
+    if (authRepair.repaired) {
+      logWarn("切号重载前已切换为中转 API Key 登录态", authRepair.detail);
+    }
+  } catch (error) {
+    logWarn("切号重载前修复 Codex provider/auth 失败", String(error));
+  }
   logInfo("正在重载 Codex app-server", reason);
   try {
     codex?.stop();
@@ -3450,6 +3492,7 @@ async function reloadCodexAppServer(reason: string): Promise<void> {
     // ignore
   }
   codex = null;
+  codexLoadedCredentialFingerprint = null;
   await ensureCodex();
 }
 
@@ -3491,6 +3534,18 @@ function startEngineCredentialAndCatalogWatch(): void {
     onCodexCredentialChanged: (reason) => {
       scheduleCodexCredentialReload(`切号/凭证变更:${reason}`);
     },
+    onHeadlessCredentialChanged: (reason) => {
+      // Claude/Grok/Cursor/Antigravity spawn a fresh CLI each turn and re-read disk.
+      // No app-server to kill — just refresh capabilities so the web picker matches the new account.
+      logInfo("检测到 headless 引擎切号/配置变更（下回合自动生效）", reason);
+      if (capabilityRefreshInFlight) return;
+      capabilityRefreshInFlight = true;
+      void publishHostStatus()
+        .catch(handleError)
+        .finally(() => {
+          capabilityRefreshInFlight = false;
+        });
+    },
     onCapabilitySourcesChanged: (reason) => {
       if (capabilityRefreshInFlight) return;
       capabilityRefreshInFlight = true;
@@ -3506,23 +3561,47 @@ function startEngineCredentialAndCatalogWatch(): void {
 
 async function ensureCodexTrustedAndReady(cwd: string): Promise<void> {
   const accessCwd = await ensureMacFolderAccess(cwd, "Codex 任务需要访问该工作区文件夹");
-  // Cockpit Local Access 常留下 model_provider=codex_local_access 却删掉对应 section。
-  const providerRepair = await repairCodexModelProviderConfig();
-  if (providerRepair.repaired) {
-    logWarn("已自动修复 Codex model_provider 配置", providerRepair.detail);
-    if (codex) {
-      if (hasActiveCodexTurn()) {
-        pendingCodexAppServerReload = `provider-repair:${providerRepair.detail}`;
-      } else {
-        await reloadCodexAppServer(`provider-repair:${providerRepair.detail}`);
-      }
+  // Old threads stick to the provider baked in at creation time. Before every turn/resume,
+  // re-read ~/.codex config+auth, repair mid-proxy routing, and reload app-server when the
+  // on-disk fingerprint differs from what the running process last loaded.
+  let synced: Awaited<ReturnType<typeof syncCodexRelayConfigForTurn>> | null = null;
+  try {
+    synced = await syncCodexRelayConfigForTurn();
+    if (synced.repaired) {
+      logWarn("回合前已同步最新 Codex 中转配置", synced.detail);
+    }
+  } catch (error) {
+    logWarn("回合前同步 Codex 中转配置失败", String(error));
+  }
+  const fingerprint = synced?.fingerprint;
+  const staleAppServer = Boolean(
+    codex
+    && fingerprint
+    && (
+      !codexLoadedCredentialFingerprint
+      || codexLoadedCredentialFingerprint !== fingerprint
+    )
+  );
+  if ((synced?.repaired || staleAppServer) && codex) {
+    const reason = synced?.repaired
+      ? `turn-config-sync:${synced.detail}`
+      : "turn-config-stale-appserver";
+    // Use hasRunningCodexTurn (not hasActiveCodexTurn): turn.start marks this thread as
+    // "starting" before we get here, which would otherwise forever defer the reload and
+    // let the current resume still hit a stale api.openai.com base_url.
+    if (hasRunningCodexTurn()) {
+      pendingCodexAppServerReload = reason;
+      logWarn("检测到配置已更新，有任务进行中，延后重载 Codex app-server", reason);
+    } else {
+      await reloadCodexAppServer(reason);
     }
   }
   await assertCodexLocalGatewayReady();
   const trustChanged = await ensureWorkspaceTrusted("codex", accessCwd);
   if (trustChanged && codex) {
-    // Never kill app-server mid-turn — that aborts upstream /responses and surfaces as HTTP 499.
-    if (hasActiveCodexTurn()) {
+    // Never kill app-server mid-stream — that aborts upstream /responses and surfaces as HTTP 499.
+    // At turn.start we are only "starting", so reloading here is safe and picks up fresh trust.
+    if (hasRunningCodexTurn()) {
       pendingCodexAppServerReload = accessCwd;
       logWarn("Codex 目录信任已写入，有任务进行中，延后重载 app-server", accessCwd);
       for (const threadId of activeTurnByThread.keys()) {
@@ -5501,6 +5580,7 @@ async function releaseCodexThreadForHandoff(threadId: string): Promise<void> {
   }
   codex = null;
   pendingCodexAppServerReload = null;
+  codexLoadedCredentialFingerprint = null;
 }
 
 async function relayTaskToCli(threadId: string): Promise<void> {
@@ -6071,6 +6151,7 @@ function prepareForUpdateQuit(): void {
     // ignore
   }
   codex = null;
+  codexLoadedCredentialFingerprint = null;
   try {
     if (tray) {
       tray.destroy();
@@ -6675,4 +6756,5 @@ app.on("before-quit", () => {
     // ignore
   }
   codex = null;
+  codexLoadedCredentialFingerprint = null;
 });

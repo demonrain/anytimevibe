@@ -3,9 +3,18 @@ import os from "node:os";
 import path from "node:path";
 
 export type EngineConfigWatchHandlers = {
-  /** auth.json / config.toml changed — Codex app-server must reload to pick up new account. */
+  /**
+   * Codex credential files changed — long-lived app-server must reload.
+   * (Codex is the only engine that caches config.toml/auth.json in-process.)
+   */
   onCodexCredentialChanged: (reason: string) => void;
-  /** Model catalogs / Claude settings / Grok cache changed — refresh UI capabilities. */
+  /**
+   * Headless engines (Claude / Grok / Cursor / Antigravity) credential files changed.
+   * No process restart needed: the next turn re-spawns and re-reads disk.
+   * Caller should refresh UI capabilities / host status.
+   */
+  onHeadlessCredentialChanged: (reason: string) => void;
+  /** Model catalogs / settings changed — refresh UI capabilities. */
   onCapabilitySourcesChanged: (reason: string) => void;
 };
 
@@ -21,10 +30,21 @@ export function startEngineConfigWatch(handlers: EngineConfigWatchHandlers): () 
   const cursorHome = path.join(home, ".cursor");
   const antigravityHome = path.join(home, ".gemini", "antigravity-cli");
 
-  const credentialFiles = new Set([
+  const codexCredentialFiles = new Set([
     path.join(codexHome, "auth.json"),
     path.join(codexHome, "config.toml"),
     path.join(codexHome, ".cockpit_codex_auth.json")
+  ].map((p) => path.normalize(p).toLowerCase()));
+
+  // Headless CLIs re-read these on every turn spawn — still watch so UI + logs stay in sync.
+  const headlessCredentialFiles = new Set([
+    path.join(claudeHome, "settings.json"),
+    path.join(grokHome, "auth.json"),
+    path.join(grokHome, "config.toml"),
+    path.join(cursorHome, "cli-config.json"),
+    path.join(antigravityHome, "settings.json"),
+    // Antigravity OAuth / session blob (CCSwitch / interactive login may rewrite).
+    path.join(antigravityHome, "jetski_state.pbtxt")
   ].map((p) => path.normalize(p).toLowerCase()));
 
   const capabilityFiles = new Set([
@@ -42,21 +62,34 @@ export function startEngineConfigWatch(handlers: EngineConfigWatchHandlers): () 
 
   const watchDirs = [codexHome, grokHome, claudeHome, cursorHome, antigravityHome];
   const watchers: FSWatcher[] = [];
-  let credentialTimer: ReturnType<typeof setTimeout> | null = null;
+  let codexCredentialTimer: ReturnType<typeof setTimeout> | null = null;
+  let headlessCredentialTimer: ReturnType<typeof setTimeout> | null = null;
   let capabilityTimer: ReturnType<typeof setTimeout> | null = null;
-  let lastCredentialReason = "";
+  let lastCodexCredentialReason = "";
+  let lastHeadlessCredentialReason = "";
   let lastCapabilityReason = "";
   let stopped = false;
 
-  const scheduleCredential = (reason: string) => {
-    lastCredentialReason = reason;
-    if (credentialTimer) clearTimeout(credentialTimer);
-    credentialTimer = setTimeout(() => {
-      credentialTimer = null;
+  const scheduleCodexCredential = (reason: string) => {
+    lastCodexCredentialReason = reason;
+    if (codexCredentialTimer) clearTimeout(codexCredentialTimer);
+    codexCredentialTimer = setTimeout(() => {
+      codexCredentialTimer = null;
       if (stopped) return;
-      handlers.onCodexCredentialChanged(lastCredentialReason);
+      handlers.onCodexCredentialChanged(lastCodexCredentialReason);
     }, 800);
-    credentialTimer.unref?.();
+    codexCredentialTimer.unref?.();
+  };
+
+  const scheduleHeadlessCredential = (reason: string) => {
+    lastHeadlessCredentialReason = reason;
+    if (headlessCredentialTimer) clearTimeout(headlessCredentialTimer);
+    headlessCredentialTimer = setTimeout(() => {
+      headlessCredentialTimer = null;
+      if (stopped) return;
+      handlers.onHeadlessCredentialChanged(lastHeadlessCredentialReason);
+    }, 800);
+    headlessCredentialTimer.unref?.();
   };
 
   const scheduleCapability = (reason: string) => {
@@ -80,11 +113,15 @@ export function startEngineConfigWatch(handlers: EngineConfigWatchHandlers): () 
         if (/\.(sqlite|sqlite-wal|sqlite-shm|tmp|bak|log)$/i.test(base)) return;
         if (base.startsWith("..") || base.endsWith(".bak")) return;
 
-        if (credentialFiles.has(full)) {
-          scheduleCredential(`${path.basename(dir)}/${base}`);
+        const label = `${path.basename(dir)}/${base}`;
+        if (codexCredentialFiles.has(full)) {
+          scheduleCodexCredential(label);
+        }
+        if (headlessCredentialFiles.has(full)) {
+          scheduleHeadlessCredential(label);
         }
         if (capabilityFiles.has(full)) {
-          scheduleCapability(`${path.basename(dir)}/${base}`);
+          scheduleCapability(label);
         }
       });
       watcher.on("error", () => undefined);
@@ -96,7 +133,8 @@ export function startEngineConfigWatch(handlers: EngineConfigWatchHandlers): () 
 
   return () => {
     stopped = true;
-    if (credentialTimer) clearTimeout(credentialTimer);
+    if (codexCredentialTimer) clearTimeout(codexCredentialTimer);
+    if (headlessCredentialTimer) clearTimeout(headlessCredentialTimer);
     if (capabilityTimer) clearTimeout(capabilityTimer);
     for (const watcher of watchers) {
       try {

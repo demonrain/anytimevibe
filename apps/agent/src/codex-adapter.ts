@@ -4,6 +4,7 @@ import { windowsCmdArguments } from "./windows-command";
 import { localGatewayChildEnv } from "./local-proxy";
 import { isCodexModelsManagerNoise } from "./cli/log-noise";
 import type { PermissionMode } from "@anytimevibe/protocol";
+import { PRODUCT_VERSION } from "@anytimevibe/protocol";
 
 type RpcId = string | number;
 type JsonObject = Record<string, any>;
@@ -101,7 +102,7 @@ export class CodexAdapter {
     child.on("error", (error) => this.onExit(error.message));
 
     await this.request("initialize", {
-      clientInfo: { name: "anytimevibe-agent", title: "随码", version: "0.4.23" },
+      clientInfo: { name: "anytimevibe-agent", title: "随码", version: PRODUCT_VERSION },
       capabilities: { experimentalApi: false, requestAttestation: false }
     });
     this.notify("initialized");
@@ -210,6 +211,28 @@ export function extractCodexTurnError(turn: JsonObject | undefined | null): stri
 export function explainCodexUpstreamError(message: string): string {
   const raw = String(message || "").trim();
   if (!raw) return raw;
+  if (
+    /refresh token was revoked|access token could not be refreshed|token_invalidated|refresh_token_invalidated|authentication token has been invalidated|Your session has ended|Encountered invalidated oauth|MCP client for `codex_apps` failed/i.test(raw)
+  ) {
+    return [
+      raw,
+      "",
+      "说明：本机 ~/.codex/auth.json 仍是 ChatGPT OAuth 登录态，但 refresh token 已失效。",
+      "中转供应商（Demonrain / AnyRouter）即使 requires_openai_auth=false，只要 auth.json 里还留着 tokens，Codex 仍会 auth_mode=Chatgpt，并去拉官方 MCP/plugins（codex_apps）导致 401。",
+      "处理：随码会在切号热重载时自动清掉 OAuth tokens、改用中转 API Key；也可在 CCSwitch 关闭「切换时保留官方 Codex 登录」后重新切换一次 Demonrain。"
+    ].join("\n");
+  }
+  if (
+    /Incorrect API key provided|invalid_api_key|url:\s*https:\/\/api\.openai\.com\//i.test(raw)
+  ) {
+    return [
+      raw,
+      "",
+      "说明：当前是 API Key 模式，但请求打到了官方 https://api.openai.com（不是 Demonrain 中转）。",
+      "常见原因：旧线程仍绑定内置 provider=openai；清掉 ChatGPT OAuth 后 Codex 用 auth.json 里的中转 sk- 去打官网 → 必然 invalid_api_key。",
+      "处理：随码会在每次旧会话继续前重读最新 config/auth，并写入 openai_base_url 指向中转；若仍异常请重启客户端后再试该会话。"
+    ].join("\n");
+  }
   if (/auth_unavailable|no auth available/i.test(raw)) {
     return [
       raw,
