@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import { windowsCmdArguments } from "./windows-command";
 import { localGatewayChildEnv } from "./local-proxy";
 import { isCodexModelsManagerNoise } from "./cli/log-noise";
+import { resolveCodexOpenaiBaseUrlForEnv } from "./cli/codex-gateway";
 import type { PermissionMode } from "@anytimevibe/protocol";
 import { PRODUCT_VERSION } from "@anytimevibe/protocol";
 
@@ -76,12 +77,24 @@ export class CodexAdapter {
     const args = isWindows
       ? windowsCmdArguments(this.codexCommand, ["app-server", "--stdio"])
       : ["app-server", "--stdio"];
+    const baseEnv = localGatewayChildEnv(process.env);
+    // Sticky openai threads / ApiKey mode still honor OPENAI_BASE_URL for the built-in
+    // provider when config.toml openai_base_url alone is flaky across Codex versions.
+    try {
+      const openaiBase = await resolveCodexOpenaiBaseUrlForEnv();
+      if (openaiBase) {
+        baseEnv.OPENAI_BASE_URL = openaiBase;
+        baseEnv.openai_base_url = openaiBase;
+      }
+    } catch {
+      // optional
+    }
     const child = spawn(executable, args, {
       windowsHide: true,
       windowsVerbatimArguments: isWindows,
       stdio: ["pipe", "pipe", "pipe"],
       // Local Codex gateway only — never inherit Clash HTTP_PROXY.
-      env: localGatewayChildEnv(process.env)
+      env: baseEnv
     });
     this.process = child;
     createInterface({ input: child.stdout }).on("line", (line) => this.handleLine(line));
@@ -229,8 +242,8 @@ export function explainCodexUpstreamError(message: string): string {
       raw,
       "",
       "说明：当前是 API Key 模式，但请求打到了官方 https://api.openai.com（不是 Demonrain 中转）。",
-      "常见原因：旧线程仍绑定内置 provider=openai；清掉 ChatGPT OAuth 后 Codex 用 auth.json 里的中转 sk- 去打官网 → 必然 invalid_api_key。",
-      "处理：随码会在每次旧会话继续前重读最新 config/auth，并写入 openai_base_url 指向中转；若仍异常请重启客户端后再试该会话。"
+      "常见原因：① 旧线程绑定内置 provider=openai；② config.toml 里 openai_base_url 曾被写坏（与 model 粘在同一行）导致未生效。",
+      "处理：更新随码后会自动修好配置并注入 OPENAI_BASE_URL；请新开一条任务验证（不要只看历史失败气泡——同一 request id 多半是旧错误）。"
     ].join("\n");
   }
   if (/auth_unavailable|no auth available/i.test(raw)) {

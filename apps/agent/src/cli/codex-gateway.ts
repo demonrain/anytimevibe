@@ -39,6 +39,23 @@ function listCustomModelProviders(text: string): string[] {
   return names;
 }
 
+/** Read openai_base_url (or active relay base) for Codex child env OPENAI_BASE_URL. */
+export async function resolveCodexOpenaiBaseUrlForEnv(): Promise<string | null> {
+  let text = "";
+  try {
+    text = await fs.readFile(path.join(codexHomeDir(), "config.toml"), "utf8");
+  } catch {
+    return null;
+  }
+  text = repairGluedOpenaiBaseUrlLine(text);
+  const top = parseTomlString(text, "openai_base_url");
+  if (top && !isOpenaiApiHost(top)) return toOpenaiStyleBaseUrl(top);
+  const resolved = await resolveCodexProviderBaseUrl();
+  if (!resolved?.baseUrl || isOpenaiApiHost(resolved.baseUrl)) return null;
+  if (BUILTIN_CODEX_PROVIDERS.has(resolved.provider)) return null;
+  return toOpenaiStyleBaseUrl(resolved.baseUrl);
+}
+
 /** Read active model_provider base_url from ~/.codex/config.toml (no secrets). */
 export async function resolveCodexProviderBaseUrl(): Promise<{
   provider: string;
@@ -50,6 +67,7 @@ export async function resolveCodexProviderBaseUrl(): Promise<{
   } catch {
     return null;
   }
+  text = repairGluedOpenaiBaseUrlLine(text);
   const provider = parseTomlString(text, "model_provider");
   if (!provider) return null;
 
@@ -156,13 +174,22 @@ function isOpenaiApiHost(baseUrl: string): boolean {
 function upsertTopLevelTomlString(text: string, key: string, value: string): string {
   const re = new RegExp(`((?:^|\\n)\\s*${key}\\s*=\\s*)"[^"]*"`, "i");
   if (re.test(text)) return text.replace(re, `$1"${value}"`);
-  // Insert near the top, after model_provider if present.
-  const providerLine = text.match(/(^|\n)(\s*model_provider\s*=\s*"[^"]*"\s*)/i);
+  // Insert on its own line after model_provider. Do NOT let \s* eat the following
+  // newline — that previously produced: openai_base_url = "…"model = "…"
+  const providerLine = text.match(/(?:^|\n)\s*model_provider\s*=\s*"[^"]*"/i);
   if (providerLine && providerLine.index != null) {
     const at = providerLine.index + providerLine[0].length;
     return `${text.slice(0, at)}\n${key} = "${value}"${text.slice(at)}`;
   }
   return `${key} = "${value}"\n${text}`;
+}
+
+/** Normalize a previously corrupted `openai_base_url = "…"model =` glue line. */
+function repairGluedOpenaiBaseUrlLine(text: string): string {
+  return text.replace(
+    /^(\s*openai_base_url\s*=\s*"[^"]+")(\s*model\s*=)/im,
+    "$1\n$2"
+  );
 }
 
 function upsertProviderBearer(text: string, provider: string, apiKey: string): { text: string; changed: boolean } {
@@ -245,6 +272,11 @@ export async function repairCodexModelProviderConfig(): Promise<{
 
   const details: string[] = [];
   let next = text;
+  const unglued = repairGluedOpenaiBaseUrlLine(next);
+  if (unglued !== next) {
+    next = unglued;
+    details.push("fixed glued openai_base_url/model line");
+  }
   const fallbackBaseUrl = resolveFallbackProviderBaseUrl(next);
 
   // Historical threads created under Cockpit Local Access still reference this provider.
