@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=1600, height=900" />
+  <title>随码五引擎产品截图</title>
+  <style>
+    :root { --ink: #15251d; --paper: #efe6d5; --card: #fff9ed; --line: rgba(21,37,29,.14); --orange: #ef5b2a; --green: #2d7a55; --muted: #68746b; }
+    * { box-sizing: border-box; }
+    html, body { width: 1600px; height: 900px; margin: 0; overflow: hidden; background: var(--paper); color: var(--ink); font-family: "Microsoft YaHei", "Segoe UI", sans-serif; }
+    body { padding: 62px 72px; }
+    .screen { display: none; width: 1456px; height: 776px; }
+    .screen.active { display: grid; }
+    .chrome { display: grid; grid-template-columns: 236px 1fr; width: 100%; height: 100%; overflow: hidden; border: 1px solid var(--line); border-radius: 26px; background: #f7f0e4; box-shadow: 0 28px 70px rgba(21,37,29,.18); }
+    .rail { padding: 26px 20px; background: var(--ink); color: #fff9ed; }
+    .brand { display: flex; gap: 11px; align-items: center; margin-bottom: 48px; font-weight: 900; letter-spacing: .02em; }
+    .brand img { width: 36px; height: 36px; }
+    .nav { display: grid; gap: 9px; color: #c7d1c9; font-size: 15px; }
+    .nav div { padding: 12px 13px; border-radius: 10px; }
+    .nav .on { background: rgba(255,249,237,.13); color: #fff9ed; }
+    .body { min-width: 0; padding: 34px 40px; }
+    .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 22px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: 32px; letter-spacing: -.02em; }
+    h2 { font-size: 24px; }
+    h3 { font-size: 17px; }
+    .eyebrow { color: var(--orange); font: 800 13px "Cascadia Code", monospace; letter-spacing: .12em; text-transform: uppercase; }
+    .status { display: inline-flex; align-items: center; gap: 7px; padding: 8px 12px; border-radius: 999px; color: #1d6b47; background: #dcefe4; font: 700 12px "Cascadia Code", monospace; }
+    .status i { width: 8px; height: 8px; border-radius: 50%; background: #2d7a55; }
+    .panel { border: 1px solid var(--line); border-radius: 17px; background: var(--card); box-shadow: 0 14px 34px rgba(21,37,29,.08); }
+    .engine-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-top: 18px; }
+    .engine { min-width: 0; padding: 16px 11px 14px; border: 2px solid var(--line); border-radius: 15px; background: var(--card); }
+    .engine.selected { border-color: var(--orange); box-shadow: 0 0 0 4px rgba(239,91,42,.1); }
+    .engine img { width: 34px; height: 34px; display: block; object-fit: contain; margin-bottom: 11px; }
+    .engine strong { display: block; font-size: 14px; }
+    .engine small { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; line-height: 1.35; }
+    .form-grid { display: grid; grid-template-columns: 1fr 310px; gap: 18px; margin-top: 18px; }
+    .field { padding: 17px 18px; }
+    .field label { display: block; margin-bottom: 9px; color: var(--muted); font-size: 12px; }
+    .field strong { display: block; font-size: 15px; }
+    .prompt { min-height: 122px; line-height: 1.65; }
+    .select { display: flex; align-items: center; justify-content: space-between; padding: 12px 13px; border: 1px solid var(--line); border-radius: 10px; background: #f6ecdc; font-size: 14px; }
+    .select b { color: var(--green); font-size: 12px; }
+    .cta { display: inline-flex; margin-top: 18px; padding: 13px 18px; border-radius: 11px; background: var(--orange); color: white; font-weight: 900; }
+    .task-layout { grid-template-columns: 236px 350px 1fr; grid-template-rows: 1fr; }
+    .task-list { padding: 24px 19px; background: #f3ebdd; border-right: 1px solid var(--line); }
+    .task-list-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 17px; }
+    .task-row { padding: 14px; margin-top: 10px; border: 1px solid var(--line); border-radius: 13px; background: var(--card); }
+    .task-row.current { border-color: var(--orange); box-shadow: 0 0 0 3px rgba(239,91,42,.08); }
+    .task-row strong { display: block; font-size: 14px; }
+    .task-row small { display: block; margin-top: 8px; color: var(--muted); font-size: 11px; }
+    .task-row .tag { display: inline-block; margin-top: 9px; padding: 4px 7px; border-radius: 6px; color: #1d6b47; background: #dcefe4; font: 700 10px "Cascadia Code", monospace; }
+    .conversation { display: grid; grid-template-rows: auto 1fr auto; min-width: 0; }
+    .conversation-head { display: flex; justify-content: space-between; padding: 23px 28px; border-bottom: 1px solid var(--line); }
+    .conversation-head p { margin-top: 7px; color: var(--muted); font-size: 13px; }
+    .messages { display: grid; align-content: start; gap: 13px; padding: 25px 28px; }
+    .message { max-width: 82%; padding: 15px 17px; border-radius: 14px; line-height: 1.55; font-size: 14px; }
+    .message.user { justify-self: end; background: #f4d8c7; }
+    .message.agent { background: var(--card); border: 1px solid var(--line); }
+    .message code { display: block; margin-top: 10px; padding: 11px 13px; border-radius: 9px; background: var(--ink); color: #dce7dd; font: 12px/1.55 "Cascadia Code", monospace; }
+    .composer { display: flex; align-items: center; gap: 12px; padding: 18px 28px; border-top: 1px solid var(--line); }
+    .composer input { flex: 1; padding: 13px 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--muted); }
+    .queue { padding: 24px; }
+    .queue-layout { display: grid; grid-template-columns: 1fr 1.1fr; gap: 18px; }
+    .queue-item { display: grid; grid-template-columns: 48px 1fr auto; gap: 14px; align-items: center; padding: 15px 0; border-bottom: 1px solid var(--line); }
+    .queue-item:last-child { border-bottom: 0; }
+    .queue-item img { width: 38px; height: 38px; object-fit: contain; }
+    .queue-item small { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; }
+    .pill { padding: 6px 9px; border-radius: 999px; font: 700 10px "Cascadia Code", monospace; }
+    .pill.run { color: #1d6b47; background: #dcefe4; }
+    .pill.wait { color: #806311; background: #f5eabf; }
+    .pill.done { color: #315e8e; background: #e2edf8; }
+    .perm-table { overflow: hidden; }
+    .perm-head, .perm-row { display: grid; grid-template-columns: 1.25fr repeat(5, 1fr); align-items: center; }
+    .perm-head { color: #fff9ed; background: var(--ink); font-weight: 800; }
+    .perm-head > div, .perm-row > div { min-height: 56px; padding: 14px 13px; border-right: 1px solid rgba(255,249,237,.14); }
+    .perm-row > div { border-right-color: var(--line); border-top: 1px solid var(--line); font-size: 12px; }
+    .perm-row > div:first-child { font-size: 14px; }
+    .perm-row .agy { background: #fff0d7; }
+    .check { color: var(--green); font-weight: 900; }
+    .handoff-layout { display: grid; grid-template-columns: 370px 1fr; gap: 34px; align-items: center; height: 610px; }
+    .phone { justify-self: center; width: 284px; height: 580px; padding: 19px; border: 12px solid var(--ink); border-radius: 40px; background: #f4ead9; box-shadow: 0 22px 44px rgba(21,37,29,.18); }
+    .phone-top { display: flex; justify-content: space-between; padding-bottom: 15px; border-bottom: 1px solid var(--line); font-size: 13px; }
+    .handoff-card { margin-top: 22px; padding: 18px; }
+    .handoff-card code { display: block; margin-bottom: 10px; color: var(--green); font: 700 10px "Cascadia Code", monospace; }
+    .handoff-card p { margin-top: 10px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .terminal { padding: 23px; min-height: 396px; border-radius: 20px; background: var(--ink); color: #dce7dd; font: 15px/1.9 "Cascadia Code", monospace; box-shadow: 0 24px 55px rgba(21,37,29,.19); }
+    .terminal-tabs { display: flex; gap: 9px; padding-bottom: 16px; border-bottom: 1px solid rgba(255,249,237,.14); }
+    .terminal-tab { display: flex; gap: 7px; align-items: center; padding: 8px 10px; border-radius: 9px; color: #b4c1b8; font-size: 12px; }
+    .terminal-tab img { width: 20px; height: 20px; object-fit: contain; }
+    .terminal-tab.current { color: var(--ink); background: var(--card); }
+    .terminal .ok { color: #75d8a2; }
+    .terminal .orange { color: #ef8c69; }
+    .terminal .result { margin-top: 17px; padding: 12px 14px; border-radius: 10px; color: #8de3b5; background: rgba(45,122,85,.16); font-family: "Microsoft YaHei", sans-serif; }
+  </style>
+</head>
+<body>
+  <section class="screen active" data-view="remote">
+    <div class="chrome"><aside class="rail"><div class="brand"><img src="../apps/web/public/icon-512.png" />随码 AnytimeVibe</div><div class="nav"><div>⌂ 首页</div><div class="on">＋ 新建任务</div><div>▣ 任务列表</div><div>⚙ 设置</div></div></aside><main class="body"><div class="top"><div><div class="eyebrow">NEW TASK · FIVE ENGINES</div><h1>向开发主机下发任务</h1></div><span class="status"><i></i>开发主机在线</span></div><div class="engine-grid"><div class="engine"><img src="../apps/web/public/vendors/codex.png" /><strong>Codex</strong><small>OpenAI · Full Access</small></div><div class="engine"><img src="../apps/web/public/vendors/claude.png" /><strong>Claude Code</strong><small>Anthropic · 接受编辑</small></div><div class="engine"><img src="../apps/web/public/vendors/grok.png" /><strong>Grok Build</strong><small>xAI · 全自动批准</small></div><div class="engine"><img src="../apps/web/public/vendors/cursor.png" /><strong>Cursor Agent</strong><small>Cursor · 全自动写盘</small></div><div class="engine selected"><img src="../apps/web/public/vendors/antigravity.png" /><strong>Antigravity</strong><small>Google · Accept Edits</small></div></div><div class="form-grid"><div class="field panel prompt"><label>任务命令</label><strong>优化移动端任务切换，并运行完整测试。</strong><p style="margin-top:14px;color:var(--muted);font-size:13px">任务会在本机工作区执行，回复与状态实时同步到 Web。</p></div><div class="field panel"><label>权限模式</label><div class="select"><span>Accept Edits</span><b>Antigravity</b></div><label style="margin-top:18px">工作区</label><div class="select"><span>H:\git\anytimevibe</span><b>已信任</b></div></div></div><span class="cta">发送到我的电脑 →</span></main></div>
+  </section>
+  <section class="screen" data-view="stream">
+    <div class="chrome task-layout"><aside class="rail"><div class="brand"><img src="../apps/web/public/icon-512.png" />随码</div><div class="nav"><div>⌂ 首页</div><div class="on">▣ 任务列表</div><div>⌁ 连接主机</div><div>⚙ 设置</div></div></aside><aside class="task-list"><div class="task-list-head"><h2>任务</h2><span class="status"><i></i>在线</span></div><div class="task-row current"><strong>优化移动端任务切换</strong><small>刚刚 · anytimevibe</small><span class="tag">AGY · 处理中</span></div><div class="task-row"><strong>审查加密授权流程</strong><small>3 分钟前 · main</small><span class="tag">CODEX · 队列中</span></div><div class="task-row"><strong>重构更新逻辑</strong><small>今天 · agent</small><span class="tag">CURSOR · 已完成</span></div><div class="task-row"><strong>补充 API 文档</strong><small>今天 · docs</small><span class="tag">GROK · 已完成</span></div></aside><main class="conversation"><header class="conversation-head"><div><div class="eyebrow">ANTIGRAVITY · ACCEPT EDITS</div><h2>优化移动端任务切换</h2><p>Google Antigravity · brain_8f2 · H:\git\anytimevibe</p></div><span class="pill run">处理中</span></header><div class="messages"><div class="message user">修复返回列表时滚动位置丢失的问题，并补充测试。</div><div class="message agent"><strong>Antigravity</strong> 正在读取项目结构并准备修改。<code>agy · stage 1/3 · workspace trusted<br />→ 检查移动端导航状态<br />→ 生成修复方案</code></div><div class="message agent"><strong>实时同步</strong> 刷新、退出或换浏览器后，任务仍保持处理中。</div></div><div class="composer"><input value="继续检查小屏幕 Diff 布局…" readonly /><span class="cta" style="margin:0">发送</span></div></main></div>
+  </section>
+  <section class="screen" data-view="permissions">
+    <div class="chrome"><aside class="rail"><div class="brand"><img src="../apps/web/public/icon-512.png" />随码</div><div class="nav"><div>⌂ 首页</div><div>▣ 任务列表</div><div class="on">⚿ 权限设置</div><div>⚙ 设置</div></div></aside><main class="body"><div class="top"><div><div class="eyebrow">ENGINE-AWARE PERMISSIONS</div><h1>权限按编码引擎准确映射</h1></div><span class="status"><i></i>本机凭据不出电脑</span></div><div class="panel perm-table"><div class="perm-head"><div>能力</div><div>Codex</div><div>Claude</div><div>Grok</div><div>Cursor</div><div>Antigravity</div></div><div class="perm-row"><div>读取项目文件</div><div class="check">✓ Full Access</div><div class="check">✓ Read-only</div><div class="check">✓ Read-only</div><div class="check">✓ Propose</div><div class="check agy">✓ --sandbox</div></div><div class="perm-row"><div>写入工作区</div><div>全权限</div><div>接受编辑</div><div>全自动批准</div><div>全自动写盘</div><div class="check agy">✓ --mode accept-edits</div></div><div class="perm-row"><div>执行 Shell</div><div class="check">✓ approvalPolicy</div><div>按需确认</div><div>始终批准</div><div>受信任工作区</div><div class="check agy">✓ Accept Edits</div></div><div class="perm-row"><div>跳过权限确认</div><div>Full Access</div><div>Bypass</div><div>Always approve</div><div>Full auto</div><div class="agy">--dangerously-skip-permissions</div></div></div><div class="panel field" style="margin-top:18px"><label>当前任务权限</label><div class="select"><span>Accept Edits</span><b>映射到 agy --mode accept-edits</b></div></div></main></div>
+  </section>
+  <section class="screen" data-view="handoff">
+    <div class="chrome"><aside class="rail"><div class="brand"><img src="../apps/web/public/icon-512.png" />随码</div><div class="nav"><div>⌂ 首页</div><div class="on">↗ 任务接力</div><div>▣ 任务列表</div><div>⚙ 设置</div></div></aside><main class="body"><div class="top"><div><div class="eyebrow">NATIVE CLI HANDOFF</div><h1>回到电脑，任务一键接力</h1><p style="margin-top:8px;color:var(--muted)">同一引擎、同一会话、同一权限，不需要重新解释上下文。</p></div><span class="status"><i></i>本机 Agent 在线</span></div><div class="handoff-layout"><div class="phone"><div class="phone-top"><b>task_8f2</b><span class="pill run">进行中</span></div><div class="panel handoff-card"><code>ANTIGRAVITY · ACCEPT EDITS</code><h3>优化移动端任务切换</h3><p>上下文、阶段日志和工作区路径均已同步。</p></div><span class="cta" style="display:flex;justify-content:center;margin-top:18px">在电脑上接力</span></div><div class="terminal"><div class="terminal-tabs"><span class="terminal-tab"><img src="../apps/web/public/vendors/codex.png" />Codex</span><span class="terminal-tab"><img src="../apps/web/public/vendors/claude.png" />Claude</span><span class="terminal-tab"><img src="../apps/web/public/vendors/grok.png" />Grok</span><span class="terminal-tab"><img src="../apps/web/public/vendors/cursor.png" />Cursor</span><span class="terminal-tab current"><img src="../apps/web/public/vendors/antigravity.png" />AGY</span></div><div style="margin-top:22px"><span class="orange">›</span> agy --conversation brain_8f2</div><div class="ok">✓ 原生会话已恢复</div><div class="ok">✓ Accept Edits 已继承</div><div class="ok">✓ H:\git\anytimevibe</div><div style="margin-top:22px">继续检查小屏幕 Diff 布局…</div><div>$ <span style="color:var(--orange)">▋</span></div><div class="result">手机上的任务，已经在桌面 CLI 继续。</div></div></div></main></div>
+  </section>
+  <script>
+    const view = (location.hash.slice(1) || "remote");
+    document.querySelectorAll(".screen").forEach((node) => node.classList.toggle("active", node.dataset.view === view));
+  </script>
+</body>
+</html>

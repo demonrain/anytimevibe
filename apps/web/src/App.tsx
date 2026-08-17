@@ -38,6 +38,7 @@ import {
   type PairingPublicInfo,
   type PermissionMode,
   type ReasoningEffort,
+  type RunInfo,
   type Workspace,
   PRODUCT_VERSION,
   compareSemver
@@ -99,6 +100,8 @@ type Task = {
   reasoningEffort?: ReasoningEffort;
   /** Cursor: extended-thinking variant active for this thread. */
   thinking?: boolean;
+  /** Last effective coding-engine runtime configuration. */
+  runInfo?: RunInfo;
   contextUsage?: ContextUsage;
   /** Follow-up prompts waiting on the agent (not yet started). */
   queuedTurns?: QueuedTurnItem[];
@@ -1560,6 +1563,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const engine = event.cliEngine ?? existing?.cliEngine;
     const model = event.model ?? existing?.model;
     const reasoningEffort = event.reasoningEffort ?? existing?.reasoningEffort;
+    const runInfo = event.runInfo ?? existing?.runInfo;
     const contextUsage = event.contextUsage ?? existing?.contextUsage;
     const providerSessionId = event.providerSessionId ?? existing?.providerSessionId;
     // Never let a stale snapshot push a recently active task down the list.
@@ -1620,6 +1624,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       ...(providerSessionId ? { providerSessionId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(runInfo ? { runInfo } : {}),
       ...(contextUsage ? { contextUsage } : {}),
       // Preserve agent queue state — snapshots do not carry it and must not wipe it.
       // Use !== undefined so an empty [] (queue finished) is kept and not treated as "missing".
@@ -1705,6 +1710,14 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   };
   next.tasks[event.threadId] = task;
   task.updatedAt = Date.now() / 1000;
+  if (event.type === "turn.info") {
+    task.runInfo = event.runInfo;
+    task.cliEngine = event.runInfo.engine;
+    if (event.runInfo.model) task.model = event.runInfo.model;
+    if (event.runInfo.reasoningEffort) task.reasoningEffort = event.runInfo.reasoningEffort;
+    if (event.runInfo.thinking !== undefined) task.thinking = event.runInfo.thinking;
+    return next;
+  }
   if (event.type === "turn.started") {
     task.status = "active";
     task.activeTurnId = event.turnId;
@@ -2787,6 +2800,26 @@ function formatEngineQuotaChip(quota: EngineQuota): string {
   return line ? (line.length > 28 ? `${line.slice(0, 26)}…` : line) : "—";
 }
 
+function RunInfoPanel({ info }: { info: RunInfo }) {
+  const { locale } = useI18n();
+  const isEnglish = locale === "en";
+  const value = (item: string | undefined, fallback: string) => item?.trim() || fallback;
+  return (
+    <section className="run-info-panel" aria-label={isEnglish ? "Current engine runtime" : "当前代码引擎运行信息"}>
+      <span className="run-info-title">{isEnglish ? "Runtime" : "本轮运行"}</span>
+      <div className="run-info-chips">
+        <span className="run-info-chip"><em>{isEnglish ? "Engine" : "引擎"}</em><strong>{cliEngineLabel(info.engine)}</strong></span>
+        <span className="run-info-chip"><em>{isEnglish ? "Model" : "模型"}</em><strong>{value(info.model, isEnglish ? "Default" : "默认")}</strong></span>
+        <span className="run-info-chip"><em>Effort</em><strong>{value(info.reasoningEffort, isEnglish ? "Default" : "默认")}</strong></span>
+        <span className="run-info-chip"><em>Thinking</em><strong>{info.thinking === true ? (isEnglish ? "On" : "开启") : info.thinking === false ? (isEnglish ? "Off" : "关闭") : (isEnglish ? "Unset" : "未设置")}</strong></span>
+        {info.engine === "codex" && info.endpoint ? (
+          <span className="run-info-chip run-info-endpoint" title={info.endpoint}><em>Endpoint</em><strong>{info.endpoint}</strong></span>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 function TaskConversation({
   task,
   online,
@@ -2860,6 +2893,12 @@ function TaskConversation({
   });
   const [tab, setTab] = useState<"chat" | "diff">("chat");
   const taskEngine = normalizeCliEngine(task.cliEngine);
+  const runInfo: RunInfo = task.runInfo ?? {
+    engine: taskEngine,
+    ...(task.model ? { model: task.model } : {}),
+    ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
+    ...(task.thinking !== undefined ? { thinking: task.thinking } : {})
+  };
   const cap = capabilityForEngine(engineCapabilities, taskEngine);
   // Avoid localStorage prefs reads on every parent re-render (streaming deltas).
   const uiPrefs = useMemo(() => loadTaskUiPrefs(task.threadId), [task.threadId]);
@@ -3396,6 +3435,7 @@ function TaskConversation({
             </button>
           )}
         </div>
+        <RunInfoPanel info={runInfo} />
         {QUOTA_QUERY_ENABLED && (taskQuota?.detail || quotaDetail) && (
           <details className="quota-detail-panel" open={Boolean(taskQuota || quotaDetail)}>
             <summary>

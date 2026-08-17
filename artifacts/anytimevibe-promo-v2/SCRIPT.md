@@ -1,4 +1,4 @@
-# 随码 35 秒宣传片 V2 脚本
+# 随码 35 秒宣传片 V2.1 脚本
 
 ## 0–5 秒
 
@@ -8,7 +8,7 @@
 
 ## 5–10 秒
 
-ChatGPT、Claude Code、Grok、Cursor，
+ChatGPT、Claude Code、Grok、Cursor、Antigravity，
 
 引擎切换，随心所欲。
 
@@ -24,7 +24,7 @@ ChatGPT、Claude Code、Grok、Cursor，
 
 ## 20–25 秒
 
-回到电脑，任务一键接力。同一引擎、同一会话、同一权限，无需重新解释上下文。
+回到电脑，任务一键接力。同一引擎、同一会话、同一权限，无需重新解释上下文；包括 `agy --conversation`。
 
 ## 25–30 秒
 
@@ -32,4 +32,4 @@ ChatGPT、Claude Code、Grok、Cursor，
 
 ## 30–35 秒
 
-随码。随时随地 Vibe Coding。移动端与电脑端，无缝衔接。
+随码。随时随地 Vibe Coding。五种引擎，移动端与电脑端无缝衔接。

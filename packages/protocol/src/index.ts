@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.90";
+export const PRODUCT_VERSION = "0.4.92";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -111,6 +111,18 @@ export type CliEngineInfo = z.infer<typeof cliEngineInfoSchema>;
 /** Reasoning / thinking intensity — vendor labels differ; values are normalized. */
 export const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
+
+/** Runtime configuration used for a coding-engine turn. Never include credentials here. */
+export const runInfoSchema = z.object({
+  engine: cliEngineSchema,
+  model: z.string().trim().max(200).optional(),
+  reasoningEffort: reasoningEffortSchema.optional(),
+  /** Whether extended thinking is enabled for this turn. */
+  thinking: z.boolean().optional(),
+  /** Effective Codex endpoint after local routing; sanitized by the agent. */
+  endpoint: z.string().trim().max(500).optional()
+});
+export type RunInfo = z.infer<typeof runInfoSchema>;
 
 /** A model selectable on the host for a given coding CLI. */
 export const engineModelOptionSchema = z.object({
@@ -355,6 +367,7 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     reasoningEffort: reasoningEffortSchema.optional(),
     /** Cursor: whether the extended-thinking variant is active for this thread. */
     thinking: z.boolean().optional(),
+    runInfo: runInfoSchema.optional(),
     contextUsage: contextUsageSchema.optional(),
     /** Unified diff / git status for the task Diff tab (optional; may be large). */
     diff: z.string().max(500_000).optional(),
@@ -370,6 +383,12 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     threadId: z.string(),
     turnId: z.string(),
     prompt: z.string().optional()
+  }),
+  eventBase.extend({
+    type: z.literal("turn.info"),
+    threadId: z.string(),
+    turnId: z.string(),
+    runInfo: runInfoSchema
   }),
   eventBase.extend({
     type: z.literal("turn.delta"),

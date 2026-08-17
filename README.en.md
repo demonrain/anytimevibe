@@ -9,14 +9,16 @@
 
 **Run Codex, Claude Code, Grok Build, Cursor Agent, or Google Antigravity on your own machine—and keep the task moving from your phone. Not a remote desktop. Not a cloud that holds your source or API keys.**
 
-## 20-second overview
+## 35-second overview (five-engine edition)
+
+> This updated cut includes Google Antigravity end to end: dispatch from your phone, run on the paired computer, and hand off to the native `agy` conversation alongside Codex, Claude Code, Grok Build, and Cursor Agent.
 
 <p align="center">
-  <img src="docs/media/anytimevibe-promo.gif" alt="AnytimeVibe 20-second product preview" width="100%" />
+  <img src="docs/media/anytimevibe-promo.gif" alt="AnytimeVibe 35-second five-engine product preview" width="100%" />
 </p>
 
 <p align="center">
-  <a href="docs/media/anytimevibe-promo.webp">WebP animation</a>
+  <a href="docs/media/anytimevibe-promo.webp">WebP poster</a>
   ·
   <a href="docs/media/anytimevibe-promo.mp4">Full MP4 video</a>
   ·

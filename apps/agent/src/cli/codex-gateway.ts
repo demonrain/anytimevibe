@@ -1,7 +1,11 @@
+import { execFile } from "node:child_process";
 import { createConnection } from "node:net";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 function parseTomlString(text: string, key: string): string | undefined {
   const re = new RegExp(`(?:^|\\n)\\s*${key}\\s*=\\s*"([^"]*)"`, "i");
@@ -253,6 +257,166 @@ function alignRelayOpenaiBaseUrl(text: string): { text: string; detail?: string 
   };
 }
 
+/** True when config only has dead loopback Local Access (or no usable custom provider). */
+function isHollowCodexConfig(text: string): boolean {
+  const provider = parseTomlString(text, "model_provider");
+  const customs = listCustomModelProviders(text).filter(
+    (name) => name.toLowerCase() !== "codex_local_access"
+  );
+  if (provider && BUILTIN_CODEX_PROVIDERS.has(provider)) return false;
+  if (provider && !BUILTIN_CODEX_PROVIDERS.has(provider)) {
+    if (!hasModelProviderSection(text, provider)) return true;
+    const sectionRe = new RegExp(
+      `\\[model_providers\\.${provider.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]([\\s\\S]*?)(?=\\n\\[|$)`,
+      "i"
+    );
+    const section = text.match(sectionRe)?.[1] ?? "";
+    const baseUrl = parseTomlString(section, "base_url") || "";
+    if (!baseUrl) return true;
+    try {
+      return isLoopbackHost(new URL(baseUrl).hostname);
+    } catch {
+      return true;
+    }
+  }
+  // model_provider unset: usable if a non-local custom section exists with a public base_url.
+  for (const name of customs) {
+    const sectionRe = new RegExp(
+      `\\[model_providers\\.${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]([\\s\\S]*?)(?=\\n\\[|$)`,
+      "i"
+    );
+    const section = text.match(sectionRe)?.[1] ?? "";
+    const baseUrl = parseTomlString(section, "base_url") || "";
+    if (!baseUrl) continue;
+    try {
+      if (!isLoopbackHost(new URL(baseUrl).hostname) && !isOpenaiApiHost(baseUrl)) {
+        return false;
+      }
+    } catch {
+      /* keep scanning */
+    }
+  }
+  const localBase =
+    (() => {
+      const sectionRe = /\[model_providers\.codex_local_access\]([\s\S]*?)(?=\n\[|$)/i;
+      const section = text.match(sectionRe)?.[1] ?? "";
+      return parseTomlString(section, "base_url") || parseTomlString(text, "openai_base_url") || "";
+    })();
+  if (!localBase && !customs.length && !provider) return true;
+  try {
+    return !localBase || isLoopbackHost(new URL(localBase).hostname);
+  } catch {
+    return true;
+  }
+}
+
+async function readCcSwitchCurrentCodexConfigToml(): Promise<string | null> {
+  const dbPath = path.join(os.homedir(), ".cc-switch", "cc-switch.db");
+  try {
+    await fs.access(dbPath);
+  } catch {
+    return null;
+  }
+  const py = [
+    "import json,sqlite3,sys",
+    "con=sqlite3.connect(sys.argv[1])",
+    "cur=con.cursor()",
+    "cur.execute(\"SELECT settings_config FROM providers WHERE app_type='codex' AND is_current=1 LIMIT 1\")",
+    "row=cur.fetchone()",
+    "if not row: raise SystemExit(0)",
+    "data=json.loads(row[0] or '{}')",
+    "cfg=data.get('config')",
+    "if isinstance(cfg,str) and cfg.strip():",
+    "  sys.stdout.write(cfg)",
+  ].join(";");
+  for (const bin of ["python", "python3", "py"]) {
+    try {
+      const args = bin === "py" ? ["-3", "-c", py, dbPath] : ["-c", py, dbPath];
+      const { stdout } = await execFileAsync(bin, args, {
+        windowsHide: true,
+        encoding: "utf8",
+        maxBuffer: 2_000_000,
+        timeout: 8_000
+      });
+      const text = String(stdout || "").trim();
+      if (text && /model_provider\s*=/i.test(text)) return `${text}\n`;
+    } catch {
+      /* try next interpreter */
+    }
+  }
+  return null;
+}
+
+async function readBestCodexConfigBackup(): Promise<string | null> {
+  const home = codexHomeDir();
+  let entries: string[] = [];
+  try {
+    entries = (await fs.readdir(home))
+      .filter((name) => /^config\.toml\./i.test(name) || /^config\.toml\.bak/i.test(name))
+      .filter((name) => !/\.before-loopfix/i.test(name) && !/\.broken-by-switch/i.test(name));
+  } catch {
+    return null;
+  }
+  const scored: Array<{ score: number; mtime: number; text: string }> = [];
+  for (const name of entries) {
+    try {
+      const full = path.join(home, name);
+      const st = await fs.stat(full);
+      const text = await fs.readFile(full, "utf8");
+      if (isHollowCodexConfig(text)) continue;
+      const provider = parseTomlString(text, "model_provider") || "";
+      if (!provider || BUILTIN_CODEX_PROVIDERS.has(provider)) continue;
+      if (!hasModelProviderSection(text, provider)) continue;
+      const sectionRe = new RegExp(
+        `\\[model_providers\\.${provider.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]([\\s\\S]*?)(?=\\n\\[|$)`,
+        "i"
+      );
+      const section = text.match(sectionRe)?.[1] ?? "";
+      const baseUrl = parseTomlString(section, "base_url") || "";
+      if (!baseUrl || isOpenaiApiHost(baseUrl)) continue;
+      try {
+        if (isLoopbackHost(new URL(baseUrl).hostname)) continue;
+      } catch {
+        continue;
+      }
+      let score = 1;
+      if (parseTomlString(text, "openai_base_url")) score += 2;
+      if (/requires_openai_auth\s*=\s*false/i.test(section)) score += 2;
+      if (parseTomlString(section, "experimental_bearer_token")) score += 1;
+      scored.push({ score, mtime: st.mtimeMs, text });
+    } catch {
+      /* skip */
+    }
+  }
+  scored.sort((a, b) => b.score - a.score || b.mtime - a.mtime);
+  return scored[0]?.text ?? null;
+}
+
+/**
+ * When切号 software guts config.toml down to localhost Local Access only, restore the
+ * current CCSwitch Codex template (or the best local backup) so ApiKey mode keeps using
+ * the mid-proxy instead of api.openai.com.
+ */
+async function restoreHollowCodexConfig(text: string): Promise<{ text: string; detail?: string }> {
+  if (!isHollowCodexConfig(text)) return { text };
+  const fromCc = await readCcSwitchCurrentCodexConfigToml();
+  const restored = fromCc || (await readBestCodexConfigBackup());
+  if (!restored || isHollowCodexConfig(restored)) {
+    return { text };
+  }
+  const home = codexHomeDir();
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    await fs.writeFile(path.join(home, `config.toml.bak-hollow-${stamp}`), text, "utf8");
+  } catch {
+    /* best-effort backup */
+  }
+  return {
+    text: restored,
+    detail: `restored hollow Codex config from ${fromCc ? "cc-switch" : "local-backup"}`
+  };
+}
+
 /**
  * Cockpit Local Access often sets `model_provider = "codex_local_access"` then later
  * strips `[model_providers.codex_local_access]`. Old threads still store that provider
@@ -281,6 +445,11 @@ export async function repairCodexModelProviderConfig(): Promise<{
     next = unglued;
     details.push("fixed glued openai_base_url/model line");
   }
+  const restored = await restoreHollowCodexConfig(next);
+  if (restored.detail) {
+    next = restored.text;
+    details.push(restored.detail);
+  }
   const fallbackBaseUrl = resolveFallbackProviderBaseUrl(next);
 
   // Historical threads created under Cockpit Local Access still reference this provider.
@@ -303,18 +472,37 @@ export async function repairCodexModelProviderConfig(): Promise<{
     details.push(aligned.detail);
   }
 
-  const provider = parseTomlString(next, "model_provider");
+  let provider = parseTomlString(next, "model_provider");
   if (!provider) {
-    if (next !== text) {
-      await fs.writeFile(configPath, next, "utf8");
-      details.push("model_provider unset");
+    const customs = listCustomModelProviders(next).filter(
+      (name) => name.toLowerCase() !== "codex_local_access"
+    );
+    const pick =
+      customs.find((name) => name.toLowerCase() === "custom") ||
+      customs[0];
+    if (pick) {
+      if (/(?:^|\n)\s*model_provider\s*=/i.test(next)) {
+        next = next.replace(
+          /((?:^|\n)\s*model_provider\s*=\s*)"[^"]*"/i,
+          `$1"${pick}"`
+        );
+      } else {
+        next = `model_provider = "${pick}"\n${next}`;
+      }
+      provider = pick;
+      details.push(`set model_provider=${pick}`);
+    } else {
+      if (next !== text) {
+        await fs.writeFile(configPath, next, "utf8");
+        details.push("model_provider unset");
+      }
+      const authRepair = await sanitizeCodexRelayAuth(next);
+      if (authRepair.repaired) details.push(authRepair.detail);
+      return {
+        repaired: details.length > 0,
+        detail: details.join("; ") || "model_provider unset"
+      };
     }
-    const authRepair = await sanitizeCodexRelayAuth(next);
-    if (authRepair.repaired) details.push(authRepair.detail);
-    return {
-      repaired: details.length > 0,
-      detail: details.join("; ") || "model_provider unset"
-    };
   }
 
   if (!BUILTIN_CODEX_PROVIDERS.has(provider) && !hasModelProviderSection(next, provider)) {

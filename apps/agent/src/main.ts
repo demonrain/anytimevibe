@@ -37,6 +37,7 @@ import {
   type EncryptedEnvelope,
   type PermissionMode,
   type ReasoningEffort,
+  type RunInfo,
   type EngineQuota,
   type Workspace,
   PRODUCT_VERSION
@@ -66,7 +67,7 @@ import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, isHeadlessCliEngine, type BackendStreamEvent } from "./cli/types";
 import { handoffPermissionArgs, normalizePermissionMode } from "./cli/permission-args";
 import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
-import { assertCodexLocalGatewayReady, readCodexCredentialFingerprint, repairCodexModelProviderConfig, sanitizeCodexRelayAuth, syncCodexRelayConfigForTurn } from "./cli/codex-gateway";
+import { assertCodexLocalGatewayReady, readCodexCredentialFingerprint, repairCodexModelProviderConfig, resolveCodexOpenaiBaseUrlForEnv, resolveCodexProviderBaseUrl, sanitizeCodexRelayAuth, syncCodexRelayConfigForTurn } from "./cli/codex-gateway";
 import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt } from "./cli/macos-fs";
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix, proxyClearShellLines, stripProxyFromEnv, applyProcessProxyEnv, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
@@ -3225,6 +3226,12 @@ async function connect(force = false): Promise<void> {
           status: "online",
           detail: "代理在线。未安装 Codex 也可使用 Claude Code / Grok Build 下发任务。"
         });
+        try {
+          await refreshLocalTasks();
+          await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
+        } catch {
+          // ignore
+        }
         return;
       }
       try {
@@ -3232,6 +3239,11 @@ async function connect(force = false): Promise<void> {
         if (generation !== connectGeneration || socket !== connection) return;
         // Local 接力 list reads Codex threads directly (not gated on web sync).
         await refreshLocalTasks();
+        try {
+          await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
+        } catch {
+          // ignore; UI can refresh manually
+        }
         // Do not auto syncAllThreads on every reconnect — it floods the link and can
         // look like flapping; user can sync from web when needed.
       } catch (error) {
@@ -3716,6 +3728,61 @@ function preferTaskCwd(...candidates: Array<string | undefined | null>): string 
   return resolved[0]!;
 }
 
+/** Remove credentials and query secrets before an endpoint is sent to the Web UI. */
+function sanitizeRunEndpoint(raw: string | undefined | null): string | undefined {
+  const value = String(raw || "").trim();
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    const safePath = url.pathname.replace(
+      /(sk-[a-z0-9_-]{8,}|(?:api[_-]?key|token|secret)[=/][^/]+)/gi,
+      "<redacted>"
+    );
+    return `${url.origin}${safePath}`.replace(/\/+$/, "") || url.origin;
+  } catch {
+    return value.replace(/[?#].*$/, "").replace(/\/+$/, "") || undefined;
+  }
+}
+
+async function codexRunInfo(model?: string, reasoningEffort?: ReasoningEffort): Promise<RunInfo> {
+  let endpoint: string | undefined;
+  try {
+    const routed = await resolveCodexOpenaiBaseUrlForEnv();
+    const provider = await resolveCodexProviderBaseUrl();
+    endpoint = sanitizeRunEndpoint(routed || provider?.baseUrl || "https://api.openai.com/v1");
+  } catch {
+    endpoint = "https://api.openai.com/v1";
+  }
+  return {
+    engine: "codex",
+    ...(model?.trim() ? { model: model.trim() } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    thinking: false,
+    ...(endpoint ? { endpoint } : {})
+  };
+}
+
+async function persistAndPublishRunInfo(threadId: string, turnId: string, runInfo: RunInfo): Promise<void> {
+  const task = taskStore.get(threadId);
+  if (task) {
+    task.runInfo = runInfo;
+    task.updatedAt = Date.now() / 1000;
+    await taskStore.upsert(task);
+  }
+  await publish({
+    type: "turn.info",
+    eventId: crypto.randomUUID(),
+    occurredAt: new Date().toISOString(),
+    threadId,
+    turnId,
+    runInfo
+  }, true);
+}
+
 async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void> {
   if (event.type === "delta") {
     const itemId = event.kind === "assistant"
@@ -3753,6 +3820,10 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
       turnId: event.turnId,
       ...(!promptAlreadyPersisted && event.prompt ? { prompt: event.prompt } : {})
     }, true);
+    return;
+  }
+  if (event.type === "turn.info") {
+    await persistAndPublishRunInfo(event.threadId, event.turnId, event.runInfo);
     return;
   }
   if (event.type === "session") {
@@ -3986,6 +4057,7 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     ...(task.model ? { model: task.model } : {}),
     ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
     ...(task.thinking !== undefined ? { thinking: task.thinking } : {}),
+    ...(task.runInfo ? { runInfo: task.runInfo } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
     ...(task.lastDiff ? { diff: task.lastDiff } : {}),
     messages: messages
@@ -4377,6 +4449,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       }
       activeTurnByThread.set(thread.id, String(turn.turn.id));
       await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: thread.id, turnId: turn.turn.id, prompt: command.prompt }, true);
+      await persistAndPublishRunInfo(thread.id, String(turn.turn.id), await codexRunInfo(command.model, command.reasoningEffort));
       return;
     }
     if (command.type === "thread.resume") {
@@ -4520,6 +4593,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         }
         activeTurnByThread.set(command.threadId, String(result.turn.id));
         await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: result.turn.id, prompt: command.prompt }, true);
+        await persistAndPublishRunInfo(command.threadId, String(result.turn.id), await codexRunInfo(model, effort));
         return;
       } finally {
         turnStartingByThread.delete(command.threadId);
@@ -4540,6 +4614,8 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       });
       activeTurnByThread.set(command.threadId, String(command.turnId));
       await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: command.turnId, prompt: command.prompt }, true);
+      const stored = taskStore.get(command.threadId);
+      await persistAndPublishRunInfo(command.threadId, String(command.turnId), await codexRunInfo(stored?.model, stored?.reasoningEffort));
       return;
     }
     if (command.type === "turn.interrupt") {
@@ -4853,6 +4929,13 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     if (threadId) {
       clearEngineDiffChunks(threadId);
       touchAgentTask(threadId, { status: "active", engine: "codex" });
+      const stored = taskStore.get(threadId);
+      const nativeModel = String(params.turn?.model ?? params.model ?? "").trim();
+      await persistAndPublishRunInfo(
+        threadId,
+        turnId,
+        await codexRunInfo(nativeModel || stored?.model, stored?.reasoningEffort)
+      );
     }
   }
   if (message.method === "turn/completed") {
@@ -5198,8 +5281,65 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
   }, true);
 }
 
+function isInProgressStoredStatus(status: string | undefined): boolean {
+  const normalized = String(status || "").toLowerCase().replace(/[\s_-]/g, "");
+  return ["active", "running", "inprogress", "processing"].includes(normalized);
+}
+
+/**
+ * After agent restart / relay disconnect, headless turns may never emit turn.completed,
+ * leaving multi-cli status=active and the web UI stuck on「远程主机正在处理」.
+ * Clear orphans that have no live process and no pending Cursor approval cards.
+ */
+async function reconcileOrphanedActiveTasks(): Promise<number> {
+  let fixed = 0;
+  for (const task of taskStore.list(500)) {
+    if (!isHeadlessCliEngine(task.engine)) continue;
+    if (!isInProgressStoredStatus(task.status)) continue;
+    if (threadHasPendingCursorApproval(task.threadId)) continue;
+    if (isThreadTurnBusy(task.threadId)) continue;
+    if (isHeadlessThreadActive(task.threadId)) continue;
+
+    const hasAssistant = task.messages.some(
+      (message) => message.role === "assistant" && String(message.text || "").trim()
+    );
+    const nextStatus = hasAssistant ? "completed" : "interrupted";
+    const turnId = activeTurnByThread.get(task.threadId) || crypto.randomUUID();
+    activeTurnByThread.delete(task.threadId);
+    turnStartingByThread.delete(task.threadId);
+    clearThreadCursorApprovals(task.threadId);
+    finishLocalActivity(task.threadId, nextStatus);
+    task.status = nextStatus;
+    task.updatedAt = Date.now() / 1000;
+    await taskStore.upsert(task).catch(() => undefined);
+    await publish({
+      type: "turn.completed",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadId: task.threadId,
+      turnId,
+      status: nextStatus
+    }, true, "completed").catch(() => undefined);
+    try {
+      await publishStoredTaskSnapshot(task.threadId);
+    } catch {
+      /* ignore */
+    }
+    fixed += 1;
+  }
+  if (fixed > 0) {
+    logInfo(`已清理 ${fixed} 个断开后仍显示进行中的 headless 任务`);
+  }
+  return fixed;
+}
+
 /** Load 接力 task list from local Codex (thread/list) — independent of web sync. */
 async function refreshLocalTasks(limit = 50): Promise<void> {
+  try {
+    await reconcileOrphanedActiveTasks();
+  } catch {
+    // ignore reconcile failures
+  }
   const listLimit = Math.min(100, Math.max(1, limit));
   // Pull sessions created by local Claude/Grok CLIs into the index so web sync can see them.
   // Always the per-engine recent window (10), even when the local 接力 list asks for more rows.
@@ -6642,6 +6782,16 @@ if (process.platform === "win32") {
   app.setAppUserModelId("com.anytimevibe.agent");
 }
 
+// One running agent per userData directory. A second launch focuses the existing window
+// (including when it is only in the tray) instead of starting another process.
+if (!app.requestSingleInstanceLock()) {
+  app.exit(0);
+} else {
+  app.on("second-instance", () => {
+    showWindow();
+  });
+}
+
 // Keep the tray agent alive: a CONNECTING WebSocket abort used to surface as an
 // uncaught main-process exception and leave the UI unable to reopen.
 process.on("uncaughtException", (error) => {
@@ -6669,6 +6819,7 @@ process.on("unhandledRejection", (reason) => {
 });
 
 app.whenReady().then(async () => {
+  if (!app.hasSingleInstanceLock()) return;
   await loadConfig();
   // Apply Clash/system proxy BEFORE env detect / Cursor model list —
   // Cursor catalogs models by egress IP (China → kimi/glm; proxy → gpt/opus).
@@ -6679,6 +6830,11 @@ app.whenReady().then(async () => {
   }
   await taskStore.load(app.getPath("userData"));
   await loadTurnQueue(app.getPath("userData"));
+  try {
+    await reconcileOrphanedActiveTasks();
+  } catch {
+    // ignore
+  }
   await loadDeletedThreads(app.getPath("userData"));
   await initAgentLogFile(app.getPath("userData"));
   updateState({ cliEngine: taskStore.getDefaultEngine(), agentVersion: agentAppVersion() });

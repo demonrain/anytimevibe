@@ -20,6 +20,7 @@ artifacts/**/contact-sheet.png
 artifacts/**/updated-*.png
 artifacts/**/product-*.png
 artifacts/**/draft-*.png
+artifacts/**/review/
 artifacts/**/AGENTS.md
 artifacts/**/CLAUDE.md
 

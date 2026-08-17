@@ -9,14 +9,16 @@
 
 **在自己的电脑上跑 Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity，用手机随时续上任务——不是远程桌面，也不把源码和凭据交给云端。**
 
-## 35 秒看懂
+## 35 秒看懂（五引擎版）
+
+> 最新宣传片已同步 Google Antigravity：手机下发任务、电脑端执行、`agy` 原生会话接力，和 Codex / Claude Code / Grok Build / Cursor Agent 一起在同一条任务流中完成。
 
 <p align="center">
   <img src="docs/media/anytimevibe-promo.gif" alt="随码 35 秒产品预览" width="100%" />
 </p>
 
 <p align="center">
-  <a href="docs/media/anytimevibe-promo.webp">WebP 动图</a>
+  <a href="docs/media/anytimevibe-promo.webp">WebP 海报</a>
   ·
   <a href="docs/media/anytimevibe-promo.mp4">完整 MP4 视频</a>
   ·

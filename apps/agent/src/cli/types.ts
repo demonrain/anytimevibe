@@ -1,4 +1,4 @@
-import type { CliEngine, ContextUsage, PermissionMode, ReasoningEffort } from "@anytimevibe/protocol";
+import type { CliEngine, ContextUsage, PermissionMode, ReasoningEffort, RunInfo } from "@anytimevibe/protocol";
 
 export type StreamDeltaKind = "assistant" | "stage" | "exec" | "cli-log" | "thought";
 
@@ -19,6 +19,7 @@ export type ApprovalPlan = {
 export type BackendStreamEvent =
   | { type: "delta"; threadId: string; turnId: string; itemId: string; kind: StreamDeltaKind; delta: string }
   | { type: "turn.started"; threadId: string; turnId: string; prompt?: string }
+  | { type: "turn.info"; threadId: string; turnId: string; runInfo: RunInfo }
   | { type: "turn.completed"; threadId: string; turnId: string; status: string; contextUsage?: ContextUsage }
   | { type: "session"; threadId: string; providerSessionId: string }
   | { type: "error"; threadId?: string; message: string }
@@ -51,6 +52,8 @@ export type StoredTask = {
   reasoningEffort?: ReasoningEffort;
   /** Cursor: extended-thinking variant enabled for this thread. */
   thinking?: boolean;
+  /** Last effective coding-engine runtime configuration. */
+  runInfo?: RunInfo;
   /** Last web permission mode — reused by interactive CLI handoff. */
   permissionMode?: PermissionMode;
   contextUsage?: ContextUsage;

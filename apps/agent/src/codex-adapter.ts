@@ -234,8 +234,8 @@ export function explainCodexUpstreamError(message: string): string {
       raw,
       "",
       "说明：本机 ~/.codex/auth.json 仍是 ChatGPT OAuth 登录态，但 refresh token 已失效。",
-      "中转供应商（Demonrain / AnyRouter）即使 requires_openai_auth=false，只要 auth.json 里还留着 tokens，Codex 仍会 auth_mode=Chatgpt，并去拉官方 MCP/plugins（codex_apps）导致 401。",
-      "处理：随码会在切号热重载时自动清掉 OAuth tokens、改用中转 API Key；也可在 CCSwitch 关闭「切换时保留官方 Codex 登录」后重新切换一次 Demonrain。"
+      "自定义 / 中转供应商即使 requires_openai_auth=false，只要 auth.json 里还留着 tokens，Codex 仍会走 ChatGPT 登录并访问官方接口，导致 401。",
+      "处理：随码会在切号热重载时自动清掉 OAuth tokens、改用 API Key；也可在切号工具中关闭「切换时保留官方 Codex 登录」后重新切换一次供应商。"
     ].join("\n");
   }
   if (
@@ -244,9 +244,9 @@ export function explainCodexUpstreamError(message: string): string {
     return [
       raw,
       "",
-      "说明：当前是 API Key 模式，但请求打到了官方 https://api.openai.com（不是 Demonrain 中转）。",
-      "常见原因：① 旧线程绑定内置 provider=openai；② config.toml 里 openai_base_url 曾被写坏（与 model 粘在同一行）导致未生效。",
-      "处理：更新随码后会自动修好配置并注入 OPENAI_BASE_URL；请新开一条任务验证（不要只看历史失败气泡——同一 request id 多半是旧错误）。"
+      "说明：当前是 API Key 模式，但请求打到了官方 https://api.openai.com，而不是你在 config.toml 里配置的自定义 base_url。",
+      "常见原因：① 旧线程仍绑定内置 provider=openai；② 切号软件冲掉了 model_provider / openai_base_url；③ openai_base_url 配置无效。",
+      "处理：确认 ~/.codex/config.toml 中 model_provider 指向自定义供应商且 openai_base_url 正确；随码会尝试自动修复并注入 OPENAI_BASE_URL。可继续旧会话或新开任务验证。"
     ].join("\n");
   }
   if (/auth_unavailable|no auth available/i.test(raw)) {

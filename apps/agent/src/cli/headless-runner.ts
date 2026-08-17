@@ -3,7 +3,7 @@ import { promises as fs, existsSync as fsExistsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
-import type { CliEngine, ContextUsage, PermissionMode } from "@anytimevibe/protocol";
+import type { CliEngine, ContextUsage, PermissionMode, RunInfo } from "@anytimevibe/protocol";
 import { cloudProxyChildEnv, collectLocalProxyEnv, ensureCursorHttp1ForProxy } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
@@ -226,6 +226,24 @@ function buildArgs(
   if (options.providerSessionId) args.push("--resume", options.providerSessionId);
   args.push(...headlessPermissionArgs(engine, options.permissionMode));
   return args;
+}
+
+function initialHeadlessRunInfo(
+  engine: Exclude<CliEngine, "codex">,
+  options: HeadlessRunOptions,
+  childEnv: NodeJS.ProcessEnv
+): RunInfo {
+  let model = options.model;
+  if (!model && engine === "claude") model = childEnv.CLAUDE_MODEL || childEnv.ANTHROPIC_MODEL;
+  if (!model && engine === "grok") model = childEnv.GROK_MODEL || childEnv.XAI_MODEL;
+  if (!model && engine === "antigravity") model = childEnv.AGY_MODEL || childEnv.ANTIGRAVITY_MODEL;
+  if (engine === "cursor" && model) model = parseCursorModelHints(model).model;
+  return {
+    engine,
+    ...(model?.trim() ? { model: model.trim() } : {}),
+    ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+    ...(options.thinking !== undefined ? { thinking: options.thinking } : {})
+  };
 }
 
 function formatAgyPrintTimeout(ms: number): string {
@@ -1360,9 +1378,13 @@ export async function runHeadlessTurn(
   const executable = useCmdShim ? (process.env.ComSpec ?? "cmd.exe") : command;
   const finalArgs = useCmdShim ? windowsCmdArguments(command, args) : args;
 
+  const initialRunInfo = initialHeadlessRunInfo(engine, options, env);
+  let reportedModel = initialRunInfo.model;
+
   if (!options.cursorResumeRetried && !options.agyConversationRetried) {
     safeOnEvent({ type: "turn.started", threadId: options.threadId, turnId: options.turnId, prompt: options.prompt });
   }
+  safeOnEvent({ type: "turn.info", threadId: options.threadId, turnId: options.turnId, runInfo: initialRunInfo });
   const engineLabel = engine === "claude"
     ? "Claude Code"
     : engine === "cursor"
@@ -1546,6 +1568,15 @@ export async function runHeadlessTurn(
         else if (engine === "cursor") handleCursorLine(line, options, state, safeOnEvent);
         else if (engine === "antigravity") handleAntigravityLine(line, options, state, safeOnEvent);
         else handleGrokLine(line, options, state, safeOnEvent);
+        if (state.model && state.model !== reportedModel) {
+          reportedModel = state.model;
+          safeOnEvent({
+            type: "turn.info",
+            threadId: options.threadId,
+            turnId: options.turnId,
+            runInfo: { ...initialRunInfo, model: state.model }
+          });
+        }
         if (state.sessionId && state.sessionId !== options.providerSessionId) {
           safeOnEvent({ type: "session", threadId: options.threadId, providerSessionId: state.sessionId });
         }
