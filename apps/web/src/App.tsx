@@ -2812,15 +2812,55 @@ function RunInfoPanel({ info }: { info: RunInfo }) {
     : info.thinking === false
       ? (isEnglish ? "Off" : "关闭")
       : info.engine === "cursor" ? missing : notApplicable;
+  const [isMobile, setIsMobile] = useState(
+    () => typeof window !== "undefined" && window.matchMedia("(max-width: 700px)").matches
+  );
+  const [expanded, setExpanded] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const media = window.matchMedia("(max-width: 700px)");
+    const update = () => {
+      const next = media.matches;
+      setIsMobile(next);
+      if (next) setExpanded(false);
+    };
+    update();
+    media.addEventListener?.("change", update);
+    return () => media.removeEventListener?.("change", update);
+  }, []);
+  const detailsVisible = !isMobile || expanded;
+  const toggleLabel = expanded
+    ? (isEnglish ? "Hide details" : "收起详情")
+    : (isEnglish ? "Show details" : "查看详情");
   return (
-    <section className="run-info-panel" aria-label={isEnglish ? "Current engine runtime" : "当前代码引擎运行信息"}>
-      <span className="run-info-title">{isEnglish ? "Runtime" : "本轮运行"}</span>
+    <section className={`run-info-panel${isMobile ? " run-info-mobile" : ""}${expanded ? " run-info-expanded" : ""}`} aria-label={isEnglish ? "Current engine runtime" : "当前代码引擎运行信息"}>
+      <div className="run-info-header">
+        <span className="run-info-title">{isEnglish ? "Runtime" : "本轮运行"}</span>
+        <span className="run-info-summary" title={`${cliEngineLabel(info.engine)} · ${value(info.model)}`}>
+          <strong>{cliEngineLabel(info.engine)}</strong>
+          <span aria-hidden="true">·</span>
+          <strong>{value(info.model)}</strong>
+        </span>
+        {isMobile ? (
+          <button
+            type="button"
+            className="run-info-toggle"
+            aria-expanded={detailsVisible}
+            aria-label={toggleLabel}
+            title={toggleLabel}
+            onClick={() => setExpanded((current) => !current)}
+          >
+            <span>{expanded ? (isEnglish ? "Less" : "收起") : (isEnglish ? "Details" : "详情")}</span>
+            <span aria-hidden="true">{expanded ? "⌃" : "⌄"}</span>
+          </button>
+        ) : null}
+      </div>
       <div className="run-info-chips">
         <span className="run-info-chip"><em>{isEnglish ? "Engine" : "引擎"}</em><strong>{cliEngineLabel(info.engine)}</strong></span>
         <span className="run-info-chip"><em>{isEnglish ? "Model" : "模型"}</em><strong>{value(info.model)}</strong></span>
         <span className="run-info-chip"><em>Effort</em><strong>{effort}</strong></span>
         <span className="run-info-chip"><em>Thinking</em><strong>{thinking}</strong></span>
-        {info.engine === "codex" && info.endpoint ? (
+        {info.endpoint ? (
           <span className="run-info-chip run-info-endpoint" title={info.endpoint}><em>Endpoint</em><strong>{info.endpoint}</strong></span>
         ) : null}
       </div>

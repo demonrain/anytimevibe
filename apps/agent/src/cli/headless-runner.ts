@@ -3,6 +3,7 @@ import { promises as fs, existsSync as fsExistsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { URL } from "node:url";
 import type { CliEngine, ContextUsage, PermissionMode, RunInfo } from "@anytimevibe/protocol";
 import { cloudProxyChildEnv, collectLocalProxyEnv, ensureCursorHttp1ForProxy } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
@@ -53,7 +54,20 @@ async function applyHeadlessDiskCredentials(
     try {
       const settingsRaw = await fs.readFile(path.join(os.homedir(), ".claude", "settings.json"), "utf8");
       const settings = JSON.parse(settingsRaw) as { env?: Record<string, string> };
+      // A switcher may remove the previous key before writing the new settings.
+      // Clear values supplied by the long-lived Agent process before applying the
+      // latest on-disk env block, otherwise a stale API key can win the next turn.
       if (settings.env && typeof settings.env === "object") {
+        for (const key of [
+          "ANTHROPIC_API_KEY",
+          "ANTHROPIC_AUTH_TOKEN",
+          "ANTHROPIC_BASE_URL",
+          "ANTHROPIC_API_URL",
+          "CLAUDE_BASE_URL",
+          "CLAUDE_API_URL",
+          "CLAUDE_MODEL",
+          "ANTHROPIC_MODEL"
+        ]) delete next[key];
         for (const [key, value] of Object.entries(settings.env)) {
           if (typeof value === "string" && value.trim()) next[key] = value;
         }
@@ -68,6 +82,15 @@ async function applyHeadlessDiskCredentials(
     // Stale Agent process.env keys from a previous account would otherwise win.
     for (const key of ["XAI_API_KEY", "GROK_API_KEY", "OPENAI_API_KEY"]) {
       delete next[key];
+    }
+    // Let the current config.toml select the model when it exists. Explicit task
+    // options still win in buildArgs; this only removes stale process-level hints.
+    try {
+      await fs.access(path.join(next.GROK_HOME?.trim() || path.join(os.homedir(), ".grok"), "config.toml"));
+      delete next.GROK_MODEL;
+      delete next.XAI_MODEL;
+    } catch {
+      // Keep env-only Grok setups working when no config file exists.
     }
     return next;
   }
@@ -145,8 +168,6 @@ function buildArgs(
       options.model
       || childEnv.CLAUDE_MODEL
       || childEnv.ANTHROPIC_MODEL
-      || process.env.CLAUDE_MODEL
-      || process.env.ANTHROPIC_MODEL
       || ""
     ).trim();
     args.push(
@@ -159,7 +180,7 @@ function buildArgs(
     if (options.reasoningEffort) args.push("--effort", options.reasoningEffort);
     // Only use --bare when API key is present (bare skips keychain/OAuth).
     // Prefer per-turn settings.json env (CCSwitch / Cockpit) over stale process.env.
-    if (childEnv.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY) args.push("--bare");
+    if (childEnv.ANTHROPIC_API_KEY) args.push("--bare");
     if (options.providerSessionId) args.push("--resume", options.providerSessionId);
     args.push(...headlessPermissionArgs(engine, options.permissionMode));
     return args;
@@ -194,7 +215,7 @@ function buildArgs(
   if (engine === "antigravity") {
     const printTimeout = formatAgyPrintTimeout(HEADLESS_MAX_TIMEOUT_MS);
     const spawn = formatAgySpawnArgs(
-      options.model || process.env.AGY_MODEL || process.env.ANTIGRAVITY_MODEL,
+      options.model || childEnv.AGY_MODEL || childEnv.ANTIGRAVITY_MODEL,
       options.reasoningEffort
     );
     args.push(
@@ -211,7 +232,7 @@ function buildArgs(
     return args;
   }
   // Grok Build CLI (distinct binary: grok, not agent)
-  const model = (options.model || process.env.GROK_MODEL || process.env.XAI_MODEL || "").trim();
+  const model = (options.model || childEnv.GROK_MODEL || childEnv.XAI_MODEL || "").trim();
   args.push(
     "-p", options.prompt,
     "--output-format", "streaming-json",
@@ -228,21 +249,71 @@ function buildArgs(
   return args;
 }
 
+/** Remove credentials and query secrets before an endpoint is sent to the Web UI. */
+function sanitizeRunEndpoint(raw: string | undefined | null): string | undefined {
+  const value = String(raw || "").trim();
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    const safePath = url.pathname.replace(
+      /(sk-[a-z0-9_-]{8,}|(?:api[_-]?key|token|secret)[=/][^/]+)/gi,
+      "<redacted>"
+    );
+    return `${url.origin}${safePath}`.replace(/\/+$/, "") || url.origin;
+  } catch {
+    return value.replace(/[?#].*$/, "").replace(/\/+$/, "") || undefined;
+  }
+}
+
+/**
+ * Resolve the API root used by a headless engine. Environment overrides win;
+ * the provider roots cover the normal signed-in CLI path when no override is
+ * exposed by the CLI itself.
+ */
+function headlessEndpoint(
+  engine: Exclude<CliEngine, "codex">,
+  childEnv: NodeJS.ProcessEnv,
+  override?: string
+): string | undefined {
+  const configured = engine === "claude"
+    ? [childEnv.ANTHROPIC_BASE_URL, childEnv.ANTHROPIC_API_URL, childEnv.CLAUDE_BASE_URL, childEnv.CLAUDE_API_URL]
+    : engine === "grok"
+      ? [childEnv.GROK_BASE_URL, childEnv.XAI_BASE_URL, childEnv.XAI_API_BASE_URL]
+      : engine === "cursor"
+        ? [childEnv.CURSOR_BASE_URL, childEnv.CURSOR_API_URL, childEnv.CURSOR_AGENT_BASE_URL]
+        : [childEnv.AGY_BASE_URL, childEnv.ANTIGRAVITY_BASE_URL, childEnv.GEMINI_BASE_URL, childEnv.GOOGLE_GENAI_BASE_URL];
+  const fallback = engine === "claude"
+    ? "https://api.anthropic.com"
+    : engine === "grok"
+      ? "https://api.x.ai/v1"
+      : engine === "cursor"
+        ? "https://api2.cursor.sh"
+        : "https://cloudcode-pa.googleapis.com";
+  return sanitizeRunEndpoint(override || configured.find((item) => item?.trim()) || fallback);
+}
+
 function initialHeadlessRunInfo(
   engine: Exclude<CliEngine, "codex">,
   options: HeadlessRunOptions,
-  childEnv: NodeJS.ProcessEnv
+  childEnv: NodeJS.ProcessEnv,
+  endpointOverride?: string
 ): RunInfo {
   let model = options.model;
   if (!model && engine === "claude") model = childEnv.CLAUDE_MODEL || childEnv.ANTHROPIC_MODEL;
   if (!model && engine === "grok") model = childEnv.GROK_MODEL || childEnv.XAI_MODEL;
   if (!model && engine === "antigravity") model = childEnv.AGY_MODEL || childEnv.ANTIGRAVITY_MODEL;
   if (engine === "cursor" && model) model = parseCursorModelHints(model).model;
+  const endpoint = headlessEndpoint(engine, childEnv, endpointOverride);
   return {
     engine,
     ...(model?.trim() ? { model: model.trim() } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
-    ...(options.thinking !== undefined ? { thinking: options.thinking } : {})
+    ...(options.thinking !== undefined ? { thinking: options.thinking } : {}),
+    ...(endpoint ? { endpoint } : {})
   };
 }
 
@@ -1378,7 +1449,7 @@ export async function runHeadlessTurn(
   const executable = useCmdShim ? (process.env.ComSpec ?? "cmd.exe") : command;
   const finalArgs = useCmdShim ? windowsCmdArguments(command, args) : args;
 
-  const initialRunInfo = initialHeadlessRunInfo(engine, options, env);
+  const initialRunInfo = initialHeadlessRunInfo(engine, options, env, grokCompat?.endpoint);
   let reportedModel = initialRunInfo.model;
 
   if (!options.cursorResumeRetried && !options.agyConversationRetried) {

@@ -8,6 +8,8 @@ import { URL } from "node:url";
 
 export type GrokCompatSession = {
   env: NodeJS.ProcessEnv;
+  /** Upstream API root; the local compatibility proxy must never be shown in Web. */
+  endpoint?: string;
   cleanup: () => Promise<void>;
 };
 
@@ -130,7 +132,9 @@ function resolveGrokCustomResponsesUpstream(configText: string): {
   let match: RegExpExecArray | null;
   const blocks: Array<{ id: string; body: string }> = [];
   while ((match = blockRe.exec(configText))) {
-    blocks.push({ id: match[1], body: match[2] });
+    const id = match[1];
+    const body = match[2];
+    if (id && body) blocks.push({ id, body });
   }
   const preferred = (defaultModel
     ? blocks.find((block) => block.id === defaultModel)
@@ -288,7 +292,7 @@ export async function prepareGrokResponsesCompat(baseEnv: NodeJS.ProcessEnv = pr
     }
   };
 
-  return { env, cleanup };
+  return { env, endpoint: target.upstream, cleanup };
 }
 
 /** Enrich Grok CLI serialization errors so the web UI points at the real cause. */

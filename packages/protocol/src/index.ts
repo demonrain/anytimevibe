@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.92";
+export const PRODUCT_VERSION = "0.4.93";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -119,7 +119,7 @@ export const runInfoSchema = z.object({
   reasoningEffort: reasoningEffortSchema.optional(),
   /** Whether extended thinking is enabled for this turn. */
   thinking: z.boolean().optional(),
-  /** Effective Codex endpoint after local routing; sanitized by the agent. */
+  /** Effective provider API root; sanitized by the agent before publication. */
   endpoint: z.string().trim().max(500).optional()
 });
 export type RunInfo = z.infer<typeof runInfoSchema>;

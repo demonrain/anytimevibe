@@ -3578,18 +3578,6 @@ function startEngineCredentialAndCatalogWatch(): void {
     onCodexCredentialChanged: (reason) => {
       scheduleCodexCredentialReload(`切号/凭证变更:${reason}`);
     },
-    onHeadlessCredentialChanged: (reason) => {
-      // Claude/Grok/Cursor/Antigravity spawn a fresh CLI each turn and re-read disk.
-      // No app-server to kill — just refresh capabilities so the web picker matches the new account.
-      logInfo("检测到 headless 引擎切号/配置变更（下回合自动生效）", reason);
-      if (capabilityRefreshInFlight) return;
-      capabilityRefreshInFlight = true;
-      void publishHostStatus()
-        .catch(handleError)
-        .finally(() => {
-          capabilityRefreshInFlight = false;
-        });
-    },
     onCapabilitySourcesChanged: (reason) => {
       if (capabilityRefreshInFlight) return;
       capabilityRefreshInFlight = true;
