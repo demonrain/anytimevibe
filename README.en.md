@@ -63,13 +63,13 @@ AnytimeVibe does **not** replace SSH or RDP. Use “Handoff to computer” when 
 
 ## Screenshots
 
-| Multi-engine task selection | Native CLI handoff |
+| Web task list and paired host | Client tasks and native CLI handoff |
 | --- | --- |
-| ![Choose Codex, Claude Code, Grok Build, Cursor Agent, or Google Antigravity for a task](docs/media/remote-command.png) | ![Resume a task with its provider-native CLI (including agy)](docs/media/cli-handoff.png) |
+| ![Live Web task list, paired host, and engine filters](docs/media/remote-command.png) | ![Live client task page with execution output and handoff entry point](docs/media/cli-handoff.png) |
 
-| Unified multi-engine task stream | Engine permission mapping |
+| Codex conversation and run details | Conversation controls and permissions |
 | --- | --- |
-| ![Codex, Claude, Grok, Cursor, and Antigravity tasks in one stream](docs/media/task-stream.png) | ![Permission mapping for each of the five coding engines](docs/media/permissions.png) |
+| ![Live Codex conversation with model, Effort, and Endpoint details](docs/media/task-stream.png) | ![Live model, Effort, permission, and send controls](docs/media/permissions.png) |
 
 ## Core workflow
 

@@ -63,13 +63,13 @@
 
 ## 产品截图
 
-| 多引擎任务选择 | 原生 CLI 接力 |
+| Web 任务列表与已配对主机 | 客户端任务与原生 CLI 接力 |
 | --- | --- |
-| ![选择 Codex、Claude Code、Grok Build、Cursor Agent 或 Google Antigravity 下发任务](docs/media/remote-command.png) | ![任务按所属引擎接力到原生 CLI（支持 agy 会话接力）](docs/media/cli-handoff.png) |
+| ![真实 Web 任务列表、已配对主机与编码引擎筛选](docs/media/remote-command.png) | ![真实客户端任务页、执行输出与任务接力入口](docs/media/cli-handoff.png) |
 
-| 多引擎任务流 | 引擎权限映射 |
+| Codex 会话与运行信息 | 会话控制与权限设置 |
 | --- | --- |
-| ![Codex、Claude、Grok、Cursor 和 Antigravity 的统一任务流](docs/media/task-stream.png) | ![五款编码引擎的权限映射](docs/media/permissions.png) |
+| ![真实 Codex 会话消息流、模型、Effort 与 Endpoint](docs/media/task-stream.png) | ![真实会话底部的模型、Effort、权限与发送控件](docs/media/permissions.png) |
 
 ## 核心工作流
 

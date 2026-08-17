@@ -2,6 +2,7 @@ node_modules/
 .pnpm-store/
 .npm-cache/
 .playwright-cli/
+/output/playwright/
 dist/
 .vite/
 coverage/
