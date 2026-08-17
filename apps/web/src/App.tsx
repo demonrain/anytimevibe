@@ -2803,15 +2803,23 @@ function formatEngineQuotaChip(quota: EngineQuota): string {
 function RunInfoPanel({ info }: { info: RunInfo }) {
   const { locale } = useI18n();
   const isEnglish = locale === "en";
-  const value = (item: string | undefined, fallback: string) => item?.trim() || fallback;
+  const missing = isEnglish ? "Not reported" : "未上报";
+  const notApplicable = isEnglish ? "N/A" : "不适用";
+  const value = (item: string | undefined, fallback = missing) => item?.trim() || fallback;
+  const effort = value(info.reasoningEffort, info.engine === "cursor" ? missing : notApplicable);
+  const thinking = info.thinking === true
+    ? (isEnglish ? "On" : "开启")
+    : info.thinking === false
+      ? (isEnglish ? "Off" : "关闭")
+      : info.engine === "cursor" ? missing : notApplicable;
   return (
     <section className="run-info-panel" aria-label={isEnglish ? "Current engine runtime" : "当前代码引擎运行信息"}>
       <span className="run-info-title">{isEnglish ? "Runtime" : "本轮运行"}</span>
       <div className="run-info-chips">
         <span className="run-info-chip"><em>{isEnglish ? "Engine" : "引擎"}</em><strong>{cliEngineLabel(info.engine)}</strong></span>
-        <span className="run-info-chip"><em>{isEnglish ? "Model" : "模型"}</em><strong>{value(info.model, isEnglish ? "Default" : "默认")}</strong></span>
-        <span className="run-info-chip"><em>Effort</em><strong>{value(info.reasoningEffort, isEnglish ? "Default" : "默认")}</strong></span>
-        <span className="run-info-chip"><em>Thinking</em><strong>{info.thinking === true ? (isEnglish ? "On" : "开启") : info.thinking === false ? (isEnglish ? "Off" : "关闭") : (isEnglish ? "Unset" : "未设置")}</strong></span>
+        <span className="run-info-chip"><em>{isEnglish ? "Model" : "模型"}</em><strong>{value(info.model)}</strong></span>
+        <span className="run-info-chip"><em>Effort</em><strong>{effort}</strong></span>
+        <span className="run-info-chip"><em>Thinking</em><strong>{thinking}</strong></span>
         {info.engine === "codex" && info.endpoint ? (
           <span className="run-info-chip run-info-endpoint" title={info.endpoint}><em>Endpoint</em><strong>{info.endpoint}</strong></span>
         ) : null}
@@ -2893,11 +2901,21 @@ function TaskConversation({
   });
   const [tab, setTab] = useState<"chat" | "diff">("chat");
   const taskEngine = normalizeCliEngine(task.cliEngine);
-  const runInfo: RunInfo = task.runInfo ?? {
-    engine: taskEngine,
-    ...(task.model ? { model: task.model } : {}),
-    ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
-    ...(task.thinking !== undefined ? { thinking: task.thinking } : {})
+  // Older snapshots can contain a partial runInfo object alongside the task's
+  // persisted model/effort/thinking fields. Merge them so the panel never
+  // replaces a real value with a generic default label.
+  const runInfo: RunInfo = {
+    ...(task.runInfo ?? {}),
+    engine: task.runInfo?.engine ?? taskEngine,
+    ...(task.runInfo?.model || task.model
+      ? { model: task.runInfo?.model || task.model }
+      : {}),
+    ...(task.runInfo?.reasoningEffort || task.reasoningEffort
+      ? { reasoningEffort: task.runInfo?.reasoningEffort || task.reasoningEffort }
+      : {}),
+    ...(task.runInfo?.thinking !== undefined || task.thinking !== undefined
+      ? { thinking: task.runInfo?.thinking ?? task.thinking }
+      : {})
   };
   const cap = capabilityForEngine(engineCapabilities, taskEngine);
   // Avoid localStorage prefs reads on every parent re-render (streaming deltas).
