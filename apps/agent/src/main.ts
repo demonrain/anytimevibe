@@ -3541,10 +3541,45 @@ async function maybeReloadCodexAppServerWhenIdle(): Promise<void> {
   await reloadCodexAppServer(`空闲后应用：${reason}`);
 }
 
+let delayedCredentialReconcileTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * If our own config rewrite is in the ignore window, still re-check after it expires.
+ * CCSwitch often overwrites config.toml a second time (without bearer) during that
+ * window; dropping the watch event left the running app-server on the old key.
+ */
 function scheduleCodexCredentialReload(reason: string): void {
-  if (Date.now() < ignoreCodexCredentialWatchUntilMs) {
+  const remaining = ignoreCodexCredentialWatchUntilMs - Date.now();
+  if (remaining > 0) {
+    if (delayedCredentialReconcileTimer) clearTimeout(delayedCredentialReconcileTimer);
+    delayedCredentialReconcileTimer = setTimeout(() => {
+      delayedCredentialReconcileTimer = null;
+      void reconcileCodexCredentialsIfStale(reason).catch(handleError);
+    }, remaining + 80);
+    delayedCredentialReconcileTimer.unref?.();
     return;
   }
+  queueCodexCredentialReload(reason);
+}
+
+async function reconcileCodexCredentialsIfStale(reason: string): Promise<void> {
+  let live = "";
+  try {
+    const synced = await syncCodexRelayConfigForTurn();
+    live = synced.fingerprint;
+    if (codex && live && live === codexLoadedCredentialFingerprint) return;
+  } catch {
+    try {
+      live = await readCodexCredentialFingerprint();
+      if (codex && live && live === codexLoadedCredentialFingerprint) return;
+    } catch {
+      // reload anyway
+    }
+  }
+  queueCodexCredentialReload(reason);
+}
+
+function queueCodexCredentialReload(reason: string): void {
   if (!codex && !publicState.environment.codexCompatible && !publicState.environment.codexInstalled) {
     void publishHostStatus().catch(() => undefined);
     return;

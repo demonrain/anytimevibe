@@ -60,6 +60,38 @@ export async function resolveCodexOpenaiBaseUrlForEnv(): Promise<string | null> 
   return toOpenaiStyleBaseUrl(resolved.baseUrl);
 }
 
+/** Relay API key for Codex child env (never log the value). */
+export async function resolveCodexRelayApiKeyForEnv(): Promise<string | null> {
+  const home = codexHomeDir();
+  let text = "";
+  try {
+    text = await fs.readFile(path.join(home, "config.toml"), "utf8");
+  } catch {
+    return null;
+  }
+  text = repairGluedOpenaiBaseUrlLine(text);
+  const provider = parseTomlString(text, "model_provider");
+  if (!provider || BUILTIN_CODEX_PROVIDERS.has(provider)) return null;
+
+  const sectionRe = new RegExp(
+    `\\[model_providers\\.${provider.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]([\\s\\S]*?)(?=\\n\\[|$)`,
+    "i"
+  );
+  const section = text.match(sectionRe)?.[1] ?? "";
+  const baseUrl = parseTomlString(section, "base_url") || parseTomlString(text, "openai_base_url") || "";
+  if (!baseUrl || isOpenaiApiHost(baseUrl)) return null;
+
+  const bearer = parseTomlString(section, "experimental_bearer_token")?.trim() || "";
+  if (bearer) return bearer;
+  try {
+    const auth = JSON.parse(await fs.readFile(path.join(home, "auth.json"), "utf8")) as Record<string, unknown>;
+    const key = typeof auth.OPENAI_API_KEY === "string" ? auth.OPENAI_API_KEY.trim() : "";
+    return key || null;
+  } catch {
+    return null;
+  }
+}
+
 /** Read active model_provider base_url from ~/.codex/config.toml (no secrets). */
 export async function resolveCodexProviderBaseUrl(): Promise<{
   provider: string;

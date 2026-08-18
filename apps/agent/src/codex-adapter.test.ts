@@ -3,6 +3,7 @@ import {
   CODEX_COMPAT_LABEL,
   CODEX_INSTALL_PACKAGE,
   codexPermissionParams,
+  explainCodexUpstreamError,
   isCodexCompatibleVersion,
   normalizeUnixSeconds,
   threadResumeParams,
@@ -86,5 +87,22 @@ describe("threadToSnapshot", () => {
       turns: [{ startedAt: 200, completedAt: 300, items: [] }]
     });
     expect(snapshot.updatedAt).toBe(300);
+  });
+});
+
+describe("explainCodexUpstreamError", () => {
+  it("does not claim official OpenAI when the 401 is from a custom relay", () => {
+    const text = explainCodexUpstreamError(
+      'unexpected status 401 Unauthorized: {"code":"INVALID_API_KEY","message":"Invalid API key"}, url: https://store.example.com/responses'
+    );
+    expect(text).toContain("请求已打到自定义 / 中转供应商");
+    expect(text).not.toContain("https://api.openai.com，而不是");
+  });
+
+  it("explains official OpenAI host 401 separately", () => {
+    const text = explainCodexUpstreamError(
+      "unexpected status 401 Unauthorized: Incorrect API key provided: sk-abc, url: https://api.openai.com/v1/responses"
+    );
+    expect(text).toContain("请求打到了官方 https://api.openai.com");
   });
 });

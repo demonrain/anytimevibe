@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 import { windowsCmdArguments } from "./windows-command";
 import { localGatewayChildEnv } from "./local-proxy";
 import { isCodexModelsManagerNoise } from "./cli/log-noise";
-import { resolveCodexOpenaiBaseUrlForEnv } from "./cli/codex-gateway";
+import { resolveCodexOpenaiBaseUrlForEnv, resolveCodexRelayApiKeyForEnv } from "./cli/codex-gateway";
 import type { PermissionMode } from "@anytimevibe/protocol";
 import { PRODUCT_VERSION } from "@anytimevibe/protocol";
 
@@ -85,6 +85,10 @@ export class CodexAdapter {
       if (openaiBase) {
         baseEnv.OPENAI_BASE_URL = openaiBase;
         baseEnv.openai_base_url = openaiBase;
+      }
+      const relayKey = await resolveCodexRelayApiKeyForEnv();
+      if (relayKey) {
+        baseEnv.OPENAI_API_KEY = relayKey;
       }
     } catch {
       // optional
@@ -238,15 +242,24 @@ export function explainCodexUpstreamError(message: string): string {
       "处理：随码会在切号热重载时自动清掉 OAuth tokens、改用 API Key；也可在切号工具中关闭「切换时保留官方 Codex 登录」后重新切换一次供应商。"
     ].join("\n");
   }
-  if (
-    /Incorrect API key provided|invalid_api_key|url:\s*https:\/\/api\.openai\.com\//i.test(raw)
-  ) {
+  const hitsOfficialOpenai = /url:\s*https:\/\/api\.openai\.com\//i.test(raw);
+  const invalidApiKey = /Incorrect API key provided|invalid_api_key|INVALID_API_KEY/i.test(raw);
+  if (hitsOfficialOpenai) {
     return [
       raw,
       "",
       "说明：当前是 API Key 模式，但请求打到了官方 https://api.openai.com，而不是你在 config.toml 里配置的自定义 base_url。",
       "常见原因：① 旧线程仍绑定内置 provider=openai；② 切号软件冲掉了 model_provider / openai_base_url；③ openai_base_url 配置无效。",
       "处理：确认 ~/.codex/config.toml 中 model_provider 指向自定义供应商且 openai_base_url 正确；随码会尝试自动修复并注入 OPENAI_BASE_URL。可继续旧会话或新开任务验证。"
+    ].join("\n");
+  }
+  if (invalidApiKey) {
+    return [
+      raw,
+      "",
+      "说明：请求已打到自定义 / 中转供应商，但对方拒绝了当前 API Key（不是打到官方 api.openai.com）。",
+      "常见原因：① 切号后 config.toml 没有 experimental_bearer_token，Codex 仍带上旧 ChatGPT token；② 切号工具里的密钥已失效。",
+      "处理：在切号工具确认当前供应商密钥有效后重新切换一次；随码会把该密钥写入供应商 bearer 并注入 Codex 进程。请重启随码或新开任务后再试。"
     ].join("\n");
   }
   if (/auth_unavailable|no auth available/i.test(raw)) {
