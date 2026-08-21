@@ -401,6 +401,8 @@ type ParseState = {
    * "Agent execution terminated due to error."
    */
   agyLastCause?: string;
+  /** Claude --resume pointed at a missing/stale/sidechain session id. */
+  claudeResumeInvalid?: boolean;
 };
 
 /** Strip UI prefixes so "错误：API Error" and "API Error" dedupe as one. */
@@ -536,6 +538,35 @@ function emitCursorInteractiveApproval(
   });
 }
 
+/** Claude CLI when --resume points at a deleted, cleaned, or non-parent session. */
+export function isClaudeSessionNotFound(text: string | undefined | null): boolean {
+  return /No conversation found with session ID/i.test(String(text || ""));
+}
+
+/**
+ * Only accept parent-conversation session ids.
+ * Nested Agent/Task channels share stream-json output and may carry sidechain markers;
+ * blindly overwriting providerSessionId with those breaks the next --resume.
+ */
+export function shouldAcceptClaudeSessionId(parsed: Record<string, unknown> | null | undefined): boolean {
+  if (!parsed || typeof parsed !== "object") return false;
+  if (!parsed.session_id) return false;
+  if (parsed.isSidechain === true || parsed.is_sidechain === true) return false;
+  const parentTool = parsed.parent_tool_use_id;
+  if (parentTool != null && String(parentTool).trim() !== "") return false;
+  const type = String(parsed.type || "");
+  if (type === "system" && String(parsed.subtype || "") === "init") return true;
+  if (type === "result") return !parsed.is_error;
+  // Parent-channel traffic may repeat the same id; safe to refresh.
+  return type === "assistant" || type === "user" || type === "stream_event" || type === "content_block_delta";
+}
+
+function noteClaudeSessionId(state: ParseState, parsed: Record<string, unknown>): void {
+  if (!shouldAcceptClaudeSessionId(parsed)) return;
+  const next = String(parsed.session_id || "").trim();
+  if (next) state.sessionId = next;
+}
+
 function handleClaudeLine(
   line: string,
   options: HeadlessRunOptions,
@@ -551,7 +582,7 @@ function handleClaudeLine(
     return;
   }
   const type = String(parsed.type || "");
-  if (parsed.session_id) state.sessionId = String(parsed.session_id);
+  noteClaudeSessionId(state, parsed);
 
   if (type === "system") {
     const subtype = String(parsed.subtype || "");
@@ -674,7 +705,7 @@ function handleClaudeLine(
     return;
   }
   if (type === "result") {
-    if (parsed.session_id) state.sessionId = String(parsed.session_id);
+    noteClaudeSessionId(state, parsed);
     const usage = usageFromUnknown(parsed.usage, Number(parsed.context_window) || undefined);
     if (usage) {
       state.contextUsage = usage;
@@ -683,6 +714,11 @@ function handleClaudeLine(
     if (typeof parsed.result === "string" && parsed.result) {
       if (parsed.is_error) {
         let message = parsed.result;
+        if (isClaudeSessionNotFound(message)) {
+          state.claudeResumeInvalid = true;
+          // Do not keep seeding the missing id for the next turn.
+          state.sessionId = "";
+        }
         // Common after interactive trust decline
         if (/trust|workspace|not.*allowed|permission/i.test(parsed.result)) {
           message = `${parsed.result}\n（若曾在接力终端拒绝信任目录，请在本机重新接力并选择信任，或删除该目录后重建任务）`;
@@ -1547,6 +1583,18 @@ export async function runHeadlessTurn(
         const raw = captured || options.providerSessionId || "";
         providerSessionId = raw && raw !== options.threadId ? raw : (captured || "");
         if (options.providerSessionId && !providerSessionId) clearProviderSession = true;
+      } else if (engine === "claude") {
+        const notFound = state.claudeResumeInvalid
+          || isClaudeSessionNotFound(state.errorMessage || state.text);
+        if (notFound) {
+          clearProviderSession = Boolean(options.providerSessionId);
+          providerSessionId = "";
+        } else {
+          // Never persist the AnytimeVibe web thread UUID as a Claude --resume id.
+          const raw = captured || options.providerSessionId || "";
+          providerSessionId = raw && raw !== options.threadId ? raw : "";
+          if (options.providerSessionId && !providerSessionId) clearProviderSession = true;
+        }
       } else {
         providerSessionId = captured || options.providerSessionId || options.threadId;
       }
@@ -1648,7 +1696,11 @@ export async function runHeadlessTurn(
             runInfo: { ...initialRunInfo, model: state.model }
           });
         }
-        if (state.sessionId && state.sessionId !== options.providerSessionId) {
+        if (
+          state.sessionId
+          && state.sessionId !== options.providerSessionId
+          && state.sessionId !== options.threadId
+        ) {
           safeOnEvent({ type: "session", threadId: options.threadId, providerSessionId: state.sessionId });
         }
         // Interactive plan/question: stop headless process so Web can choose, then --resume follow-up.
@@ -1712,6 +1764,12 @@ export async function runHeadlessTurn(
           return;
         }
         if (isCodexModelsManagerNoise(line)) return;
+        if (engine === "claude" && isClaudeSessionNotFound(line)) {
+          state.claudeResumeInvalid = true;
+          state.sessionId = "";
+          emitHeadlessErrorOnce(state, safeOnEvent, options, line.trim());
+          return;
+        }
         emitDelta(safeOnEvent, options, "cli-log", "cli-log", `${line}\n`);
       });
     }
@@ -1825,6 +1883,27 @@ export async function runHeadlessTurn(
     );
     const { providerSessionId: _ignored, ...rest } = options;
     const retry = await runHeadlessTurn(engine, { ...rest, agyConversationRetried: true }, onEvent);
+    await eventChain;
+    return retry;
+  }
+
+  // Claude: stale / cleaned / non-parent session id → retry without --resume.
+  if (
+    engine === "claude"
+    && result.status === "failed"
+    && options.providerSessionId
+    && !options.claudeResumeRetried
+    && (result.clearProviderSession || isClaudeSessionNotFound(result.text))
+  ) {
+    emitDelta(
+      safeOnEvent,
+      options,
+      "stage:retry",
+      "stage",
+      "\n… Claude 会话 ID 无效或不存在，正在不带 --resume 重试\n"
+    );
+    const { providerSessionId: _ignored, ...rest } = options;
+    const retry = await runHeadlessTurn(engine, { ...rest, claudeResumeRetried: true }, onEvent);
     await eventChain;
     return retry;
   }

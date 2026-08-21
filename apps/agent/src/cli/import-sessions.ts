@@ -12,6 +12,27 @@ const execFileAsync = promisify(execFile);
 
 type HistoryMessage = StoredTask["messages"][number];
 
+/** Keep enough early turns so long sessions remain scrollable after import/re-sync. */
+const TRANSCRIPT_MESSAGE_CAP = 2000;
+
+function capTranscriptMessages(messages: HistoryMessage[]): HistoryMessage[] {
+  return messages.length > TRANSCRIPT_MESSAGE_CAP
+    ? messages.slice(-TRANSCRIPT_MESSAGE_CAP)
+    : messages;
+}
+
+/** Prefer the longer side so a short re-import does not erase older AnytimeVibe turns. */
+function preferLongerTranscript(
+  existing: HistoryMessage[] | undefined,
+  imported: HistoryMessage[]
+): HistoryMessage[] {
+  const a = existing?.length ? existing : [];
+  const b = imported.length ? imported : [];
+  if (!b.length) return capTranscriptMessages(a);
+  if (!a.length) return capTranscriptMessages(b);
+  return capTranscriptMessages(a.length >= b.length ? a : b);
+}
+
 /** Keep failure/interrupt from AnytimeVibe turns; only default brand-new CLI imports to completed. */
 function mergeImportStatus(existing: StoredTask | undefined): string {
   if (!existing?.status) return "completed";
@@ -503,7 +524,7 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
       status: mergeImportStatus(existing),
       createdAt: existing?.createdAt ?? hit.createdAt,
       updatedAt: Math.max(existing?.updatedAt ?? 0, hit.updatedAt, hit.mtime),
-      messages: messages.slice(-80),
+      messages: capTranscriptMessages(messages),
       ...(existing?.model ? { model: existing.model } : {}),
       ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
       ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})
@@ -805,7 +826,7 @@ async function readGrokSessionDir(dir: string, sessionId: string): Promise<{
   return {
     ...(cwd ? { cwd } : {}),
     ...(title ? { title } : {}),
-    messages: messages.slice(-80),
+    messages: capTranscriptMessages(messages),
     ...(updatedAt ? { updatedAt } : {})
   };
 }
@@ -883,7 +904,7 @@ async function importGrokSessions(store: TaskStore, limit: number): Promise<numb
       status: mergeImportStatus(existing),
       createdAt: existing?.createdAt ?? hit.mtime,
       updatedAt: Math.max(existing?.updatedAt ?? 0, meta.updatedAt ?? 0, hit.mtime),
-      messages: messages.slice(-80),
+      messages: capTranscriptMessages(messages),
       ...(existing?.model ? { model: existing.model } : {}),
       ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
       ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})
@@ -1201,7 +1222,7 @@ async function importClaudeSessions(
       status: mergeImportStatus(existing),
       createdAt: existing?.createdAt ?? hit.mtime,
       updatedAt: Math.max(existing?.updatedAt ?? 0, hit.mtime),
-      messages: mergedMessages.slice(-80),
+      messages: capTranscriptMessages(mergedMessages),
       ...(existing?.model ? { model: existing.model } : {}),
       ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
       ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})
@@ -1506,7 +1527,7 @@ async function importAntigravitySessions(store: TaskStore, limit: number): Promi
       status: mergeImportStatus(existing),
       createdAt: existing?.createdAt ?? hit.mtime,
       updatedAt: Math.max(existing?.updatedAt ?? 0, hit.mtime),
-      messages: mergedMessages.slice(-80),
+      messages: preferLongerTranscript(existingMessages, importedMessages),
       ...(existing?.model ? { model: existing.model } : {}),
       ...(existing?.reasoningEffort ? { reasoningEffort: existing.reasoningEffort } : {}),
       ...(existing?.contextUsage ? { contextUsage: existing.contextUsage } : {})

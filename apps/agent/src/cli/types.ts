@@ -86,6 +86,11 @@ export type HeadlessRunOptions = {
    * (bogus AnytimeVibe thread UUID / deleted brain id → trajectory not found).
    */
   agyConversationRetried?: boolean;
+  /**
+   * Internal: Claude retry without --resume already attempted
+   * (stale / deleted / sidechain session id → "No conversation found with session ID").
+   */
+  claudeResumeRetried?: boolean;
 };
 
 export type HeadlessRunResult = {

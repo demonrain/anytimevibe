@@ -29,7 +29,10 @@ import {
   generatePairingKeyPair,
   importAesKey,
   openEnvelope,
+  pageTranscriptMessagesBefore,
   randomKeyBytes,
+  TRANSCRIPT_HISTORY_PAGE_SIZE,
+  windowTranscriptMessages,
   type AgentEvent,
   type CliEngine,
   type CliEngineInfo,
@@ -4051,6 +4054,7 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     task.messages = messages;
     await taskStore.upsert(task);
   }
+  const windowed = windowTranscriptMessages(messages);
   const agentTask: AgentTask = {
     threadId: task.threadId,
     title: task.title,
@@ -4083,7 +4087,10 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     ...(task.runInfo ? { runInfo: task.runInfo } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
     ...(task.lastDiff ? { diff: task.lastDiff } : {}),
-    messages: messages
+    messages: windowed.messages,
+    messageTotal: windowed.messageTotal,
+    hasOlderMessages: windowed.hasOlderMessages,
+    ...(windowed.oldestMessageId ? { oldestMessageId: windowed.oldestMessageId } : {})
   }, true);
 }
 
@@ -4210,9 +4217,9 @@ async function runHeadlessTaskTurn(options: {
   if (result.clearProviderSession) {
     latest.providerSessionId = "";
   } else if (result.providerSessionId) {
-    // Never bind Antigravity to the AnytimeVibe web thread UUID.
+    // Never bind Antigravity/Claude/Cursor to the AnytimeVibe web thread UUID.
     if (
-      options.engine === "antigravity"
+      (options.engine === "antigravity" || options.engine === "claude" || options.engine === "cursor")
       && result.providerSessionId === options.threadId
     ) {
       // keep prior / empty
@@ -4338,6 +4345,41 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         ? `已取消 ${result.removed} 条排队指令（剩余 ${result.remaining}）`
         : "没有可取消的排队指令"
     });
+    return;
+  }
+  if (command.type === "thread.history.request") {
+    const threadId = command.threadId;
+    if (isThreadDeleted(threadId)) return;
+    let messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string }> = [];
+    const stored = taskStore.get(threadId);
+    if (stored) {
+      messages = sanitizeTranscriptMessages(stored.messages);
+    } else {
+      // Codex-only threads may live outside the multi-CLI store.
+      try {
+        await ensureCodex();
+        const result = await codex!.request("thread/read", { threadId, includeTurns: true });
+        const snapshot = threadToSnapshot(result.thread);
+        messages = sanitizeTranscriptMessages(snapshot.messages);
+      } catch {
+        messages = [];
+      }
+    }
+    const page = pageTranscriptMessagesBefore(
+      messages,
+      command.beforeMessageId,
+      command.limit ?? TRANSCRIPT_HISTORY_PAGE_SIZE
+    );
+    await publish({
+      type: "thread.history.page",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadId,
+      messages: page.messages,
+      hasOlderMessages: page.hasOlderMessages,
+      ...(page.oldestMessageId ? { oldestMessageId: page.oldestMessageId } : {}),
+      ...(page.newestMessageId ? { newestMessageId: page.newestMessageId } : {})
+    }, false);
     return;
   }
   if (command.type === "thread.delete") {
@@ -5285,12 +5327,16 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
       .slice(0, 200)
   });
   // Codex app-server snapshots do not carry our UI model/effort — merge from local task store.
+  const windowed = windowTranscriptMessages(messages);
   await publish({
     type: "thread.snapshot",
     eventId: crypto.randomUUID(),
     occurredAt: new Date().toISOString(),
     ...snapshot,
-    messages,
+    messages: windowed.messages,
+    messageTotal: windowed.messageTotal,
+    hasOlderMessages: windowed.hasOlderMessages,
+    ...(windowed.oldestMessageId ? { oldestMessageId: windowed.oldestMessageId } : {}),
     cwd,
     updatedAt,
     cliEngine: "codex",

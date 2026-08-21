@@ -26,6 +26,7 @@ import {
   openEnvelope,
   pairingClaimResponseSchema,
   randomUuid,
+  TRANSCRIPT_HISTORY_PAGE_SIZE,
   type AgentEvent,
   type CliEngine,
   type CliEngineInfo,
@@ -105,6 +106,12 @@ type Task = {
   contextUsage?: ContextUsage;
   /** Follow-up prompts waiting on the agent (not yet started). */
   queuedTurns?: QueuedTurnItem[];
+  /** Agent index has turns older than the current in-memory tip. */
+  hasOlderMessages?: boolean;
+  /** Total messages known to the agent (may exceed local `messages.length`). */
+  messageTotal?: number;
+  /** True while a thread.history.request is in flight. */
+  historyLoading?: boolean;
 };
 
 function capabilityForEngine(
@@ -761,6 +768,66 @@ function mergeSnapshotUserPrompts<T extends { id: string; role: string; text: st
 }
 
 /**
+ * Prefer the longer transcript when a snapshot/import is truncated.
+ * Append any brand-new tip messages from the shorter incoming list.
+ */
+function preferLongerTranscriptMessages<T extends { id: string; role: string; text: string }>(
+  incoming: T[],
+  existing: T[] | undefined
+): T[] {
+  if (!incoming.length) return existing ?? [];
+  if (!existing?.length) return incoming;
+  if (existing.length <= incoming.length) {
+    return mergeSnapshotUserPrompts(incoming, existing);
+  }
+  const existingKeys = new Set(
+    existing.map((message) => `${message.role}\0${message.text.trim()}`)
+  );
+  const extras = incoming.filter(
+    (message) => !existingKeys.has(`${message.role}\0${message.text.trim()}`)
+  );
+  if (!extras.length) return existing;
+  return [...existing, ...extras];
+}
+
+function messageIdentityKey(message: { role: string; text: string }): string {
+  return `${message.role}\0${message.text.trim()}`;
+}
+
+/**
+ * Merge a windowed snapshot tip with older pages already loaded in the browser.
+ * Aligns on role+text so re-imported UUID churn does not duplicate the tip.
+ */
+function mergeRecentWindowSnapshot<T extends { id: string; role: string; text: string }>(
+  incoming: T[],
+  existing: T[] | undefined,
+  hasOlderMessages: boolean
+): T[] {
+  if (!incoming.length) return existing ?? [];
+  if (!existing?.length) return incoming;
+  if (!hasOlderMessages) {
+    return preferLongerTranscriptMessages(incoming, existing);
+  }
+  const firstKey = messageIdentityKey(incoming[0]!);
+  let alignAt = -1;
+  for (let i = existing.length - 1; i >= 0; i -= 1) {
+    if (messageIdentityKey(existing[i]!) === firstKey) {
+      alignAt = i;
+      break;
+    }
+  }
+  if (alignAt < 0) {
+    if (existing.length > incoming.length) {
+      const existingKeys = new Set(existing.map(messageIdentityKey));
+      const extras = incoming.filter((message) => !existingKeys.has(messageIdentityKey(message)));
+      return extras.length ? [...existing, ...extras] : existing;
+    }
+    return mergeSnapshotUserPrompts(incoming, existing);
+  }
+  return [...existing.slice(0, alignAt), ...incoming];
+}
+
+/**
  * Local / host filesystem paths must not become <a href> on the web UI.
  * Markdown often emits [text](H:/git/foo.md); browsers then treat `H:` as a URL scheme or
  * resolve a bare `/git/...` against the site origin (e.g. https://vibe.demonrain.top/).
@@ -953,7 +1020,12 @@ const ChatMessageStream = memo(function ChatMessageStream({
   onCommand,
   stickToBottomRef,
   messageStreamRef,
-  messageEndRef
+  messageEndRef,
+  hasOlderMessages,
+  historyLoading,
+  onLoadOlder,
+  loadOlderLabel,
+  loadingOlderLabel
 }: {
   messages: ChatMessage[];
   replyDetail: ReplyDetail;
@@ -988,6 +1060,11 @@ const ChatMessageStream = memo(function ChatMessageStream({
   stickToBottomRef: MutableRefObject<boolean>;
   messageStreamRef: RefObject<HTMLDivElement | null>;
   messageEndRef: RefObject<HTMLDivElement | null>;
+  hasOlderMessages: boolean;
+  historyLoading: boolean;
+  onLoadOlder(): void;
+  loadOlderLabel: string;
+  loadingOlderLabel: string;
 }) {
   const visibleMessages = useMemo(
     () => dedupeAdjacentUserMessages(
@@ -1009,8 +1086,26 @@ const ChatMessageStream = memo(function ChatMessageStream({
       onScroll={(event) => {
         const stream = event.currentTarget;
         stickToBottomRef.current = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 90;
+        if (
+          stream.scrollTop < 56
+          && hasOlderMessages
+          && !historyLoading
+          && online === true
+        ) {
+          onLoadOlder();
+        }
       }}
     >
+      {(hasOlderMessages || historyLoading) && (
+        <button
+          type="button"
+          className="load-older"
+          disabled={historyLoading || online !== true}
+          onClick={onLoadOlder}
+        >
+          {historyLoading ? loadingOlderLabel : loadOlderLabel}
+        </button>
+      )}
       {visibleMessages.map((message) => (
         <ChatMessageRow
           key={message.id}
@@ -1359,8 +1454,8 @@ const ConversationComposer = memo(function ConversationComposer({
         }}
         placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"}
       />
-      <div>
-        <small>
+      <div className="composer-toolbar">
+        <small className="composer-controls">
           <label className="composer-permission">
             模型
             <select
@@ -1425,17 +1520,19 @@ const ConversationComposer = memo(function ConversationComposer({
             {" "}{sendShortcutLabel}
           </span>
         </small>
-        {(running || pendingPrompt) && (
-          <button type="button" className="stop" onClick={onStop} disabled={online !== true}>
-            {stopLabel}
-          </button>
-        )}
-        {canResend && !running && !pendingPrompt && (
-          <button type="button" className="resend" onClick={onResend} disabled={online !== true}>
-            {resendLabel}
-          </button>
-        )}
-        <button className="send" disabled={online !== true || !prompt.trim()}>{sendLabel}</button>
+        <div className="composer-actions">
+          {(running || pendingPrompt) && (
+            <button type="button" className="stop" onClick={onStop} disabled={online !== true}>
+              {stopLabel}
+            </button>
+          )}
+          {canResend && !running && !pendingPrompt && (
+            <button type="button" className="resend" onClick={onResend} disabled={online !== true}>
+              {resendLabel}
+            </button>
+          )}
+          <button className="send" disabled={online !== true || !prompt.trim()}>{sendLabel}</button>
+        </div>
       </div>
     </form>
   );
@@ -1556,6 +1653,21 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     return next;
   }
   if (event.type === "sync.completed" || event.type === "sync.progress") return next;
+  if (event.type === "thread.history.page") {
+    const existing = next.tasks[event.threadId];
+    if (!existing) return next;
+    existing.historyLoading = false;
+    existing.hasOlderMessages = event.hasOlderMessages;
+    const knownIds = new Set(existing.messages.map((message) => message.id));
+    const knownText = new Set(existing.messages.map(messageIdentityKey));
+    const older = sanitizeTranscriptMessages(event.messages).filter(
+      (message) => !knownIds.has(message.id) && !knownText.has(messageIdentityKey(message))
+    );
+    if (older.length) {
+      existing.messages = dedupeAdjacentUserMessages([...older, ...existing.messages]);
+    }
+    return next;
+  }
   if (event.type === "thread.snapshot") {
     // Never resurrect a task the user already deleted in this session if event races.
     // (Agent also tombstones; this is a local guard.)
@@ -1586,9 +1698,10 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       ? undefined
       : (event.activeTurnId || existing?.activeTurnId);
     const incomingMessages = event.messages?.length ? event.messages : [];
+    const hasOlderMessages = Boolean(event.hasOlderMessages);
     const rawMessages = sanitizeTranscriptMessages(
       incomingMessages.length
-        ? mergeSnapshotUserPrompts(incomingMessages, existing?.messages ?? [])
+        ? mergeRecentWindowSnapshot(incomingMessages, existing?.messages, hasOlderMessages)
         : (existing?.messages ?? [])
     );
     // Prefer the more specific absolute cwd (task subdir over bare workspace root when both known).
@@ -1619,6 +1732,14 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
         : (existing?.diff ?? ""),
       messages: dedupeAdjacentUserMessages(rawMessages),
       approvals: existing?.approvals ?? [],
+      // Windowed tip: keep true if we already know there are older pages locally,
+      // unless the agent says the snapshot is complete (hasOlderMessages === false).
+      hasOlderMessages: event.hasOlderMessages === false
+        ? false
+        : Boolean(event.hasOlderMessages || existing?.hasOlderMessages),
+      ...(typeof event.messageTotal === "number"
+        ? { messageTotal: event.messageTotal }
+        : (existing?.messageTotal != null ? { messageTotal: existing.messageTotal } : {})),
       ...(engine ? { cliEngine: engine } : {}),
       ...(activeTurnId ? { activeTurnId } : {}),
       ...(providerSessionId ? { providerSessionId } : {}),
@@ -3010,6 +3131,10 @@ function TaskConversation({
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const previousThreadRef = useRef(task.threadId);
+  const pendingHistoryScrollRef = useRef<{ height: number; top: number } | null>(null);
+  const historyRequestTokenRef = useRef(0);
+  const historyInFlightRef = useRef(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
   // After a page refresh, snapshots often omit activeTurnId while status is still 进行中.
   const running = Boolean(task.activeTurnId) || isInProgressTaskStatus(task.status);
   const permissionOptions = useMemo(
@@ -3403,11 +3528,62 @@ function TaskConversation({
     }
   }, [task.activeTurnId, pendingPrompt]);
 
+  useEffect(() => {
+    if (task.historyLoading === false) {
+      historyInFlightRef.current = false;
+      setHistoryLoading(false);
+    }
+  }, [task.historyLoading]);
+
+  useEffect(() => {
+    historyInFlightRef.current = false;
+    setHistoryLoading(false);
+    historyRequestTokenRef.current += 1;
+    pendingHistoryScrollRef.current = null;
+  }, [task.threadId]);
+
+  const oldestMessageId = task.messages[0]?.id;
+  const loadOlderMessages = useCallback(() => {
+    if (historyInFlightRef.current || historyLoading || !task.hasOlderMessages || online !== true) return;
+    const stream = messageStreamRef.current;
+    if (stream) {
+      pendingHistoryScrollRef.current = {
+        height: stream.scrollHeight,
+        top: stream.scrollTop
+      };
+    }
+    const token = historyRequestTokenRef.current + 1;
+    historyRequestTokenRef.current = token;
+    historyInFlightRef.current = true;
+    setHistoryLoading(true);
+    onCommand({
+      type: "thread.history.request",
+      commandId: randomUuid(),
+      threadId: task.threadId,
+      limit: TRANSCRIPT_HISTORY_PAGE_SIZE,
+      ...(oldestMessageId ? { beforeMessageId: oldestMessageId } : {})
+    });
+    window.setTimeout(() => {
+      if (historyRequestTokenRef.current === token) {
+        historyInFlightRef.current = false;
+        setHistoryLoading(false);
+      }
+    }, 15_000);
+  }, [historyLoading, task.hasOlderMessages, task.threadId, oldestMessageId, online, onCommand]);
+
   useLayoutEffect(() => {
     const stream = messageStreamRef.current;
     if (!stream || tab !== "chat") return;
     const changedThread = previousThreadRef.current !== task.threadId;
     previousThreadRef.current = task.threadId;
+    const pending = pendingHistoryScrollRef.current;
+    if (pending) {
+      pendingHistoryScrollRef.current = null;
+      const frame = window.requestAnimationFrame(() => {
+        stream.scrollTop = stream.scrollHeight - pending.height + pending.top;
+      });
+      return () => window.cancelAnimationFrame(frame);
+    }
     if (changedThread || visible || stickToBottomRef.current) {
       const frame = window.requestAnimationFrame(() => {
         window.requestAnimationFrame(() => {
@@ -3495,7 +3671,7 @@ function TaskConversation({
         </div>
         <RunInfoPanel info={runInfo} />
         {QUOTA_QUERY_ENABLED && (taskQuota?.detail || quotaDetail) && (
-          <details className="quota-detail-panel" open={Boolean(taskQuota || quotaDetail)}>
+          <details className="quota-detail-panel">
             <summary>
               {locale === "en" ? "Quota details" : "额度详情"}
               {taskQuota?.checkedAt ? ` · ${new Date(taskQuota.checkedAt).toLocaleString()}` : ""}
@@ -3543,6 +3719,11 @@ function TaskConversation({
         stickToBottomRef={stickToBottomRef}
         messageStreamRef={messageStreamRef}
         messageEndRef={messageEndRef}
+        hasOlderMessages={Boolean(task.hasOlderMessages)}
+        historyLoading={historyLoading || Boolean(task.historyLoading)}
+        onLoadOlder={loadOlderMessages}
+        loadOlderLabel={t("loadOlder")}
+        loadingOlderLabel={t("loadingOlder")}
       />
     ) : (
       <DiffView diff={task.diff} />

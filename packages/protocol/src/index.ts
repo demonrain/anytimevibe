@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.94";
+export const PRODUCT_VERSION = "0.4.95";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -187,6 +187,71 @@ export type ContextUsage = z.infer<typeof contextUsageSchema>;
 export const ENGINE_QUOTA_DETAIL_MAX = 4000;
 
 /**
+ * Transcript sync windowing — keep routine snapshots small; older turns load on demand.
+ * Agent store may keep more (e.g. 2000); only the recent tip rides every thread.snapshot.
+ */
+export const TRANSCRIPT_SNAPSHOT_WINDOW = 80;
+export const TRANSCRIPT_HISTORY_PAGE_SIZE = 80;
+export const TRANSCRIPT_HISTORY_PAGE_MAX = 100;
+
+export type TranscriptMessageRef = { id: string; role: string; text: string };
+
+/** Take the newest `windowSize` messages and describe whether older turns remain. */
+export function windowTranscriptMessages<T extends TranscriptMessageRef>(
+  messages: T[],
+  windowSize: number = TRANSCRIPT_SNAPSHOT_WINDOW
+): {
+  messages: T[];
+  messageTotal: number;
+  hasOlderMessages: boolean;
+  oldestMessageId?: string;
+} {
+  const messageTotal = messages.length;
+  const size = Math.max(1, windowSize);
+  const sliced = messageTotal > size ? messages.slice(-size) : messages;
+  return {
+    messages: sliced,
+    messageTotal,
+    hasOlderMessages: messageTotal > sliced.length,
+    ...(sliced[0]?.id ? { oldestMessageId: sliced[0].id } : {})
+  };
+}
+
+/**
+ * Page of messages strictly older than `beforeMessageId`.
+ * If the id is missing (re-import rotated UUIDs), assume the client already has the
+ * recent snapshot window and return the page just before that tip.
+ */
+export function pageTranscriptMessagesBefore<T extends TranscriptMessageRef>(
+  messages: T[],
+  beforeMessageId: string | undefined,
+  limit: number = TRANSCRIPT_HISTORY_PAGE_SIZE
+): {
+  messages: T[];
+  hasOlderMessages: boolean;
+  oldestMessageId?: string;
+  newestMessageId?: string;
+} {
+  const pageSize = Math.max(1, Math.min(TRANSCRIPT_HISTORY_PAGE_MAX, limit));
+  let end = beforeMessageId
+    ? messages.findIndex((message) => message.id === beforeMessageId)
+    : -1;
+  if (end < 0) {
+    end = Math.max(0, messages.length - TRANSCRIPT_SNAPSHOT_WINDOW);
+  }
+  const start = Math.max(0, end - pageSize);
+  const page = messages.slice(start, end);
+  return {
+    messages: page,
+    hasOlderMessages: start > 0,
+    ...(page[0]?.id ? { oldestMessageId: page[0].id } : {}),
+    ...(page.length && page[page.length - 1]?.id
+      ? { newestMessageId: page[page.length - 1]!.id }
+      : {})
+  };
+}
+
+/**
  * Host-level subscription / plan usage for one coding engine (queried on demand).
  * Prefer percent remaining; if monetary, use amountRemaining + currency.
  */
@@ -267,6 +332,16 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
     type: z.literal("thread.delete"),
     threadId: z.string().min(1)
+  }),
+  /**
+   * Load older transcript turns for a thread (scroll-up pagination).
+   * beforeMessageId = oldest message currently shown; omit to page before the default window.
+   */
+  commandBase.extend({
+    type: z.literal("thread.history.request"),
+    threadId: z.string().min(1),
+    beforeMessageId: z.string().min(1).optional(),
+    limit: z.number().int().positive().max(TRANSCRIPT_HISTORY_PAGE_MAX).optional()
   }),
   commandBase.extend({
     type: z.literal("approval.resolve"),
@@ -376,7 +451,27 @@ export const agentEventSchema = z.discriminatedUnion("type", [
       role: z.enum(["user", "assistant", "system"]),
       text: z.string(),
       createdAt: z.number().optional()
-    }))
+    })),
+    /** Total messages in the agent index (may exceed `messages.length` when windowed). */
+    messageTotal: z.number().int().nonnegative().optional(),
+    /** True when older turns exist beyond this snapshot tip — request via thread.history.request. */
+    hasOlderMessages: z.boolean().optional(),
+    /** Id of the oldest message included in this snapshot window. */
+    oldestMessageId: z.string().optional()
+  }),
+  /** Older transcript page in response to thread.history.request (not persisted). */
+  eventBase.extend({
+    type: z.literal("thread.history.page"),
+    threadId: z.string(),
+    messages: z.array(z.object({
+      id: z.string(),
+      role: z.enum(["user", "assistant", "system"]),
+      text: z.string(),
+      createdAt: z.number().optional()
+    })),
+    hasOlderMessages: z.boolean(),
+    oldestMessageId: z.string().optional(),
+    newestMessageId: z.string().optional()
   }),
   eventBase.extend({
     type: z.literal("turn.started"),

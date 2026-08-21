@@ -1,0 +1,48 @@
+import { describe, expect, it } from "vitest";
+import { isClaudeSessionNotFound, shouldAcceptClaudeSessionId } from "./headless-runner";
+
+describe("Claude session id acceptance", () => {
+  it("detects missing-session CLI errors", () => {
+    expect(isClaudeSessionNotFound("No conversation found with session ID: abc")).toBe(true);
+    expect(isClaudeSessionNotFound("API Error: rate limit")).toBe(false);
+  });
+
+  it("accepts parent init / result ids and rejects sidechain / nested Agent channels", () => {
+    expect(shouldAcceptClaudeSessionId({
+      type: "system",
+      subtype: "init",
+      session_id: "parent-1"
+    })).toBe(true);
+
+    expect(shouldAcceptClaudeSessionId({
+      type: "result",
+      session_id: "parent-1",
+      is_error: false
+    })).toBe(true);
+
+    expect(shouldAcceptClaudeSessionId({
+      type: "assistant",
+      session_id: "parent-1",
+      parent_tool_use_id: null
+    })).toBe(true);
+
+    expect(shouldAcceptClaudeSessionId({
+      type: "assistant",
+      session_id: "child-1",
+      parent_tool_use_id: "toolu_abc"
+    })).toBe(false);
+
+    expect(shouldAcceptClaudeSessionId({
+      type: "user",
+      session_id: "child-1",
+      isSidechain: true
+    })).toBe(false);
+
+    expect(shouldAcceptClaudeSessionId({
+      type: "result",
+      session_id: "parent-1",
+      is_error: true,
+      result: "No conversation found with session ID: parent-1"
+    })).toBe(false);
+  });
+});

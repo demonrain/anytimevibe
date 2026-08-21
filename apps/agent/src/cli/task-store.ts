@@ -85,8 +85,8 @@ export class TaskStore {
     const task = this.data.tasks[threadId];
     if (!task) return;
     task.messages.push(message);
-    // Cap stored transcript for local index size.
-    if (task.messages.length > 200) task.messages = task.messages.slice(-200);
+    // Cap stored transcript for local index size (keep enough early turns for long chats).
+    if (task.messages.length > 2000) task.messages = task.messages.slice(-2000);
     task.updatedAt = Date.now() / 1000;
     await this.save();
   }

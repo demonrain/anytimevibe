@@ -10,8 +10,10 @@ import {
   generatePairingKeyPair,
   importAesKey,
   openEnvelope,
+  pageTranscriptMessagesBefore,
   pairingClaimResponseSchema,
-  randomKeyBytes
+  randomKeyBytes,
+  windowTranscriptMessages
 } from "./index";
 
 describe("protocol crypto", () => {
@@ -101,5 +103,54 @@ describe("protocol crypto", () => {
     expect(event.type).toBe("sync.completed");
     if (event.type !== "sync.completed") throw new Error("Unexpected event type");
     expect(event.threadCount).toBe(12);
+  });
+
+  it("windows recent messages and pages older turns", () => {
+    const messages = Array.from({ length: 120 }, (_, index) => ({
+      id: `m${index}`,
+      role: index % 2 === 0 ? "user" : "assistant",
+      text: `turn-${index}`
+    }));
+    const windowed = windowTranscriptMessages(messages, 80);
+    expect(windowed.messages).toHaveLength(80);
+    expect(windowed.messageTotal).toBe(120);
+    expect(windowed.hasOlderMessages).toBe(true);
+    expect(windowed.oldestMessageId).toBe("m40");
+
+    const page = pageTranscriptMessagesBefore(messages, windowed.oldestMessageId, 80);
+    expect(page.messages).toHaveLength(40);
+    expect(page.messages[0]?.id).toBe("m0");
+    expect(page.messages[page.messages.length - 1]?.id).toBe("m39");
+    expect(page.hasOlderMessages).toBe(false);
+  });
+
+  it("accepts windowed snapshot and history page events", () => {
+    const snapshot = agentEventSchema.parse({
+      type: "thread.snapshot",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadId: "t1",
+      title: "demo",
+      cwd: "/tmp",
+      status: "completed",
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [{ id: "a", role: "user", text: "hi" }],
+      messageTotal: 120,
+      hasOlderMessages: true,
+      oldestMessageId: "a"
+    });
+    expect(snapshot.type).toBe("thread.snapshot");
+    const page = agentEventSchema.parse({
+      type: "thread.history.page",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadId: "t1",
+      messages: [{ id: "b", role: "assistant", text: "earlier" }],
+      hasOlderMessages: false,
+      oldestMessageId: "b",
+      newestMessageId: "b"
+    });
+    expect(page.type).toBe("thread.history.page");
   });
 });
