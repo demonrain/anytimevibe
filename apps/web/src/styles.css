@@ -715,28 +715,47 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .sheet-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 60;
+  z-index: 1;
   border: 0;
   padding: 0;
   margin: 0;
-  background: rgba(23, 33, 27, 0.38);
+  background: rgba(23, 33, 27, 0.42);
   cursor: pointer;
 }
-.mobile-sheet {
+.mobile-sheet-root {
   position: fixed;
+  inset: 0;
+  z-index: 120;
+  pointer-events: none;
+}
+.mobile-sheet-root > .sheet-backdrop,
+.mobile-sheet-root > .mobile-sheet {
+  pointer-events: auto;
+}
+.mobile-sheet {
+  position: absolute;
   left: 0;
   right: 0;
   bottom: 0;
-  z-index: 61;
-  max-height: min(72vh, 520px);
-  overflow: auto;
-  -webkit-overflow-scrolling: touch;
-  padding: 14px 14px max(16px, env(safe-area-inset-bottom, 0px));
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  max-height: min(78vh, 560px);
+  overflow: hidden;
+  padding: 14px 14px 0;
   border-radius: 18px 18px 0 0;
   border: 1px solid var(--line);
   border-bottom: 0;
   background: rgba(247, 240, 226, 0.98);
-  box-shadow: 0 -12px 32px rgba(23, 33, 27, 0.16);
+  box-shadow: 0 -12px 32px rgba(23, 33, 27, 0.18);
+}
+.mobile-sheet-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 0 0 max(18px, env(safe-area-inset-bottom, 0px));
 }
 .mobile-sheet-head {
   display: flex;
@@ -744,6 +763,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   justify-content: space-between;
   gap: 10px;
   margin-bottom: 12px;
+  flex: 0 0 auto;
 }
 .mobile-sheet-head strong {
   font-size: 15px;
@@ -774,11 +794,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   max-width: none;
 }
 .run-info-sheet .run-info-chip strong {
-  max-width: none;
+  max-width: min(62vw, 240px);
   text-align: right;
   white-space: normal;
-  overflow: visible;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   text-overflow: unset;
+  overflow: visible;
 }
 .composer-settings-body {
   display: grid;
@@ -1379,39 +1401,32 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
     margin-top: 5px;
   }
   .workspace.mobile-conversation .composer-settings-btn {
-    flex: 1 1 auto;
-    min-width: 0;
-    max-width: calc(100% - 96px);
+    flex: 0 0 auto;
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    justify-content: center;
     margin-right: auto;
     min-height: 36px;
-    padding: 6px 10px;
+    min-width: 52px;
+    max-width: 72px;
+    padding: 6px 12px;
     border: 1px solid var(--line);
     border-radius: 10px;
     background: rgba(255, 250, 240, 0.9);
-    color: #4a524c;
-    font-size: 11px;
-    font-weight: 750;
+    color: #2d7653;
+    font-size: 12px;
+    font-weight: 850;
     cursor: pointer;
-    text-align: left;
+    white-space: nowrap;
   }
   .workspace.mobile-conversation .composer-settings-label {
     flex: 0 0 auto;
-    color: #2d7653;
-    font-weight: 850;
-  }
-  .workspace.mobile-conversation .composer-settings-summary {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: #637068;
-    font-weight: 700;
+    color: inherit;
+    font-weight: inherit;
   }
   .workspace.mobile-conversation .composer-actions {
     flex: 0 0 auto;
+    margin-left: auto;
     gap: 6px;
   }
   .workspace.mobile-conversation .composer-actions > button {

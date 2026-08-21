@@ -12,6 +12,7 @@ import {
   type RefObject,
   type TouchEvent as ReactTouchEvent
 } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -512,6 +513,57 @@ function useIsMobileConversation(): boolean {
     return () => media.removeEventListener?.("change", update);
   }, []);
   return isMobile;
+}
+
+/**
+ * Bottom sheet portaled to document.body so conversation-head / composer stacking
+ * contexts cannot clip or cover it on mobile.
+ */
+function MobileBottomSheet({
+  open,
+  title,
+  onClose,
+  closeLabel,
+  className = "",
+  children
+}: {
+  open: boolean;
+  title: string;
+  onClose(): void;
+  closeLabel: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, [open]);
+
+  if (!open || typeof document === "undefined") return null;
+  return createPortal(
+    <div className="mobile-sheet-root" role="presentation">
+      <button
+        type="button"
+        className="sheet-backdrop"
+        aria-label={closeLabel}
+        onClick={onClose}
+      />
+      <div className={`mobile-sheet ${className}`.trim()} role="dialog" aria-modal="true" aria-label={title}>
+        <div className="mobile-sheet-head">
+          <strong>{title}</strong>
+          <button type="button" className="mobile-sheet-close" onClick={onClose}>
+            {closeLabel}
+          </button>
+        </div>
+        <div className="mobile-sheet-body">{children}</div>
+      </div>
+    </div>,
+    document.body
+  );
 }
 
 /** Deep-clone host runtime without `structuredClone` (missing on Safari < 15.4). */
@@ -1566,7 +1618,6 @@ const ConversationComposer = memo(function ConversationComposer({
             onClick={() => setSettingsOpen(true)}
           >
             <span className="composer-settings-label">{t("composerSettings")}</span>
-            <span className="composer-settings-summary">{modelLabel}</span>
           </button>
         ) : (
           <small className="composer-controls">{controls}</small>
@@ -1585,25 +1636,15 @@ const ConversationComposer = memo(function ConversationComposer({
           <button className="send" disabled={online !== true || !prompt.trim()}>{sendLabel}</button>
         </div>
       </div>
-      {isMobile && settingsOpen ? (
-        <>
-          <button
-            type="button"
-            className="sheet-backdrop"
-            aria-label={t("composerSettingsClose")}
-            onClick={() => setSettingsOpen(false)}
-          />
-          <div className="mobile-sheet composer-settings-sheet" role="dialog" aria-label={t("composerSettings")}>
-            <div className="mobile-sheet-head">
-              <strong>{t("composerSettings")}</strong>
-              <button type="button" className="mobile-sheet-close" onClick={() => setSettingsOpen(false)}>
-                {t("composerSettingsClose")}
-              </button>
-            </div>
-            <div className="composer-settings-body">{controls}</div>
-          </div>
-        </>
-      ) : null}
+      <MobileBottomSheet
+        open={isMobile && settingsOpen}
+        title={t("composerSettings")}
+        onClose={() => setSettingsOpen(false)}
+        closeLabel={t("composerSettingsClose")}
+        className="composer-settings-sheet"
+      >
+        <div className="composer-settings-body">{controls}</div>
+      </MobileBottomSheet>
     </form>
   );
 });
@@ -3036,25 +3077,15 @@ function RunInfoPanel({ info }: { info: RunInfo }) {
           <em>{title}</em>
           <strong>{cliEngineLabel(info.engine)}</strong>
         </button>
-        {expanded ? (
-          <>
-            <button
-              type="button"
-              className="sheet-backdrop"
-              aria-label={isEnglish ? "Close" : "关闭"}
-              onClick={() => setExpanded(false)}
-            />
-            <div className="mobile-sheet run-info-sheet" role="dialog" aria-label={title}>
-              <div className="mobile-sheet-head">
-                <strong>{title}</strong>
-                <button type="button" className="mobile-sheet-close" onClick={() => setExpanded(false)}>
-                  {isEnglish ? "Done" : "完成"}
-                </button>
-              </div>
-              {chips}
-            </div>
-          </>
-        ) : null}
+        <MobileBottomSheet
+          open={expanded}
+          title={title}
+          onClose={() => setExpanded(false)}
+          closeLabel={isEnglish ? "Done" : "完成"}
+          className="run-info-sheet"
+        >
+          {chips}
+        </MobileBottomSheet>
       </>
     );
   }
