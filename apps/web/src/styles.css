@@ -804,30 +804,38 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 }
 .composer-settings-body {
   display: grid;
-  gap: 12px;
+  gap: 14px;
 }
 .composer-settings-body .composer-permission,
 .composer-settings-body .composer-reply-detail,
 .composer-settings-body .composer-fast-toggle {
-  display: grid;
-  grid-template-columns: 88px minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  white-space: normal;
   font-size: 12px;
   color: #53635a;
   font-weight: 750;
 }
-.composer-settings-body select {
+.composer-settings-body .composer-permission select,
+.composer-settings-body .composer-reply-detail select {
+  display: block;
   width: 100%;
   min-width: 0;
   max-width: none;
-  padding: 10px 11px;
+  box-sizing: border-box;
+  padding: 11px 12px;
   border-radius: 10px;
   font-size: 14px;
+  line-height: 1.35;
 }
 .composer-settings-body .composer-fast-toggle {
-  grid-template-columns: 88px auto;
-  justify-content: start;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
 }
 /* Do not use overflow:hidden / width:fit-content on bubbles — they collapse multi-line pre height in Chromium. */
 .message { max-width: 88%; min-width: 0; flex: 0 0 auto; animation: rise .25s ease both; }.message > span, .message-label { display: block; font-size: 9px; letter-spacing: .14em; color: #8b9089; font-weight: 900; margin-bottom: 5px; }.message pre, .approval-card pre, .message-source { margin: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; word-wrap: break-word; font-family: "Cascadia Code", Consolas, "Segoe UI Mono", monospace; font-size: var(--msg-font); line-height: var(--msg-lh); overflow-x: auto; overflow-y: visible; tab-size: 2; }.message.user { align-self: flex-end; background: var(--ink); color: #f8f1e5; padding: 10px 12px; border-radius: 14px 14px 4px 14px; }.message.user > span { color: rgba(255,255,255,.5); }.message.assistant { align-self: flex-start; background: var(--cream); border: 1px solid var(--line); padding: 11px 12px; border-radius: 4px 14px 14px 14px; box-shadow: 0 6px 16px rgba(0,0,0,.03); }
@@ -1333,8 +1341,12 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
     background: rgba(242,234,219,.96);
     max-height: none;
     overflow: visible;
-    padding: 6px 8px 4px;
+    padding: 6px 8px 6px;
     gap: 6px 8px;
+  }
+  .workspace.mobile-conversation .conversation-head > div:first-of-type {
+    overflow: visible;
+    min-width: 0;
   }
   .workspace.mobile-conversation .conversation-head .eyebrow,
   .workspace.mobile-conversation .conversation-head > div > code {
@@ -1345,10 +1357,12 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
     font-size: 15px;
   }
   .workspace.mobile-conversation .thread-meta-chips {
-    margin-top: 2px;
+    margin-top: 4px;
     gap: 4px;
     flex-wrap: nowrap;
     overflow-x: auto;
+    overflow-y: visible;
+    padding: 3px 2px 4px;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
   }
@@ -1358,6 +1372,19 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   .workspace.mobile-conversation .run-info-chip-btn {
     flex: 0 0 auto;
     max-width: 7.5rem;
+    position: relative;
+    z-index: 3;
+    /* Keep full border visible: parent overflow + hover translate used to clip the top edge. */
+    transform: none !important;
+  }
+  .workspace.mobile-conversation .run-info-chip-btn:hover:not(:disabled),
+  .workspace.mobile-conversation .run-info-chip-btn:active:not(:disabled) {
+    transform: none !important;
+    border-color: rgba(45, 118, 83, 0.55);
+    background: rgba(45, 118, 83, 0.16);
+  }
+  .workspace.mobile-conversation .meta-chip-action:hover:not(:disabled) {
+    transform: none;
   }
   .workspace.mobile-conversation .run-info-chip-btn strong {
     max-width: 3.8rem;
@@ -1436,7 +1463,20 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   }
   .workspace.mobile-conversation .mobile-back { position: relative; z-index: 3; }
 }
-@media (max-width: 700px) { .composer textarea { max-height: 180px; }.composer-permission select, .composer-reply-detail select { min-width: 96px; max-width: 128px; }.settings-row { gap: 8px; }.permission-select, .reply-detail-select { grid-template-columns: auto minmax(0, 1fr); } }
+@media (max-width: 700px) {
+  .composer textarea { max-height: 180px; }
+  .composer-permission select,
+  .composer-reply-detail select { min-width: 96px; max-width: 128px; }
+  .composer-settings-body .composer-permission select,
+  .composer-settings-body .composer-reply-detail select {
+    min-width: 0;
+    max-width: none;
+    width: 100%;
+  }
+  .settings-row { gap: 8px; }
+  .permission-select,
+  .reply-detail-select { grid-template-columns: auto minmax(0, 1fr); }
+}
 
 /* New-task / pairing sheets: keep full form reachable on short phone viewports */
 @media (max-width: 700px) {
