@@ -498,6 +498,22 @@ function emptyRuntime(online: boolean | null = null): HostRuntime {
   return { online, workspaces: [], tasks: {}, availableEngines: [] };
 }
 
+/** Track `(max-width: 700px)` for mobile conversation chrome. */
+function useIsMobileConversation(): boolean {
+  const [isMobile, setIsMobile] = useState(
+    () => typeof window !== "undefined" && window.matchMedia("(max-width: 700px)").matches
+  );
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const media = window.matchMedia("(max-width: 700px)");
+    const update = () => setIsMobile(media.matches);
+    update();
+    media.addEventListener?.("change", update);
+    return () => media.removeEventListener?.("change", update);
+  }, []);
+  return isMobile;
+}
+
 /** Deep-clone host runtime without `structuredClone` (missing on Safari < 15.4). */
 function cloneRuntime(runtime: HostRuntime): HostRuntime {
   return JSON.parse(JSON.stringify(runtime)) as HostRuntime;
@@ -1397,7 +1413,10 @@ const ConversationComposer = memo(function ConversationComposer({
   onStop(): void;
   onResend(): void;
 }) {
+  const { t, locale } = useI18n();
+  const isMobile = useIsMobileConversation();
   const [prompt, setPrompt] = useState(() => loadTaskDraft(threadId));
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const draftTimerRef = useRef<number | null>(null);
 
@@ -1428,6 +1447,10 @@ const ConversationComposer = memo(function ConversationComposer({
     textarea.style.overflowY = textarea.scrollHeight > 220 ? "auto" : "hidden";
   }, [prompt]);
 
+  useEffect(() => {
+    if (!isMobile) setSettingsOpen(false);
+  }, [isMobile, threadId]);
+
   function submit() {
     if (!prompt.trim() || online !== true) return;
     const text = prompt.trim();
@@ -1435,6 +1458,85 @@ const ConversationComposer = memo(function ConversationComposer({
     saveTaskDraft(threadId, "");
     onSubmitPrompt(text);
   }
+
+  const modelLabel = modelOptions.find((option) => option.id === model)?.label
+    || model
+    || (locale === "en" ? "Model" : "模型");
+  const settingsSummary = [
+    modelLabel,
+    reasoningEffort || null,
+    permissionOptions.find((option) => option.value === permissionMode)?.label || null
+  ].filter(Boolean).join(" · ");
+
+  const controls = (
+    <>
+      <label className="composer-permission">
+        {locale === "en" ? "Model" : "模型"}
+        <select
+          value={model}
+          onChange={(event) => {
+            const next = event.target.value.split("[")[0] || event.target.value;
+            onModelChange(next);
+          }}
+          disabled={!modelOptions.length}
+        >
+          {!modelOptions.length && <option value="">{locale === "en" ? "Host has not reported models" : "主机未上报模型列表"}</option>}
+          {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+        </select>
+      </label>
+      {taskEngine === "cursor" && modelMeta?.supportsFast && (
+        <label className="composer-permission composer-fast-toggle">
+          Fast
+          <input
+            type="checkbox"
+            checked={fastMode}
+            onChange={(event) => onFastModeChange(event.target.checked)}
+          />
+        </label>
+      )}
+      {taskEngine === "cursor" && supportsThinking && (
+        <label className="composer-permission composer-fast-toggle">
+          Thinking
+          <input
+            type="checkbox"
+            checked={thinkingMode}
+            onChange={(event) => onThinkingModeChange(event.target.checked)}
+          />
+        </label>
+      )}
+      <label className="composer-permission">
+        {taskEngine === "cursor" || taskEngine === "antigravity" ? "Effort" : (locale === "en" ? "Effort" : "推理强度")}
+        <select
+          value={reasoningEffort}
+          onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
+          disabled={!effortOptions.length}
+          title={usesPerModelEffort(taskEngine) && !effortOptions.length ? "当前模型不支持 --effort" : undefined}
+        >
+          {!effortOptions.length && <option value="">—</option>}
+          {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+        </select>
+      </label>
+      <label className="composer-permission">
+        {currentPermissionLabel}
+        <select value={permissionMode} onChange={(event) => onPermissionModeChange(normalizePermissionMode(event.target.value))}>
+          {permissionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+        </select>
+      </label>
+      <label className="composer-reply-detail">
+        {agentReplyDetailLabel}
+        <select value={replyDetail} onChange={(event) => onReplyDetailChange(normalizeReplyDetail(event.target.value))}>
+          <option value="concise">{replyConciseLabel}</option>
+          <option value="detailed">{replyDetailedLabel}</option>
+        </select>
+      </label>
+      {!isMobile && (
+        <span className="send-shortcut">
+          {isMac ? <><kbd>⌘</kbd> + <kbd>Enter</kbd></> : <><kbd>Ctrl</kbd> + <kbd>Enter</kbd></>}
+          {" "}{sendShortcutLabel}
+        </span>
+      )}
+    </>
+  );
 
   return (
     <form className="composer" onSubmit={(event) => {
@@ -1455,71 +1557,20 @@ const ConversationComposer = memo(function ConversationComposer({
         placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"}
       />
       <div className="composer-toolbar">
-        <small className="composer-controls">
-          <label className="composer-permission">
-            模型
-            <select
-              value={model}
-              onChange={(event) => {
-                const next = event.target.value.split("[")[0] || event.target.value;
-                onModelChange(next);
-              }}
-              disabled={!modelOptions.length}
-            >
-              {!modelOptions.length && <option value="">主机未上报模型列表</option>}
-              {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
-            </select>
-          </label>
-          {taskEngine === "cursor" && modelMeta?.supportsFast && (
-            <label className="composer-permission composer-fast-toggle">
-              Fast
-              <input
-                type="checkbox"
-                checked={fastMode}
-                onChange={(event) => onFastModeChange(event.target.checked)}
-              />
-            </label>
-          )}
-          {taskEngine === "cursor" && supportsThinking && (
-            <label className="composer-permission composer-fast-toggle">
-              Thinking
-              <input
-                type="checkbox"
-                checked={thinkingMode}
-                onChange={(event) => onThinkingModeChange(event.target.checked)}
-              />
-            </label>
-          )}
-          <label className="composer-permission">
-            {taskEngine === "cursor" || taskEngine === "antigravity" ? "Effort" : "推理强度"}
-            <select
-              value={reasoningEffort}
-              onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
-              disabled={!effortOptions.length}
-              title={usesPerModelEffort(taskEngine) && !effortOptions.length ? "当前模型不支持 --effort" : undefined}
-            >
-              {!effortOptions.length && <option value="">—</option>}
-              {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
-            </select>
-          </label>
-          <label className="composer-permission">
-            {currentPermissionLabel}
-            <select value={permissionMode} onChange={(event) => onPermissionModeChange(normalizePermissionMode(event.target.value))}>
-              {permissionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </select>
-          </label>
-          <label className="composer-reply-detail">
-            {agentReplyDetailLabel}
-            <select value={replyDetail} onChange={(event) => onReplyDetailChange(normalizeReplyDetail(event.target.value))}>
-              <option value="concise">{replyConciseLabel}</option>
-              <option value="detailed">{replyDetailedLabel}</option>
-            </select>
-          </label>
-          <span className="send-shortcut">
-            {isMac ? <><kbd>⌘</kbd> + <kbd>Enter</kbd></> : <><kbd>Ctrl</kbd> + <kbd>Enter</kbd></>}
-            {" "}{sendShortcutLabel}
-          </span>
-        </small>
+        {isMobile ? (
+          <button
+            type="button"
+            className="composer-settings-btn"
+            aria-expanded={settingsOpen}
+            title={settingsSummary}
+            onClick={() => setSettingsOpen(true)}
+          >
+            <span className="composer-settings-label">{t("composerSettings")}</span>
+            <span className="composer-settings-summary">{modelLabel}</span>
+          </button>
+        ) : (
+          <small className="composer-controls">{controls}</small>
+        )}
         <div className="composer-actions">
           {(running || pendingPrompt) && (
             <button type="button" className="stop" onClick={onStop} disabled={online !== true}>
@@ -1534,6 +1585,25 @@ const ConversationComposer = memo(function ConversationComposer({
           <button className="send" disabled={online !== true || !prompt.trim()}>{sendLabel}</button>
         </div>
       </div>
+      {isMobile && settingsOpen ? (
+        <>
+          <button
+            type="button"
+            className="sheet-backdrop"
+            aria-label={t("composerSettingsClose")}
+            onClick={() => setSettingsOpen(false)}
+          />
+          <div className="mobile-sheet composer-settings-sheet" role="dialog" aria-label={t("composerSettings")}>
+            <div className="mobile-sheet-head">
+              <strong>{t("composerSettings")}</strong>
+              <button type="button" className="mobile-sheet-close" onClick={() => setSettingsOpen(false)}>
+                {t("composerSettingsClose")}
+              </button>
+            </div>
+            <div className="composer-settings-body">{controls}</div>
+          </div>
+        </>
+      ) : null}
     </form>
   );
 });
@@ -2924,6 +2994,8 @@ function formatEngineQuotaChip(quota: EngineQuota): string {
 function RunInfoPanel({ info }: { info: RunInfo }) {
   const { locale } = useI18n();
   const isEnglish = locale === "en";
+  const isMobile = useIsMobileConversation();
+  const [expanded, setExpanded] = useState(false);
   const missing = isEnglish ? "Not reported" : "未上报";
   const notApplicable = isEnglish ? "N/A" : "不适用";
   const value = (item: string | undefined, fallback = missing) => item?.trim() || fallback;
@@ -2933,58 +3005,66 @@ function RunInfoPanel({ info }: { info: RunInfo }) {
     : info.thinking === false
       ? (isEnglish ? "Off" : "关闭")
       : info.engine === "cursor" ? missing : notApplicable;
-  const [isMobile, setIsMobile] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(max-width: 700px)").matches
+  const title = isEnglish ? "Runtime" : "本轮运行";
+  const chips = (
+    <div className="run-info-chips">
+      <span className="run-info-chip"><em>{isEnglish ? "Engine" : "引擎"}</em><strong>{cliEngineLabel(info.engine)}</strong></span>
+      <span className="run-info-chip"><em>{isEnglish ? "Model" : "模型"}</em><strong>{value(info.model)}</strong></span>
+      <span className="run-info-chip"><em>Effort</em><strong>{effort}</strong></span>
+      <span className="run-info-chip"><em>Thinking</em><strong>{thinking}</strong></span>
+      {info.endpoint ? (
+        <span className="run-info-chip run-info-endpoint" title={info.endpoint}><em>Endpoint</em><strong>{info.endpoint}</strong></span>
+      ) : null}
+    </div>
   );
-  const [expanded, setExpanded] = useState(false);
+
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    const media = window.matchMedia("(max-width: 700px)");
-    const update = () => {
-      const next = media.matches;
-      setIsMobile(next);
-      if (next) setExpanded(false);
-    };
-    update();
-    media.addEventListener?.("change", update);
-    return () => media.removeEventListener?.("change", update);
-  }, []);
-  const detailsVisible = !isMobile || expanded;
-  const toggleLabel = expanded
-    ? (isEnglish ? "Hide details" : "收起详情")
-    : (isEnglish ? "Show details" : "查看详情");
-  return (
-    <section className={`run-info-panel${isMobile ? " run-info-mobile" : ""}${expanded ? " run-info-expanded" : ""}`} aria-label={isEnglish ? "Current engine runtime" : "当前代码引擎运行信息"}>
-      <div className="run-info-header">
-        <span className="run-info-title">{isEnglish ? "Runtime" : "本轮运行"}</span>
-        <span className="run-info-summary" title={`${cliEngineLabel(info.engine)} · ${value(info.model)}`}>
+    if (!isMobile) setExpanded(false);
+  }, [isMobile]);
+
+  if (isMobile) {
+    return (
+      <>
+        <button
+          type="button"
+          className="meta-chip meta-chip-action run-info-chip-btn"
+          aria-expanded={expanded}
+          aria-label={title}
+          title={`${cliEngineLabel(info.engine)} · ${value(info.model)}`}
+          onClick={() => setExpanded((current) => !current)}
+        >
+          <em>{title}</em>
           <strong>{cliEngineLabel(info.engine)}</strong>
-          <span aria-hidden="true">·</span>
-          <strong>{value(info.model)}</strong>
-        </span>
-        {isMobile ? (
-          <button
-            type="button"
-            className="run-info-toggle"
-            aria-expanded={detailsVisible}
-            aria-label={toggleLabel}
-            title={toggleLabel}
-            onClick={() => setExpanded((current) => !current)}
-          >
-            <span>{expanded ? (isEnglish ? "Less" : "收起") : (isEnglish ? "Details" : "详情")}</span>
-            <span aria-hidden="true">{expanded ? "⌃" : "⌄"}</span>
-          </button>
+        </button>
+        {expanded ? (
+          <>
+            <button
+              type="button"
+              className="sheet-backdrop"
+              aria-label={isEnglish ? "Close" : "关闭"}
+              onClick={() => setExpanded(false)}
+            />
+            <div className="mobile-sheet run-info-sheet" role="dialog" aria-label={title}>
+              <div className="mobile-sheet-head">
+                <strong>{title}</strong>
+                <button type="button" className="mobile-sheet-close" onClick={() => setExpanded(false)}>
+                  {isEnglish ? "Done" : "完成"}
+                </button>
+              </div>
+              {chips}
+            </div>
+          </>
         ) : null}
+      </>
+    );
+  }
+
+  return (
+    <section className="run-info-panel" aria-label={isEnglish ? "Current engine runtime" : "当前代码引擎运行信息"}>
+      <div className="run-info-header">
+        <span className="run-info-title">{title}</span>
       </div>
-      <div className="run-info-chips">
-        <span className="run-info-chip"><em>{isEnglish ? "Engine" : "引擎"}</em><strong>{cliEngineLabel(info.engine)}</strong></span>
-        <span className="run-info-chip"><em>{isEnglish ? "Model" : "模型"}</em><strong>{value(info.model)}</strong></span>
-        <span className="run-info-chip"><em>Effort</em><strong>{effort}</strong></span>
-        <span className="run-info-chip"><em>Thinking</em><strong>{thinking}</strong></span>
-        {info.endpoint ? (
-          <span className="run-info-chip run-info-endpoint" title={info.endpoint}><em>Endpoint</em><strong>{info.endpoint}</strong></span>
-        ) : null}
-      </div>
+      {chips}
     </section>
   );
 }
@@ -3021,6 +3101,7 @@ function TaskConversation({
   onQuotaRefresh(): void;
 }) {
   const { t, locale } = useI18n();
+  const isMobile = useIsMobileConversation();
   const [pendingPrompt, setPendingPrompt] = useState("");
   const [draftClearNonce, setDraftClearNonce] = useState(0);
   const submittingRef = useRef(false);
@@ -3668,8 +3749,9 @@ function TaskConversation({
                 : (locale === "en" ? "Quota" : "查额度")}
             </button>
           )}
+          {isMobile ? <RunInfoPanel info={runInfo} /> : null}
         </div>
-        <RunInfoPanel info={runInfo} />
+        {!isMobile ? <RunInfoPanel info={runInfo} /> : null}
         {QUOTA_QUERY_ENABLED && (taskQuota?.detail || quotaDetail) && (
           <details className="quota-detail-panel">
             <summary>
