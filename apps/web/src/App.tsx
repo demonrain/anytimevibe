@@ -3071,9 +3071,14 @@ function RunInfoPanel({ info }: { info: RunInfo }) {
       <span className="run-info-chip"><em>{isEnglish ? "Model" : "模型"}</em><strong>{value(info.model)}</strong></span>
       <span className="run-info-chip"><em>Effort</em><strong>{effort}</strong></span>
       <span className="run-info-chip"><em>Thinking</em><strong>{thinking}</strong></span>
-      <span className="run-info-chip run-info-endpoint" title={info.endpoint?.trim() || endpoint}>
+      <span className="run-info-chip">
         <em>Endpoint</em>
-        <strong>{endpoint}</strong>
+        <strong
+          className={info.endpoint?.trim() ? "run-info-endpoint-value" : undefined}
+          title={info.endpoint?.trim() || endpoint}
+        >
+          {endpoint}
+        </strong>
       </span>
     </div>
   );
