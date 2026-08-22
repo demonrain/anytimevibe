@@ -3795,17 +3795,26 @@ async function codexRunInfo(model?: string, reasoningEffort?: ReasoningEffort): 
 async function persistAndPublishRunInfo(threadId: string, turnId: string, runInfo: RunInfo): Promise<void> {
   const task = taskStore.get(threadId);
   if (task) {
-    task.runInfo = runInfo;
+    // Preserve endpoint when a later sample only refreshes model/effort.
+    const previous = task.runInfo;
+    task.runInfo = {
+      ...(previous ?? {}),
+      ...runInfo,
+      ...(runInfo.endpoint?.trim()
+        ? { endpoint: runInfo.endpoint.trim() }
+        : (previous?.endpoint?.trim() ? { endpoint: previous.endpoint.trim() } : {}))
+    };
     task.updatedAt = Date.now() / 1000;
     await taskStore.upsert(task);
   }
+  const published = taskStore.get(threadId)?.runInfo ?? runInfo;
   await publish({
     type: "turn.info",
     eventId: crypto.randomUUID(),
     occurredAt: new Date().toISOString(),
     threadId,
     turnId,
-    runInfo
+    runInfo: published
   }, true);
 }
 

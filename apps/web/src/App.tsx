@@ -1786,7 +1786,17 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const engine = event.cliEngine ?? existing?.cliEngine;
     const model = event.model ?? existing?.model;
     const reasoningEffort = event.reasoningEffort ?? existing?.reasoningEffort;
-    const runInfo = event.runInfo ?? existing?.runInfo;
+    const incomingRunInfo = event.runInfo;
+    const existingRunInfo = existing?.runInfo;
+    const runInfo = incomingRunInfo
+      ? {
+          ...(existingRunInfo ?? {}),
+          ...incomingRunInfo,
+          ...(incomingRunInfo.endpoint?.trim()
+            ? { endpoint: incomingRunInfo.endpoint.trim() }
+            : (existingRunInfo?.endpoint?.trim() ? { endpoint: existingRunInfo.endpoint.trim() } : {}))
+        }
+      : existingRunInfo;
     const contextUsage = event.contextUsage ?? existing?.contextUsage;
     const providerSessionId = event.providerSessionId ?? existing?.providerSessionId;
     // Never let a stale snapshot push a recently active task down the list.
@@ -1943,7 +1953,14 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   next.tasks[event.threadId] = task;
   task.updatedAt = Date.now() / 1000;
   if (event.type === "turn.info") {
-    task.runInfo = event.runInfo;
+    // Merge so a later model-only turn.info does not wipe endpoint from the first sample.
+    task.runInfo = {
+      ...(task.runInfo ?? {}),
+      ...event.runInfo,
+      ...(event.runInfo.endpoint?.trim()
+        ? { endpoint: event.runInfo.endpoint.trim() }
+        : (task.runInfo?.endpoint?.trim() ? { endpoint: task.runInfo.endpoint.trim() } : {}))
+    };
     task.cliEngine = event.runInfo.engine;
     if (event.runInfo.model) task.model = event.runInfo.model;
     if (event.runInfo.reasoningEffort) task.reasoningEffort = event.runInfo.reasoningEffort;
@@ -3047,15 +3064,17 @@ function RunInfoPanel({ info }: { info: RunInfo }) {
       ? (isEnglish ? "Off" : "关闭")
       : info.engine === "cursor" ? missing : notApplicable;
   const title = isEnglish ? "Runtime" : "本轮运行";
+  const endpoint = value(info.endpoint);
   const chips = (
     <div className="run-info-chips">
       <span className="run-info-chip"><em>{isEnglish ? "Engine" : "引擎"}</em><strong>{cliEngineLabel(info.engine)}</strong></span>
       <span className="run-info-chip"><em>{isEnglish ? "Model" : "模型"}</em><strong>{value(info.model)}</strong></span>
       <span className="run-info-chip"><em>Effort</em><strong>{effort}</strong></span>
       <span className="run-info-chip"><em>Thinking</em><strong>{thinking}</strong></span>
-      {info.endpoint ? (
-        <span className="run-info-chip run-info-endpoint" title={info.endpoint}><em>Endpoint</em><strong>{info.endpoint}</strong></span>
-      ) : null}
+      <span className="run-info-chip run-info-endpoint" title={info.endpoint?.trim() || endpoint}>
+        <em>Endpoint</em>
+        <strong>{endpoint}</strong>
+      </span>
     </div>
   );
 
@@ -3188,7 +3207,9 @@ function TaskConversation({
       : {}),
     ...(task.runInfo?.thinking !== undefined || task.thinking !== undefined
       ? { thinking: task.runInfo?.thinking ?? task.thinking }
-      : {})
+      : {}),
+    // Keep endpoint even when later snapshots omit it.
+    ...(task.runInfo?.endpoint?.trim() ? { endpoint: task.runInfo.endpoint.trim() } : {})
   };
   const cap = capabilityForEngine(engineCapabilities, taskEngine);
   // Avoid localStorage prefs reads on every parent re-render (streaming deltas).
