@@ -12,6 +12,7 @@ import { formatAgySpawnArgs, formatCursorModelArg, parseCursorModelRef } from ".
 import { explainGrokSerializationError, prepareGrokResponsesCompat } from "./grok-responses-compat";
 import { isCodexModelsManagerNoise, stripAnsi } from "./log-noise";
 import { headlessPermissionArgs } from "./permission-args";
+import { appendEngineDiffChunk, extractFileChangeDiff } from "./task-diff";
 import type { ApprovalPlan, ApprovalQuestion, BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
 import { ensureWorkspaceTrusted } from "./workspace-trust";
 
@@ -326,10 +327,30 @@ function formatAgyPrintTimeout(ms: number): string {
 function usageFromUnknown(raw: unknown, contextWindow?: number): ContextUsage | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const u = raw as Record<string, unknown>;
-  const input = Number(u.input_tokens ?? u.inputTokens ?? u.prompt_tokens ?? 0) || 0;
-  const output = Number(u.output_tokens ?? u.outputTokens ?? u.completion_tokens ?? 0) || 0;
-  const total = Number(u.total_tokens ?? u.totalTokens ?? input + output) || input + output;
-  const window = contextWindow || Number(u.context_window ?? u.contextWindow ?? 0) || undefined;
+  const nested = [u, asRecord(u.usage), asRecord(u.token_usage), asRecord(u.tokenUsage), asRecord(u.metrics)]
+    .filter((value): value is Record<string, unknown> => Boolean(value));
+  const numberFrom = (keys: string[]): number => {
+    for (const source of nested) {
+      for (const key of keys) {
+        const value = Number(source[key]);
+        if (Number.isFinite(value) && value >= 0) return value;
+      }
+    }
+    return 0;
+  };
+  const input = numberFrom(["input_tokens", "inputTokens", "prompt_tokens", "promptTokens"]);
+  const output = numberFrom(["output_tokens", "outputTokens", "completion_tokens", "completionTokens"]);
+  const cachedInput = numberFrom([
+    "cached_input_tokens", "cachedInputTokens", "cache_read_input_tokens", "cacheReadInputTokens",
+    "cache_read_tokens", "cacheReadTokens", "prompt_cache_tokens"
+  ]);
+  const reasoning = numberFrom([
+    "reasoning_tokens", "reasoningTokens", "thinking_tokens", "thinkingTokens",
+    "reasoning_output_tokens", "reasoningOutputTokens"
+  ]);
+  const reportedTotal = numberFrom(["total_tokens", "totalTokens", "total_token_count", "totalTokenCount"]);
+  const total = reportedTotal || (input + output + reasoning);
+  const window = contextWindow || numberFrom(["context_window", "contextWindow", "max_context_tokens", "maxContextTokens"]) || undefined;
   // Optional subscription / rate-limit pool when CLI surfaces it.
   const planRemaining = Number(
     u.plan_remaining ?? u.planRemaining ?? u.rate_limit_remaining ?? u.rateLimitRemaining ?? 0
@@ -341,10 +362,12 @@ function usageFromUnknown(raw: unknown, contextWindow?: number): ContextUsage | 
   const planLabel = typeof planLabelRaw === "string" && planLabelRaw.trim()
     ? planLabelRaw.trim().slice(0, 80)
     : undefined;
-  if (!input && !output && !total && planRemaining == null && !planLabel) return undefined;
+  if (!input && !output && !cachedInput && !reasoning && !total && planRemaining == null && !planLabel) return undefined;
   return {
     ...(input ? { inputTokens: input } : {}),
     ...(output ? { outputTokens: output } : {}),
+    ...(cachedInput ? { cachedInputTokens: cachedInput } : {}),
+    ...(reasoning ? { reasoningTokens: reasoning } : {}),
     ...(total ? { totalTokens: total } : {}),
     ...(window ? { contextWindow: window } : {}),
     ...(window && total ? { remainingTokens: Math.max(0, window - total) } : {}),
@@ -352,6 +375,41 @@ function usageFromUnknown(raw: unknown, contextWindow?: number): ContextUsage | 
     ...(planLimit ? { planLimit } : {}),
     ...(planLabel ? { planLabel } : {})
   };
+}
+
+function mergeContextUsage(previous: ContextUsage | undefined, next: ContextUsage): ContextUsage {
+  const merged = { ...(previous ?? {}), ...next };
+  const input = merged.inputTokens ?? 0;
+  const output = merged.outputTokens ?? 0;
+  const reasoning = merged.reasoningTokens ?? 0;
+  if (merged.totalTokens == null && (input || output || reasoning)) merged.totalTokens = input + output + reasoning;
+  if (merged.contextWindow != null && merged.totalTokens != null && merged.remainingTokens == null) {
+    merged.remainingTokens = Math.max(0, merged.contextWindow - merged.totalTokens);
+  }
+  return merged;
+}
+
+function captureReportedDiff(threadId: string, value: unknown, depth = 0): void {
+  if (!value || depth > 4) return;
+  if (Array.isArray(value)) {
+    for (const item of value) captureReportedDiff(threadId, item, depth + 1);
+    return;
+  }
+  if (typeof value !== "object") return;
+  const record = value as Record<string, any>;
+  const marker = String(record.type ?? record.name ?? record.tool ?? record.kind ?? record.action ?? "").toLowerCase();
+  const hasPatch = ["diff", "patch", "unifiedDiff", "unified_diff", "old_string", "oldString", "new_string", "newString", "content"].some((key) => {
+    const candidate = record[key];
+    return typeof candidate === "string" && candidate.trim().length > 0;
+  });
+  const fileLike = marker.includes("file") || marker.includes("write") || marker.includes("edit") || marker.includes("patch") || marker.includes("apply") || hasPatch;
+  if (fileLike) {
+    const patch = extractFileChangeDiff(record);
+    if (patch) appendEngineDiffChunk(threadId, patch);
+  }
+  for (const key of ["item", "message", "content", "result", "step_update", "tool_call", "toolCall", "tool_info", "toolInfo"]) {
+    if (record[key] && record[key] !== value) captureReportedDiff(threadId, record[key], depth + 1);
+  }
 }
 
 function emitDelta(
@@ -581,8 +639,14 @@ function handleClaudeLine(
     emitDelta(onEvent, options, "cli-log", "cli-log", `${line}\n`);
     return;
   }
+  captureReportedDiff(options.threadId, parsed);
   const type = String(parsed.type || "");
   noteClaudeSessionId(state, parsed);
+  const liveUsage = usageFromUnknown(parsed.usage ?? parsed.message?.usage ?? parsed.usage_metadata, Number(parsed.context_window ?? parsed.contextWindow) || undefined);
+  if (liveUsage) {
+    state.contextUsage = mergeContextUsage(state.contextUsage, liveUsage);
+    onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
+  }
 
   if (type === "system") {
     const subtype = String(parsed.subtype || "");
@@ -706,9 +770,12 @@ function handleClaudeLine(
   }
   if (type === "result") {
     noteClaudeSessionId(state, parsed);
-    const usage = usageFromUnknown(parsed.usage, Number(parsed.context_window) || undefined);
+    const usage = usageFromUnknown(
+      parsed.usage ?? parsed.result?.usage ?? parsed.message?.usage ?? parsed,
+      Number(parsed.context_window ?? parsed.contextWindow) || undefined
+    );
     if (usage) {
-      state.contextUsage = usage;
+      state.contextUsage = mergeContextUsage(state.contextUsage, usage);
       onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
     }
     if (typeof parsed.result === "string" && parsed.result) {
@@ -754,8 +821,14 @@ function handleCursorLine(
     emitDelta(onEvent, options, "cli-log", "cli-log", `${line}\n`);
     return;
   }
+  captureReportedDiff(options.threadId, parsed);
   const type = String(parsed.type || "");
   if (parsed.session_id) state.sessionId = String(parsed.session_id);
+  const liveUsage = usageFromUnknown(parsed.usage ?? parsed.metrics, Number(parsed.context_window ?? parsed.contextWindow) || undefined);
+  if (liveUsage) {
+    state.contextUsage = mergeContextUsage(state.contextUsage, liveUsage);
+    onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
+  }
 
   if (type === "system") {
     const subtype = String(parsed.subtype || "");
@@ -965,6 +1038,14 @@ function handleCursorLine(
       emitDelta(onEvent, options, "assistant", "assistant", parsed.result);
     }
     const duration = Number(parsed.duration_ms || 0);
+    const usage = usageFromUnknown(
+      parsed.usage ?? parsed.result?.usage ?? parsed.metrics ?? parsed,
+      Number(parsed.context_window ?? parsed.contextWindow) || undefined
+    );
+    if (usage) {
+      state.contextUsage = mergeContextUsage(state.contextUsage, usage);
+      onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
+    }
     emitDelta(
       onEvent,
       options,
@@ -989,7 +1070,13 @@ function handleGrokLine(
     emitDelta(onEvent, options, "cli-log", "cli-log", `${line}\n`);
     return;
   }
+  captureReportedDiff(options.threadId, parsed);
   const type = String(parsed.type || "");
+  const liveUsage = usageFromUnknown(parsed.usage ?? parsed.response?.usage ?? parsed.result?.usage, Number(parsed.context_window ?? parsed.contextWindow) || undefined);
+  if (liveUsage) {
+    state.contextUsage = mergeContextUsage(state.contextUsage, liveUsage);
+    onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
+  }
   if (type === "text" && parsed.data != null) {
     state.text += String(parsed.data);
     state.sawAssistant = true;
@@ -1018,9 +1105,12 @@ function handleGrokLine(
   }
   if (type === "end") {
     if (parsed.sessionId) state.sessionId = String(parsed.sessionId);
-    const usage = usageFromUnknown(parsed.usage, Number(parsed.context_window ?? parsed.contextWindow) || undefined);
+    const usage = usageFromUnknown(
+      parsed.usage ?? parsed.response?.usage ?? parsed.result?.usage ?? parsed.metrics ?? parsed,
+      Number(parsed.context_window ?? parsed.contextWindow) || undefined
+    );
     if (usage) {
-      state.contextUsage = usage;
+      state.contextUsage = mergeContextUsage(state.contextUsage, usage);
       onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
     }
     if (!state.sawAssistant && typeof parsed.text === "string" && parsed.text) {
@@ -1266,6 +1356,7 @@ function handleAntigravityLine(
     emitDelta(onEvent, options, "cli-log", "cli-log", `${line}\n`);
     return;
   }
+  captureReportedDiff(options.threadId, parsed);
 
   const eventName = String(parsed.event || "");
   // stream-json puts conversation_id on the top-level envelope for init/result.
@@ -1287,7 +1378,7 @@ function handleAntigravityLine(
     const stepType = String(step.step_type || "").toLowerCase();
     const usage = usageFromUnknown(step.usage);
     if (usage) {
-      state.contextUsage = usage;
+      state.contextUsage = mergeContextUsage(state.contextUsage, usage);
       onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
     }
     if (stepType === "user_input" || stepType === "checkpoint") return;
@@ -1345,7 +1436,7 @@ function handleAntigravityLine(
     if (resultConversationId) state.sessionId = resultConversationId;
     const usage = usageFromUnknown(result.usage);
     if (usage) {
-      state.contextUsage = usage;
+      state.contextUsage = mergeContextUsage(state.contextUsage, usage);
       onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
     }
     const finalText = typeof result.response === "string" ? result.response : agyStepText(result);

@@ -169,6 +169,10 @@ export type EngineCapability = z.infer<typeof engineCapabilitySchema>;
 export const contextUsageSchema = z.object({
   inputTokens: z.number().nonnegative().optional(),
   outputTokens: z.number().nonnegative().optional(),
+  /** Tokens served from the provider prompt cache, when reported. */
+  cachedInputTokens: z.number().nonnegative().optional(),
+  /** Reasoning / thinking tokens, when reported separately. */
+  reasoningTokens: z.number().nonnegative().optional(),
   totalTokens: z.number().nonnegative().optional(),
   /** Model context window size when known. */
   contextWindow: z.number().positive().optional(),

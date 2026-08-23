@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -6,15 +8,27 @@ const MAX_DIFF_CHARS = 400_000;
 
 /** In-turn patches reported by the engine (Codex fileChange, etc.). */
 const engineDiffChunks = new Map<string, string[]>();
+const gitDiffBaselines = new Map<string, string>();
 
 export function clearEngineDiffChunks(threadId: string): void {
   engineDiffChunks.delete(threadId);
+}
+
+/** Capture the dirty workspace before a turn so unchanged pre-existing edits are excluded. */
+export async function captureTurnDiffBaseline(threadId: string, cwd: string | undefined): Promise<void> {
+  const root = cwd?.trim();
+  if (!root) {
+    gitDiffBaselines.set(threadId, "");
+    return;
+  }
+  gitDiffBaselines.set(threadId, await collectGitWorkspaceDiff(root).catch(() => ""));
 }
 
 export function appendEngineDiffChunk(threadId: string, chunk: string): void {
   const text = chunk.trimEnd();
   if (!text) return;
   const list = engineDiffChunks.get(threadId) ?? [];
+  if (list.includes(text)) return;
   list.push(text);
   // Bound memory for long turns.
   while (list.join("\n\n").length > MAX_DIFF_CHARS && list.length > 1) list.shift();
@@ -55,6 +69,27 @@ export function extractFileChangeDiff(item: Record<string, any>): string {
       parts.push(`diff --git a/${filePath} b/${filePath}\n--- a/${filePath}\n+++ b/${filePath}\n@@ // ${kind} @@`);
     }
   }
+  const tool = item.tool_call ?? item.toolCall ?? item.tool_info ?? item.toolInfo ?? item;
+  const input = tool.input ?? tool.args ?? tool.arguments ?? tool.params ?? tool;
+  if (input && typeof input === "object") {
+    const filePath = String(input.file_path ?? input.filePath ?? input.path ?? input.filename ?? "").trim();
+    const patch = String(input.patch ?? input.diff ?? input.unified_diff ?? input.unifiedDiff ?? "").trim();
+    if (patch) {
+      if (patch.startsWith("diff ") || patch.startsWith("--- ") || patch.startsWith("+++ ")) parts.push(patch);
+      else if (filePath) parts.push(`--- a/${filePath}\n+++ b/${filePath}\n${patch}`);
+    } else if (filePath) {
+      const before = input.old_string ?? input.oldString ?? input.before ?? input.original;
+      const after = input.new_string ?? input.newString ?? input.after ?? input.content;
+      if (typeof before === "string" && typeof after === "string" && before !== after) {
+        const removed = before.split(/\r?\n/).map((line: string) => `-${line}`).join("\n");
+        const added = after.split(/\r?\n/).map((line: string) => `+${line}`).join("\n");
+        parts.push(`diff --git a/${filePath} b/${filePath}\n--- a/${filePath}\n+++ b/${filePath}\n@@ -1 +1 @@\n${removed}\n${added}`);
+      } else if (typeof after === "string" && after) {
+        const added = after.split(/\r?\n/).map((line: string) => `+${line}`).join("\n");
+        parts.push(`diff --git a/${filePath} b/${filePath}\n--- /dev/null\n+++ b/${filePath}\n@@ -0,0 +1 @@\n${added}`);
+      }
+    }
+  }
   return parts.join("\n\n").trim();
 }
 
@@ -87,12 +122,11 @@ export async function collectGitWorkspaceDiff(cwd: string): Promise<string> {
   const unstaged = (await runGit(root, ["diff", "--no-color", "--find-renames"])).trimEnd();
   const staged = (await runGit(root, ["diff", "--cached", "--no-color", "--find-renames"])).trimEnd();
 
-  // For untracked files, show a simple "new file" header list (full content can be huge).
-  const untracked = status
+  // Git's normal diff omits untracked files. Read small text files so a newly
+  // created file has an actionable patch instead of only a filename header.
+  const untracked = (await runGit(root, ["ls-files", "--others", "--exclude-standard"]))
     .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter((line) => line.startsWith("?? "))
-    .map((line) => line.slice(3).trim())
+    .map((line) => line.trim())
     .filter(Boolean);
 
   const sections: string[] = [];
@@ -106,10 +140,22 @@ export async function collectGitWorkspaceDiff(cwd: string): Promise<string> {
     sections.push(unstaged);
   }
   if (untracked.length) {
-    const headers = untracked.map((file) => {
+    const headers: string[] = [];
+    for (const file of untracked) {
       const safe = file.replace(/\\/g, "/");
-      return `diff --git a/${safe} b/${safe}\nnew file mode 100644\n--- /dev/null\n+++ b/${safe}\n@@ // untracked @@`;
-    });
+      try {
+        const content = await fs.readFile(path.join(root, file));
+        if (content.length > 200_000 || content.includes(0)) {
+          headers.push(`diff --git a/${safe} b/${safe}\nnew file mode 100644\nBinary files /dev/null and b/${safe} differ`);
+          continue;
+        }
+        const text = content.toString("utf8").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        const body = text ? text.split("\n").map((line) => `+${line}`).join("\n") : "+";
+        headers.push(`diff --git a/${safe} b/${safe}\nnew file mode 100644\n--- /dev/null\n+++ b/${safe}\n@@ -0,0 +1,${text ? text.split("\n").length : 1} @@\n${body}`);
+      } catch {
+        headers.push(`diff --git a/${safe} b/${safe}\nnew file mode 100644\n--- /dev/null\n+++ b/${safe}\n@@ // untracked @@`);
+      }
+    }
     sections.push(headers.join("\n"));
   }
 
@@ -124,6 +170,8 @@ export async function buildTurnDiff(threadId: string, cwd: string | undefined): 
   const engineParts = engineDiffChunks.get(threadId) ?? [];
   engineDiffChunks.delete(threadId);
   const engineDiff = engineParts.join("\n\n").trim();
+  const baseline = gitDiffBaselines.get(threadId) ?? "";
+  gitDiffBaselines.delete(threadId);
 
   let gitDiff = "";
   if (cwd?.trim()) {
@@ -134,8 +182,31 @@ export async function buildTurnDiff(threadId: string, cwd: string | undefined): 
     }
   }
 
-  if (gitDiff) return gitDiff.slice(0, MAX_DIFF_CHARS);
-  return engineDiff.slice(0, MAX_DIFF_CHARS);
+  if (gitDiff && engineDiff) {
+    const gitPaths = new Set(summarizeDiffPaths(gitDiff, 1000));
+    const engineOnly = engineParts.filter((part) => {
+      const paths = summarizeDiffPaths(part, 1000);
+      return paths.length === 0 || paths.some((file) => !gitPaths.has(file));
+    });
+    const seen = new Set<string>();
+    const blocks = [gitDiff, ...engineOnly]
+      .flatMap((value) => value.split(/(?=^diff --git )/m))
+      .map((value) => value.trim())
+      .filter((value) => value && !seen.has(value) && seen.add(value));
+    return blocks.join("\n\n").slice(0, MAX_DIFF_CHARS);
+  }
+
+  if (gitDiff && baseline) {
+    const baselineBlocks = new Set(
+      baseline.split(/(?=^diff --git )/m).filter((block) => block.startsWith("diff --git ")).map((block) => block.trim())
+    );
+    gitDiff = gitDiff
+      .split(/(?=^diff --git )/m)
+      .filter((block) => block.startsWith("diff --git ") && !baselineBlocks.has(block.trim()))
+      .map((block) => block.trim())
+      .join("\n\n");
+  }
+  return (gitDiff || engineDiff).slice(0, MAX_DIFF_CHARS);
 }
 
 /** List of paths mentioned in a unified diff / status blob (for UI summaries). */

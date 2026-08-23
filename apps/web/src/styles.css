@@ -1028,9 +1028,14 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .diff-panel { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
 .diff-file-list { padding: 12px 14px; border-bottom: 1px solid var(--line); background: rgba(255,250,240,.9); min-width: 0; }
 .diff-file-list strong { display: block; font-size: 12px; margin-bottom: 8px; color: var(--ink); }
-.diff-file-list ul { margin: 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 6px; max-height: 96px; overflow: auto; }
-.diff-file-list li { margin: 0; }
-.diff-file-list code { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; padding: 3px 8px; border-radius: 8px; background: rgba(23,33,27,.06); color: #2a332c; }
+.diff-file-list ul { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 6px; max-height: 132px; overflow: auto; }
+.diff-file-list li { margin: 0; min-width: 0; }
+.diff-file-list button { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; border: 1px solid transparent; border-radius: 8px; padding: 5px 7px; background: rgba(23,33,27,.06); color: #2a332c; cursor: pointer; text-align: left; }
+.diff-file-list button:hover, .diff-file-list button.selected { border-color: rgba(45,118,83,.45); background: rgba(45,118,83,.12); }
+.diff-file-list code { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: #2a332c; }
+.diff-file-status, .diff-file-list small { flex: 0 0 auto; font-size: 10px; font-weight: 800; }
+.diff-file-status { color: #2d7653; }
+.diff-file-status.added { color: #2f8a58; }.diff-file-status.deleted { color: #b34735; }.diff-file-status.renamed { color: #9b7b27; }
 .diff-view { min-width: 0; min-height: 0; overflow: auto; padding: 12px 0; font: 11px/1.5 "Cascadia Code", Consolas, monospace; background: #18201b; color: #d5d9d1; }
 .diff-view div { padding: 0 14px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%; }
 .diff-view .add { background: rgba(60,160,99,.2); color: #b9efca; }
@@ -1040,6 +1045,15 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .diff-empty { display: grid; place-content: center; gap: 8px; text-align: left; color: #747a73; padding: 28px 24px; min-width: 0; max-width: 420px; margin: 0 auto; }
 .diff-empty strong { color: var(--ink); font-size: 15px; }
 .diff-empty p, .diff-empty ul { margin: 0; font-size: 13px; line-height: 1.55; }
+@media (max-width: 700px) {
+  .diff-file-list { padding: 9px 10px; }
+  .diff-file-list strong { margin-bottom: 6px; }
+  .diff-file-list ul { display: flex; flex-wrap: nowrap; max-height: none; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+  .diff-file-list ul::-webkit-scrollbar { display: none; }
+  .diff-file-list li { flex: 0 0 min(78vw, 260px); }
+  .diff-view { font-size: 10.5px; }
+  .diff-view div { padding-inline: 10px; }
+}
 .diff-empty ul { padding-left: 1.2em; }
 .conversation-empty { display: grid; place-content: center; text-align: center; color: #747a73; padding: 24px; min-width: 0; grid-row: 1 / -1; }
 .orbit { width: 72px; height: 72px; border: 2px solid var(--rust); border-radius: 50%; margin: auto; position: relative; }
@@ -1447,15 +1461,16 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
     margin-top: 5px;
   }
   .workspace.mobile-conversation .composer-settings-btn {
-    flex: 0 0 auto;
+    flex: 1 1 auto;
     display: inline-flex;
     align-items: center;
-    justify-content: center;
+    justify-content: flex-start;
+    gap: 5px;
     margin-right: auto;
     min-height: 36px;
-    min-width: 52px;
-    max-width: 72px;
-    padding: 6px 12px;
+    min-width: 0;
+    max-width: none;
+    padding: 5px 7px;
     border: 1px solid var(--line);
     border-radius: 10px;
     background: rgba(255, 250, 240, 0.9);
@@ -1464,11 +1479,40 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
     font-weight: 850;
     cursor: pointer;
     white-space: nowrap;
+    overflow: hidden;
+  }
+  .workspace.mobile-conversation .composer-settings-summary {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .workspace.mobile-conversation .composer-settings-summary-item {
+    display: none;
+    flex: 0 0 auto;
+    min-width: 0;
+    max-width: 7.5rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 3px 6px;
+    border-radius: 6px;
+    background: rgba(45, 118, 83, 0.09);
+    color: #315a43;
+    font-size: 10px;
+    line-height: 1.3;
+    font-weight: 800;
+  }
+  .workspace.mobile-conversation .composer-settings-summary-model {
+    display: block;
+    flex: 1 1 auto;
   }
   .workspace.mobile-conversation .composer-settings-label {
     flex: 0 0 auto;
     color: inherit;
     font-weight: inherit;
+    font-size: 10px;
   }
   .workspace.mobile-conversation .composer-actions {
     flex: 0 0 auto;
@@ -1481,6 +1525,21 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
     padding: 7px 12px;
   }
   .workspace.mobile-conversation .mobile-back { position: relative; z-index: 3; }
+}
+@media (min-width: 360px) and (max-width: 700px) {
+  .workspace.mobile-conversation .composer-settings-summary-effort {
+    display: block;
+  }
+}
+@media (min-width: 430px) and (max-width: 700px) {
+  .workspace.mobile-conversation .composer-settings-summary-mode {
+    display: block;
+  }
+}
+@media (max-width: 339px) {
+  .workspace.mobile-conversation .composer-settings-label {
+    display: none;
+  }
 }
 @media (max-width: 700px) {
   .composer textarea { max-height: 180px; }

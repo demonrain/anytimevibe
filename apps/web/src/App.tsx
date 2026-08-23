@@ -344,6 +344,10 @@ type ContextUsageView = {
   remainingTokens: number | null;
   contextWindow: number | null;
   totalTokens: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedInputTokens: number | null;
+  reasoningTokens: number | null;
   planLabel: string | null;
   planRemaining: number | null;
   planLimit: number | null;
@@ -374,6 +378,10 @@ function parseContextUsageView(usage?: ContextUsage): ContextUsageView | null {
     remainingTokens: remaining,
     contextWindow: window,
     totalTokens: total || null,
+    inputTokens: usage.inputTokens ?? null,
+    outputTokens: usage.outputTokens ?? null,
+    cachedInputTokens: usage.cachedInputTokens ?? null,
+    reasoningTokens: usage.reasoningTokens ?? null,
     planLabel,
     planRemaining,
     planLimit,
@@ -394,6 +402,10 @@ function contextUsageTitle(view: ContextUsageView): string {
   if (view.remainingTokens != null && view.contextWindow != null) {
     parts.push(`上下文剩余 ${compactTokenCount(view.remainingTokens)}`);
   }
+  if (view.inputTokens != null) parts.push(`输入 ${compactTokenCount(view.inputTokens)}`);
+  if (view.outputTokens != null) parts.push(`输出 ${compactTokenCount(view.outputTokens)}`);
+  if (view.cachedInputTokens != null) parts.push(`缓存 ${compactTokenCount(view.cachedInputTokens)}`);
+  if (view.reasoningTokens != null) parts.push(`思考 ${compactTokenCount(view.reasoningTokens)}`);
   if (view.planLabel || view.planRemaining != null) {
     const plan = view.planLabel || "订阅额度";
     if (view.planRemaining != null && view.planLimit != null) {
@@ -1517,8 +1529,15 @@ const ConversationComposer = memo(function ConversationComposer({
   const settingsSummary = [
     modelLabel,
     reasoningEffort || null,
+    taskEngine === "cursor" && modelMeta?.supportsFast && fastMode ? "Fast" : null,
+    taskEngine === "cursor" && supportsThinking ? `Thinking ${thinkingMode ? "On" : "Off"}` : null,
     permissionOptions.find((option) => option.value === permissionMode)?.label || null
   ].filter(Boolean).join(" · ");
+  const compactModeLabel = taskEngine === "cursor" && modelMeta?.supportsFast && fastMode
+    ? "Fast"
+    : taskEngine === "cursor" && supportsThinking
+      ? `Think ${thinkingMode ? "On" : "Off"}`
+      : "";
 
   const controls = (
     <>
@@ -1617,6 +1636,21 @@ const ConversationComposer = memo(function ConversationComposer({
             title={settingsSummary}
             onClick={() => setSettingsOpen(true)}
           >
+            <span className="composer-settings-summary" aria-hidden="true">
+              <span className="composer-settings-summary-item composer-settings-summary-model" title={modelLabel}>
+                {modelLabel}
+              </span>
+              {reasoningEffort ? (
+                <span className="composer-settings-summary-item composer-settings-summary-effort">
+                  Effort {reasoningEffort}
+                </span>
+              ) : null}
+              {compactModeLabel ? (
+                <span className="composer-settings-summary-item composer-settings-summary-mode">
+                  {compactModeLabel}
+                </span>
+              ) : null}
+            </span>
             <span className="composer-settings-label">{t("composerSettings")}</span>
           </button>
         ) : (
@@ -1813,11 +1847,11 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const status = preferExistingStatus ? existingStatus : (incomingStatus || existingStatus || "unknown");
     const terminalStatus = isFailedTaskStatus(status)
       || /^(completed|complete|success|succeeded|idle)$/i.test(status);
-    // Snapshots from agent often omit activeTurnId; do not clear a live turn mid-run
-    // (cleared activeTurnId also breaks queue UI cleanup and looks like a double YOU bubble).
+    // A snapshot without activeTurnId is authoritative unless an approval card is
+    // still open. This lets reconnect/sync clear stale "processing" state.
     const activeTurnId = terminalStatus
       ? undefined
-      : (event.activeTurnId || existing?.activeTurnId);
+      : (event.activeTurnId || (existing?.approvals.length ? existing.activeTurnId : undefined));
     const incomingMessages = event.messages?.length ? event.messages : [];
     const hasOlderMessages = Boolean(event.hasOlderMessages);
     const rawMessages = sanitizeTranscriptMessages(
@@ -1848,7 +1882,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       status,
       updatedAt: updatedAt || Date.now() / 1000,
       // Prefer snapshot-persisted diff (survives reconnect); keep existing if absent.
-      diff: ("diff" in event && typeof event.diff === "string" && event.diff)
+      diff: ("diff" in event && typeof event.diff === "string")
         ? event.diff
         : (existing?.diff ?? ""),
       messages: dedupeAdjacentUserMessages(rawMessages),
@@ -2918,7 +2952,10 @@ function TaskListRow({
   onDelete(): void;
 }) {
   const { t } = useI18n();
-  const status = taskStatusMeta(task.status);
+  const effectiveStatus = isInProgressTaskStatus(task.status) && !task.activeTurnId && task.approvals.length === 0
+    ? "idle"
+    : task.status;
+  const status = taskStatusMeta(effectiveStatus);
   const engine = task.cliEngine ? normalizeCliEngine(task.cliEngine) : undefined;
   const updated = new Date(task.updatedAt * 1000);
   const timeLabel = Number.isFinite(updated.getTime())
@@ -3273,8 +3310,10 @@ function TaskConversation({
   const historyRequestTokenRef = useRef(0);
   const historyInFlightRef = useRef(false);
   const [historyLoading, setHistoryLoading] = useState(false);
-  // After a page refresh, snapshots often omit activeTurnId while status is still 进行中.
-  const running = Boolean(task.activeTurnId) || isInProgressTaskStatus(task.status);
+  // A persisted "active" status can outlive a dropped relay notification. Treat a
+  // task as running only while the agent exposes a live turn or an approval card.
+  // This prevents an idle Codex thread from blocking the composer forever.
+  const running = Boolean(task.activeTurnId) || task.approvals.length > 0;
   const permissionOptions = useMemo(
     () => permissionOptionsForEngine(taskEngine, locale),
     [taskEngine, locale]
@@ -3908,42 +3947,62 @@ function TaskConversation({
   </>;
 }
 
-function listDiffPaths(diff: string): string[] {
-  const paths = new Set<string>();
+type ParsedDiffFile = {
+  path: string;
+  status: "modified" | "added" | "deleted" | "renamed" | "unknown";
+  patch: string;
+  additions: number;
+  deletions: number;
+};
+
+function parseDiffFiles(diff: string): ParsedDiffFile[] {
+  const entries = new Map<string, ParsedDiffFile>();
+  const statusByPath = new Map<string, ParsedDiffFile["status"]>();
   let inStatus = false;
   for (const raw of diff.split(/\r?\n/)) {
     const line = raw.trimEnd();
-    if (line === "# git status") {
-      inStatus = true;
-      continue;
-    }
+    if (line === "# git status") { inStatus = true; continue; }
     if (inStatus) {
-      if (line.startsWith("# ") || line.startsWith("diff ")) {
-        inStatus = false;
-      } else {
-        const status = line.match(/^[ MADRCU?]{1,2}\s+(.+)$/);
-        if (status?.[1]) {
-          paths.add(status[1].replace(/^.* -> /, "").trim());
-          continue;
+      if (line.startsWith("# ") || line.startsWith("diff ")) { inStatus = false; }
+      else {
+        const match = line.match(/^([ MADRCU?]{1,2})\s+(.+)$/);
+        if (match?.[1] && match[2]) {
+          const code = match[1].trim();
+          const path = match[2].replace(/^.* -> /, "").trim();
+          if (path) statusByPath.set(path, code.includes("?") ? "added" : code.includes("D") ? "deleted" : code.includes("R") ? "renamed" : "modified");
         }
-        if (!line.trim()) {
-          inStatus = false;
-          continue;
-        }
+        if (!line.trim()) inStatus = false;
       }
     }
-    const git = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
-    if (git?.[2]) {
-      paths.add(git[2]);
-      continue;
-    }
-    const plus = line.match(/^\+\+\+ b\/(.+)$/);
-    if (plus?.[1] && plus[1] !== "/dev/null") paths.add(plus[1]);
   }
-  return [...paths].filter(Boolean);
+  const blocks = diff.split(/(?=^diff --git )/m).filter((block) => /^diff --git /m.test(block));
+  for (const block of blocks) {
+    const header = block.match(/^diff --git a\/(.+?) b\/(.+)$/m);
+    const plus = block.match(/^\+\+\+ b\/(.+)$/m);
+    const minus = block.match(/^--- a\/(.+)$/m);
+    const filePath = header?.[2] || (plus?.[1] && plus[1] !== "/dev/null" ? plus[1] : minus?.[1]);
+    if (!filePath) continue;
+    const patch = block.trim();
+    const additions = patch.split(/\r?\n/).filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
+    const deletions = patch.split(/\r?\n/).filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
+    let status: ParsedDiffFile["status"] = statusByPath.get(filePath) || "modified";
+    if (/new file mode|--- \/dev\/null/.test(patch)) status = "added";
+    else if (/deleted file mode|\+\+\+ \/dev\/null/.test(patch)) status = "deleted";
+    else if (/similarity index|rename from/.test(patch)) status = "renamed";
+    entries.set(filePath, { path: filePath, status, patch, additions, deletions });
+  }
+  for (const [path, status] of statusByPath) {
+    if (!entries.has(path)) entries.set(path, { path, status, patch: "", additions: 0, deletions: 0 });
+  }
+  return [...entries.values()];
 }
 
 function DiffView({ diff }: { diff: string }) {
+  const files = useMemo(() => parseDiffFiles(diff), [diff]);
+  const [selectedPath, setSelectedPath] = useState("");
+  useEffect(() => {
+    if (!files.some((file) => file.path === selectedPath)) setSelectedPath(files[0]?.path || "");
+  }, [files, selectedPath]);
   if (!diff?.trim()) {
     return (
       <div className="diff-empty">
@@ -3957,7 +4016,8 @@ function DiffView({ diff }: { diff: string }) {
       </div>
     );
   }
-  const files = listDiffPaths(diff);
+  const selected = files.find((file) => file.path === selectedPath) || files[0];
+  const patch = selected?.patch || "# 该文件暂无可展开的 patch";
   return (
     <div className="diff-panel">
       {files.length > 0 && (
@@ -3965,13 +4025,19 @@ function DiffView({ diff }: { diff: string }) {
           <strong>变更文件（{files.length}）</strong>
           <ul>
             {files.map((file) => (
-              <li key={file} title={file}><code>{file}</code></li>
+              <li key={file.path} title={file.path}>
+                <button type="button" className={file.path === selected?.path ? "selected" : ""} onClick={() => setSelectedPath(file.path)}>
+                  <code>{file.path}</code>
+                  <span className={`diff-file-status ${file.status}`}>{file.status === "added" ? "新增" : file.status === "deleted" ? "删除" : file.status === "renamed" ? "重命名" : "修改"}</span>
+                  {(file.additions || file.deletions) ? <small>+{file.additions} -{file.deletions}</small> : null}
+                </button>
+              </li>
             ))}
           </ul>
         </div>
       )}
       <div className="diff-view">
-        {sanitizeDisplayText(diff).split("\n").map((line, index) => {
+        {sanitizeDisplayText(patch).split("\n").map((line, index) => {
           let className = "";
           if (line.startsWith("+") && !line.startsWith("+++")) className = "add";
           else if (line.startsWith("-") && !line.startsWith("---")) className = "remove";

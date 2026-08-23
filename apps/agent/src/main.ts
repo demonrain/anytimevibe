@@ -42,6 +42,7 @@ import {
   type ReasoningEffort,
   type RunInfo,
   type EngineQuota,
+  type ContextUsage,
   type Workspace,
   PRODUCT_VERSION
 } from "@anytimevibe/protocol";
@@ -65,7 +66,7 @@ import { isCodexModelsManagerNoise } from "./cli/log-noise";
 import { importLocalCliSessions, sanitizeTranscriptMessages } from "./cli/import-sessions";
 import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
 import { startEngineConfigWatch } from "./cli/engine-config-watch";
-import { appendEngineDiffChunk, buildTurnDiff, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
+import { appendEngineDiffChunk, buildTurnDiff, captureTurnDiffBaseline, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
 import { TaskStore } from "./cli/task-store";
 import { normalizeCliEngine, isHeadlessCliEngine, type BackendStreamEvent } from "./cli/types";
 import { handoffPermissionArgs, normalizePermissionMode } from "./cli/permission-args";
@@ -3839,6 +3840,7 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     // Headless path already upserts the user message + snapshot before spawning the CLI.
     // Omitting prompt here avoids the web adding a second YOU bubble for the same turn.
     const stored = taskStore.get(event.threadId);
+    await captureTurnDiffBaseline(event.threadId, stored?.cwd);
     const lastUser = stored
       ? [...stored.messages].reverse().find((message) => message.role === "user")
       : undefined;
@@ -3907,9 +3909,12 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
   if (event.type === "usage") {
     const task = taskStore.get(event.threadId);
     if (task) {
-      task.contextUsage = event.contextUsage;
+      task.contextUsage = mergeContextUsage(task.contextUsage, event.contextUsage);
       task.updatedAt = Date.now() / 1000;
       await taskStore.upsert(task);
+      // Usage is emitted during a turn; publish a snapshot immediately so the web
+      // client does not have to wait for turn.completed to see current consumption.
+      await publishStoredTaskSnapshot(event.threadId).catch(() => undefined);
     }
     return;
   }
@@ -3966,13 +3971,14 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     const waitingApproval = isApprovalPause;
     const statusForStore = waitingApproval ? "active" : event.status;
     activeTurnByThread.delete(event.threadId);
+    turnStartingByThread.delete(event.threadId);
     finishLocalActivity(event.threadId, statusForStore);
     await taskStore.setStatus(event.threadId, statusForStore);
     const failed = isTerminalTurnStatus(statusForStore) && /error|fail/i.test(statusForStore);
     if (event.contextUsage) {
       const task = taskStore.get(event.threadId);
       if (task) {
-        task.contextUsage = event.contextUsage;
+        task.contextUsage = mergeContextUsage(task.contextUsage, event.contextUsage);
         await taskStore.upsert(task);
       }
     }
@@ -4032,7 +4038,6 @@ async function publishTaskDiff(threadId: string, turnId: string): Promise<void> 
   const listed = publicState.tasks.find((item) => item.threadId === threadId);
   const cwd = preferTaskCwd(stored?.cwd, listed?.cwd);
   const diff = await buildTurnDiff(threadId, cwd);
-  if (!diff.trim()) return;
   if (stored) {
     stored.lastDiff = diff;
     stored.updatedAt = Date.now() / 1000;
@@ -4095,7 +4100,7 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     ...(task.thinking !== undefined ? { thinking: task.thinking } : {}),
     ...(task.runInfo ? { runInfo: task.runInfo } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
-    ...(task.lastDiff ? { diff: task.lastDiff } : {}),
+    ...(task.lastDiff !== undefined ? { diff: task.lastDiff } : {}),
     messages: windowed.messages,
     messageTotal: windowed.messageTotal,
     hasOlderMessages: windowed.hasOlderMessages,
@@ -4171,10 +4176,10 @@ async function runHeadlessTaskTurn(options: {
   stored.messages.push({ id: crypto.randomUUID(), role: "user", text: options.prompt });
   stored.status = "active";
   stored.updatedAt = now;
+  activeTurnByThread.set(options.threadId, turnId);
   await taskStore.upsert(stored);
   await publishStoredTaskSnapshot(options.threadId);
   startLocalActivity(options.threadId, options.prompt, stored.title, options.engine);
-  activeTurnByThread.set(options.threadId, turnId);
 
   // Ensure GUI-spawned agent can see user-installed CLIs on PATH.
   try {
@@ -4925,6 +4930,23 @@ async function handleCommand(command: ClientCommand): Promise<void> {
 }
 
 async function handleCodexMessage(message: Record<string, any>): Promise<void> {
+  const methodName = String(message.method || "").toLowerCase();
+  if (methodName.includes("tokenusage") || methodName.includes("token_usage")) {
+    const params = message.params ?? {};
+    const threadId = String(params.threadId ?? params.thread_id ?? "");
+    const usage = codexUsageFromUnknown(
+      params.tokenUsage ?? params.token_usage ?? params.usage ?? params.totalTokenUsage ?? params
+    );
+    if (threadId && usage) {
+      const stored = taskStore.get(threadId);
+      if (stored) {
+        stored.contextUsage = { ...(stored.contextUsage ?? {}), ...usage };
+        stored.updatedAt = Date.now() / 1000;
+        await taskStore.upsert(stored);
+        await publishStoredTaskSnapshot(threadId).catch(() => undefined);
+      }
+    }
+  }
   if (message.method === "item/started") {
     const params = message.params ?? {};
     const item = params.item ?? {};
@@ -4958,6 +4980,18 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     if (String(item.type ?? "") === "fileChange" && threadId) {
       const patch = extractFileChangeDiff(item);
       if (patch) appendEngineDiffChunk(threadId, patch);
+    }
+    if (threadId) {
+      const usage = codexUsageFromUnknown(item.usage ?? item.tokenUsage ?? item.metrics ?? params.usage);
+      if (usage) {
+        const stored = taskStore.get(threadId);
+        if (stored) {
+        stored.contextUsage = mergeContextUsage(stored.contextUsage, usage);
+          stored.updatedAt = Date.now() / 1000;
+          await taskStore.upsert(stored);
+          await publishStoredTaskSnapshot(threadId).catch(() => undefined);
+        }
+      }
     }
   }
   if (message.method === "item/agentMessage/delta") {
@@ -5004,6 +5038,10 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       clearEngineDiffChunks(threadId);
       touchAgentTask(threadId, { status: "active", engine: "codex" });
       const stored = taskStore.get(threadId);
+      await captureTurnDiffBaseline(
+        threadId,
+        preferTaskCwd(stored?.cwd, publicState.tasks.find((item) => item.threadId === threadId)?.cwd)
+      );
       const nativeModel = String(params.turn?.model ?? params.model ?? "").trim();
       await persistAndPublishRunInfo(
         threadId,
@@ -5017,11 +5055,26 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const threadId = String(params.threadId);
     const turnId = String(params.turn?.id ?? params.turnId ?? "");
     const turnStatus = String(params.turn?.status ?? params.status ?? "unknown");
+    const contextUsage = codexUsageFromUnknown(
+      params.usage
+      ?? params.turn?.usage
+      ?? params.turn?.tokenUsage
+      ?? params.turn?.contextUsage
+      ?? params.total_token_usage
+      ?? params.totalTokenUsage
+    );
     const errorMessage = extractCodexTurnError(params.turn) || extractCodexTurnError(params);
     finishLocalActivity(threadId, turnStatus);
     await flushRemoteDeltas();
     activeTurnByThread.delete(threadId);
     turnStartingByThread.delete(threadId);
+    const completedStored = taskStore.get(threadId);
+    if (completedStored) {
+      completedStored.status = turnStatus;
+      if (contextUsage) completedStored.contextUsage = contextUsage;
+      completedStored.updatedAt = Date.now() / 1000;
+      await taskStore.upsert(completedStored);
+    }
     const failed = isTerminalTurnStatus(turnStatus) && /error|fail/i.test(turnStatus);
     if (failed && errorMessage) {
       // Persist into multi-cli store when present; always publish for web UI.
@@ -5059,6 +5112,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       threadId: params.threadId,
       turnId: params.turn?.id ?? turnId,
       status: turnStatus,
+      ...(contextUsage ? { contextUsage } : {}),
       ...(errorMessage ? { errorMessage } : {})
     }, true, "completed");
     // Workspace git diff + any fileChange patches → Diff tab.
@@ -5191,6 +5245,60 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       title: "Codex 请求额外权限", detail: JSON.stringify({ reason: params.reason, permissions: params.permissions }, null, 2), availableDecisions: ["cancel"]
     }, true, "approval");
   }
+}
+
+function codexUsageFromUnknown(raw: unknown): ContextUsage | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const root = raw as Record<string, any>;
+  const sources = [
+    root,
+    root.usage,
+    root.tokenUsage,
+    root.contextUsage,
+    root.totalTokenUsage,
+    root.total_token_usage,
+    root.total,
+    root.last,
+    root.metrics
+  ]
+    .filter((value): value is Record<string, any> => Boolean(value && typeof value === "object"));
+  const number = (keys: string[]): number => {
+    for (const source of sources) {
+      for (const key of keys) {
+        const value = Number(source[key]);
+        if (Number.isFinite(value) && value >= 0) return value;
+      }
+    }
+    return 0;
+  };
+  const input = number(["input_tokens", "inputTokens", "prompt_tokens"]);
+  const output = number(["output_tokens", "outputTokens", "completion_tokens"]);
+  const cached = number(["cached_input_tokens", "cachedInputTokens", "cache_read_tokens", "cacheReadTokens"]);
+  const reasoning = number(["reasoning_tokens", "reasoningTokens", "thinking_tokens", "thinkingTokens", "reasoning_output_tokens", "reasoningOutputTokens"]);
+  const reportedTotal = number(["total_tokens", "totalTokens", "total_token_usage"]);
+  const total = reportedTotal || (input + output + reasoning);
+  const contextWindow = number(["context_window", "contextWindow", "model_context_window", "modelContextWindow", "max_context_tokens", "maxContextTokens"]);
+  if (!input && !output && !cached && !reasoning && !total && !contextWindow) return undefined;
+  return {
+    ...(input ? { inputTokens: input } : {}),
+    ...(output ? { outputTokens: output } : {}),
+    ...(cached ? { cachedInputTokens: cached } : {}),
+    ...(reasoning ? { reasoningTokens: reasoning } : {}),
+    ...(total ? { totalTokens: total } : {}),
+    ...(contextWindow ? { contextWindow, remainingTokens: Math.max(0, contextWindow - total) } : {})
+  };
+}
+
+function mergeContextUsage(previous: ContextUsage | undefined, next: ContextUsage): ContextUsage {
+  const merged = { ...(previous ?? {}), ...next };
+  const input = merged.inputTokens ?? 0;
+  const output = merged.outputTokens ?? 0;
+  const reasoning = merged.reasoningTokens ?? 0;
+  if (merged.totalTokens == null && (input || output || reasoning)) merged.totalTokens = input + output + reasoning;
+  if (merged.contextWindow != null && merged.totalTokens != null && merged.remainingTokens == null) {
+    merged.remainingTokens = Math.max(0, merged.contextWindow - merged.totalTokens);
+  }
+  return merged;
 }
 
 function resolveReportedEngineVersion(engine: CliEngine): string {
@@ -5351,7 +5459,8 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     cliEngine: "codex",
     ...(stored?.model ? { model: stored.model } : {}),
     ...(stored?.reasoningEffort ? { reasoningEffort: stored.reasoningEffort } : {}),
-    ...(stored?.lastDiff ? { diff: stored.lastDiff } : {}),
+    ...(stored?.contextUsage ? { contextUsage: stored.contextUsage } : {}),
+    ...(stored?.lastDiff !== undefined ? { diff: stored.lastDiff } : {}),
     ...(stored?.providerSessionId ? { providerSessionId: stored.providerSessionId } : { providerSessionId: threadId }),
     ...(snapshot.activeTurnId || activeTurnByThread.get(threadId)
       ? { activeTurnId: snapshot.activeTurnId || activeTurnByThread.get(threadId) }
@@ -5372,11 +5481,24 @@ function isInProgressStoredStatus(status: string | undefined): boolean {
 async function reconcileOrphanedActiveTasks(): Promise<number> {
   let fixed = 0;
   for (const task of taskStore.list(500)) {
-    if (!isHeadlessCliEngine(task.engine)) continue;
     if (!isInProgressStoredStatus(task.status)) continue;
     if (threadHasPendingCursorApproval(task.threadId)) continue;
-    if (isThreadTurnBusy(task.threadId)) continue;
-    if (isHeadlessThreadActive(task.threadId)) continue;
+    if (isHeadlessCliEngine(task.engine)) {
+      if (isThreadTurnBusy(task.threadId)) continue;
+      if (isHeadlessThreadActive(task.threadId)) continue;
+    } else if (task.engine === "codex") {
+      // Codex app-server may lose a notification during reconnect. Read its durable
+      // thread state before deciding that the task is orphaned.
+      if (!codex) continue;
+      try {
+        const result = await codex.request("thread/read", { threadId: task.threadId, includeTurns: true });
+        const snapshot = threadToSnapshot(result.thread);
+        if (snapshot.activeTurnId || isInProgressStoredStatus(snapshot.status)) continue;
+      } catch {
+        // If the app-server is unavailable, leave the task untouched for the next pass.
+        continue;
+      }
+    }
 
     const hasAssistant = task.messages.some(
       (message) => message.role === "assistant" && String(message.text || "").trim()
