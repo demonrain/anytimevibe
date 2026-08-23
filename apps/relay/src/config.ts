@@ -13,6 +13,8 @@ const configSchema = z.object({
   PUBLIC_ORIGIN: z.string().url(),
   REGISTRATION_ENABLED: z.string().default("true").transform((value) => value === "true"),
   MAX_USERS: z.coerce.number().int().positive().default(100),
+  SYNC_EVENT_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
+  SYNC_EVENT_MAX_PER_HOST: z.coerce.number().int().positive().default(10000),
   WINDOWS_CLIENT_URL: urlWithDefault("https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent-Setup.exe"),
   // Leave empty to show「敬请期待」on the web UI when no macOS package is published.
   MAC_CLIENT_URL: urlWithDefault("https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent.dmg"),

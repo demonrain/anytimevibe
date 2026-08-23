@@ -73,4 +73,17 @@ describe("task diff collection", () => {
     expect(diff).toContain("diff --git a/tracked.txt b/tracked.txt");
     expect(diff).not.toContain("preexisting.txt");
   });
+
+  it("builds the current-turn patch from a preexisting dirty baseline", async () => {
+    const cwd = await createRepository();
+    await fs.writeFile(path.join(cwd, "tracked.txt"), "dirty before turn\n", "utf8");
+    const threadId = "diff-baseline-change-test";
+    await captureTurnDiffBaseline(threadId, cwd);
+
+    await fs.writeFile(path.join(cwd, "tracked.txt"), "dirty before turn\nnew line in turn\n", "utf8");
+    const diff = await buildTurnDiff(threadId, cwd);
+
+    expect(diff).toContain("+new line in turn");
+    expect(diff).not.toContain("-before");
+  });
 });

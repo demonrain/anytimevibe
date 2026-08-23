@@ -9,6 +9,7 @@ const MAX_DIFF_CHARS = 400_000;
 /** In-turn patches reported by the engine (Codex fileChange, etc.). */
 const engineDiffChunks = new Map<string, string[]>();
 const gitDiffBaselines = new Map<string, string>();
+const fileBaselines = new Map<string, Map<string, string | null>>();
 
 export function clearEngineDiffChunks(threadId: string): void {
   engineDiffChunks.delete(threadId);
@@ -19,9 +20,24 @@ export async function captureTurnDiffBaseline(threadId: string, cwd: string | un
   const root = cwd?.trim();
   if (!root) {
     gitDiffBaselines.set(threadId, "");
+    fileBaselines.delete(threadId);
     return;
   }
   gitDiffBaselines.set(threadId, await collectGitWorkspaceDiff(root).catch(() => ""));
+  const files = (await runGit(root, ["ls-files", "--cached", "--others", "--exclude-standard"]))
+    .split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+  const baseline = new Map<string, string | null>();
+  for (const file of files) {
+    try {
+      const content = await fs.readFile(path.join(root, file));
+      baseline.set(file.replace(/\\/g, "/"), content.length <= 200_000 && !content.includes(0)
+        ? content.toString("utf8").replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+        : null);
+    } catch {
+      baseline.set(file.replace(/\\/g, "/"), null);
+    }
+  }
+  fileBaselines.set(threadId, baseline);
 }
 
 export function appendEngineDiffChunk(threadId: string, chunk: string): void {
@@ -172,6 +188,8 @@ export async function buildTurnDiff(threadId: string, cwd: string | undefined): 
   const engineDiff = engineParts.join("\n\n").trim();
   const baseline = gitDiffBaselines.get(threadId) ?? "";
   gitDiffBaselines.delete(threadId);
+  const baselineFiles = fileBaselines.get(threadId);
+  fileBaselines.delete(threadId);
 
   let gitDiff = "";
   if (cwd?.trim()) {
@@ -196,7 +214,10 @@ export async function buildTurnDiff(threadId: string, cwd: string | undefined): 
     return blocks.join("\n\n").slice(0, MAX_DIFF_CHARS);
   }
 
-  if (gitDiff && baseline) {
+  if (gitDiff && baselineFiles && cwd?.trim()) {
+    const precise = await buildPreciseFileDiff(cwd.trim(), baselineFiles, gitDiff);
+    if (precise) gitDiff = precise;
+  } else if (gitDiff && baseline) {
     const baselineBlocks = new Set(
       baseline.split(/(?=^diff --git )/m).filter((block) => block.startsWith("diff --git ")).map((block) => block.trim())
     );
@@ -207,6 +228,49 @@ export async function buildTurnDiff(threadId: string, cwd: string | undefined): 
       .join("\n\n");
   }
   return (gitDiff || engineDiff).slice(0, MAX_DIFF_CHARS);
+}
+
+function simpleUnifiedPatch(filePath: string, before: string | undefined, after: string | undefined): string {
+  const oldLines = before == null ? [] : before.split("\n");
+  const newLines = after == null ? [] : after.split("\n");
+  const oldHeader = before == null ? "/dev/null" : `a/${filePath}`;
+  const newHeader = after == null ? "/dev/null" : `b/${filePath}`;
+  const body = [
+    ...oldLines.map((line) => `-${line}`),
+    ...newLines.map((line) => `+${line}`)
+  ];
+  return `diff --git a/${filePath} b/${filePath}\n--- ${oldHeader}\n+++ ${newHeader}\n@@ -${before == null ? 0 : 1},${oldLines.length} +${after == null ? 0 : 1},${newLines.length} @@\n${body.join("\n")}`;
+}
+
+async function buildPreciseFileDiff(
+  cwd: string,
+  baseline: Map<string, string | null>,
+  currentDiff: string
+): Promise<string> {
+  const blocks = currentDiff.split(/(?=^diff --git )/m).filter((block) => block.startsWith("diff --git "));
+  const output: string[] = [];
+  for (const block of blocks) {
+    const match = block.match(/^diff --git a\/(.+?) b\/(.+)$/m);
+    const filePath = match?.[2]?.replace(/\\/g, "/");
+    if (!filePath || !baseline.has(filePath)) {
+      output.push(block.trim());
+      continue;
+    }
+    const before = baseline.get(filePath);
+    let after: string | undefined;
+    try {
+      const content = await fs.readFile(path.join(cwd, filePath));
+      if (content.length <= 200_000 && !content.includes(0)) after = content.toString("utf8").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    } catch {
+      after = undefined;
+    }
+    if (before === null || after === undefined) {
+      output.push(block.trim());
+      continue;
+    }
+    if (before !== after) output.push(simpleUnifiedPatch(filePath, before, after));
+  }
+  return output.join("\n\n").trim().slice(0, MAX_DIFF_CHARS);
 }
 
 /** List of paths mentioned in a unified diff / status blob (for UI summaries). */

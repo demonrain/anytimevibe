@@ -2,7 +2,7 @@ import cookie from "@fastify/cookie";
 import rateLimit from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import webPush from "web-push";
 import { z } from "zod";
 import { encryptedEnvelopeSchema, type EncryptedEnvelope } from "@anytimevibe/protocol";
@@ -18,6 +18,7 @@ type User = { id: string; username: string; isAdmin: boolean };
 
 type SocketLike = {
   readyState: number;
+  bufferedAmount?: number;
   send(data: string): void;
   close(code?: number, reason?: string): void;
   on(event: "message", listener: (data: Buffer) => void): void;
@@ -93,7 +94,12 @@ const pushBody = z.object({
 });
 
 function pairingCode(): string {
-  return String(Math.floor(100_000 + Math.random() * 900_000));
+  return String(randomInt(100_000, 1_000_000));
+}
+
+function pairingSecretFromRequest(request: FastifyRequest): string | null {
+  const value = request.headers.authorization;
+  return value?.startsWith("Bearer ") ? value.slice(7).trim() || null : null;
 }
 
 function setSessionCookie(reply: FastifyReply, token: string, secure: boolean): void {
@@ -173,6 +179,37 @@ async function main(): Promise<void> {
 
   const agentSockets = new Map<string, SocketLike>();
   const clientSockets = new Map<string, Set<SocketLike>>();
+  const socketRate = new WeakMap<SocketLike, { startedAt: number; count: number }>();
+  const MAX_CLIENT_SOCKETS_PER_USER = 8;
+  const MAX_MESSAGES_PER_MINUTE = 600;
+
+  function allowSocketMessage(socket: SocketLike): boolean {
+    const now = Date.now();
+    const previous = socketRate.get(socket);
+    if (!previous || now - previous.startedAt >= 60_000) {
+      socketRate.set(socket, { startedAt: now, count: 1 });
+      return true;
+    }
+    previous.count += 1;
+    return previous.count <= MAX_MESSAGES_PER_MINUTE;
+  }
+
+  async function cleanupSyncEvents(): Promise<void> {
+    await sql`
+      DELETE FROM sync_events
+      WHERE created_at < now() - ${`${config.SYNC_EVENT_RETENTION_DAYS} days`}::interval
+    `;
+    await sql`
+      WITH ranked AS (
+        SELECT id, row_number() OVER (PARTITION BY host_id ORDER BY sequence DESC) AS row_number
+        FROM sync_events
+      )
+      DELETE FROM sync_events
+      WHERE id IN (
+        SELECT id FROM ranked WHERE row_number > ${config.SYNC_EVENT_MAX_PER_HOST}
+      )
+    `;
+  }
 
   function broadcastToUser(userId: string, payload: string): void {
     const sockets = clientSockets.get(userId);
@@ -413,7 +450,7 @@ async function main(): Promise<void> {
     return reply.code(201).send({ pairingId, agentPublicKey: host.agentPublicKey, expiresInSeconds: 600 });
   });
 
-  app.post("/api/agent/pairings", async (request, reply) => {
+  app.post("/api/agent/pairings", { config: { rateLimit: { max: isProd ? 10 : 100, timeWindow: "15 minutes" } } }, async (request, reply) => {
     const body = agentPairBody.parse(request.body);
     let code = pairingCode();
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -434,15 +471,15 @@ async function main(): Promise<void> {
     return reply.code(201).send({ pairingId: id, code, expiresInSeconds: 600 });
   });
 
-  app.get("/api/agent/pairings/:pairingId", async (request, reply) => {
+  app.get("/api/agent/pairings/:pairingId", { config: { rateLimit: { max: isProd ? 60 : 300, timeWindow: "1 minute" } } }, async (request, reply) => {
     const { pairingId } = request.params as { pairingId: string };
-    const { secret } = request.query as { secret?: string };
+    const secret = pairingSecretFromRequest(request);
     if (!secret) return reply.code(401).send({ error: "missing_secret" });
     const rows = await sql<Array<Record<string, unknown>>>`
       SELECT * FROM pairings WHERE id = ${pairingId} AND expires_at > now() LIMIT 1
     `;
     const pairing = rows[0];
-    if (!pairing || hashToken(secret) !== pairing.secretHash) return reply.code(404).send({ error: "pairing_not_found" });
+    if (!pairing || !safeEqual(hashToken(secret), String(pairing.secretHash))) return reply.code(404).send({ error: "pairing_not_found" });
     if (pairing.status !== "claimed") return { status: pairing.status };
     const response = {
       status: "claimed",
@@ -454,16 +491,16 @@ async function main(): Promise<void> {
     return response;
   });
 
-  app.post("/api/agent/pairings/:pairingId/authorize", async (request, reply) => {
+  app.post("/api/agent/pairings/:pairingId/authorize", { config: { rateLimit: { max: isProd ? 20 : 100, timeWindow: "10 minutes" } } }, async (request, reply) => {
     const { pairingId } = request.params as { pairingId: string };
-    const { secret } = request.query as { secret?: string };
+    const secret = pairingSecretFromRequest(request);
     if (!secret) return reply.code(401).send({ error: "missing_secret" });
     const body = authorizePairingBody.parse(request.body);
     const rows = await sql<Array<Record<string, unknown>>>`
       SELECT id, secret_hash, status FROM pairings WHERE id = ${pairingId} AND expires_at > now() LIMIT 1
     `;
     const pairing = rows[0];
-    if (!pairing || hashToken(secret) !== pairing.secretHash || pairing.status !== "claimed") {
+    if (!pairing || !safeEqual(hashToken(secret), String(pairing.secretHash)) || pairing.status !== "claimed") {
       return reply.code(404).send({ error: "pairing_not_found" });
     }
     await sql`
@@ -580,7 +617,11 @@ async function main(): Promise<void> {
     const user = await requireUser(sql, request, reply);
     if (!user) return;
     const { hostId } = request.params as { hostId: string };
-    const after = Math.max(0, Number((request.query as { after?: string }).after ?? 0));
+    const query = request.query as { after?: string; limit?: string };
+    const afterValue = Number(query.after ?? 0);
+    const after = Number.isFinite(afterValue) ? Math.max(0, Math.floor(afterValue)) : 0;
+    const limitValue = Number(query.limit ?? 500);
+    const limit = Number.isFinite(limitValue) ? Math.min(1000, Math.max(1, Math.floor(limitValue))) : 500;
     const owns = await sql`SELECT id FROM hosts WHERE id = ${hostId} AND user_id = ${user.id} AND revoked_at IS NULL`;
     if (!owns.length) return reply.code(404).send({ error: "host_not_found" });
     const rows = await sql<Array<{ sequence: number; envelope: EncryptedEnvelope }>>`
@@ -588,9 +629,15 @@ async function main(): Promise<void> {
       FROM sync_events
       WHERE host_id = ${hostId} AND sequence > ${after}
       ORDER BY sequence ASC
-      LIMIT 1000
+      LIMIT ${limit + 1}
     `;
-    return { events: rows.map((row) => row.envelope), nextSequence: rows.at(-1)?.sequence ?? after };
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    return {
+      events: page.map((row) => row.envelope),
+      nextSequence: page.at(-1)?.sequence ?? after,
+      hasMore
+    };
   });
 
   app.post("/api/push/subscriptions", async (request, reply) => {
@@ -627,6 +674,7 @@ async function main(): Promise<void> {
     if (!user) return socket.close(4001, "unauthorized");
     const clientSocket = socket as unknown as SocketLike;
     const sockets = clientSockets.get(user.id) ?? new Set<SocketLike>();
+    if (sockets.size >= MAX_CLIENT_SOCKETS_PER_USER) return socket.close(4029, "too_many_client_connections");
     sockets.add(clientSocket);
     clientSockets.set(user.id, sockets);
 
@@ -635,11 +683,13 @@ async function main(): Promise<void> {
 
     clientSocket.on("message", async (data) => {
       try {
+        if (!allowSocketMessage(clientSocket)) return clientSocket.send(jsonControl("relay.error", { error: "message_rate_limited" }));
         const envelope = encryptedEnvelopeSchema.parse(JSON.parse(data.toString()));
         const owns = await sql`SELECT id FROM hosts WHERE id = ${envelope.hostId} AND user_id = ${user.id} AND revoked_at IS NULL`;
         if (!owns.length) return clientSocket.send(jsonControl("relay.error", { hostId: envelope.hostId, error: "host_not_found" }));
         const agent = agentSockets.get(envelope.hostId);
         if (!agent || agent.readyState !== 1) return clientSocket.send(jsonControl("relay.error", { hostId: envelope.hostId, error: "host_offline" }));
+        if ((agent.bufferedAmount ?? 0) > 4 * 1024 * 1024) return clientSocket.send(jsonControl("relay.error", { hostId: envelope.hostId, error: "agent_backpressure" }));
         agent.send(JSON.stringify(envelope));
       } catch (error) {
         app.log.warn({ error }, "invalid client websocket message");
@@ -686,6 +736,7 @@ async function main(): Promise<void> {
 
     agentSocket.on("message", async (data) => {
       try {
+        if (!allowSocketMessage(agentSocket)) return;
         const parsed = JSON.parse(data.toString()) as Record<string, unknown>;
         if (parsed.type === "agent.key_authorization") {
           const pairingId = z.string().uuid().parse(parsed.pairingId);
@@ -795,6 +846,13 @@ async function main(): Promise<void> {
   app.addHook("onClose", async () => {
     await sql.end({ timeout: 5 });
   });
+
+  await cleanupSyncEvents().catch((error) => app.log.warn({ error }, "initial sync event cleanup failed"));
+  const cleanupTimer = setInterval(() => {
+    void cleanupSyncEvents().catch((error) => app.log.warn({ error }, "sync event cleanup failed"));
+  }, 15 * 60 * 1000);
+  cleanupTimer.unref();
+  app.addHook("onClose", async () => clearInterval(cleanupTimer));
 
   await app.listen({ port: config.PORT, host: config.HOST });
 }

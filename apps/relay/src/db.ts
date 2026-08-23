@@ -88,6 +88,7 @@ export async function ensureSchema(sql: Database): Promise<void> {
       UNIQUE(host_id, message_id)
     );
     CREATE INDEX IF NOT EXISTS sync_events_host_sequence_idx ON sync_events(host_id, sequence);
+    CREATE INDEX IF NOT EXISTS sync_events_created_at_idx ON sync_events(created_at);
 
     CREATE TABLE IF NOT EXISTS push_subscriptions (
       id uuid PRIMARY KEY,

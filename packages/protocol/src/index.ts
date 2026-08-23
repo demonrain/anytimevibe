@@ -436,6 +436,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     cwd: z.string(),
     status: z.string(),
     activeTurnId: z.string().optional(),
+    /** Last time the agent observed progress for the active turn. */
+    lastProgressAt: z.number().optional(),
     createdAt: z.number(),
     updatedAt: z.number(),
     /** Which coding CLI owns this thread. */
@@ -504,6 +506,25 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     contextUsage: contextUsageSchema.optional(),
     /** Failure reason when status is failed / systemerror / error. */
     errorMessage: z.string().max(4000).optional()
+  }),
+  eventBase.extend({
+    type: z.literal("usage.updated"),
+    threadId: z.string(),
+    contextUsage: contextUsageSchema
+  }),
+  eventBase.extend({
+    type: z.literal("command.status"),
+    commandId: z.string().uuid(),
+    status: z.enum(["accepted", "queued", "duplicate", "completed", "failed"]),
+    threadId: z.string().optional(),
+    detail: z.string().max(1000).optional()
+  }),
+  eventBase.extend({
+    type: z.literal("thread.heartbeat"),
+    threadId: z.string(),
+    turnId: z.string().optional(),
+    status: z.string(),
+    lastProgressAt: z.number().optional()
   }),
   /** Durable follow-up queue on the agent for this thread (not yet started). */
   eventBase.extend({

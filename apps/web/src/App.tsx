@@ -92,6 +92,7 @@ type Task = {
   status: string;
   updatedAt: number;
   activeTurnId?: string;
+  lastProgressAt?: number;
   diff: string;
   messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string }>;
   approvals: Approval[];
@@ -441,6 +442,7 @@ function taskStatusMeta(status: string): { label: string; tone: string } {
     // Plain string statuses are expected for turn events.
   }
   const normalized = statusType.toLowerCase().replace(/[\s_-]/g, "");
+  if (normalized === "stale") return { label: "状态待确认", tone: "stale" };
   if (["active", "running", "inprogress", "processing"].includes(normalized)) return { label: "进行中", tone: "active" };
   if (["completed", "complete", "success", "succeeded"].includes(normalized)) return { label: "已完成", tone: "completed" };
   // systemerror / rate_limit_error / failed etc.
@@ -462,6 +464,12 @@ function isInProgressTaskStatus(status: string | undefined): boolean {
   }
   const normalized = statusType.toLowerCase().replace(/[\s_-]/g, "");
   return ["active", "running", "inprogress", "processing"].includes(normalized);
+}
+
+function isStaleTask(task: Pick<Task, "status" | "activeTurnId" | "lastProgressAt" | "updatedAt" | "approvals">): boolean {
+  if (!task.activeTurnId || task.approvals.length > 0 || !isInProgressTaskStatus(task.status)) return false;
+  const last = Number(task.lastProgressAt ?? task.updatedAt ?? 0);
+  return last > 0 && Date.now() / 1000 - last > 120;
 }
 
 function isFailedTaskStatus(status: string | undefined): boolean {
@@ -1798,6 +1806,23 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     return next;
   }
   if (event.type === "sync.completed" || event.type === "sync.progress") return next;
+  if (event.type === "usage.updated") {
+    const task = next.tasks[event.threadId];
+    if (task) task.contextUsage = event.contextUsage;
+    return next;
+  }
+  if (event.type === "thread.heartbeat") {
+    const task = next.tasks[event.threadId];
+    if (task) {
+      if (!task.activeTurnId && !isInProgressTaskStatus(task.status)) return next;
+      if (task.activeTurnId && event.turnId && task.activeTurnId !== event.turnId) return next;
+      if (typeof event.lastProgressAt === "number") task.lastProgressAt = event.lastProgressAt;
+      if (event.turnId) task.activeTurnId = event.turnId;
+      task.status = event.status;
+    }
+    return next;
+  }
+  if (event.type === "command.status") return next;
   if (event.type === "thread.history.page") {
     const existing = next.tasks[event.threadId];
     if (!existing) return next;
@@ -1849,9 +1874,9 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       || /^(completed|complete|success|succeeded|idle)$/i.test(status);
     // A snapshot without activeTurnId is authoritative unless an approval card is
     // still open. This lets reconnect/sync clear stale "processing" state.
-    const activeTurnId = terminalStatus
-      ? undefined
-      : (event.activeTurnId || (existing?.approvals.length ? existing.activeTurnId : undefined));
+      const activeTurnId = terminalStatus
+        ? undefined
+        : (event.activeTurnId || (existing?.approvals.length ? existing.activeTurnId : undefined));
     const incomingMessages = event.messages?.length ? event.messages : [];
     const hasOlderMessages = Boolean(event.hasOlderMessages);
     const rawMessages = sanitizeTranscriptMessages(
@@ -1897,6 +1922,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
         : (existing?.messageTotal != null ? { messageTotal: existing.messageTotal } : {})),
       ...(engine ? { cliEngine: engine } : {}),
       ...(activeTurnId ? { activeTurnId } : {}),
+      ...(typeof event.lastProgressAt === "number" ? { lastProgressAt: event.lastProgressAt } : (existing?.lastProgressAt != null ? { lastProgressAt: existing.lastProgressAt } : {})),
       ...(providerSessionId ? { providerSessionId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
@@ -2056,7 +2082,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     if (errText) {
       const norm = normalizeSystemErrorText(errText).toLowerCase();
       const already = Boolean(norm) && task.messages.some(
-        (message) => message.role === "system" && normalizeSystemErrorText(message.text).toLowerCase() === norm
+        (message: Task["messages"][number]) => message.role === "system" && normalizeSystemErrorText(message.text).toLowerCase() === norm
       );
       if (!already) {
         task.messages.push({
@@ -2066,7 +2092,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
         });
       }
     } else if (isFailedTaskStatus(event.status)) {
-      const hasSystem = task.messages.some((message) => message.role === "system" && isErrorSystemMessage(message.text));
+      const hasSystem = task.messages.some((message: Task["messages"][number]) => message.role === "system" && isErrorSystemMessage(message.text));
       if (!hasSystem) {
         task.messages.push({
           id: event.eventId,
@@ -2079,7 +2105,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   if (event.type === "diff.updated") task.diff = event.diff;
   if (event.type === "approval.requested") {
     // Replace same requestId so a richer completed payload can upgrade a sparse started card.
-    task.approvals = task.approvals.filter((item) => item.requestId !== event.requestId);
+    task.approvals = task.approvals.filter((item: Approval) => item.requestId !== event.requestId);
     task.approvals.push(event);
   }
   return next;
@@ -2435,9 +2461,16 @@ export function App() {
         delete next[host.id];
         return next;
       });
-      const after = Number(localStorage.getItem(`sync:${host.id}`) ?? 0);
-      const sync = await api<{ events: EncryptedEnvelope[]; nextSequence: number }>(`/api/sync/${host.id}?after=${after}`);
-      for (const envelope of sync.events) await handleEnvelope(envelope);
+      let after = Number(localStorage.getItem(`sync:${host.id}`) ?? 0);
+      for (let page = 0; page < 100; page += 1) {
+        const sync = await api<{ events: EncryptedEnvelope[]; nextSequence: number; hasMore?: boolean }>(
+          `/api/sync/${host.id}?after=${after}&limit=500`
+        );
+        for (const envelope of sync.events) await handleEnvelope(envelope);
+        const next = Number(sync.nextSequence);
+        if (!sync.hasMore || !Number.isFinite(next) || next <= after) break;
+        after = next;
+      }
     }
   });
 
@@ -2952,10 +2985,18 @@ function TaskListRow({
   onDelete(): void;
 }) {
   const { t } = useI18n();
-  const effectiveStatus = isInProgressTaskStatus(task.status) && !task.activeTurnId && task.approvals.length === 0
-    ? "idle"
-    : task.status;
+  const effectiveStatus = isStaleTask(task)
+    ? "stale"
+    : isInProgressTaskStatus(task.status) && !task.activeTurnId && task.approvals.length === 0
+      ? "idle"
+      : task.status;
   const status = taskStatusMeta(effectiveStatus);
+  const [, setStaleClock] = useState(0);
+  useEffect(() => {
+    if (!task.activeTurnId) return;
+    const timer = window.setInterval(() => setStaleClock((value) => value + 1), 30_000);
+    return () => window.clearInterval(timer);
+  }, [task.activeTurnId]);
   const engine = task.cliEngine ? normalizeCliEngine(task.cliEngine) : undefined;
   const updated = new Date(task.updatedAt * 1000);
   const timeLabel = Number.isFinite(updated.getTime())
@@ -3310,10 +3351,16 @@ function TaskConversation({
   const historyRequestTokenRef = useRef(0);
   const historyInFlightRef = useRef(false);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [, setStaleClock] = useState(0);
+  useEffect(() => {
+    if (!task.activeTurnId) return;
+    const timer = window.setInterval(() => setStaleClock((value) => value + 1), 30_000);
+    return () => window.clearInterval(timer);
+  }, [task.activeTurnId]);
   // A persisted "active" status can outlive a dropped relay notification. Treat a
   // task as running only while the agent exposes a live turn or an approval card.
   // This prevents an idle Codex thread from blocking the composer forever.
-  const running = Boolean(task.activeTurnId) || task.approvals.length > 0;
+  const running = (Boolean(task.activeTurnId) && !isStaleTask(task)) || task.approvals.length > 0;
   const permissionOptions = useMemo(
     () => permissionOptionsForEngine(taskEngine, locale),
     [taskEngine, locale]

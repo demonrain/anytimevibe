@@ -105,6 +105,32 @@ describe("protocol crypto", () => {
     expect(event.threadCount).toBe(12);
   });
 
+  it("accepts command lifecycle, usage, and heartbeat events", () => {
+    const base = { eventId: crypto.randomUUID(), occurredAt: new Date().toISOString() };
+    expect(agentEventSchema.parse({
+      ...base,
+      type: "command.status",
+      commandId: crypto.randomUUID(),
+      status: "accepted",
+      threadId: "thread-1"
+    }).type).toBe("command.status");
+    expect(agentEventSchema.parse({
+      ...base,
+      type: "usage.updated",
+      threadId: "thread-1",
+      contextUsage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 }
+    }).type).toBe("usage.updated");
+    const heartbeat = agentEventSchema.parse({
+      ...base,
+      type: "thread.heartbeat",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      status: "active",
+      lastProgressAt: 123
+    });
+    expect(heartbeat.type).toBe("thread.heartbeat");
+  });
+
   it("windows recent messages and pages older turns", () => {
     const messages = Array.from({ length: 120 }, (_, index) => ({
       id: `m${index}`,

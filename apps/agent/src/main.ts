@@ -116,6 +116,7 @@ type AgentConfig = {
   workspaces: Workspace[];
   workspaceBookmarks?: Record<string, string>;
   sequence: number;
+  processedCommandIds?: Record<string, number>;
   /** Undelivered push hints, flushed to the relay on reconnect. */
   pendingPushHints?: PendingPushHint[];
 };
@@ -271,6 +272,10 @@ let reconnectAttempt = 0;
 /** Permanent auth failures must not flap reconnect forever. */
 let reconnectBlockedReason: string | null = null;
 const pendingPrompts = new Map<string, string>();
+const lastProgressAtByThread = new Map<string, number>();
+const usageFlushTimers = new Map<string, NodeJS.Timeout>();
+const pendingUsageByThread = new Map<string, ContextUsage>();
+const queuedCommandIds = new Set<string>();
 const pendingRequestTypes = new Map<string, "command" | "file" | "permission" | "input" | "plan" | "question" | "elicitation">();
 
 /** Protocol question shape (structured options rendered by web ApprovalCard). */
@@ -896,7 +901,7 @@ async function drainTurnQueue(threadId: string): Promise<void> {
   await persistTurnQueue();
   await publishTurnQueueUpdated(threadId);
   logInfo(`执行排队指令`, `thread=${threadId.slice(0, 8)} remaining=${list.length}`);
-  await handleCommand({
+  const queuedCommand: ClientCommand = {
     type: "turn.start",
     commandId: next.commandId,
     threadId,
@@ -904,7 +909,15 @@ async function drainTurnQueue(threadId: string): Promise<void> {
     ...(next.permissionMode ? { permissionMode: next.permissionMode } : {}),
     ...(next.model ? { model: next.model } : {}),
     ...(next.reasoningEffort ? { reasoningEffort: next.reasoningEffort } : {})
-  });
+  };
+  queuedCommandIds.delete(next.commandId);
+  try {
+    await handleCommandImpl(queuedCommand);
+    await publishCommandStatus(queuedCommand, "completed");
+  } catch (error) {
+    await publishCommandStatus(queuedCommand, "failed", error instanceof Error ? error.message : String(error));
+    throw error;
+  }
 }
 
 function scheduleDrainAllTurnQueues(): void {
@@ -1233,8 +1246,9 @@ function showWindow(): void {
     windowRef = null;
     try {
       createWindow();
-      windowRef?.show();
-      windowRef?.focus();
+      const recreatedWindow = windowRef as BrowserWindow | null;
+      recreatedWindow?.show();
+      recreatedWindow?.focus();
     } catch (recreateError) {
       logError("重建主界面失败", recreateError instanceof Error ? recreateError.message : String(recreateError));
     }
@@ -1998,6 +2012,11 @@ async function loadConfig(): Promise<void> {
   config.workspaces ??= [];
   config.workspaceBookmarks ??= {};
   config.sequence ??= 0;
+  config.processedCommandIds ??= {};
+  const commandCutoff = Date.now() - 24 * 60 * 60 * 1000;
+  config.processedCommandIds = Object.fromEntries(
+    Object.entries(config.processedCommandIds).filter(([, timestamp]) => Number(timestamp) >= commandCutoff).slice(-2000)
+  );
   // Sanitize offline push queue from disk (ignore corrupt entries).
   if (Array.isArray(config.pendingPushHints)) {
     config.pendingPushHints = config.pendingPushHints
@@ -2034,7 +2053,7 @@ function activateMacWorkspaceBookmarks(): void {
     const bookmark = bookmarks[workspace.id];
     if (!bookmark) continue;
     try {
-      const stop = app.startAccessingSecurityScopedResource(bookmark);
+      const stop = app.startAccessingSecurityScopedResource(bookmark) as (() => void) | undefined;
       if (typeof stop === "function") macBookmarkStoppers.push(stop);
       grantMacFsAccessRoot(workspace.path);
       logInfo("\u5df2\u6fc0\u6d3b\u5de5\u4f5c\u533a\u4e66\u7b7e\u8bbf\u95ee", workspace.path);
@@ -2068,7 +2087,7 @@ async function ensureMacFolderAccess(targetPath: string, reason: string): Promis
     config.workspaceBookmarks = { ...(config.workspaceBookmarks || {}), [matched.id]: bookmark };
     await saveConfig();
     try {
-      const stop = app.startAccessingSecurityScopedResource(bookmark);
+      const stop = app.startAccessingSecurityScopedResource(bookmark) as (() => void) | undefined;
       if (typeof stop === "function") macBookmarkStoppers.push(stop);
     } catch { /* ignore */ }
   }
@@ -2548,9 +2567,11 @@ async function proxyShellLines(platform: "win32" | "darwin" | "powershell"): Pro
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
     "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY"
   ] as const;
-  const entries = keys
-    .map((key) => [key, merged[key]] as const)
-    .filter((entry): entry is readonly [string, string] => Boolean(entry[1]));
+  const entries: Array<readonly [string, string]> = [];
+  for (const key of keys) {
+    const value = merged[key];
+    if (typeof value === "string" && value) entries.push([key, value]);
+  }
   if (!entries.length) return [];
   if (platform === "powershell") {
     return entries.map(([key, value]) => `$env:${key} = ${JSON.stringify(value)}`);
@@ -3040,7 +3061,9 @@ async function pollPairing(): Promise<void> {
       updateState({ status: "waiting_pairing", detail: "配对码已过期，请重新生成配对码。", pairingCode: undefined, pairingExpiresAt: undefined });
       return;
     }
-    const response = await fetch(`${config.relayUrl}/api/agent/pairings/${pairing.id}?secret=${encodeURIComponent(pairing.secret)}`);
+    const response = await fetch(`${config.relayUrl}/api/agent/pairings/${pairing.id}`, {
+      headers: { authorization: `Bearer ${pairing.secret}` }
+    });
     if (!response.ok) throw new Error(`配对状态查询失败：HTTP ${response.status}`);
     const result = await response.json() as Record<string, any>;
     if (result.status === "consumed") throw new Error("配对凭据已被读取但代理未完成保存，请重新生成配对码。");
@@ -3060,9 +3083,9 @@ async function pollPairing(): Promise<void> {
       ? decryptSecret(config.encryptedSyncKey)
       : bytesToBase64(randomKeyBytes());
     const wrappedSyncKey = await encryptPayload(pairingKey, { syncKey: syncKeyValue }, pairing.id);
-    const authorization = await fetch(`${config.relayUrl}/api/agent/pairings/${pairing.id}/authorize?secret=${encodeURIComponent(pairing.secret)}`, {
+    const authorization = await fetch(`${config.relayUrl}/api/agent/pairings/${pairing.id}/authorize`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: `Bearer ${pairing.secret}` },
       body: JSON.stringify({ wrappedSyncKey })
     });
     if (!authorization.ok) throw new Error(`浏览器密钥授权失败：HTTP ${authorization.status}`);
@@ -3821,6 +3844,7 @@ async function persistAndPublishRunInfo(threadId: string, turnId: string, runInf
 
 async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void> {
   if (event.type === "delta") {
+    lastProgressAtByThread.set(event.threadId, Date.now() / 1000);
     const itemId = event.kind === "assistant"
       ? event.itemId
       : event.kind === "exec"
@@ -3836,6 +3860,7 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
   }
   if (event.type === "turn.started") {
     activeTurnByThread.set(event.threadId, event.turnId);
+    lastProgressAtByThread.set(event.threadId, Date.now() / 1000);
     clearEngineDiffChunks(event.threadId);
     // Headless path already upserts the user message + snapshot before spawning the CLI.
     // Omitting prompt here avoids the web adding a second YOU bubble for the same turn.
@@ -3907,15 +3932,7 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     return;
   }
   if (event.type === "usage") {
-    const task = taskStore.get(event.threadId);
-    if (task) {
-      task.contextUsage = mergeContextUsage(task.contextUsage, event.contextUsage);
-      task.updatedAt = Date.now() / 1000;
-      await taskStore.upsert(task);
-      // Usage is emitted during a turn; publish a snapshot immediately so the web
-      // client does not have to wait for turn.completed to see current consumption.
-      await publishStoredTaskSnapshot(event.threadId).catch(() => undefined);
-    }
+    await recordUsageUpdate(event.threadId, event.contextUsage);
     return;
   }
   if (event.type === "error") {
@@ -3970,15 +3987,26 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     // Keep store status "active" while Web still needs to answer Cursor plan/question cards.
     const waitingApproval = isApprovalPause;
     const statusForStore = waitingApproval ? "active" : event.status;
+    const pendingUsage = pendingUsageByThread.get(event.threadId);
     activeTurnByThread.delete(event.threadId);
+    lastProgressAtByThread.delete(event.threadId);
+    const usageTimer = usageFlushTimers.get(event.threadId);
+    if (usageTimer) clearTimeout(usageTimer);
+    usageFlushTimers.delete(event.threadId);
+    pendingUsageByThread.delete(event.threadId);
     turnStartingByThread.delete(event.threadId);
     finishLocalActivity(event.threadId, statusForStore);
     await taskStore.setStatus(event.threadId, statusForStore);
     const failed = isTerminalTurnStatus(statusForStore) && /error|fail/i.test(statusForStore);
-    if (event.contextUsage) {
+    if (pendingUsage || event.contextUsage) {
       const task = taskStore.get(event.threadId);
       if (task) {
-        task.contextUsage = mergeContextUsage(task.contextUsage, event.contextUsage);
+        if (event.contextUsage) {
+          const withPending = pendingUsage ? mergeContextUsage(task.contextUsage, pendingUsage) : task.contextUsage;
+          task.contextUsage = mergeContextUsage(withPending, event.contextUsage);
+        } else if (pendingUsage) {
+          task.contextUsage = mergeContextUsage(task.contextUsage, pendingUsage);
+        }
         await taskStore.upsert(task);
       }
     }
@@ -4094,6 +4122,7 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     updatedAt: task.updatedAt,
     cliEngine: task.engine,
     ...(activeTurnByThread.get(task.threadId) ? { activeTurnId: activeTurnByThread.get(task.threadId) } : {}),
+    ...(lastProgressAtByThread.get(task.threadId) ? { lastProgressAt: lastProgressAtByThread.get(task.threadId) } : {}),
     ...(task.providerSessionId ? { providerSessionId: task.providerSessionId } : {}),
     ...(task.model ? { model: task.model } : {}),
     ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
@@ -4335,7 +4364,77 @@ async function runHeadlessTaskTurn(options: {
   void maybeReloadCodexAppServerWhenIdle().catch(handleError);
 }
 
+async function publishCommandStatus(command: ClientCommand, status: "accepted" | "queued" | "duplicate" | "completed" | "failed", detail?: string): Promise<void> {
+  await publish({
+    type: "command.status",
+    eventId: crypto.randomUUID(),
+    occurredAt: new Date().toISOString(),
+    commandId: command.commandId,
+    status,
+    ...(command.type !== "host.refresh" && command.type !== "host.quota.refresh" && command.type !== "host.set_cli_engine" && "threadId" in command
+      ? { threadId: command.threadId }
+      : {}),
+    ...(detail ? { detail: detail.slice(0, 1000) } : {})
+  }, false).catch(() => undefined);
+}
+
 async function handleCommand(command: ClientCommand): Promise<void> {
+  const now = Date.now();
+  const previous = config.processedCommandIds?.[command.commandId];
+  if (previous && now - previous < 24 * 60 * 60 * 1000) {
+    await publishCommandStatus(command, "duplicate", "命令已处理，忽略重复投递");
+    return;
+  }
+  config.processedCommandIds = { ...(config.processedCommandIds ?? {}), [command.commandId]: now };
+  const entries = Object.entries(config.processedCommandIds);
+  if (entries.length > 2000) {
+    config.processedCommandIds = Object.fromEntries(entries.sort((a, b) => a[1] - b[1]).slice(-2000));
+  }
+  await saveConfig().catch(() => undefined);
+  await publishCommandStatus(command, "accepted");
+  try {
+    await handleCommandImpl(command);
+    if (queuedCommandIds.delete(command.commandId)) {
+      await publishCommandStatus(command, "queued");
+      return;
+    }
+    await publishCommandStatus(command, "completed");
+  } catch (error) {
+    await publishCommandStatus(command, "failed", error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+}
+
+async function recordUsageUpdate(threadId: string, usage: ContextUsage): Promise<void> {
+  const task = taskStore.get(threadId);
+  if (!task) return;
+  const merged = mergeContextUsage(pendingUsageByThread.get(threadId), usage);
+  pendingUsageByThread.set(threadId, mergeContextUsage(task.contextUsage, merged));
+  lastProgressAtByThread.set(threadId, Date.now() / 1000);
+  if (usageFlushTimers.has(threadId)) return;
+  const timer = setTimeout(() => {
+    usageFlushTimers.delete(threadId);
+    void (async () => {
+      const current = taskStore.get(threadId);
+      const latest = pendingUsageByThread.get(threadId);
+      pendingUsageByThread.delete(threadId);
+      if (!current || !latest) return;
+      current.contextUsage = mergeContextUsage(current.contextUsage, latest);
+      current.updatedAt = Date.now() / 1000;
+      await taskStore.upsert(current);
+      await publish({
+        type: "usage.updated",
+        eventId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(),
+        threadId,
+        contextUsage: current.contextUsage
+      }, false).catch(() => undefined);
+    })().catch(() => undefined);
+  }, 1000);
+  usageFlushTimers.set(threadId, timer);
+}
+
+async function handleCommandImpl(command: ClientCommand): Promise<void> {
   // host.refresh: status + re-import local Claude/Grok/Cursor sessions for web list.
   if (command.type === "host.refresh") {
     // Always re-push agentVersion first so web update banners clear quickly after client upgrade.
@@ -4548,6 +4647,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       // so closing the browser does not drop it (web localStorage alone is not enough).
       if (isThreadTurnBusy(command.threadId)) {
         await enqueueTurnStart(command);
+        queuedCommandIds.add(command.commandId);
         return;
       }
       turnStartingByThread.add(command.threadId);
@@ -4926,6 +5026,7 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         try { await publishStoredTaskSnapshot(snapshotThreadId); } catch { /* ignore */ }
       }
     }
+    throw error;
   }
 }
 
@@ -4938,13 +5039,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       params.tokenUsage ?? params.token_usage ?? params.usage ?? params.totalTokenUsage ?? params
     );
     if (threadId && usage) {
-      const stored = taskStore.get(threadId);
-      if (stored) {
-        stored.contextUsage = { ...(stored.contextUsage ?? {}), ...usage };
-        stored.updatedAt = Date.now() / 1000;
-        await taskStore.upsert(stored);
-        await publishStoredTaskSnapshot(threadId).catch(() => undefined);
-      }
+      await recordUsageUpdate(threadId, usage);
     }
   }
   if (message.method === "item/started") {
@@ -4984,13 +5079,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     if (threadId) {
       const usage = codexUsageFromUnknown(item.usage ?? item.tokenUsage ?? item.metrics ?? params.usage);
       if (usage) {
-        const stored = taskStore.get(threadId);
-        if (stored) {
-        stored.contextUsage = mergeContextUsage(stored.contextUsage, usage);
-          stored.updatedAt = Date.now() / 1000;
-          await taskStore.upsert(stored);
-          await publishStoredTaskSnapshot(threadId).catch(() => undefined);
-        }
+        await recordUsageUpdate(threadId, usage);
       }
     }
   }
@@ -5034,6 +5123,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const threadId = String(params.threadId ?? params.turn?.threadId ?? "");
     const turnId = String(params.turnId ?? params.turn?.id ?? "");
     if (threadId && turnId) activeTurnByThread.set(threadId, turnId);
+    if (threadId) lastProgressAtByThread.set(threadId, Date.now() / 1000);
     if (threadId) {
       clearEngineDiffChunks(threadId);
       touchAgentTask(threadId, { status: "active", engine: "codex" });
@@ -5066,12 +5156,18 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const errorMessage = extractCodexTurnError(params.turn) || extractCodexTurnError(params);
     finishLocalActivity(threadId, turnStatus);
     await flushRemoteDeltas();
+    const pendingUsage = pendingUsageByThread.get(threadId);
     activeTurnByThread.delete(threadId);
+    lastProgressAtByThread.delete(threadId);
+    const usageTimer = usageFlushTimers.get(threadId);
+    if (usageTimer) clearTimeout(usageTimer);
+    usageFlushTimers.delete(threadId);
+    pendingUsageByThread.delete(threadId);
     turnStartingByThread.delete(threadId);
     const completedStored = taskStore.get(threadId);
     if (completedStored) {
       completedStored.status = turnStatus;
-      if (contextUsage) completedStored.contextUsage = contextUsage;
+      if (pendingUsage || contextUsage) completedStored.contextUsage = mergeContextUsage(pendingUsage, contextUsage ?? pendingUsage!);
       completedStored.updatedAt = Date.now() / 1000;
       await taskStore.upsert(completedStored);
     }
@@ -5415,6 +5511,21 @@ async function publishHostStatus(): Promise<void> {
   }, true);
 }
 
+async function publishActiveTurnHeartbeats(): Promise<void> {
+  for (const [threadId, turnId] of activeTurnByThread) {
+    const status = taskStore.get(threadId)?.status || "active";
+    await publish({
+      type: "thread.heartbeat",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadId,
+      turnId,
+      status,
+      ...(lastProgressAtByThread.get(threadId) ? { lastProgressAt: lastProgressAtByThread.get(threadId) } : {})
+    }, false).catch(() => undefined);
+  }
+}
+
 async function publishThread(threadId: string, options: { touch?: boolean } = {}): Promise<void> {
   if (isThreadDeleted(threadId)) return;
   const result = await codex!.request("thread/read", { threadId, includeTurns: true });
@@ -5450,6 +5561,7 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     eventId: crypto.randomUUID(),
     occurredAt: new Date().toISOString(),
     ...snapshot,
+    ...(lastProgressAtByThread.get(threadId) ? { lastProgressAt: lastProgressAtByThread.get(threadId) } : {}),
     messages: windowed.messages,
     messageTotal: windowed.messageTotal,
     hasOlderMessages: windowed.hasOlderMessages,
@@ -6203,7 +6315,7 @@ async function addWorkspace(): Promise<PublicState> {
     if (bookmark) {
       config.workspaceBookmarks = { ...(config.workspaceBookmarks || {}), [workspace.id]: bookmark };
       try {
-        const stop = app.startAccessingSecurityScopedResource(bookmark);
+        const stop = app.startAccessingSecurityScopedResource(bookmark) as (() => void) | undefined;
         if (typeof stop === "function") macBookmarkStoppers.push(stop);
       } catch {
         // The grant below still covers the current agent session.
@@ -7055,6 +7167,7 @@ app.whenReady().then(async () => {
     if (process.platform === "win32") showWindow();
   });
   createWindow();
+  setInterval(() => void publishActiveTurnHeartbeats(), 15_000).unref();
   startEngineCredentialAndCatalogWatch();
   // Defer update check so first paint / IPC is never delayed by network download.
   setTimeout(() => {
