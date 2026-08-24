@@ -5,6 +5,7 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { URL } from "node:url";
 import type { CliEngine, ContextUsage, PermissionMode, RunInfo } from "@anytimevibe/protocol";
+import { mergeContextUsage, normalizeContextUsage } from "@anytimevibe/protocol";
 import { cloudProxyChildEnv, collectLocalProxyEnv, ensureCursorHttp1ForProxy } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
@@ -324,71 +325,6 @@ function formatAgyPrintTimeout(ms: number): string {
   return `${minutes}m`;
 }
 
-function usageFromUnknown(raw: unknown, contextWindow?: number): ContextUsage | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const u = raw as Record<string, unknown>;
-  const nested = [u, asRecord(u.usage), asRecord(u.token_usage), asRecord(u.tokenUsage), asRecord(u.metrics)]
-    .filter((value): value is Record<string, unknown> => Boolean(value));
-  const numberFrom = (keys: string[]): number => {
-    for (const source of nested) {
-      for (const key of keys) {
-        const value = Number(source[key]);
-        if (Number.isFinite(value) && value >= 0) return value;
-      }
-    }
-    return 0;
-  };
-  const input = numberFrom(["input_tokens", "inputTokens", "prompt_tokens", "promptTokens"]);
-  const output = numberFrom(["output_tokens", "outputTokens", "completion_tokens", "completionTokens"]);
-  const cachedInput = numberFrom([
-    "cached_input_tokens", "cachedInputTokens", "cache_read_input_tokens", "cacheReadInputTokens",
-    "cache_read_tokens", "cacheReadTokens", "prompt_cache_tokens"
-  ]);
-  const reasoning = numberFrom([
-    "reasoning_tokens", "reasoningTokens", "thinking_tokens", "thinkingTokens",
-    "reasoning_output_tokens", "reasoningOutputTokens"
-  ]);
-  const reportedTotal = numberFrom(["total_tokens", "totalTokens", "total_token_count", "totalTokenCount"]);
-  const total = reportedTotal || (input + output + reasoning);
-  const window = contextWindow || numberFrom(["context_window", "contextWindow", "max_context_tokens", "maxContextTokens"]) || undefined;
-  // Optional subscription / rate-limit pool when CLI surfaces it.
-  const planRemaining = Number(
-    u.plan_remaining ?? u.planRemaining ?? u.rate_limit_remaining ?? u.rateLimitRemaining ?? 0
-  ) || undefined;
-  const planLimit = Number(
-    u.plan_limit ?? u.planLimit ?? u.rate_limit_limit ?? u.rateLimitLimit ?? 0
-  ) || undefined;
-  const planLabelRaw = u.plan_label ?? u.planLabel ?? u.rate_limit_label ?? u.subscription;
-  const planLabel = typeof planLabelRaw === "string" && planLabelRaw.trim()
-    ? planLabelRaw.trim().slice(0, 80)
-    : undefined;
-  if (!input && !output && !cachedInput && !reasoning && !total && planRemaining == null && !planLabel) return undefined;
-  return {
-    ...(input ? { inputTokens: input } : {}),
-    ...(output ? { outputTokens: output } : {}),
-    ...(cachedInput ? { cachedInputTokens: cachedInput } : {}),
-    ...(reasoning ? { reasoningTokens: reasoning } : {}),
-    ...(total ? { totalTokens: total } : {}),
-    ...(window ? { contextWindow: window } : {}),
-    ...(window && total ? { remainingTokens: Math.max(0, window - total) } : {}),
-    ...(planRemaining != null ? { planRemaining } : {}),
-    ...(planLimit ? { planLimit } : {}),
-    ...(planLabel ? { planLabel } : {})
-  };
-}
-
-function mergeContextUsage(previous: ContextUsage | undefined, next: ContextUsage): ContextUsage {
-  const merged = { ...(previous ?? {}), ...next };
-  const input = merged.inputTokens ?? 0;
-  const output = merged.outputTokens ?? 0;
-  const reasoning = merged.reasoningTokens ?? 0;
-  if (merged.totalTokens == null && (input || output || reasoning)) merged.totalTokens = input + output + reasoning;
-  if (merged.contextWindow != null && merged.totalTokens != null && merged.remainingTokens == null) {
-    merged.remainingTokens = Math.max(0, merged.contextWindow - merged.totalTokens);
-  }
-  return merged;
-}
-
 function captureReportedDiff(threadId: string, value: unknown, depth = 0): void {
   if (!value || depth > 4) return;
   if (Array.isArray(value)) {
@@ -642,7 +578,7 @@ function handleClaudeLine(
   captureReportedDiff(options.threadId, parsed);
   const type = String(parsed.type || "");
   noteClaudeSessionId(state, parsed);
-  const liveUsage = usageFromUnknown(parsed.usage ?? parsed.message?.usage ?? parsed.usage_metadata, Number(parsed.context_window ?? parsed.contextWindow) || undefined);
+  const liveUsage = normalizeContextUsage(parsed.usage ?? parsed.message?.usage ?? parsed.usage_metadata, Number(parsed.context_window ?? parsed.contextWindow) || undefined);
   if (liveUsage) {
     state.contextUsage = mergeContextUsage(state.contextUsage, liveUsage);
     onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
@@ -770,13 +706,16 @@ function handleClaudeLine(
   }
   if (type === "result") {
     noteClaudeSessionId(state, parsed);
-    const usage = usageFromUnknown(
+    const usage = normalizeContextUsage(
       parsed.usage ?? parsed.result?.usage ?? parsed.message?.usage ?? parsed,
       Number(parsed.context_window ?? parsed.contextWindow) || undefined
     );
     if (usage) {
       state.contextUsage = mergeContextUsage(state.contextUsage, usage);
-      onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
+      // Publish the accumulated snapshot rather than this single sample: a sparse
+      // sample would leave older web clients (which replace instead of merging)
+      // without the window size, blanking the context gauge until the next sync.
+      onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
     }
     if (typeof parsed.result === "string" && parsed.result) {
       if (parsed.is_error) {
@@ -785,6 +724,14 @@ function handleClaudeLine(
           state.claudeResumeInvalid = true;
           // Do not keep seeding the missing id for the next turn.
           state.sessionId = "";
+          // "No conversation found" in a result event is a sub-agent sidechain error:
+          // Claude continues on the main channel. Suppress the hard failure; show a warning.
+          const warnKey = "claude-session-not-found";
+          if (!state.emittedErrors.has(warnKey)) {
+            state.emittedErrors.add(warnKey);
+            emitDelta(onEvent, options, "stage:resume-warn", "stage", `\n… Claude 已重置会话（${message}），继续执行\n`);
+          }
+          return;
         }
         // Common after interactive trust decline
         if (/trust|workspace|not.*allowed|permission/i.test(parsed.result)) {
@@ -824,7 +771,7 @@ function handleCursorLine(
   captureReportedDiff(options.threadId, parsed);
   const type = String(parsed.type || "");
   if (parsed.session_id) state.sessionId = String(parsed.session_id);
-  const liveUsage = usageFromUnknown(parsed.usage ?? parsed.metrics, Number(parsed.context_window ?? parsed.contextWindow) || undefined);
+  const liveUsage = normalizeContextUsage(parsed.usage ?? parsed.metrics, Number(parsed.context_window ?? parsed.contextWindow) || undefined);
   if (liveUsage) {
     state.contextUsage = mergeContextUsage(state.contextUsage, liveUsage);
     onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
@@ -1038,13 +985,16 @@ function handleCursorLine(
       emitDelta(onEvent, options, "assistant", "assistant", parsed.result);
     }
     const duration = Number(parsed.duration_ms || 0);
-    const usage = usageFromUnknown(
+    const usage = normalizeContextUsage(
       parsed.usage ?? parsed.result?.usage ?? parsed.metrics ?? parsed,
       Number(parsed.context_window ?? parsed.contextWindow) || undefined
     );
     if (usage) {
       state.contextUsage = mergeContextUsage(state.contextUsage, usage);
-      onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
+      // Publish the accumulated snapshot rather than this single sample: a sparse
+      // sample would leave older web clients (which replace instead of merging)
+      // without the window size, blanking the context gauge until the next sync.
+      onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
     }
     emitDelta(
       onEvent,
@@ -1072,7 +1022,7 @@ function handleGrokLine(
   }
   captureReportedDiff(options.threadId, parsed);
   const type = String(parsed.type || "");
-  const liveUsage = usageFromUnknown(parsed.usage ?? parsed.response?.usage ?? parsed.result?.usage, Number(parsed.context_window ?? parsed.contextWindow) || undefined);
+  const liveUsage = normalizeContextUsage(parsed.usage ?? parsed.response?.usage ?? parsed.result?.usage, Number(parsed.context_window ?? parsed.contextWindow) || undefined);
   if (liveUsage) {
     state.contextUsage = mergeContextUsage(state.contextUsage, liveUsage);
     onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
@@ -1105,13 +1055,16 @@ function handleGrokLine(
   }
   if (type === "end") {
     if (parsed.sessionId) state.sessionId = String(parsed.sessionId);
-    const usage = usageFromUnknown(
+    const usage = normalizeContextUsage(
       parsed.usage ?? parsed.response?.usage ?? parsed.result?.usage ?? parsed.metrics ?? parsed,
       Number(parsed.context_window ?? parsed.contextWindow) || undefined
     );
     if (usage) {
       state.contextUsage = mergeContextUsage(state.contextUsage, usage);
-      onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
+      // Publish the accumulated snapshot rather than this single sample: a sparse
+      // sample would leave older web clients (which replace instead of merging)
+      // without the window size, blanking the context gauge until the next sync.
+      onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
     }
     if (!state.sawAssistant && typeof parsed.text === "string" && parsed.text) {
       state.text = parsed.text;
@@ -1376,10 +1329,13 @@ function handleAntigravityLine(
     const conversationId = String(step.conversation_id || parsed.conversation_id || "").trim();
     if (conversationId) state.sessionId = conversationId;
     const stepType = String(step.step_type || "").toLowerCase();
-    const usage = usageFromUnknown(step.usage);
+    const usage = normalizeContextUsage(step.usage);
     if (usage) {
       state.contextUsage = mergeContextUsage(state.contextUsage, usage);
-      onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
+      // Publish the accumulated snapshot rather than this single sample: a sparse
+      // sample would leave older web clients (which replace instead of merging)
+      // without the window size, blanking the context gauge until the next sync.
+      onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
     }
     if (stepType === "user_input" || stepType === "checkpoint") return;
     if (stepType === "tool") {
@@ -1434,10 +1390,13 @@ function handleAntigravityLine(
       return;
     }
     if (resultConversationId) state.sessionId = resultConversationId;
-    const usage = usageFromUnknown(result.usage);
+    const usage = normalizeContextUsage(result.usage);
     if (usage) {
       state.contextUsage = mergeContextUsage(state.contextUsage, usage);
-      onEvent({ type: "usage", threadId: options.threadId, contextUsage: usage });
+      // Publish the accumulated snapshot rather than this single sample: a sparse
+      // sample would leave older web clients (which replace instead of merging)
+      // without the window size, blanking the context gauge until the next sync.
+      onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
     }
     const finalText = typeof result.response === "string" ? result.response : agyStepText(result);
     if (finalText) emitAgyAssistantText(state, options, onEvent, finalText);
@@ -1858,7 +1817,14 @@ export async function runHeadlessTurn(
         if (engine === "claude" && isClaudeSessionNotFound(line)) {
           state.claudeResumeInvalid = true;
           state.sessionId = "";
-          emitHeadlessErrorOnce(state, safeOnEvent, options, line.trim());
+          // Claude self-recovers after "No conversation found" (sidechain/sub-agent cleanup).
+          // Do NOT mark the turn as failed here — the main process keeps running and the
+          // task will complete normally. Show a soft stage note only.
+          const warnKey = `claude-session-not-found`;
+          if (!state.emittedErrors.has(warnKey)) {
+            state.emittedErrors.add(warnKey);
+            emitDelta(safeOnEvent, options, "stage:resume-warn", "stage", `\n… Claude 已重置会话（${line.trim()}），继续执行\n`);
+          }
           return;
         }
         emitDelta(safeOnEvent, options, "cli-log", "cli-log", `${line}\n`);

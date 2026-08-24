@@ -39,10 +39,18 @@ describe("Claude session id acceptance", () => {
     })).toBe(false);
 
     expect(shouldAcceptClaudeSessionId({
-      type: "result",
-      session_id: "parent-1",
-      is_error: true,
-      result: "No conversation found with session ID: parent-1"
-    })).toBe(false);
+    type: "result",
+    session_id: "parent-1",
+    is_error: true,
+    result: "No conversation found with session ID: parent-1"
+  })).toBe(false);
+  });
+
+  it("detects session-not-found in various formats", () => {
+    expect(isClaudeSessionNotFound("No conversation found with session ID: 26ceaa61-557c-4b22-be86-625d44c6a0b5")).toBe(true);
+    expect(isClaudeSessionNotFound("no conversation found with session id: abc")).toBe(true);
+    expect(isClaudeSessionNotFound("Connection refused")).toBe(false);
+    expect(isClaudeSessionNotFound("")).toBe(false);
+    expect(isClaudeSessionNotFound(null)).toBe(false);
   });
 });
