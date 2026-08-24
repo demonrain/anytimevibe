@@ -224,12 +224,15 @@ function agentAppVersion(): string {
 }
 
 function productIconPath(): string {
-  const candidates = [
-    path.join(__dirname, "..", "assets", "icon.ico"),
-    path.join(__dirname, "..", "assets", "icon.png"),
-    path.join(process.resourcesPath, "assets", "icon.ico"),
-    path.join(process.resourcesPath, "assets", "icon.png")
-  ];
+  const assetRoot = path.join(__dirname, "..", "assets");
+  const packagedAssetRoot = path.join(process.resourcesPath, "assets");
+  // macOS does not use .ico application assets. Prefer PNG there so a failed ICO
+  // decode never causes the generic fallback icon to be used for the window.
+  const assetNames = process.platform === "win32" ? ["icon.ico", "icon.png"] : ["icon.png", "icon.ico"];
+  const candidates = assetNames.flatMap((name) => [
+    path.join(assetRoot, name),
+    path.join(packagedAssetRoot, name)
+  ]);
   for (const candidate of candidates) {
     try {
       readFileSync(candidate);
@@ -250,6 +253,25 @@ function loadProductIcon() {
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="15" fill="#17211b"/><path d="M13 20h38v25H13z" fill="#f2eadb"/><path d="m19 27 7 5-7 6" fill="none" stroke="#e25832" stroke-width="5"/><path d="M31 39h14" stroke="#2d7653" stroke-width="5"/><circle cx="46" cy="24" r="3" fill="#3bab70"/></svg>'
       ).toString("base64")
   );
+}
+
+/**
+ * macOS menu-bar icons must be monochrome template images. The product mark is
+ * intentionally separate because a colorful application icon can be invisible
+ * when macOS applies template rendering in light or dark menu bars.
+ */
+function loadTrayIcon() {
+  if (process.platform !== "darwin") return loadProductIcon().resize({ width: 16, height: 16 });
+
+  const templateSource = nativeImage.createFromDataURL(
+    "data:image/svg+xml;base64," +
+      Buffer.from(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36"><path d="M7 8.5h22v15H7z" fill="none" stroke="#000" stroke-width="2.6" stroke-linejoin="round"/><path d="m12 14 4 3.5-4 3.5M19 21h6" fill="none" stroke="#000" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M13 29h10" fill="none" stroke="#000" stroke-width="2.6" stroke-linecap="round"/></svg>'
+      ).toString("base64")
+  );
+  const trayIcon = (templateSource.isEmpty() ? loadProductIcon() : templateSource).resize({ width: 18, height: 18 });
+  trayIcon.setTemplateImage(true);
+  return trayIcon;
 }
 
 function resolvedDisplayName(): string {
@@ -7157,10 +7179,7 @@ app.whenReady().then(async () => {
     Menu.setApplicationMenu(null);
   }
   app.setLoginItemSettings({ openAtLogin: true });
-  const traySource = loadProductIcon();
-  const trayIcon = traySource.resize({ width: 16, height: 16 });
-  if (process.platform === "darwin") trayIcon.setTemplateImage(true);
-  tray = new Tray(trayIcon);
+  tray = new Tray(loadTrayIcon());
   tray.setToolTip("随码");
   tray.on("double-click", showWindow);
   tray.on("click", () => {
