@@ -23,7 +23,7 @@ describe("isCodexCompatibleVersion", () => {
     expect(isCodexCompatibleVersion("0.143.0")).toBe(false);
     expect(isCodexCompatibleVersion("0.143.9")).toBe(false);
     expect(isCodexCompatibleVersion("")).toBe(false);
-    expect(CODEX_INSTALL_PACKAGE).toBe("@openai/codex@0.145.0");
+    expect(CODEX_INSTALL_PACKAGE).toBe("@openai/codex@latest");
     expect(CODEX_COMPAT_LABEL).toBe("≥ 0.144.0");
   });
 });

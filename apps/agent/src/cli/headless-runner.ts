@@ -498,6 +498,85 @@ function normalizeApprovalPlan(raw: unknown): ApprovalPlan | null {
   };
 }
 
+/**
+ * Every container a Cursor tool-call may hide its payload in.
+ *
+ * Cursor moves the interesting fields between `args` and `result` (each of which
+ * may wrap the real body in a `success` envelope) across `started` / `completed`
+ * and across CLI versions. The previous code picked ONE container with
+ * `asRecord(node.args) || asRecord(node.result) || node`, which short-circuits on
+ * an EMPTY `args: {}` — an empty object is truthy — and so never looked at
+ * `result`. A question whose options lived in `result` therefore parsed as zero
+ * questions and rendered as an approval card with nothing to click.
+ *
+ * Searching every candidate instead of guessing one is what makes this robust to
+ * the next shuffle of the payload shape.
+ */
+function approvalPayloadCandidates(node: Record<string, any>): Record<string, any>[] {
+  const out: Record<string, any>[] = [];
+  const push = (value: unknown): void => {
+    const record = asRecord(value);
+    if (record && !out.includes(record)) out.push(record);
+  };
+  push(node);
+  push(node.success);
+  for (const key of ["args", "result", "input", "arguments", "params"]) {
+    const nested = asRecord(node[key]);
+    if (!nested) continue;
+    push(nested);
+    push(nested.success);
+    push(nested.value);
+    push(nested.data);
+  }
+  return out;
+}
+
+/**
+ * Pull the question list out of a Cursor askQuestion tool call.
+ *
+ * Array shapes are tried across every container first because they are the
+ * unambiguous form; only then do we treat a container as a single inline
+ * question (`{ question, options }` with no wrapper array), which is the shape
+ * that yields a false positive most easily.
+ */
+export function findApprovalQuestions(node: Record<string, any>): ApprovalQuestion[] {
+  const containers = approvalPayloadCandidates(node);
+  for (const container of containers) {
+    const fromArray = normalizeApprovalQuestions(
+      container.questions ?? container.question_list ?? container.questionList
+    );
+    if (fromArray.length) return fromArray;
+  }
+  for (const container of containers) {
+    const single = normalizeApprovalQuestions([container])[0];
+    if (single) return [single];
+  }
+  return [];
+}
+
+/** Pull the plan out of a Cursor createPlan tool call, checking every container. */
+export function findApprovalPlan(node: Record<string, any>): ApprovalPlan | null {
+  for (const container of approvalPayloadCandidates(node)) {
+    const plan = normalizeApprovalPlan(container);
+    if (plan) return plan;
+  }
+  return null;
+}
+
+/**
+ * Compact JSON of an unparseable payload, so a card that has no options still
+ * shows the user what was asked instead of only "could not parse".
+ */
+function approvalRawSummary(node: Record<string, any>): string {
+  try {
+    const text = JSON.stringify(node, null, 2);
+    if (!text || text === "{}") return "";
+    return text.length > 4_000 ? `${text.slice(0, 4_000)}\n…（已截断）` : text;
+  } catch {
+    return "";
+  }
+}
+
 function emitCursorInteractiveApproval(
   options: HeadlessRunOptions,
   state: ParseState,
@@ -850,8 +929,7 @@ function handleCursorLine(
     const planNode = asRecord(call.createPlanToolCall) || asRecord(call.create_plan);
     const askNode = asRecord(call.askQuestionToolCall) || asRecord(call.ask_question);
     if (planNode) {
-      const args = asRecord(planNode.args) || asRecord(planNode.result) || planNode;
-      const plan = normalizeApprovalPlan(args) || normalizeApprovalPlan(asRecord(args?.success) || args);
+      const plan = findApprovalPlan(planNode);
       if (plan && (subtype === "started" || subtype === "completed")) {
         const title = plan.name
           ? `批准 Cursor 计划：${plan.name}`
@@ -877,20 +955,16 @@ function handleCursorLine(
       }
     }
     if (askNode) {
-      const args = asRecord(askNode.args) || asRecord(askNode.result) || askNode;
-      let questions = normalizeApprovalQuestions(args.questions);
-      if (!questions.length) {
-        questions = normalizeApprovalQuestions(asRecord(args.success)?.questions);
-      }
-      if (!questions.length) {
-        questions = normalizeApprovalQuestions(askNode.questions);
-      }
-      // Prefer completed (full args). Emit on started only when questions are already complete —
-      // empty started + immediate kill was leaving the Web card with title and no options.
-      const ready = questions.length > 0;
-      if (ready && (subtype === "completed" || subtype === "started")) {
-        const title = String(args.title || askNode.title || "Cursor 需要你选择选项").trim()
-          || "Cursor 需要你选择选项";
+      const questions = findApprovalQuestions(askNode);
+      // Title may sit in any container, same as the questions themselves.
+      const titleFrom = approvalPayloadCandidates(askNode)
+        .map((container) => String(container.title || "").trim())
+        .find(Boolean);
+      const title = titleFrom || "Cursor 需要你选择选项";
+      // Emit on started only when the options are already complete — a sparse
+      // started followed by an immediate kill used to leave the Web card with a
+      // title and no options.
+      if (questions.length > 0 && (subtype === "completed" || subtype === "started")) {
         const detail = questions
           .map((q) => `${q.prompt}\n${q.options.map((o) => `  - ${o.label}`).join("\n")}`)
           .join("\n\n")
@@ -919,16 +993,18 @@ function handleCursorLine(
         );
         return;
       }
-      // completed without parseable questions (e.g. headless synthetic skip) — still surface a card.
+      // Completed but no options parsed. Still surface a card so the turn is not
+      // silently stuck, and include the raw payload — without it the user saw a
+      // box with nothing in it and no way to tell what was being asked.
       if (subtype === "completed") {
-        const title = String(args.title || askNode.title || "Cursor 需要你选择选项").trim()
-          || "Cursor 需要你选择选项";
-        const detail = String(
-          args.prompt
-          || asRecord(args.success)?.message
-          || asRecord(askNode.result)?.message
-          || ""
-        ).trim() || "未能解析选项列表。请拒绝后在终端确认，或换一种提问方式重试。";
+        const message = approvalPayloadCandidates(askNode)
+          .map((container) => String(container.prompt || container.question || container.message || "").trim())
+          .find(Boolean);
+        const raw = approvalRawSummary(askNode);
+        const detail = [
+          message || "未能解析选项列表。可直接拒绝后在终端确认，或让 Cursor 换一种提问方式重试。",
+          ...(raw ? [`原始载荷：\n${raw}`] : [])
+        ].join("\n\n").slice(0, 12_000);
         emitCursorInteractiveApproval(options, state, onEvent, callId, "question", {
           title,
           detail

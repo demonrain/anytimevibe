@@ -35,10 +35,10 @@ MAX_USERS=100
 
 Agent 启动后会检测 Node.js、Codex CLI 和兼容版本。若 Node.js 缺失，“安装 Node.js”会打开官方下载页；若 Codex 缺失或版本不兼容，“一键安装兼容版 Codex”会打开系统终端并执行安装与登录命令。安装完成后点击“重新检测”。
 
-当前适配器要求 `codex-cli 0.144.x` 或 `0.145.x`。环境安装会使用：
+当前适配器要求 `codex-cli ≥ 0.144.0`（不设上限，新版本自动接受）。环境安装会使用：
 
 ```bash
-npm install -g @openai/codex@0.145.0
+npm install -g @openai/codex@latest
 codex login
 ```
 

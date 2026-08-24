@@ -10,8 +10,21 @@ import { PRODUCT_VERSION } from "@anytimevibe/protocol";
 type RpcId = string | number;
 type JsonObject = Record<string, any>;
 
-/** One-click install pin for Agent environment setup (floor; newer CLIs remain accepted). */
-export const CODEX_INSTALL_PACKAGE = "@openai/codex@0.145.0";
+/**
+ * Spec passed to `npm install -g` by one-click install.
+ *
+ * Tracks `@latest` on purpose, matching every other engine (Claude / Grok /
+ * Cursor / Antigravity all run the vendor's official installer, which is always
+ * newest). An exact pin here used to leave one-click users several minor versions
+ * behind while the compat check below happily accepted those newer builds.
+ *
+ * `CODEX_COMPAT_LABEL` remains the FLOOR that gates whether an installed CLI can
+ * drive app-server — it is deliberately not an upper bound. If a future Codex
+ * release ever breaks the app-server protocol, pin this back to the last good
+ * exact version (`@openai/codex@x.y.z`) and raise the floor; that is the one
+ * place to change.
+ */
+export const CODEX_INSTALL_PACKAGE = "@openai/codex@latest";
 /** Human-readable floor shown in UI / error messages. */
 export const CODEX_COMPAT_LABEL = "≥ 0.144.0";
 
