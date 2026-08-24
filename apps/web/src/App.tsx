@@ -1871,14 +1871,23 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const preferExistingStatus = existing
       && /failed|error|interrupt|stop|cancel/i.test(existingStatus)
       && /completed|idle|unknown/i.test(incomingStatus);
-    const status = preferExistingStatus ? existingStatus : (incomingStatus || existingStatus || "unknown");
-    const terminalStatus = isFailedTaskStatus(status)
-      || /^(completed|complete|success|succeeded|idle)$/i.test(status);
+    const hasLiveTurn = Boolean(event.activeTurnId?.trim());
+    // A live activeTurnId means the agent still has a turn in flight. Do not let a
+    // stale "completed"/"idle" status (common on Codex usage heartbeats) wipe it or
+    // flip the list badge to「已完成」while deltas keep streaming.
+    const rawStatus = preferExistingStatus ? existingStatus : (incomingStatus || existingStatus || "unknown");
+    const status = hasLiveTurn && /^(completed|complete|success|succeeded|idle|unknown)$/i.test(rawStatus)
+      ? "active"
+      : rawStatus;
+    const terminalStatus = !hasLiveTurn
+      && (isFailedTaskStatus(status) || /^(completed|complete|success|succeeded|idle)$/i.test(status));
     // A snapshot without activeTurnId is authoritative unless an approval card is
     // still open. This lets reconnect/sync clear stale "processing" state.
-      const activeTurnId = terminalStatus
+    const activeTurnId = hasLiveTurn
+      ? event.activeTurnId
+      : (terminalStatus
         ? undefined
-        : (event.activeTurnId || (existing?.approvals.length ? existing.activeTurnId : undefined));
+        : (existing?.approvals.length ? existing.activeTurnId : undefined));
     const incomingMessages = event.messages?.length ? event.messages : [];
     const hasOlderMessages = Boolean(event.hasOlderMessages);
     const rawMessages = sanitizeTranscriptMessages(

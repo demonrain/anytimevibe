@@ -4139,11 +4139,18 @@ async function publishStoredTaskSnapshot(
     await taskStore.upsert(task);
   }
   const windowed = windowTranscriptMessages(messages);
+  // While a live turn is tracked, never publish a stale terminal status from the previous
+  // turn. Usage heartbeats reuse this path and would otherwise flip the web UI to「已完成」
+  // mid-stream (Codex follow-ups often leave taskStore.status as the prior completion).
+  const liveTurnId = activeTurnByThread.get(task.threadId);
+  const publishStatus = liveTurnId && !isInProgressStoredStatus(task.status)
+    ? "active"
+    : task.status;
   const agentTask: AgentTask = {
     threadId: task.threadId,
     title: task.title,
     cwd,
-    status: task.status,
+    status: publishStatus,
     updatedAt: task.updatedAt,
     engine: task.engine
   };
@@ -4159,11 +4166,11 @@ async function publishStoredTaskSnapshot(
     threadId: task.threadId,
     title: task.title,
     cwd,
-    status: task.status,
+    status: publishStatus,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     cliEngine: task.engine,
-    ...(activeTurnByThread.get(task.threadId) ? { activeTurnId: activeTurnByThread.get(task.threadId) } : {}),
+    ...(liveTurnId ? { activeTurnId: liveTurnId } : {}),
     ...(lastProgressAtByThread.get(task.threadId) ? { lastProgressAt: lastProgressAtByThread.get(task.threadId) } : {}),
     ...(task.providerSessionId ? { providerSessionId: task.providerSessionId } : {}),
     ...(task.model ? { model: task.model } : {}),
@@ -4806,6 +4813,11 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
           });
         }
         activeTurnByThread.set(command.threadId, String(result.turn.id));
+        if (stored) {
+          stored.status = "active";
+          stored.updatedAt = Date.now() / 1000;
+          await taskStore.upsert(stored);
+        }
         await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: result.turn.id, prompt: command.prompt }, true);
         await persistAndPublishRunInfo(command.threadId, String(result.turn.id), await codexRunInfo(model, effort));
         return;
@@ -5176,6 +5188,14 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     if (threadId) {
       clearEngineDiffChunks(threadId);
       touchAgentTask(threadId, { status: "active", engine: "codex" });
+      // Persist active so usage heartbeats / lightweight snapshots do not keep
+      // broadcasting the previous turn's "completed" status mid-stream.
+      const storedForStatus = taskStore.get(threadId);
+      if (storedForStatus && storedForStatus.status !== "active") {
+        storedForStatus.status = "active";
+        storedForStatus.updatedAt = Date.now() / 1000;
+        await taskStore.upsert(storedForStatus);
+      }
       const stored = taskStore.get(threadId);
       await captureTurnDiffBaseline(
         threadId,
@@ -5531,11 +5551,16 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
   const updatedAt = options.touch
     ? Math.max(normalizeUnixSeconds(snapshot.updatedAt), Date.now() / 1000)
     : normalizeUnixSeconds(snapshot.updatedAt);
+  const liveTurnId = snapshot.activeTurnId || activeTurnByThread.get(threadId);
+  // Prefer a live in-flight turn over a stale completed/idle snapshot status.
+  const publishStatus = liveTurnId && !isInProgressStoredStatus(snapshot.status)
+    ? "active"
+    : snapshot.status;
   const task: AgentTask = {
     threadId: snapshot.threadId,
     title: snapshot.title,
     cwd,
-    status: snapshot.status,
+    status: publishStatus,
     updatedAt,
     engine: "codex"
   };
@@ -5551,6 +5576,7 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     eventId: crypto.randomUUID(),
     occurredAt: new Date().toISOString(),
     ...snapshot,
+    status: publishStatus,
     ...(lastProgressAtByThread.get(threadId) ? { lastProgressAt: lastProgressAtByThread.get(threadId) } : {}),
     messages: windowed.messages,
     messageTotal: windowed.messageTotal,
@@ -5564,9 +5590,7 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     ...(stored?.contextUsage ? { contextUsage: stored.contextUsage } : {}),
     ...(stored?.lastDiff !== undefined ? { diff: stored.lastDiff } : {}),
     ...(stored?.providerSessionId ? { providerSessionId: stored.providerSessionId } : { providerSessionId: threadId }),
-    ...(snapshot.activeTurnId || activeTurnByThread.get(threadId)
-      ? { activeTurnId: snapshot.activeTurnId || activeTurnByThread.get(threadId) }
-      : {})
+    ...(liveTurnId ? { activeTurnId: liveTurnId } : {})
   }, true);
 }
 
