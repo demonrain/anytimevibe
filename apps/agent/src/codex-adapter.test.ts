@@ -78,6 +78,32 @@ describe("threadToSnapshot", () => {
     expect(snapshot.activeTurnId).toBe("turn-active");
   });
 
+  it("does not let a previous completed turn override an active thread status", () => {
+    // Thread is active (new turn just started); previous turn finished as "completed".
+    // The snapshot must keep status=active so the web does not show "已完成" prematurely.
+    const snapshot = threadToSnapshot({
+      id: "thread-multi",
+      status: "active",
+      turns: [
+        { id: "turn-1", status: "completed", completedAt: 100, items: [] },
+        { id: "turn-2", status: "inProgress", startedAt: 200, items: [] }
+      ]
+    });
+    expect(snapshot.status).toBe("active");
+    expect(snapshot.activeTurnId).toBe("turn-2");
+  });
+
+  it("overrides active thread status with last turn failure status", () => {
+    const snapshot = threadToSnapshot({
+      id: "thread-failed",
+      status: "active",
+      turns: [
+        { id: "turn-1", status: "failed", completedAt: 100, items: [] }
+      ]
+    });
+    expect(snapshot.status).toBe("failed");
+  });
+
   it("normalizes ms timestamps and prefers last turn activity for updatedAt", () => {
     expect(normalizeUnixSeconds(1_700_000_000_000)).toBe(1_700_000_000);
     const snapshot = threadToSnapshot({

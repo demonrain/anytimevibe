@@ -470,8 +470,15 @@ export function threadToSnapshot(thread: JsonObject) {
   const rawStatus = typeof thread.status === "string"
     ? thread.status
     : JSON.stringify(thread.status ?? "unknown");
-  // Prefer last turn status when thread-level status is vague but the turn ended in systemerror/failed.
-  const status = (/unknown|active|running/i.test(rawStatus) && lastTurnStatus && isTerminalTurnStatus(lastTurnStatus))
+  // Only override thread-level status with the last turn's status when the thread is vague (unknown/active/running)
+  // AND the turn ended in a failure-type terminal state. Never let a previous turn's "completed" override a
+  // thread that is still active — doing so made the web UI show "已完成" while the task was still running.
+  const status = (
+    /unknown|active|running/i.test(rawStatus)
+    && lastTurnStatus
+    && isTerminalTurnStatus(lastTurnStatus)
+    && /error|fail|interrupt|cancel/i.test(lastTurnStatus)
+  )
     ? lastTurnStatus
     : rawStatus;
   // If still no system error bubble but we know the failure reason, append one.
