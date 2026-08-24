@@ -23,10 +23,12 @@ import {
   derivePairingKey,
   generatePairingKeyPair,
   importAesKey,
+  mergeContextUsage,
   openEnvelope,
   parseAgentEventCompat,
   pairingClaimResponseSchema,
   randomUuid,
+  resolveContextUsageTotals,
   TRANSCRIPT_HISTORY_PAGE_SIZE,
   type AgentEvent,
   type CliEngine,
@@ -357,28 +359,26 @@ type ContextUsageView = {
 
 function parseContextUsageView(usage?: ContextUsage): ContextUsageView | null {
   if (!usage) return null;
-  const total = usage.totalTokens
-    ?? (((usage.inputTokens || 0) + (usage.outputTokens || 0)) || 0);
-  const window = usage.contextWindow ?? null;
-  const remaining = usage.remainingTokens
-    ?? (window != null ? Math.max(0, window - total) : null);
-  const usedPercent = window && window > 0
-    ? Math.max(0, Math.min(100, Math.round((total / window) * 100)))
-    : null;
+  // Derived numbers come from the shared protocol helper so the gauge agrees with
+  // what the agent computed — cache-inclusive prompt size, reasoning not counted
+  // twice. Never re-derive the total here.
+  const { totalTokens, contextWindow, remainingTokens, usedPercent } = resolveContextUsageTotals(usage);
   const planRemaining = usage.planRemaining ?? null;
   const planLimit = usage.planLimit ?? null;
-  const planUsedPercent = planLimit && planLimit > 0 && planRemaining != null
+  const planUsedPercent = planLimit != null && planLimit > 0 && planRemaining != null
     ? Math.max(0, Math.min(100, Math.round(((planLimit - planRemaining) / planLimit) * 100)))
     : null;
   const planLabel = usage.planLabel?.trim() || null;
-  if (usedPercent == null && remaining == null && !total && !planLabel && planRemaining == null) {
+  // `== null` rather than falsy: a genuine 0 (fresh turn, exhausted quota) is
+  // information worth showing, not a reason to hide the chip.
+  if (usedPercent == null && remainingTokens == null && totalTokens == null && !planLabel && planRemaining == null) {
     return null;
   }
   return {
     usedPercent,
-    remainingTokens: remaining,
-    contextWindow: window,
-    totalTokens: total || null,
+    remainingTokens,
+    contextWindow,
+    totalTokens,
     inputTokens: usage.inputTokens ?? null,
     outputTokens: usage.outputTokens ?? null,
     cachedInputTokens: usage.cachedInputTokens ?? null,
@@ -1808,7 +1808,9 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   if (event.type === "sync.completed" || event.type === "sync.progress") return next;
   if (event.type === "usage.updated") {
     const task = next.tasks[event.threadId];
-    if (task) task.contextUsage = event.contextUsage;
+    // Merge, don't replace: a sample that omits the window size or input count
+    // must not erase what we already learned, or the context chip blanks out.
+    if (task) task.contextUsage = mergeContextUsage(task.contextUsage, event.contextUsage);
     return next;
   }
   if (event.type === "thread.heartbeat") {
@@ -2077,7 +2079,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     if (!task.queuedTurns?.length) {
       task.queuedTurns = [];
     }
-    if (event.contextUsage) task.contextUsage = event.contextUsage;
+    if (event.contextUsage) task.contextUsage = mergeContextUsage(task.contextUsage, event.contextUsage);
     const errText = event.errorMessage?.trim();
     if (errText) {
       const norm = normalizeSystemErrorText(errText).toLowerCase();

@@ -1,0 +1,348 @@
+import type { ContextUsage } from "./index";
+
+/**
+ * Shared token / context-usage math for every coding CLI (codex, claude, cursor,
+ * grok, agy) and for the web display. Agent and web MUST go through this module
+ * so both sides agree on what "上下文已用" means.
+ *
+ * ## Field semantics (the contract every producer normalizes into)
+ *
+ * - `inputTokens`       — the FULL prompt size, including prompt-cache hits and
+ *                         cache writes. This is what occupies the context window.
+ * - `cachedInputTokens` — the portion of `inputTokens` that was served from cache.
+ *                         A SUBSET of `inputTokens`; display-only, never summed.
+ * - `outputTokens`      — the full completion, including reasoning/thinking.
+ * - `reasoningTokens`   — the reasoning portion of `outputTokens`. A SUBSET;
+ *                         display-only, never summed.
+ * - `totalTokens`       — `inputTokens + outputTokens`. Context occupancy.
+ * - `remainingTokens`   — `contextWindow - totalTokens`, floored at 0.
+ *
+ * `totalTokens` and `remainingTokens` are DERIVED — never carried over from an
+ * earlier sample, always recomputed. Treating them as stored values is what let
+ * them freeze at a stale number.
+ *
+ * ## Why the cache fields need per-provider handling
+ *
+ * The two provider families use the same-looking keys with opposite meaning:
+ *
+ * - Anthropic (Claude Code): `input_tokens` is only the UNCACHED remainder.
+ *   True prompt size = `input_tokens + cache_creation_input_tokens +
+ *   cache_read_input_tokens`. Dropping the cache fields undercounts a cached
+ *   200k-token conversation as a few hundred tokens.
+ * - OpenAI (Codex): `input_tokens` ALREADY includes `cached_tokens`, so adding
+ *   the cache field again would double-count it.
+ *
+ * The key name itself is the signal, so we classify by name. For the genuinely
+ * ambiguous spellings we additionally check the subset invariant
+ * (`cached <= input`): a subset cannot exceed its parent, so a violation proves
+ * the field is additive regardless of what it is called.
+ */
+
+/** Container keys worth scanning for a usage block, in precedence order. */
+const CONTAINER_KEYS = [
+  "usage",
+  "token_usage",
+  "tokenUsage",
+  "contextUsage",
+  "totalTokenUsage",
+  "total_token_usage",
+  "usage_metadata",
+  "usageMetadata",
+  "metrics",
+  "total",
+  "last",
+  "message",
+  "prompt_tokens_details",
+  "promptTokensDetails",
+  "input_tokens_details",
+  "inputTokensDetails",
+  "output_tokens_details",
+  "outputTokensDetails",
+  "completion_tokens_details",
+  "completionTokensDetails"
+] as const;
+
+const INPUT_KEYS = ["input_tokens", "inputTokens", "prompt_tokens", "promptTokens"] as const;
+const OUTPUT_KEYS = ["output_tokens", "outputTokens", "completion_tokens", "completionTokens"] as const;
+
+/**
+ * Anthropic spellings — these sit ALONGSIDE `input_tokens`, not inside it.
+ * Presence of any of these marks the whole payload as Anthropic-family.
+ */
+const CACHE_READ_ADDITIVE_KEYS = ["cache_read_input_tokens", "cacheReadInputTokens"] as const;
+const CACHE_CREATION_KEYS = [
+  "cache_creation_input_tokens",
+  "cacheCreationInputTokens",
+  "cache_creation_tokens",
+  "cacheCreationTokens"
+] as const;
+
+/** OpenAI-family spellings — already counted inside `input_tokens`. */
+const CACHE_SUBSET_KEYS = [
+  "cached_input_tokens",
+  "cachedInputTokens",
+  "cached_tokens",
+  "cachedTokens",
+  "prompt_cache_tokens",
+  "promptCacheTokens",
+  "cache_read_tokens",
+  "cacheReadTokens"
+] as const;
+
+const REASONING_KEYS = [
+  "reasoning_tokens",
+  "reasoningTokens",
+  "thinking_tokens",
+  "thinkingTokens",
+  "reasoning_output_tokens",
+  "reasoningOutputTokens"
+] as const;
+
+const REPORTED_TOTAL_KEYS = [
+  "total_tokens",
+  "totalTokens",
+  "total_token_count",
+  "totalTokenCount",
+  "total_token_usage"
+] as const;
+
+const CONTEXT_WINDOW_KEYS = [
+  "context_window",
+  "contextWindow",
+  "model_context_window",
+  "modelContextWindow",
+  "max_context_tokens",
+  "maxContextTokens"
+] as const;
+
+const PLAN_REMAINING_KEYS = ["plan_remaining", "planRemaining", "rate_limit_remaining", "rateLimitRemaining"] as const;
+const PLAN_LIMIT_KEYS = ["plan_limit", "planLimit", "rate_limit_limit", "rateLimitLimit"] as const;
+const PLAN_LABEL_KEYS = ["plan_label", "planLabel", "rate_limit_label", "rateLimitLabel", "subscription"] as const;
+
+/** Measured fields — merged per-field, last writer wins. Derived fields are excluded. */
+const MEASURED_KEYS = [
+  "inputTokens",
+  "outputTokens",
+  "cachedInputTokens",
+  "reasoningTokens",
+  "contextWindow",
+  "planRemaining",
+  "planLimit",
+  "planLabel"
+] as const satisfies readonly (keyof ContextUsage)[];
+
+export const PLAN_LABEL_MAX = 80;
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/** Collect the root plus whitelisted nested containers, depth-limited. */
+function collectSources(root: Record<string, unknown>): Record<string, unknown>[] {
+  const sources: Record<string, unknown>[] = [root];
+  const walk = (record: Record<string, unknown>, depth: number): void => {
+    if (depth > 2) return;
+    for (const key of CONTAINER_KEYS) {
+      const nested = asRecord(record[key]);
+      if (nested && !sources.includes(nested)) {
+        sources.push(nested);
+        walk(nested, depth + 1);
+      }
+    }
+  };
+  walk(root, 1);
+  return sources;
+}
+
+/**
+ * First finite non-negative number found under any of `keys`.
+ *
+ * Returns `undefined` when absent so a legitimate `0` survives, and skips
+ * `null` / `""` instead of coercing them (`Number(null) === 0` used to
+ * short-circuit the whole search and mask a real value in a nested container).
+ */
+function readNumber(sources: Record<string, unknown>[], keys: readonly string[]): number | undefined {
+  for (const source of sources) {
+    for (const key of keys) {
+      const raw = source[key];
+      if (typeof raw !== "number" && typeof raw !== "string") continue;
+      if (raw === "") continue;
+      const value = Number(raw);
+      if (Number.isFinite(value) && value >= 0) return value;
+    }
+  }
+  return undefined;
+}
+
+function readString(sources: Record<string, unknown>[], keys: readonly string[]): string | undefined {
+  for (const source of sources) {
+    for (const key of keys) {
+      const raw = source[key];
+      if (typeof raw === "string" && raw.trim()) return raw.trim().slice(0, PLAN_LABEL_MAX);
+    }
+  }
+  return undefined;
+}
+
+/** Derived context numbers. `totalTokens` is null when nothing was reported. */
+export type ContextUsageTotals = {
+  totalTokens: number | null;
+  contextWindow: number | null;
+  remainingTokens: number | null;
+  /** 0-100, or null when the window size is unknown. */
+  usedPercent: number | null;
+};
+
+/**
+ * Resolve the derived numbers from any `ContextUsage`.
+ *
+ * `totalTokens` takes the larger of `inputTokens + outputTokens` and any total
+ * the producer reported. Reported totals can be session-cumulative (codex's
+ * `total_token_usage`) and therefore larger; a stale stored total is always
+ * smaller than the current input+output. Taking the max keeps both fresh and
+ * never silently shrinks a gauge whose job is to warn before the window fills.
+ */
+export function resolveContextUsageTotals(usage: ContextUsage): ContextUsageTotals {
+  const summed = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
+  const reported = usage.totalTokens ?? 0;
+  const total = Math.max(summed, reported);
+  const hasTotal = usage.inputTokens != null || usage.outputTokens != null || usage.totalTokens != null;
+  const totalTokens = hasTotal ? total : null;
+  const contextWindow = usage.contextWindow != null && usage.contextWindow > 0 ? usage.contextWindow : null;
+  const remainingTokens = contextWindow != null ? Math.max(0, contextWindow - total) : null;
+  const usedPercent = contextWindow != null
+    ? Math.max(0, Math.min(100, Math.round((total / contextWindow) * 100)))
+    : null;
+  return { totalTokens, contextWindow, remainingTokens, usedPercent };
+}
+
+/**
+ * Copy one measured field, preferring the newer sample. Generic over the key so
+ * the value type stays correlated with it (no cast needed).
+ */
+function carryMeasured<K extends (typeof MEASURED_KEYS)[number]>(
+  target: ContextUsage,
+  key: K,
+  next: ContextUsage,
+  previous?: ContextUsage
+): void {
+  const value = next[key] ?? previous?.[key];
+  if (value != null) target[key] = value;
+}
+
+/** Rebuild `totalTokens` / `remainingTokens` from the measured fields. */
+export function withDerivedTotals(usage: ContextUsage): ContextUsage {
+  // Read the derived numbers off the input first — a reported total counts as
+  // input here — then emit only measured fields plus the freshly derived ones,
+  // so a stale derived value can never survive a round trip.
+  const { totalTokens, remainingTokens } = resolveContextUsageTotals(usage);
+  const next: ContextUsage = {};
+  for (const key of MEASURED_KEYS) carryMeasured(next, key, usage);
+  if (totalTokens != null) next.totalTokens = totalTokens;
+  if (remainingTokens != null) next.remainingTokens = remainingTokens;
+  return next;
+}
+
+/**
+ * Parse a raw CLI usage payload into the normalized `ContextUsage` contract.
+ *
+ * `fallbackContextWindow` is used when the payload itself does not carry a
+ * window size (callers usually read it from the model catalog).
+ */
+export function normalizeContextUsage(
+  raw: unknown,
+  fallbackContextWindow?: number
+): ContextUsage | undefined {
+  const root = asRecord(raw);
+  if (!root) return undefined;
+  const sources = collectSources(root);
+
+  const reportedInput = readNumber(sources, INPUT_KEYS);
+  const outputTokens = readNumber(sources, OUTPUT_KEYS);
+  const cacheRead = readNumber(sources, CACHE_READ_ADDITIVE_KEYS);
+  const cacheCreation = readNumber(sources, CACHE_CREATION_KEYS);
+  const cacheSubset = readNumber(sources, CACHE_SUBSET_KEYS);
+  const reasoningTokens = readNumber(sources, REASONING_KEYS);
+  const reportedTotal = readNumber(sources, REPORTED_TOTAL_KEYS);
+
+  // Anthropic-family: input_tokens excludes cache hits, so add them back in.
+  const anthropicStyle = cacheRead != null || cacheCreation != null;
+  // Ambiguous spelling that provably cannot be a subset of input.
+  const subsetInvariantBroken =
+    cacheSubset != null && reportedInput != null && cacheSubset > reportedInput;
+
+  let inputTokens: number | undefined;
+  if (anthropicStyle) {
+    inputTokens = (reportedInput ?? 0) + (cacheRead ?? 0) + (cacheCreation ?? 0);
+  } else if (subsetInvariantBroken) {
+    inputTokens = (reportedInput ?? 0) + (cacheSubset ?? 0);
+  } else {
+    inputTokens = reportedInput;
+  }
+
+  // Display-only breakdown: what was served from cache.
+  const cachedInputTokens = cacheRead ?? cacheSubset;
+
+  // A window the payload itself reports is authoritative — it reflects the model
+  // actually serving the turn. `fallbackContextWindow` is a caller-side default
+  // (model catalog) and must only fill the gap, never override a live value.
+  const reportedWindow = readNumber(sources, CONTEXT_WINDOW_KEYS);
+  const windowCandidate = (reportedWindow != null && reportedWindow > 0)
+    ? reportedWindow
+    : fallbackContextWindow;
+  const contextWindow = windowCandidate != null && windowCandidate > 0 ? windowCandidate : undefined;
+
+  const planRemaining = readNumber(sources, PLAN_REMAINING_KEYS);
+  const planLimitCandidate = readNumber(sources, PLAN_LIMIT_KEYS);
+  // Schema requires a positive limit; 0 is not a meaningful ceiling.
+  const planLimit = planLimitCandidate != null && planLimitCandidate > 0 ? planLimitCandidate : undefined;
+  const planLabel = readString(sources, PLAN_LABEL_KEYS);
+
+  const hasAnything =
+    inputTokens != null
+    || outputTokens != null
+    || cachedInputTokens != null
+    || reasoningTokens != null
+    || reportedTotal != null
+    || contextWindow != null
+    || planRemaining != null
+    || planLimit != null
+    || planLabel != null;
+  if (!hasAnything) return undefined;
+
+  return withDerivedTotals({
+    ...(inputTokens != null ? { inputTokens } : {}),
+    ...(outputTokens != null ? { outputTokens } : {}),
+    ...(cachedInputTokens != null ? { cachedInputTokens } : {}),
+    ...(reasoningTokens != null ? { reasoningTokens } : {}),
+    ...(reportedTotal != null ? { totalTokens: reportedTotal } : {}),
+    ...(contextWindow != null ? { contextWindow } : {}),
+    ...(planRemaining != null ? { planRemaining } : {}),
+    ...(planLimit != null ? { planLimit } : {}),
+    ...(planLabel != null ? { planLabel } : {})
+  });
+}
+
+/**
+ * Fold a newer sample into an accumulated one.
+ *
+ * Measured fields are last-writer-wins so a sparse sample (e.g. an event that
+ * only carries output tokens) does not erase the window size or input count
+ * learned earlier. Derived fields are recomputed from the merged result rather
+ * than inherited — inheriting them is what used to leave `remainingTokens`
+ * disagreeing with `totalTokens`.
+ */
+export function mergeContextUsage(
+  previous: ContextUsage | undefined,
+  next: ContextUsage
+): ContextUsage {
+  if (!previous) return withDerivedTotals(next);
+  const merged: ContextUsage = {};
+  for (const key of MEASURED_KEYS) carryMeasured(merged, key, next, previous);
+  // Only the incoming sample's own reported total is authoritative; a previous
+  // total is already represented through the merged input/output above.
+  if (next.totalTokens != null) merged.totalTokens = next.totalTokens;
+  return withDerivedTotals(merged);
+}

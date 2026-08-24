@@ -1272,6 +1272,85 @@ export function formatCursorModelArg(
   );
 }
 
+/**
+ * Context-window sizes for model families whose CLI catalog does not report one.
+ *
+ * Codex and Grok publish `context_window` in their own `models_cache.json`, so
+ * those are read live and never guessed. Claude Code, Cursor and Antigravity
+ * publish no window at all, which is why the "上下文已用 %" gauge had nothing to
+ * divide by — this table is the floor that makes it renderable.
+ *
+ * Deliberately small: an entry here is a hardcoded product fact that goes stale
+ * when a model ships a new window. A family we are not confident about is left
+ * out on purpose — `undefined` degrades to the "—" chip, while a wrong number
+ * renders a confidently wrong percentage. Prefer omission over invention.
+ *
+ * Matched against the model FAMILY id (slug suffixes already stripped), most
+ * specific first.
+ */
+const KNOWN_CONTEXT_WINDOWS: Array<{ pattern: RegExp; contextWindow: number }> = [
+  // Anthropic standard window. Sonnet-class 1M variants are opt-in per request
+  // and the CLIs do not default to them, so 200k is the honest default here.
+  { pattern: /^claude[-.]/, contextWindow: 200_000 },
+  { pattern: /^(opus|sonnet|haiku|fable)\b/, contextWindow: 200_000 },
+  // GPT-5.x / Codex family.
+  { pattern: /^(gpt-5|codex)/, contextWindow: 272_000 },
+  { pattern: /^gpt-oss/, contextWindow: 131_072 },
+  // Gemini 3.x / 2.x long-context families.
+  { pattern: /^gemini-[23]/, contextWindow: 1_048_576 }
+];
+
+/** Last successful discovery, so callers off the main state path can consult it. */
+let lastDiscoveredCapabilities: EngineCapability[] = [];
+
+/** Reduce an engine-specific `--model` value to its family id. */
+function modelFamilyId(engine: CliEngine, model: string): string {
+  const raw = model.trim();
+  if (!raw) return "";
+  if (engine === "cursor") return normalizeCursorBaseId(parseCursorModelRef(raw).base);
+  if (engine === "antigravity") {
+    const mapped = agyLabelToFamily.get(raw.toLowerCase());
+    return splitAgyEffortSuffix(mapped || raw).base;
+  }
+  return raw;
+}
+
+/**
+ * Best-known context window for a model, for the token gauge.
+ *
+ * Precedence: the live CLI catalog (real data this machine reported) beats the
+ * hardcoded table above. Returns `undefined` when genuinely unknown so the
+ * caller can leave the gauge blank rather than show a made-up percentage.
+ *
+ * `model` may be omitted (the user never picked one), in which case the engine's
+ * own current default is used.
+ */
+export function resolveModelContextWindow(engine: CliEngine, model?: string): number | undefined {
+  const capability = lastDiscoveredCapabilities.find((item) => item.engine === engine);
+  const requested = (model || "").trim() || capability?.currentModel || "";
+  if (!requested) return undefined;
+  // Anthropic marks its long-context variant with a `[1m]` suffix. Check before
+  // the family patterns, which would otherwise report the standard 200k for a
+  // model that actually has a 1M window.
+  if (/\[\s*1m\s*\]/i.test(requested)) return 1_000_000;
+  const family = modelFamilyId(engine, requested);
+  if (!family) return undefined;
+
+  // Live catalog first — match the full id, then the family.
+  const lowered = requested.toLowerCase();
+  const familyLowered = family.toLowerCase();
+  for (const candidate of capability?.models || []) {
+    if (!candidate.contextWindow) continue;
+    const id = candidate.id.toLowerCase();
+    if (id === lowered || id === familyLowered) return candidate.contextWindow;
+  }
+
+  for (const row of KNOWN_CONTEXT_WINDOWS) {
+    if (row.pattern.test(familyLowered)) return row.contextWindow;
+  }
+  return undefined;
+}
+
 /** Collect model + effort options from local CLI configs/caches on this machine. */
 export async function discoverEngineCapabilities(): Promise<EngineCapability[]> {
   const [codex, claude, grok, cursor, antigravity] = await Promise.all([
@@ -1281,5 +1360,7 @@ export async function discoverEngineCapabilities(): Promise<EngineCapability[]> 
     discoverCursorCapability(),
     discoverAntigravityCapability()
   ]);
-  return [codex, claude, grok, cursor, antigravity];
+  const capabilities = [codex, claude, grok, cursor, antigravity];
+  lastDiscoveredCapabilities = capabilities;
+  return capabilities;
 }

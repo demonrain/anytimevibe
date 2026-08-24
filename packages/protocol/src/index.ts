@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.97";
+export const PRODUCT_VERSION = "0.4.98";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -186,6 +186,19 @@ export const contextUsageSchema = z.object({
   planLabel: z.string().trim().min(1).max(80).optional()
 });
 export type ContextUsage = z.infer<typeof contextUsageSchema>;
+
+/**
+ * Token / context math shared by the agent (all engines) and the web display.
+ * Both sides must use these helpers so "上下文已用" means the same thing on each.
+ */
+export {
+  normalizeContextUsage,
+  mergeContextUsage,
+  withDerivedTotals,
+  resolveContextUsageTotals,
+  PLAN_LABEL_MAX,
+  type ContextUsageTotals
+} from "./context-usage";
 
 /** Max length for engine quota free-form detail (CLI raw / API JSON snippets). */
 export const ENGINE_QUOTA_DETAIL_MAX = 4000;

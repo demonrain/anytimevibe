@@ -44,7 +44,9 @@ import {
   type EngineQuota,
   type ContextUsage,
   type Workspace,
-  PRODUCT_VERSION
+  PRODUCT_VERSION,
+  mergeContextUsage,
+  normalizeContextUsage
 } from "@anytimevibe/protocol";
 import {
   CodexAdapter,
@@ -64,7 +66,7 @@ import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn, normalizeSystemErrorText } from "./cli/headless-runner";
 import { isCodexModelsManagerNoise } from "./cli/log-noise";
 import { importLocalCliSessions, sanitizeTranscriptMessages } from "./cli/import-sessions";
-import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
+import { discoverEngineCapabilities, resolveModelContextWindow, type EngineCapability } from "./cli/model-catalog";
 import { startEngineConfigWatch } from "./cli/engine-config-watch";
 import { appendEngineDiffChunk, buildTurnDiff, captureTurnDiffBaseline, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
 import { TaskStore } from "./cli/task-store";
@@ -5063,13 +5065,24 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
   }
 }
 
+/**
+ * Context window for a codex thread, so the token gauge has a denominator.
+ *
+ * The app-server usage block does not always carry `context_window`; when it
+ * does, `normalizeContextUsage` prefers it over this value.
+ */
+function codexContextWindow(threadId: string): number | undefined {
+  return resolveModelContextWindow("codex", taskStore.get(threadId)?.model);
+}
+
 async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   const methodName = String(message.method || "").toLowerCase();
   if (methodName.includes("tokenusage") || methodName.includes("token_usage")) {
     const params = message.params ?? {};
     const threadId = String(params.threadId ?? params.thread_id ?? "");
-    const usage = codexUsageFromUnknown(
-      params.tokenUsage ?? params.token_usage ?? params.usage ?? params.totalTokenUsage ?? params
+    const usage = normalizeContextUsage(
+      params.tokenUsage ?? params.token_usage ?? params.usage ?? params.totalTokenUsage ?? params,
+      codexContextWindow(threadId)
     );
     if (threadId && usage) {
       await recordUsageUpdate(threadId, usage);
@@ -5110,7 +5123,10 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       if (patch) appendEngineDiffChunk(threadId, patch);
     }
     if (threadId) {
-      const usage = codexUsageFromUnknown(item.usage ?? item.tokenUsage ?? item.metrics ?? params.usage);
+      const usage = normalizeContextUsage(
+        item.usage ?? item.tokenUsage ?? item.metrics ?? params.usage,
+        codexContextWindow(threadId)
+      );
       if (usage) {
         await recordUsageUpdate(threadId, usage);
       }
@@ -5178,13 +5194,14 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const threadId = String(params.threadId);
     const turnId = String(params.turn?.id ?? params.turnId ?? "");
     const turnStatus = String(params.turn?.status ?? params.status ?? "unknown");
-    const contextUsage = codexUsageFromUnknown(
+    const contextUsage = normalizeContextUsage(
       params.usage
       ?? params.turn?.usage
       ?? params.turn?.tokenUsage
       ?? params.turn?.contextUsage
       ?? params.total_token_usage
-      ?? params.totalTokenUsage
+      ?? params.totalTokenUsage,
+      codexContextWindow(threadId)
     );
     const errorMessage = extractCodexTurnError(params.turn) || extractCodexTurnError(params);
     finishLocalActivity(threadId, turnStatus);
@@ -5374,60 +5391,6 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       title: "Codex 请求额外权限", detail: JSON.stringify({ reason: params.reason, permissions: params.permissions }, null, 2), availableDecisions: ["cancel"]
     }, true, "approval");
   }
-}
-
-function codexUsageFromUnknown(raw: unknown): ContextUsage | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const root = raw as Record<string, any>;
-  const sources = [
-    root,
-    root.usage,
-    root.tokenUsage,
-    root.contextUsage,
-    root.totalTokenUsage,
-    root.total_token_usage,
-    root.total,
-    root.last,
-    root.metrics
-  ]
-    .filter((value): value is Record<string, any> => Boolean(value && typeof value === "object"));
-  const number = (keys: string[]): number => {
-    for (const source of sources) {
-      for (const key of keys) {
-        const value = Number(source[key]);
-        if (Number.isFinite(value) && value >= 0) return value;
-      }
-    }
-    return 0;
-  };
-  const input = number(["input_tokens", "inputTokens", "prompt_tokens"]);
-  const output = number(["output_tokens", "outputTokens", "completion_tokens"]);
-  const cached = number(["cached_input_tokens", "cachedInputTokens", "cache_read_tokens", "cacheReadTokens"]);
-  const reasoning = number(["reasoning_tokens", "reasoningTokens", "thinking_tokens", "thinkingTokens", "reasoning_output_tokens", "reasoningOutputTokens"]);
-  const reportedTotal = number(["total_tokens", "totalTokens", "total_token_usage"]);
-  const total = reportedTotal || (input + output + reasoning);
-  const contextWindow = number(["context_window", "contextWindow", "model_context_window", "modelContextWindow", "max_context_tokens", "maxContextTokens"]);
-  if (!input && !output && !cached && !reasoning && !total && !contextWindow) return undefined;
-  return {
-    ...(input ? { inputTokens: input } : {}),
-    ...(output ? { outputTokens: output } : {}),
-    ...(cached ? { cachedInputTokens: cached } : {}),
-    ...(reasoning ? { reasoningTokens: reasoning } : {}),
-    ...(total ? { totalTokens: total } : {}),
-    ...(contextWindow ? { contextWindow, remainingTokens: Math.max(0, contextWindow - total) } : {})
-  };
-}
-
-function mergeContextUsage(previous: ContextUsage | undefined, next: ContextUsage): ContextUsage {
-  const merged = { ...(previous ?? {}), ...next };
-  const input = merged.inputTokens ?? 0;
-  const output = merged.outputTokens ?? 0;
-  const reasoning = merged.reasoningTokens ?? 0;
-  if (merged.totalTokens == null && (input || output || reasoning)) merged.totalTokens = input + output + reasoning;
-  if (merged.contextWindow != null && merged.totalTokens != null && merged.remainingTokens == null) {
-    merged.remainingTokens = Math.max(0, merged.contextWindow - merged.totalTokens);
-  }
-  return merged;
 }
 
 function resolveReportedEngineVersion(engine: CliEngine): string {
