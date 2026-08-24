@@ -3146,6 +3146,145 @@ function formatEngineQuotaChip(quota: EngineQuota): string {
   return line ? (line.length > 28 ? `${line.slice(0, 26)}…` : line) : "—";
 }
 
+/**
+ * Token / context usage chips. Desktop keeps the compact inline pair; mobile
+ * collapses into one tappable chip that opens a bottom sheet (same pattern as
+ * RunInfoPanel) so the conversation header stays readable on narrow screens.
+ */
+function ContextUsagePanel({ view }: { view: ContextUsageView | null }) {
+  const { locale } = useI18n();
+  const isEnglish = locale === "en";
+  const isMobile = useIsMobileConversation();
+  const [expanded, setExpanded] = useState(false);
+  const title = isEnglish ? "Usage" : "用量";
+  const missing = isEnglish ? "Not reported" : "未上报";
+
+  useEffect(() => {
+    if (!isMobile) setExpanded(false);
+  }, [isMobile]);
+
+  const summaryStrong = view?.usedPercent != null
+    ? `${view.usedPercent}%`
+    : view?.totalTokens != null
+      ? compactTokenCount(view.totalTokens)
+      : "—";
+  const summaryHot = view?.usedPercent != null && view.usedPercent >= 85
+    ? " hot"
+    : view?.usedPercent != null && view.usedPercent >= 60
+      ? " warm"
+      : "";
+  const tooltip = view ? contextUsageTitle(view) : (isEnglish ? "Context usage" : "上下文用量");
+
+  const detailChips = (
+    <div className="run-info-chips context-usage-chips">
+      <span className="run-info-chip">
+        <em>Token</em>
+        <strong>
+          {view?.totalTokens != null
+            ? `${compactTokenCount(view.totalTokens)}${view.contextWindow != null ? ` / ${compactTokenCount(view.contextWindow)}` : ""}`
+            : missing}
+        </strong>
+      </span>
+      <span className="run-info-chip">
+        <em>{isEnglish ? "Context" : "上下文"}</em>
+        <strong>{view?.usedPercent != null ? `${view.usedPercent}%` : missing}</strong>
+      </span>
+      {view?.remainingTokens != null && view.contextWindow != null ? (
+        <span className="run-info-chip">
+          <em>{isEnglish ? "Remaining" : "余窗"}</em>
+          <strong>
+            {Math.max(0, Math.min(100, Math.round((view.remainingTokens / view.contextWindow) * 100)))}%
+            {" · "}
+            {compactTokenCount(view.remainingTokens)}
+          </strong>
+        </span>
+      ) : null}
+      {view?.inputTokens != null ? (
+        <span className="run-info-chip"><em>{isEnglish ? "Input" : "输入"}</em><strong>{compactTokenCount(view.inputTokens)}</strong></span>
+      ) : null}
+      {view?.outputTokens != null ? (
+        <span className="run-info-chip"><em>{isEnglish ? "Output" : "输出"}</em><strong>{compactTokenCount(view.outputTokens)}</strong></span>
+      ) : null}
+      {view?.cachedInputTokens != null ? (
+        <span className="run-info-chip"><em>{isEnglish ? "Cached" : "缓存"}</em><strong>{compactTokenCount(view.cachedInputTokens)}</strong></span>
+      ) : null}
+      {view?.reasoningTokens != null ? (
+        <span className="run-info-chip"><em>{isEnglish ? "Thinking" : "思考"}</em><strong>{compactTokenCount(view.reasoningTokens)}</strong></span>
+      ) : null}
+    </div>
+  );
+
+  if (isMobile) {
+    return (
+      <>
+        <button
+          type="button"
+          className={`meta-chip meta-chip-action run-info-chip-btn context-usage-chip-btn${summaryHot}`}
+          aria-expanded={expanded}
+          aria-label={title}
+          title={tooltip}
+          onClick={() => setExpanded((current) => !current)}
+        >
+          <em>{title}</em>
+          <strong>{summaryStrong}</strong>
+        </button>
+        <MobileBottomSheet
+          open={expanded}
+          title={title}
+          onClose={() => setExpanded(false)}
+          closeLabel={isEnglish ? "Done" : "完成"}
+          className="run-info-sheet context-usage-sheet"
+        >
+          {detailChips}
+        </MobileBottomSheet>
+      </>
+    );
+  }
+
+  return (
+    <>
+      {view?.totalTokens != null ? (
+        <span className="meta-chip meta-chip-context" title={tooltip}>
+          <em>Token</em>
+          <strong>
+            {compactTokenCount(view.totalTokens)}
+            {view.contextWindow != null ? ` / ${compactTokenCount(view.contextWindow)}` : ""}
+          </strong>
+        </span>
+      ) : (
+        <span className="meta-chip meta-chip-context muted" title={isEnglish ? "No token usage reported yet" : "本轮尚未上报 token 用量"}>
+          <em>Token</em>
+          <strong>—</strong>
+        </span>
+      )}
+      {view?.usedPercent != null ? (
+        <span
+          className={`meta-chip meta-chip-context${view.usedPercent >= 85 ? " hot" : view.usedPercent >= 60 ? " warm" : ""}`}
+          title={tooltip}
+        >
+          <em>{isEnglish ? "Context" : "上下文"}</em>
+          <span className="ctx-bar" aria-hidden="true">
+            <span style={{ width: `${view.usedPercent}%` }} />
+          </span>
+          <strong>{view.usedPercent}%</strong>
+        </span>
+      ) : view?.remainingTokens != null && view.contextWindow != null ? (
+        <span className="meta-chip meta-chip-context" title={tooltip}>
+          <em>{isEnglish ? "Left" : "余窗"}</em>
+          <strong>
+            {Math.max(0, Math.min(100, Math.round((view.remainingTokens / view.contextWindow) * 100)))}%
+          </strong>
+        </span>
+      ) : (
+        <span className="meta-chip meta-chip-context muted" title={isEnglish ? "Context window unknown" : "上下文窗口占比未知"}>
+          <em>{isEnglish ? "Context" : "上下文"}</em>
+          <strong>—</strong>
+        </span>
+      )}
+    </>
+  );
+}
+
 function RunInfoPanel({ info }: { info: RunInfo }) {
   const { locale } = useI18n();
   const isEnglish = locale === "en";
@@ -3851,44 +3990,7 @@ function TaskConversation({
           className="thread-meta-chips"
           title={contextView ? contextUsageTitle(contextView) : "上下文用量"}
         >
-          {contextView?.totalTokens != null ? (
-            <span className="meta-chip meta-chip-context" title={contextUsageTitle(contextView)}>
-              <em>Token</em>
-              <strong>
-                {compactTokenCount(contextView.totalTokens)}
-                {contextView.contextWindow != null ? ` / ${compactTokenCount(contextView.contextWindow)}` : ""}
-              </strong>
-            </span>
-          ) : (
-            <span className="meta-chip meta-chip-context muted" title="本轮尚未上报 token 用量">
-              <em>Token</em>
-              <strong>—</strong>
-            </span>
-          )}
-          {contextView?.usedPercent != null ? (
-            <span
-              className={`meta-chip meta-chip-context${contextView.usedPercent >= 85 ? " hot" : contextView.usedPercent >= 60 ? " warm" : ""}`}
-              title={contextUsageTitle(contextView)}
-            >
-              <em>上下文</em>
-              <span className="ctx-bar" aria-hidden="true">
-                <span style={{ width: `${contextView.usedPercent}%` }} />
-              </span>
-              <strong>{contextView.usedPercent}%</strong>
-            </span>
-          ) : contextView?.remainingTokens != null && contextView.contextWindow != null ? (
-            <span className="meta-chip meta-chip-context" title={contextUsageTitle(contextView)}>
-              <em>余窗</em>
-              <strong>
-                {Math.max(0, Math.min(100, Math.round((contextView.remainingTokens / contextView.contextWindow) * 100)))}%
-              </strong>
-            </span>
-          ) : (
-            <span className="meta-chip meta-chip-context muted" title="上下文窗口占比未知">
-              <em>上下文</em>
-              <strong>—</strong>
-            </span>
-          )}
+          <ContextUsagePanel view={contextView} />
           {QUOTA_QUERY_ENABLED && taskQuota ? (
             <span
               className="meta-chip meta-chip-quota"

@@ -1423,6 +1423,18 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   .workspace.mobile-conversation .run-info-chip-btn strong {
     max-width: 3.8rem;
   }
+  .workspace.mobile-conversation .context-usage-chip-btn.warm {
+    background: rgba(226, 160, 50, 0.14);
+    border-color: rgba(226, 160, 50, 0.34);
+  }
+  .workspace.mobile-conversation .context-usage-chip-btn.hot {
+    background: rgba(226, 88, 50, 0.14);
+    border-color: rgba(226, 88, 50, 0.36);
+    color: #8a3a24;
+  }
+  .workspace.mobile-conversation .context-usage-chip-btn.hot strong {
+    color: #a63b28;
+  }
   .workspace.mobile-conversation .quota-detail-panel {
     margin: 4px 0 0;
     padding: 4px 8px 6px;
