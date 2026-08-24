@@ -16,7 +16,6 @@ import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  agentEventSchema,
   base64ToBytes,
   clientCommandSchema,
   createEnvelope,
@@ -25,6 +24,7 @@ import {
   generatePairingKeyPair,
   importAesKey,
   openEnvelope,
+  parseAgentEventCompat,
   pairingClaimResponseSchema,
   randomUuid,
   TRANSCRIPT_HISTORY_PAGE_SIZE,
@@ -2321,7 +2321,15 @@ export function App() {
   const handleEnvelope = useEffectEvent(async (envelope: EncryptedEnvelope) => {
     const key = await getHostKey(envelope.hostId);
     if (!key) return;
-    const event = agentEventSchema.parse(await openEnvelope<AgentEvent>(key, envelope));
+    const decrypted = await openEnvelope<unknown>(key, envelope);
+    const event = parseAgentEventCompat(decrypted);
+    if (!event) {
+      const eventType = decrypted && typeof decrypted === "object" && "type" in decrypted
+        ? String((decrypted as { type?: unknown }).type ?? "unknown")
+        : "unknown";
+      console.warn(`[protocol] ignored unknown agent event type: ${eventType}`);
+      return;
+    }
     if (event.type === "sync.progress") {
       setSyncStatus((current) => ({
         ...current,

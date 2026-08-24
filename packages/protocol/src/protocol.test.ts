@@ -11,6 +11,7 @@ import {
   importAesKey,
   openEnvelope,
   pageTranscriptMessagesBefore,
+  parseAgentEventCompat,
   pairingClaimResponseSchema,
   randomKeyBytes,
   windowTranscriptMessages
@@ -129,6 +130,24 @@ describe("protocol crypto", () => {
       lastProgressAt: 123
     });
     expect(heartbeat.type).toBe("thread.heartbeat");
+  });
+
+  it("ignores unknown forward-compatible agent event types", () => {
+    expect(parseAgentEventCompat({
+      type: "future.optional.event",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      value: true
+    })).toBeNull();
+  });
+
+  it("still rejects malformed payloads for known agent event types", () => {
+    expect(() => parseAgentEventCompat({
+      type: "turn.completed",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      threadId: "thread-1"
+    })).toThrow();
   });
 
   it("windows recent messages and pages older turns", () => {

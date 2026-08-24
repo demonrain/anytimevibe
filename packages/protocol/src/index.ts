@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.96";
+export const PRODUCT_VERSION = "0.4.97";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -592,6 +592,27 @@ export const agentEventSchema = z.discriminatedUnion("type", [
 ]);
 
 export type AgentEvent = z.infer<typeof agentEventSchema>;
+
+/**
+ * Parse a decrypted agent event while preserving protocol-v1 forward compatibility.
+ * Unknown event discriminators are optional extensions and may be ignored by an
+ * older Web bundle; malformed payloads for known event types still throw.
+ */
+export function parseAgentEventCompat(value: unknown): AgentEvent | null {
+  const result = agentEventSchema.safeParse(value);
+  if (result.success) return result.data;
+  const eventType = value && typeof value === "object" && "type" in value
+    ? (value as { type?: unknown }).type
+    : undefined;
+  const issue = result.error.issues[0];
+  if (typeof eventType === "string"
+    && issue?.code === z.ZodIssueCode.invalid_union_discriminator
+    && issue.path.length === 1
+    && issue.path[0] === "type") {
+    return null;
+  }
+  throw result.error;
+}
 
 export type PairingPublicInfo = {
   pairingId: string;

@@ -255,6 +255,22 @@ function loadProductIcon() {
   );
 }
 
+function trayTemplateIconPath(): string {
+  const candidates = [
+    path.join(__dirname, "..", "assets", "tray-template.png"),
+    path.join(process.resourcesPath, "assets", "tray-template.png")
+  ];
+  for (const candidate of candidates) {
+    try {
+      readFileSync(candidate);
+      return candidate;
+    } catch {
+      // try the packaged location next
+    }
+  }
+  return candidates[0] ?? path.join(__dirname, "..", "assets", "tray-template.png");
+}
+
 /**
  * macOS menu-bar icons must be monochrome template images. The product mark is
  * intentionally separate because a colorful application icon can be invisible
@@ -263,13 +279,12 @@ function loadProductIcon() {
 function loadTrayIcon() {
   if (process.platform !== "darwin") return loadProductIcon().resize({ width: 16, height: 16 });
 
-  const templateSource = nativeImage.createFromDataURL(
-    "data:image/svg+xml;base64," +
-      Buffer.from(
-        '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36"><path d="M7 8.5h22v15H7z" fill="none" stroke="#000" stroke-width="2.6" stroke-linejoin="round"/><path d="m12 14 4 3.5-4 3.5M19 21h6" fill="none" stroke="#000" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M13 29h10" fill="none" stroke="#000" stroke-width="2.6" stroke-linecap="round"/></svg>'
-      ).toString("base64")
-  );
-  const trayIcon = (templateSource.isEmpty() ? loadProductIcon() : templateSource).resize({ width: 18, height: 18 });
+  const templateSource = nativeImage.createFromPath(trayTemplateIconPath());
+  if (templateSource.isEmpty()) {
+    // Keep development builds usable if an incomplete asset folder is present.
+    return loadProductIcon().resize({ width: 18, height: 18 });
+  }
+  const trayIcon = templateSource.resize({ width: 18, height: 18 });
   trayIcon.setTemplateImage(true);
   return trayIcon;
 }
@@ -4103,7 +4118,10 @@ async function publishTaskDiff(threadId: string, turnId: string): Promise<void> 
   }, true);
 }
 
-async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
+async function publishStoredTaskSnapshot(
+  threadId: string,
+  options: { persist?: boolean; lightweight?: boolean } = {}
+): Promise<void> {
   if (isThreadDeleted(threadId)) return;
   const task = taskStore.get(threadId);
   if (!task) return;
@@ -4151,12 +4169,14 @@ async function publishStoredTaskSnapshot(threadId: string): Promise<void> {
     ...(task.thinking !== undefined ? { thinking: task.thinking } : {}),
     ...(task.runInfo ? { runInfo: task.runInfo } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
-    ...(task.lastDiff !== undefined ? { diff: task.lastDiff } : {}),
-    messages: windowed.messages,
-    messageTotal: windowed.messageTotal,
-    hasOlderMessages: windowed.hasOlderMessages,
-    ...(windowed.oldestMessageId ? { oldestMessageId: windowed.oldestMessageId } : {})
-  }, true);
+    ...(!options.lightweight && task.lastDiff !== undefined ? { diff: task.lastDiff } : {}),
+    messages: options.lightweight ? [] : windowed.messages,
+    ...(!options.lightweight ? {
+      messageTotal: windowed.messageTotal,
+      hasOlderMessages: windowed.hasOlderMessages,
+      ...(windowed.oldestMessageId ? { oldestMessageId: windowed.oldestMessageId } : {})
+    } : {})
+  }, options.persist ?? true);
 }
 
 async function runHeadlessTaskTurn(options: {
@@ -4387,17 +4407,12 @@ async function runHeadlessTaskTurn(options: {
 }
 
 async function publishCommandStatus(command: ClientCommand, status: "accepted" | "queued" | "duplicate" | "completed" | "failed", detail?: string): Promise<void> {
-  await publish({
-    type: "command.status",
-    eventId: crypto.randomUUID(),
-    occurredAt: new Date().toISOString(),
-    commandId: command.commandId,
-    status,
-    ...(command.type !== "host.refresh" && command.type !== "host.quota.refresh" && command.type !== "host.set_cli_engine" && "threadId" in command
-      ? { threadId: command.threadId }
-      : {}),
-    ...(detail ? { detail: detail.slice(0, 1000) } : {})
-  }, false).catch(() => undefined);
+  // Optional lifecycle events were added after protocol v1 clients shipped.
+  // Keep local idempotency bookkeeping, but do not send command.status because
+  // old Web clients validate the encrypted event discriminator strictly.
+  void command;
+  void status;
+  void detail;
 }
 
 async function handleCommand(command: ClientCommand): Promise<void> {
@@ -4444,13 +4459,9 @@ async function recordUsageUpdate(threadId: string, usage: ContextUsage): Promise
       current.contextUsage = mergeContextUsage(current.contextUsage, latest);
       current.updatedAt = Date.now() / 1000;
       await taskStore.upsert(current);
-      await publish({
-        type: "usage.updated",
-        eventId: crypto.randomUUID(),
-        occurredAt: new Date().toISOString(),
-        threadId,
-        contextUsage: current.contextUsage
-      }, false).catch(() => undefined);
+      // thread.snapshot is understood by old v1 Web clients and carries the
+      // same context usage fields without introducing a new discriminator.
+      await publishStoredTaskSnapshot(threadId, { persist: false, lightweight: true }).catch(() => undefined);
     })().catch(() => undefined);
   }, 1000);
   usageFlushTimers.set(threadId, timer);
@@ -5534,17 +5545,11 @@ async function publishHostStatus(): Promise<void> {
 }
 
 async function publishActiveTurnHeartbeats(): Promise<void> {
-  for (const [threadId, turnId] of activeTurnByThread) {
-    const status = taskStore.get(threadId)?.status || "active";
-    await publish({
-      type: "thread.heartbeat",
-      eventId: crypto.randomUUID(),
-      occurredAt: new Date().toISOString(),
-      threadId,
-      turnId,
-      status,
-      ...(lastProgressAtByThread.get(threadId) ? { lastProgressAt: lastProgressAtByThread.get(threadId) } : {})
-    }, false).catch(() => undefined);
+  for (const threadId of activeTurnByThread.keys()) {
+    // Reuse the v1 snapshot event instead of the newer thread.heartbeat type.
+    // This preserves stale-task recovery across mixed client/server versions.
+    if (!taskStore.get(threadId)) continue;
+    await publishStoredTaskSnapshot(threadId, { persist: false, lightweight: true }).catch(() => undefined);
   }
 }
 
