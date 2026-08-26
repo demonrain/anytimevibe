@@ -45,6 +45,34 @@ export function isCodexCompatibleVersion(version: string | undefined | null): bo
 }
 
 /**
+ * Thread a Codex app-server notification is about.
+ *
+ * The app-server puts the id in several places depending on the method
+ * (`item/*` use `params.threadId`, `turn/*` may nest it under `params.turn`), and
+ * older builds use snake_case. Callers use this to decide that a thread is still
+ * alive; missing an id means a running task can look stalled to the web, so every
+ * spelling is checked rather than assuming one.
+ */
+export function codexMessageThreadId(message: Record<string, any> | null | undefined): string {
+  const params = message?.params;
+  if (!params || typeof params !== "object") return "";
+  const candidates = [
+    params.threadId,
+    params.thread_id,
+    params.turn?.threadId,
+    params.turn?.thread_id,
+    params.item?.threadId,
+    params.item?.thread_id
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" && typeof candidate !== "number") continue;
+    const value = String(candidate).trim();
+    if (value) return value;
+  }
+  return "";
+}
+
+/**
  * Map web permission mode to Codex app-server thread/turn params.
  * Labels match Codex CLI: Read Only / Ask for approval / Approve for me / Full Access.
  */

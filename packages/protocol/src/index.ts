@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.100";
+export const PRODUCT_VERSION = "0.4.101";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -199,6 +199,17 @@ export {
   PLAN_LABEL_MAX,
   type ContextUsageTotals
 } from "./context-usage";
+
+/**
+ * Shared rule for「状态待确认」. Lives here so the agent's obligation to refresh
+ * `lastProgressAt` and the web's threshold for warning cannot drift apart.
+ */
+export {
+  isTaskStale,
+  isInProgressTaskStatus,
+  STALE_TASK_AFTER_SECONDS,
+  type StaleTaskInput
+} from "./task-status";
 
 /** Max length for engine quota free-form detail (CLI raw / API JSON snippets). */
 export const ENGINE_QUOTA_DETAIL_MAX = 4000;

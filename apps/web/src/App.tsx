@@ -23,6 +23,8 @@ import {
   derivePairingKey,
   generatePairingKeyPair,
   importAesKey,
+  isInProgressTaskStatus as isInProgressTaskStatusShared,
+  isTaskStale,
   mergeContextUsage,
   openEnvelope,
   parseAgentEventCompat,
@@ -455,21 +457,19 @@ function taskStatusMeta(status: string): { label: string; tone: string } {
 }
 
 function isInProgressTaskStatus(status: string | undefined): boolean {
-  let statusType = String(status || "");
-  try {
-    const parsed = JSON.parse(statusType) as { type?: unknown };
-    if (typeof parsed.type === "string") statusType = parsed.type;
-  } catch {
-    // Plain string statuses are expected for turn events.
-  }
-  const normalized = statusType.toLowerCase().replace(/[\s_-]/g, "");
-  return ["active", "running", "inprogress", "processing"].includes(normalized);
+  return isInProgressTaskStatusShared(status);
 }
 
 function isStaleTask(task: Pick<Task, "status" | "activeTurnId" | "lastProgressAt" | "updatedAt" | "approvals">): boolean {
-  if (!task.activeTurnId || task.approvals.length > 0 || !isInProgressTaskStatus(task.status)) return false;
-  const last = Number(task.lastProgressAt ?? task.updatedAt ?? 0);
-  return last > 0 && Date.now() / 1000 - last > 120;
+  // Shared with the agent via the protocol package: the agent's obligation to
+  // refresh lastProgressAt is documented against the same threshold used here.
+  return isTaskStale({
+    activeTurnId: task.activeTurnId,
+    status: task.status,
+    lastProgressAt: task.lastProgressAt,
+    updatedAt: task.updatedAt,
+    openApprovalCount: task.approvals.length
+  });
 }
 
 function isFailedTaskStatus(status: string | undefined): boolean {

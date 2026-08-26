@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CODEX_COMPAT_LABEL,
   CODEX_INSTALL_PACKAGE,
+  codexMessageThreadId,
   codexPermissionParams,
   explainCodexUpstreamError,
   isCodexCompatibleVersion,
@@ -25,6 +26,45 @@ describe("isCodexCompatibleVersion", () => {
     expect(isCodexCompatibleVersion("")).toBe(false);
     expect(CODEX_INSTALL_PACKAGE).toBe("@openai/codex@latest");
     expect(CODEX_COMPAT_LABEL).toBe("≥ 0.144.0");
+  });
+});
+
+describe("codexMessageThreadId", () => {
+  /**
+   * Callers use this to mark a thread alive. A missed id means a running Codex
+   * task drifts into「状态待确认」, so every spelling the app-server uses matters.
+   */
+  it("reads the common item/* placement", () => {
+    expect(codexMessageThreadId({ method: "item/agentMessage/delta", params: { threadId: "t1" } })).toBe("t1");
+  });
+
+  it("reads the turn/* nested placement", () => {
+    expect(codexMessageThreadId({ method: "turn/started", params: { turn: { threadId: "t2" } } })).toBe("t2");
+  });
+
+  it("reads snake_case from older builds", () => {
+    expect(codexMessageThreadId({ params: { thread_id: "t3" } })).toBe("t3");
+    expect(codexMessageThreadId({ params: { turn: { thread_id: "t4" } } })).toBe("t4");
+  });
+
+  it("reads the item-nested placement", () => {
+    expect(codexMessageThreadId({ params: { item: { threadId: "t5" } } })).toBe("t5");
+  });
+
+  it("prefers the top-level id when several are present", () => {
+    expect(codexMessageThreadId({ params: { threadId: "top", turn: { threadId: "nested" } } })).toBe("top");
+  });
+
+  it("coerces a numeric id", () => {
+    expect(codexMessageThreadId({ params: { threadId: 42 } })).toBe("42");
+  });
+
+  it("returns empty string when there is no thread to attribute", () => {
+    expect(codexMessageThreadId({ method: "agent/log", params: { line: "x" } })).toBe("");
+    expect(codexMessageThreadId({ params: { threadId: "   " } })).toBe("");
+    expect(codexMessageThreadId({})).toBe("");
+    expect(codexMessageThreadId(null)).toBe("");
+    expect(codexMessageThreadId(undefined)).toBe("");
   });
 });
 

@@ -52,6 +52,7 @@ import {
   CodexAdapter,
   CODEX_COMPAT_LABEL,
   CODEX_INSTALL_PACKAGE,
+  codexMessageThreadId,
   extractCodexTurnError,
   isCodexCompatibleVersion,
   isTerminalTurnStatus,
@@ -312,6 +313,20 @@ let reconnectAttempt = 0;
 let reconnectBlockedReason: string | null = null;
 const pendingPrompts = new Map<string, string>();
 const lastProgressAtByThread = new Map<string, number>();
+
+/**
+ * Mark a thread as alive right now (epoch SECONDS, matching the web's clock).
+ *
+ * The web flips a running task to「状态待确认」when this timestamp falls more than
+ * 120s behind, so anything that proves the engine is still working must land here.
+ * Only threads with a live turn are recorded — a notification arriving after
+ * `turn/completed` must not resurrect a finished task.
+ */
+function noteThreadProgress(threadId: string): void {
+  if (!threadId || !activeTurnByThread.has(threadId)) return;
+  lastProgressAtByThread.set(threadId, Date.now() / 1000);
+}
+
 const usageFlushTimers = new Map<string, NodeJS.Timeout>();
 const pendingUsageByThread = new Map<string, ContextUsage>();
 const queuedCommandIds = new Set<string>();
@@ -1161,6 +1176,12 @@ function finishLocalActivity(threadId: string, status: string): void {
 function queueRemoteDelta(threadId: string, itemId: string, delta: string): void {
   if (!delta || !threadId || !itemId) return;
   if (!activeTurnByThread.has(threadId)) return;
+  // Any streamed output is proof the turn is alive. Recording it here rather than
+  // at each call site is what keeps a new streaming path from silently reviving
+  // the「状态待确认」bug: Codex previously refreshed progress only on token-usage
+  // notifications, so a long assistant message, command output, or reasoning
+  // block with no usage sample for 120s looked stalled to the web.
+  noteThreadProgress(threadId);
   const key = `${threadId}\0${itemId}`;
   remoteDeltaBuffers.set(key, (remoteDeltaBuffers.get(key) ?? "") + delta);
   if (remoteDeltaFlushTimer) return;
@@ -5089,6 +5110,11 @@ function codexContextWindow(threadId: string): number | undefined {
 
 async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   const methodName = String(message.method || "").toLowerCase();
+  // A notification about a thread with a live turn IS proof of life, whether or
+  // not it carries text we forward. Non-streaming methods (item/started with a
+  // duplicate key, thread/status/changed, MCP startup) would otherwise let the
+  // staleness window expire mid-turn and show「状态待确认」on a running task.
+  noteThreadProgress(codexMessageThreadId(message));
   if (methodName.includes("tokenusage") || methodName.includes("token_usage")) {
     const params = message.params ?? {};
     const threadId = String(params.threadId ?? params.thread_id ?? "");
