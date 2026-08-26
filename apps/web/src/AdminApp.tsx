@@ -50,7 +50,10 @@ type AdminHost = {
   cursorVersion?: string | null;
   antigravityVersion?: string | null;
   agentVersion?: string | null;
-  eventCount?: number;
+  /** Sync envelopes created in the last 24 hours (activity signal). */
+  events24h?: number;
+  /** Highest persisted agent sequence for this host (lifetime throughput proxy). */
+  sequenceMax?: number | string;
   createdAt: string;
   lastSeenAt: string | null;
   revokedAt: string | null;
@@ -82,6 +85,31 @@ type Tab = "overview" | "users" | "hosts" | "settings" | "audit";
 function formatTime(value: string | null | undefined): string {
   if (!value) return "—";
   return new Date(value).toLocaleString();
+}
+
+/** Compact large sync counters for the admin hosts table. */
+function formatHostCounter(value: number | string | null | undefined): string {
+  const n = Number(value ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(Math.round(n));
+}
+
+/** Relative age for last-seen when the host is offline. */
+function formatLastSeen(host: Pick<AdminHost, "online" | "lastSeenAt" | "revokedAt">): string {
+  const absolute = formatTime(host.lastSeenAt);
+  if (host.revokedAt || host.online || !host.lastSeenAt) return absolute;
+  const ageMs = Date.now() - new Date(host.lastSeenAt).getTime();
+  if (!Number.isFinite(ageMs) || ageMs < 0) return absolute;
+  const minutes = Math.floor(ageMs / 60_000);
+  if (minutes < 1) return `${absolute}（刚离线）`;
+  if (minutes < 60) return `${absolute}（${minutes} 分钟前）`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${absolute}（${hours} 小时前）`;
+  const days = Math.floor(hours / 24);
+  return `${absolute}（${days} 天前）`;
 }
 
 function ErrorBanner({ message, clear }: { message: string; clear(): void }) {
@@ -395,7 +423,9 @@ export function AdminApp() {
           </div>
         </header>
         <p className="admin-hint" style={{ margin: "0 0 12px" }}>
-          「客户端」与「编码引擎」版本由桌面 Agent 上线后自动上报（Codex / Claude / Grok / Cursor / Antigravity）。「撤销」仅禁用配对；「删除」永久移除主机与同步密文。
+          「客户端」与「编码引擎」版本由桌面 Agent 上线后自动上报（Codex / Claude / Grok / Cursor / Antigravity）。
+          「24h 活跃」为近 24 小时同步信封数；「累计吞吐」为该主机已上报的最大 sequence（历史总量代理，不受 1 万条缓冲上限影响）。
+          「撤销」仅禁用配对；「删除」永久移除主机与同步密文。
         </p>
         <div className="admin-table-wrap">
           <table className="admin-table">
@@ -407,7 +437,8 @@ export function AdminApp() {
                 <th>状态</th>
                 <th>客户端</th>
                 <th>编码引擎</th>
-                <th>事件数</th>
+                <th title="近 24 小时写入的同步信封数">24h 活跃</th>
+                <th title="该主机已上报的最大 sequence，近似累计吞吐">累计吞吐</th>
                 <th>最近在线</th>
                 <th className="admin-actions-col">操作</th>
               </tr>
@@ -439,8 +470,9 @@ export function AdminApp() {
                       <div><span>Antigravity</span><code title={String(host.antigravityVersion || "")}>{formatEngineVersion(host.antigravityVersion)}</code></div>
                     </div>
                   </td>
-                  <td>{host.eventCount ?? 0}</td>
-                  <td>{formatTime(host.lastSeenAt)}</td>
+                  <td title={`${host.events24h ?? 0} 条 / 24h`}>{formatHostCounter(host.events24h)}</td>
+                  <td title={`max sequence = ${host.sequenceMax ?? 0}`}>{formatHostCounter(host.sequenceMax)}</td>
+                  <td>{formatLastSeen(host)}</td>
                   <td className="admin-actions-cell">
                     <div className="admin-actions">
                       <button disabled={Boolean(host.revokedAt) || busyId === host.id} onClick={() => runAction(host.id, async () => {
@@ -467,7 +499,7 @@ export function AdminApp() {
                   </td>
                 </tr>
               ))}
-              {!hosts.length && <tr><td colSpan={9} className="admin-empty">没有匹配的主机</td></tr>}
+              {!hosts.length && <tr><td colSpan={10} className="admin-empty">没有匹配的主机</td></tr>}
             </tbody>
           </table>
         </div>

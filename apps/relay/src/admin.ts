@@ -391,7 +391,9 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: AdminContext, ses
         h.id, h.name, h.platform, h.codex_version, h.claude_version, h.grok_version, h.cursor_version, h.antigravity_version, h.agent_version,
         h.created_at, h.last_seen_at, h.revoked_at,
         u.id AS user_id, u.username,
-        (SELECT count(*)::int FROM sync_events se WHERE se.host_id = h.id) AS event_count
+        (SELECT count(*)::int FROM sync_events se
+          WHERE se.host_id = h.id AND se.created_at > now() - interval '24 hours') AS events_24h,
+        (SELECT coalesce(max(se.sequence), 0)::bigint FROM sync_events se WHERE se.host_id = h.id) AS sequence_max
       FROM hosts h
       JOIN users u ON u.id = h.user_id
       WHERE (${pattern}::text IS NULL OR h.name ILIKE ${pattern} OR u.username ILIKE ${pattern}
