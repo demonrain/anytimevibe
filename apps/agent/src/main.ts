@@ -311,7 +311,6 @@ let connectGeneration = 0;
 let reconnectAttempt = 0;
 /** Permanent auth failures must not flap reconnect forever. */
 let reconnectBlockedReason: string | null = null;
-const pendingPrompts = new Map<string, string>();
 const lastProgressAtByThread = new Map<string, number>();
 
 /**
@@ -4851,12 +4850,26 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
       }
     }
     if (command.type === "turn.steer") {
+      const stored = taskStore.get(command.threadId);
+      if (stored?.engine && stored.engine !== "codex") {
+        throw new Error("只有 Codex 活跃回合支持目标引导；其他引擎请使用发送或等待队列");
+      }
+      const activeTurnId = activeTurnByThread.get(command.threadId);
+      if (!activeTurnId) {
+        throw new Error("当前任务没有可引导的 Codex 活跃回合，请改为发送新回合");
+      }
+      if (activeTurnId !== command.turnId) {
+        throw new Error("目标引导已过期：当前回合已变化，请刷新任务后重试");
+      }
       await ensureCodex();
       await codex!.request("thread/resume", { threadId: command.threadId });
       if (!publicState.activities.some((item) => item.threadId === command.threadId && item.status === "processing")) {
         startLocalActivity(command.threadId, command.prompt, "追加远程指令", "codex");
       }
-      pendingPrompts.set(command.threadId, command.prompt);
+      // Persist steering prompts just like regular turns. Codex emits the prompt
+      // in its live turn event, but relying on that event loses the instruction
+      // when the relay is disconnected or the app-server notification is delayed.
+      await appendStoredUserPrompt(command.threadId, command.prompt);
       await codex!.request("turn/steer", {
         threadId: command.threadId,
         expectedTurnId: command.turnId,
@@ -4865,8 +4878,8 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
       });
       activeTurnByThread.set(command.threadId, String(command.turnId));
       await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: command.turnId, prompt: command.prompt }, true);
-      const stored = taskStore.get(command.threadId);
-      await persistAndPublishRunInfo(command.threadId, String(command.turnId), await codexRunInfo(stored?.model, stored?.reasoningEffort));
+      const storedForRunInfo = taskStore.get(command.threadId);
+      await persistAndPublishRunInfo(command.threadId, String(command.turnId), await codexRunInfo(storedForRunInfo?.model, storedForRunInfo?.reasoningEffort));
       return;
     }
     if (command.type === "turn.interrupt") {

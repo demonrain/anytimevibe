@@ -3,6 +3,7 @@ import {
   agentEventSchema,
   base64ToBytes,
   bytesToBase64,
+  clientCommandSchema,
   createEnvelope,
   decryptPayload,
   derivePairingKey,
@@ -130,6 +131,17 @@ describe("protocol crypto", () => {
       lastProgressAt: 123
     });
     expect(heartbeat.type).toBe("thread.heartbeat");
+  });
+
+  it("accepts a Codex steering command with the active turn id", () => {
+    const command = {
+      type: "turn.steer" as const,
+      commandId: crypto.randomUUID(),
+      threadId: "thread-1",
+      turnId: "turn-1",
+      prompt: "优先修复刚才测试暴露的边界问题"
+    };
+    expect(clientCommandSchema.parse(command)).toMatchObject({ type: "turn.steer", turnId: "turn-1" });
   });
 
   it("ignores unknown forward-compatible agent event types", () => {

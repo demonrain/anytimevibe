@@ -1420,6 +1420,7 @@ const ConversationComposer = memo(function ConversationComposer({
   modelOptions,
   modelMeta,
   taskEngine,
+  steeringEnabled,
   reasoningEffort,
   effortOptions,
   fastMode,
@@ -1431,6 +1432,7 @@ const ConversationComposer = memo(function ConversationComposer({
   canResend,
   isMac,
   sendLabel,
+  steerLabel,
   stopLabel,
   resendLabel,
   currentPermissionLabel,
@@ -1457,6 +1459,8 @@ const ConversationComposer = memo(function ConversationComposer({
   modelOptions: Array<{ id: string; label: string }>;
   modelMeta: ReturnType<typeof modelOptionMeta>;
   taskEngine: CliEngine;
+  /** Codex has a native turn/steer path while a turn is active. */
+  steeringEnabled: boolean;
   reasoningEffort: ReasoningEffort | "";
   effortOptions: ReasoningEffort[];
   fastMode: boolean;
@@ -1468,6 +1472,7 @@ const ConversationComposer = memo(function ConversationComposer({
   canResend: boolean;
   isMac: boolean;
   sendLabel: string;
+  steerLabel: string;
   stopLabel: string;
   resendLabel: string;
   currentPermissionLabel: string;
@@ -1633,7 +1638,13 @@ const ConversationComposer = memo(function ConversationComposer({
             submit();
           }
         }}
-        placeholder={online === false ? "主机离线，可先编辑，恢复在线后再发送" : running ? "给当前任务追加方向…" : "继续这个任务…"}
+        placeholder={online === false
+          ? "主机离线，可先编辑，恢复在线后再发送"
+          : steeringEnabled
+            ? "给当前回合追加方向…"
+            : running
+              ? "当前回合结束后执行…"
+              : "继续这个任务…"}
       />
       <div className="composer-toolbar">
         {isMobile ? (
@@ -1675,7 +1686,11 @@ const ConversationComposer = memo(function ConversationComposer({
               {resendLabel}
             </button>
           )}
-          <button className="send" disabled={online !== true || !prompt.trim()}>{sendLabel}</button>
+          <button
+            className="send"
+            disabled={online !== true || !prompt.trim()}
+            title={steeringEnabled ? steerLabel : undefined}
+          >{steeringEnabled ? steerLabel : sendLabel}</button>
         </div>
       </div>
       <MobileBottomSheet
@@ -3533,6 +3548,10 @@ function TaskConversation({
   // task as running only while the agent exposes a live turn or an approval card.
   // This prevents an idle Codex thread from blocking the composer forever.
   const running = (Boolean(task.activeTurnId) && !isStaleTask(task)) || task.approvals.length > 0;
+  const steeringEnabled = taskEngine === "codex"
+    && Boolean(task.activeTurnId)
+    && !isStaleTask(task)
+    && task.approvals.length === 0;
   const permissionOptions = useMemo(
     () => permissionOptionsForEngine(taskEngine, locale),
     [taskEngine, locale]
@@ -3662,6 +3681,26 @@ function TaskConversation({
   /** Composer owns the draft text; parent only receives the submitted string. */
   const submitPromptText = useCallback((submittedPrompt: string) => {
     if (!submittedPrompt.trim() || online !== true) return;
+    // A Codex active turn has a native steering path. Keep the prompt out of the
+    // durable waiting queue and let the app-server append it to the current turn.
+    if (steeringEnabled) {
+      if (pendingPrompt) return;
+      const text = submittedPrompt.trim();
+      const commandId = randomUuid();
+      const turnId = task.activeTurnId;
+      if (!turnId) return;
+      stickToBottomRef.current = true;
+      submittingRef.current = true;
+      setPendingPrompt(text);
+      onCommand({
+        type: "turn.steer",
+        commandId,
+        threadId: task.threadId,
+        turnId,
+        prompt: text
+      });
+      return;
+    }
     // Guard against double Enter / rapid re-clicks before React re-renders pending state.
     if (!running && !pendingPrompt && submittingRef.current) return;
     const text = submittedPrompt.trim();
@@ -3678,6 +3717,7 @@ function TaskConversation({
     onCommand(turnStartCommand(text, commandId));
   }, [
     online,
+    steeringEnabled,
     running,
     pendingPrompt,
     model,
@@ -3689,6 +3729,7 @@ function TaskConversation({
     effortOptions.length,
     reasoningEffort,
     permissionMode,
+    task.activeTurnId,
     task.threadId,
     onCommand
   ]);
@@ -4098,6 +4139,7 @@ function TaskConversation({
       modelOptions={modelOptions}
       modelMeta={modelMeta}
       taskEngine={taskEngine}
+      steeringEnabled={steeringEnabled}
       reasoningEffort={reasoningEffort}
       effortOptions={effortOptions}
       fastMode={fastMode}
@@ -4109,6 +4151,7 @@ function TaskConversation({
       canResend={canResend}
       isMac={isMac}
       sendLabel={t("send")}
+      steerLabel={t("steer")}
       stopLabel={t("stop")}
       resendLabel={t("resend")}
       currentPermissionLabel={t("currentPermission")}
