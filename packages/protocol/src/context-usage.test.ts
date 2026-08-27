@@ -34,6 +34,23 @@ const CODEX_TURN_USAGE = {
   total_tokens: 12_400
 } as const;
 
+const CODEX_TOKEN_USAGE_EVENT = {
+  last_token_usage: {
+    input_tokens: 18_000,
+    cached_input_tokens: 15_000,
+    output_tokens: 700,
+    reasoning_output_tokens: 400
+  },
+  total_token_usage: {
+    input_tokens: 240_000,
+    cached_input_tokens: 210_000,
+    output_tokens: 9_000,
+    reasoning_output_tokens: 5_000,
+    total_tokens: 249_000
+  },
+  model_context_window: 272_000
+} as const;
+
 describe("normalizeContextUsage — Anthropic-family cache fields are additive", () => {
   it("counts cache reads and cache writes toward the prompt size", () => {
     const usage = normalizeContextUsage(CLAUDE_ASSISTANT_EVENT.message.usage);
@@ -66,6 +83,30 @@ describe("normalizeContextUsage — Anthropic-family cache fields are additive",
 });
 
 describe("normalizeContextUsage — OpenAI-family cache fields are a subset", () => {
+  it("prefers Codex last_token_usage over session cumulative usage", () => {
+    const usage = normalizeContextUsage(CODEX_TOKEN_USAGE_EVENT);
+    expect(usage?.inputTokens).toBe(18_000);
+    expect(usage?.outputTokens).toBe(700);
+    expect(usage?.cachedInputTokens).toBe(15_000);
+    expect(usage?.contextWindow).toBe(272_000);
+    expect(usage?.totalTokens).toBe(18_700);
+  });
+
+  it("does not pretend cumulative-only Codex data is context usage", () => {
+    const usage = normalizeContextUsage({
+      total_token_usage: {
+        input_tokens: 240_000,
+        output_tokens: 9_000,
+        total_tokens: 249_000
+      },
+      model_context_window: 272_000
+    });
+    expect(usage?.inputTokens).toBeUndefined();
+    expect(usage?.outputTokens).toBeUndefined();
+    expect(usage?.totalTokens).toBeUndefined();
+    expect(usage?.contextWindow).toBe(272_000);
+  });
+
   it("does not double-count cached input", () => {
     const usage = normalizeContextUsage(CODEX_TURN_USAGE);
     expect(usage?.inputTokens).toBe(12_000);

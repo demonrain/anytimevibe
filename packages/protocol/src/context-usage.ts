@@ -44,6 +44,10 @@ const CONTAINER_KEYS = [
   "token_usage",
   "tokenUsage",
   "contextUsage",
+  // Codex tokenUsage reports both the current turn and a session cumulative
+  // block. The current-turn block must win for context-window calculations.
+  "last_token_usage",
+  "lastTokenUsage",
   "totalTokenUsage",
   "total_token_usage",
   "usage_metadata",
@@ -156,6 +160,29 @@ function collectSources(root: Record<string, unknown>): Record<string, unknown>[
   return sources;
 }
 
+/** Locate Codex's current-turn usage block inside any scanned envelope. */
+function findLastUsageSource(sources: Record<string, unknown>[]): Record<string, unknown> | undefined {
+  for (const source of sources) {
+    const snake = asRecord(source.last_token_usage);
+    if (snake) return snake;
+    const camel = asRecord(source.lastTokenUsage);
+    if (camel) return camel;
+  }
+  return undefined;
+}
+
+/** Find nested Codex session-cumulative blocks, which are not context usage. */
+function findCumulativeUsageSources(sources: Record<string, unknown>[]): Set<Record<string, unknown>> {
+  const cumulative = new Set<Record<string, unknown>>();
+  for (const source of sources) {
+    const snake = asRecord(source.total_token_usage);
+    if (snake) cumulative.add(snake);
+    const camel = asRecord(source.totalTokenUsage);
+    if (camel) cumulative.add(camel);
+  }
+  return cumulative;
+}
+
 /**
  * First finite non-negative number found under any of `keys`.
  *
@@ -258,14 +285,26 @@ export function normalizeContextUsage(
   const root = asRecord(raw);
   if (!root) return undefined;
   const sources = collectSources(root);
+  // Codex exposes both last_token_usage (current turn) and total_token_usage
+  // (session cumulative). Context-window math must use only the former when it
+  // is available; otherwise a long session appears permanently full. If the
+  // current block is absent, ignore the cumulative block entirely and let the
+  // UI say that context usage cannot be calculated.
+  const lastUsageSource = findLastUsageSource(sources);
+  const cumulativeSources = findCumulativeUsageSources(sources);
+  const measurementSources = lastUsageSource
+    ? [lastUsageSource]
+    : cumulativeSources.size
+      ? sources.filter((source) => !cumulativeSources.has(source))
+      : sources;
 
-  const reportedInput = readNumber(sources, INPUT_KEYS);
-  const outputTokens = readNumber(sources, OUTPUT_KEYS);
-  const cacheRead = readNumber(sources, CACHE_READ_ADDITIVE_KEYS);
-  const cacheCreation = readNumber(sources, CACHE_CREATION_KEYS);
-  const cacheSubset = readNumber(sources, CACHE_SUBSET_KEYS);
-  const reasoningTokens = readNumber(sources, REASONING_KEYS);
-  const reportedTotal = readNumber(sources, REPORTED_TOTAL_KEYS);
+  const reportedInput = readNumber(measurementSources, INPUT_KEYS);
+  const outputTokens = readNumber(measurementSources, OUTPUT_KEYS);
+  const cacheRead = readNumber(measurementSources, CACHE_READ_ADDITIVE_KEYS);
+  const cacheCreation = readNumber(measurementSources, CACHE_CREATION_KEYS);
+  const cacheSubset = readNumber(measurementSources, CACHE_SUBSET_KEYS);
+  const reasoningTokens = readNumber(measurementSources, REASONING_KEYS);
+  const reportedTotal = readNumber(measurementSources, REPORTED_TOTAL_KEYS);
 
   // Anthropic-family: input_tokens excludes cache hits, so add them back in.
   const anthropicStyle = cacheRead != null || cacheCreation != null;

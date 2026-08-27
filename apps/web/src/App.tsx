@@ -1858,7 +1858,11 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
             : (existingRunInfo?.endpoint?.trim() ? { endpoint: existingRunInfo.endpoint.trim() } : {}))
         }
       : existingRunInfo;
-    const contextUsage = event.contextUsage ?? existing?.contextUsage;
+    // Snapshots can race a live usage.updated event. Merge instead of replacing
+    // so an older lightweight snapshot cannot roll the gauge back.
+    const contextUsage = event.contextUsage
+      ? mergeContextUsage(existing?.contextUsage, event.contextUsage)
+      : existing?.contextUsage;
     const providerSessionId = event.providerSessionId ?? existing?.providerSessionId;
     // Never let a stale snapshot push a recently active task down the list.
     const updatedAt = Math.max(
@@ -3163,7 +3167,7 @@ function ContextUsagePanel({ view }: { view: ContextUsageView | null }) {
     if (!isMobile) setExpanded(false);
   }, [isMobile]);
 
-  const summaryStrong = view?.usedPercent != null
+  const summaryStrong = !view ? (isEnglish ? "Unavailable" : "涓嶅彲璁＄畻") : view?.usedPercent != null
     ? `${view.usedPercent}%`
     : view?.totalTokens != null
       ? compactTokenCount(view.totalTokens)
@@ -3174,6 +3178,10 @@ function ContextUsagePanel({ view }: { view: ContextUsageView | null }) {
       ? " warm"
       : "";
   const tooltip = view ? contextUsageTitle(view) : (isEnglish ? "Context usage" : "上下文用量");
+  const unavailable = isEnglish ? "Unavailable" : "不可计算";
+  const unavailableTitle = isEnglish
+    ? "This engine did not report enough data to calculate context usage"
+    : "当前引擎没有提供足够的当前回合数据，暂时无法计算上下文用量";
 
   const detailChips = (
     <div className="run-info-chips context-usage-chips">
@@ -3243,7 +3251,13 @@ function ContextUsagePanel({ view }: { view: ContextUsageView | null }) {
 
   return (
     <>
-      {view?.totalTokens != null ? (
+      {!view ? (
+        <span className="meta-chip meta-chip-context muted" title={unavailableTitle}>
+          <em>{isEnglish ? "Context" : "上下文"}</em>
+          <strong>{unavailable}</strong>
+        </span>
+      ) : null}
+      {view && view.totalTokens != null ? (
         <span className="meta-chip meta-chip-context" title={tooltip}>
           <em>Token</em>
           <strong>
@@ -3251,13 +3265,13 @@ function ContextUsagePanel({ view }: { view: ContextUsageView | null }) {
             {view.contextWindow != null ? ` / ${compactTokenCount(view.contextWindow)}` : ""}
           </strong>
         </span>
-      ) : (
+      ) : view ? (
         <span className="meta-chip meta-chip-context muted" title={isEnglish ? "No token usage reported yet" : "本轮尚未上报 token 用量"}>
           <em>Token</em>
           <strong>—</strong>
         </span>
-      )}
-      {view?.usedPercent != null ? (
+      ) : null}
+      {view && view.usedPercent != null ? (
         <span
           className={`meta-chip meta-chip-context${view.usedPercent >= 85 ? " hot" : view.usedPercent >= 60 ? " warm" : ""}`}
           title={tooltip}
@@ -3268,19 +3282,19 @@ function ContextUsagePanel({ view }: { view: ContextUsageView | null }) {
           </span>
           <strong>{view.usedPercent}%</strong>
         </span>
-      ) : view?.remainingTokens != null && view.contextWindow != null ? (
+      ) : view && view.remainingTokens != null && view.contextWindow != null ? (
         <span className="meta-chip meta-chip-context" title={tooltip}>
           <em>{isEnglish ? "Left" : "余窗"}</em>
           <strong>
             {Math.max(0, Math.min(100, Math.round((view.remainingTokens / view.contextWindow) * 100)))}%
           </strong>
         </span>
-      ) : (
+      ) : view ? (
         <span className="meta-chip meta-chip-context muted" title={isEnglish ? "Context window unknown" : "上下文窗口占比未知"}>
           <em>{isEnglish ? "Context" : "上下文"}</em>
           <strong>—</strong>
         </span>
-      )}
+      ) : null}
     </>
   );
 }

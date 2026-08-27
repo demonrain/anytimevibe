@@ -4342,7 +4342,11 @@ async function runHeadlessTaskTurn(options: {
       latest.providerSessionId = result.providerSessionId;
     }
   }
-  if (result.contextUsage) latest.contextUsage = result.contextUsage;
+  if (result.contextUsage) {
+    // The headless parser accumulates this turn only. Merge it with the task
+    // snapshot so a sparse final event cannot reset prior context metadata.
+    latest.contextUsage = mergeContextUsage(latest.contextUsage, result.contextUsage);
+  }
   if (result.model) latest.model = result.model;
   // Cursor plan/question pause ends as interrupted — keep task active until Web resolves.
   if (result.status === "interrupted" && threadHasPendingCursorApproval(options.threadId)) {
@@ -5119,7 +5123,10 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const params = message.params ?? {};
     const threadId = String(params.threadId ?? params.thread_id ?? "");
     const usage = normalizeContextUsage(
-      params.tokenUsage ?? params.token_usage ?? params.usage ?? params.totalTokenUsage ?? params,
+      // Keep the complete envelope: Codex may place both last_token_usage and
+      // total_token_usage beside each other. The normalizer must see both and
+      // choose the current-turn block for the context gauge.
+      params.tokenUsage ?? params.token_usage ?? params.usage ?? params,
       codexContextWindow(threadId)
     );
     if (threadId && usage) {
@@ -5241,12 +5248,13 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const turnId = String(params.turn?.id ?? params.turnId ?? "");
     const turnStatus = String(params.turn?.status ?? params.status ?? "unknown");
     const contextUsage = normalizeContextUsage(
+      // Keep the complete envelope for last_token_usage/total_token_usage
+      // precedence instead of selecting the cumulative block prematurely.
       params.usage
       ?? params.turn?.usage
       ?? params.turn?.tokenUsage
       ?? params.turn?.contextUsage
-      ?? params.total_token_usage
-      ?? params.totalTokenUsage,
+      ?? params,
       codexContextWindow(threadId)
     );
     const errorMessage = extractCodexTurnError(params.turn) || extractCodexTurnError(params);
@@ -5263,7 +5271,17 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const completedStored = taskStore.get(threadId);
     if (completedStored) {
       completedStored.status = turnStatus;
-      if (pendingUsage || contextUsage) completedStored.contextUsage = mergeContextUsage(pendingUsage, contextUsage ?? pendingUsage!);
+      if (pendingUsage || contextUsage) {
+        // Keep the durable snapshot as the base. A final Codex event can be
+        // sparse (or cumulative-only), and must not erase a better live sample.
+        const withPending = pendingUsage
+          ? mergeContextUsage(completedStored.contextUsage, pendingUsage)
+          : completedStored.contextUsage;
+        const mergedUsage = contextUsage
+          ? mergeContextUsage(withPending, contextUsage)
+          : withPending;
+        if (mergedUsage) completedStored.contextUsage = mergedUsage;
+      }
       completedStored.updatedAt = Date.now() / 1000;
       await taskStore.upsert(completedStored);
     }
