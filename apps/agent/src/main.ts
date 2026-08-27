@@ -567,6 +567,8 @@ type QueuedTurnStart = {
   reasoningEffort?: ReasoningEffort;
 };
 const turnQueueByThread = new Map<string, QueuedTurnStart[]>();
+/** Prevent two steering requests from consuming the same queued item concurrently. */
+const queueSteeringInFlight = new Set<string>();
 /** Covers the gap between accepting turn.start and activeTurnByThread being set. */
 const turnStartingByThread = new Set<string>();
 let turnQueueFilePath = "";
@@ -823,6 +825,51 @@ async function cancelTurnQueue(
   }
   const remaining = turnQueueByThread.get(threadId)?.length ?? 0;
   return { removed, remaining };
+}
+
+async function steerCodexTurn(
+  threadId: string,
+  turnId: string,
+  prompt: string,
+  commandId: string
+): Promise<void> {
+  const stored = taskStore.get(threadId);
+  const engine = stored?.engine || resolveActivityEngine(threadId);
+  if (engine && engine !== "codex") {
+    throw new Error("鍙湁 Codex 娲昏穬鍥炲悎鏀寔鐩爣寮曞锛涘叾浠栧紩鎿庤浣跨敤鍙戦€佹垨绛夊緟闃熷垪");
+  }
+  const activeTurnId = activeTurnByThread.get(threadId);
+  if (!activeTurnId) {
+    throw new Error("褰撳墠浠诲姟娌℃湁鍙紩瀵肩殑 Codex 娲昏穬鍥炲悎锛岃鏀逛负鍙戦€佹柊鍥炲悎");
+  }
+  if (activeTurnId !== turnId) {
+    throw new Error("鐩爣寮曞宸茶繃鏈燂細褰撳墠鍥炲悎宸插彉鍖栵紝璇峰埛鏂颁换鍔″悗閲嶈瘯");
+  }
+  await ensureCodex();
+  await codex!.request("thread/resume", { threadId });
+  if (!publicState.activities.some((item) => item.threadId === threadId && item.status === "processing")) {
+    startLocalActivity(threadId, prompt, "杩藉姞杩滅▼鎸囦护", "codex");
+  }
+  await codex!.request("turn/steer", {
+    threadId,
+    expectedTurnId: turnId,
+    clientUserMessageId: commandId,
+    input: [{ type: "text", text: prompt, text_elements: [] }]
+  });
+  // Persist only after Codex accepts the steering request, so a failed request
+  // remains solely in the durable queue instead of looking already executed.
+  await appendStoredUserPrompt(threadId, prompt);
+  activeTurnByThread.set(threadId, turnId);
+  await publish({
+    type: "turn.started",
+    eventId: crypto.randomUUID(),
+    occurredAt: new Date().toISOString(),
+    threadId,
+    turnId,
+    prompt
+  }, true);
+  const storedForRunInfo = taskStore.get(threadId);
+  await persistAndPublishRunInfo(threadId, turnId, await codexRunInfo(storedForRunInfo?.model, storedForRunInfo?.reasoningEffort));
 }
 
 // ── Deleted task tombstones (skip on future sync/import) ─────────────────
@@ -4517,6 +4564,28 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
     await publishAllTurnQueues().catch(() => undefined);
     return;
   }
+  if (command.type === "turn.queue.steer") {
+    const list = turnQueueByThread.get(command.threadId) ?? [];
+    const queued = list.find((item) => item.commandId === command.queueCommandId);
+    if (!queued) throw new Error("鎸囧畾鐨勬帓闃熸寚浠ゅ凡涓嶅瓨鍦ㄦ垨宸插畬鎴愶紝璇峰埛鏂颁换鍔￠樁娈点€�");
+    if (queueSteeringInFlight.has(command.queueCommandId)) {
+      throw new Error("鎸囧畾鐨勬帓闃熸寚浠ｅ凡鍦ㄥ鐞嗕腑");
+    }
+    queueSteeringInFlight.add(command.queueCommandId);
+    try {
+      await steerCodexTurn(command.threadId, command.turnId, queued.prompt, command.commandId);
+      const current = turnQueueByThread.get(command.threadId) ?? [];
+      const next = current.filter((item) => item.commandId !== command.queueCommandId);
+      if (next.length) turnQueueByThread.set(command.threadId, next);
+      else turnQueueByThread.delete(command.threadId);
+      queuedCommandIds.delete(command.queueCommandId);
+      await persistTurnQueue();
+      await publishTurnQueueUpdated(command.threadId);
+    } finally {
+      queueSteeringInFlight.delete(command.queueCommandId);
+    }
+    return;
+  }
   if (command.type === "turn.queue.cancel") {
     const result = await cancelTurnQueue(command.threadId, command.queueCommandId);
     updateState({
@@ -4850,36 +4919,7 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
       }
     }
     if (command.type === "turn.steer") {
-      const stored = taskStore.get(command.threadId);
-      if (stored?.engine && stored.engine !== "codex") {
-        throw new Error("只有 Codex 活跃回合支持目标引导；其他引擎请使用发送或等待队列");
-      }
-      const activeTurnId = activeTurnByThread.get(command.threadId);
-      if (!activeTurnId) {
-        throw new Error("当前任务没有可引导的 Codex 活跃回合，请改为发送新回合");
-      }
-      if (activeTurnId !== command.turnId) {
-        throw new Error("目标引导已过期：当前回合已变化，请刷新任务后重试");
-      }
-      await ensureCodex();
-      await codex!.request("thread/resume", { threadId: command.threadId });
-      if (!publicState.activities.some((item) => item.threadId === command.threadId && item.status === "processing")) {
-        startLocalActivity(command.threadId, command.prompt, "追加远程指令", "codex");
-      }
-      // Persist steering prompts just like regular turns. Codex emits the prompt
-      // in its live turn event, but relying on that event loses the instruction
-      // when the relay is disconnected or the app-server notification is delayed.
-      await appendStoredUserPrompt(command.threadId, command.prompt);
-      await codex!.request("turn/steer", {
-        threadId: command.threadId,
-        expectedTurnId: command.turnId,
-        clientUserMessageId: command.commandId,
-        input: [{ type: "text", text: command.prompt, text_elements: [] }]
-      });
-      activeTurnByThread.set(command.threadId, String(command.turnId));
-      await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: command.turnId, prompt: command.prompt }, true);
-      const storedForRunInfo = taskStore.get(command.threadId);
-      await persistAndPublishRunInfo(command.threadId, String(command.turnId), await codexRunInfo(storedForRunInfo?.model, storedForRunInfo?.reasoningEffort));
+      await steerCodexTurn(command.threadId, command.turnId, command.prompt, command.commandId);
       return;
     }
     if (command.type === "turn.interrupt") {

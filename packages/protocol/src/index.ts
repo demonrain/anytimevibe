@@ -356,6 +356,14 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     /** Target queued turn's commandId (not the cancel command's own commandId). */
     queueCommandId: z.string().uuid().optional()
   }),
+  /** Apply Codex native steering to one durable queued follow-up atomically. */
+  commandBase.extend({
+    type: z.literal("turn.queue.steer"),
+    threadId: z.string().min(1),
+    turnId: z.string().min(1),
+    /** Target queued turn's commandId (not this command's own commandId). */
+    queueCommandId: z.string().uuid()
+  }),
   /** Delete a task from the agent index (local store + sync tombstone). */
   commandBase.extend({
     type: z.literal("thread.delete"),

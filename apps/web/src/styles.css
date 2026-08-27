@@ -421,6 +421,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   align-items: start;
 }
 .command-queue .queue-cancel,
+.command-queue .queue-steer,
 .command-queue .queue-clear {
   border: 0;
   border-radius: 8px;
@@ -431,6 +432,16 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   padding: 4px 8px;
   cursor: pointer;
   white-space: nowrap;
+}
+.command-queue .queue-steer {
+  background: rgba(42, 112, 93, 0.14);
+  color: #216b59;
+}
+.command-queue .queue-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
 }
 .command-queue .queue-clear { margin-left: auto; }
 .command-queue > div {

@@ -144,6 +144,21 @@ describe("protocol crypto", () => {
     expect(clientCommandSchema.parse(command)).toMatchObject({ type: "turn.steer", turnId: "turn-1" });
   });
 
+  it("accepts steering for a durable queued command", () => {
+    const command = {
+      type: "turn.queue.steer" as const,
+      commandId: crypto.randomUUID(),
+      threadId: "thread-1",
+      turnId: "turn-1",
+      queueCommandId: crypto.randomUUID()
+    };
+    expect(clientCommandSchema.parse(command)).toMatchObject({
+      type: "turn.queue.steer",
+      turnId: "turn-1",
+      queueCommandId: command.queueCommandId
+    });
+  });
+
   it("ignores unknown forward-compatible agent event types", () => {
     expect(parseAgentEventCompat({
       type: "future.optional.event",
