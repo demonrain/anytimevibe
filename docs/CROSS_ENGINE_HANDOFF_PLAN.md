@@ -358,3 +358,38 @@ Web 层：
 - 当前上下文无法计算时 UI 不显示伪造的 token 百分比。
 - 旧 Agent/Web 客户端仍能查看和继续旧任务。
 
+## 14. 当前实现审查：开始开发前的门槛
+
+本节按当前代码（`main` 分支，2026-08-27）核对，不是未来架构假设。结论是：跨引擎接力可行，但还不能只在 `turn.start` 增加一个 `cliEngine` 字段。
+
+### P0 阻塞项（不完成就不应开放切换按钮）
+
+1. **任务模型仍是一对一绑定。** `StoredTask` 只有 `engine`、`providerSessionId` 和单个 `contextUsage`；`task-store.ts` 的 `setProviderSession` 会覆盖原会话。必须先加入按引擎/会话键索引的 `EngineSession`，并为旧 JSON 提供惰性迁移和写回策略。
+2. **切换没有事务边界。** 当前 `turnStartingByThread`、`activeTurnByThread`、headless 进程表均为进程内状态，Relay/WebSocket 消息也会并发进入 `handleCommand`。切换需要任务级互斥锁或 generation fencing，保证停止、flush、创建目标会话、提交 active 指针是一个可恢复状态机。
+3. **没有可重放的 handoff 输入。** 流式 delta 主要实时发布，headless 只有进程结束后才把完整回复写入 `messages`；中途停止或崩溃可能丢失最后一段回复。必须在切换前固定 transcript 水位，并保存摘要、最近消息、diff、测试结果及其来源和截断信息。
+4. **目标引擎没有统一预检/回滚。** `availableEngines.ready` 只能说明二进制可发现，不能证明登录、模型、网络、权限模式或 resume 参数可用。目标 session 创建失败时必须保持源 session active，并发布可重试的失败事件。
+5. **usage 尚未按 session 隔离。** 协议和 Web `Task` 都只有一个 `contextUsage`，而 `usage.updated` 没有 `turnId`/session 标识。切换后若继续合并，会把源引擎的上下文百分比显示在目标引擎上；必须改为 `sessions[key].contextUsage`，并禁止跨引擎合并窗口和百分比。
+
+### P1 重要问题（MVP 可以限制，但必须显式处理）
+
+- **“接力”不是原生续跑。** Codex/Claude/Cursor 等 provider session ID、resume 协议和工具权限互不兼容；跨引擎只能新开目标会话并注入 handoff。产品文案和审计记录必须明确这一点。
+- **切换会产生额外 token。** 摘要、最近消息和 diff 都是目标引擎的新输入；应限制为 `summary-recent`，设置字节/token 上限，并显示“接力上下文可能产生额外用量”。
+- **隐式模型记忆不可迁移。** 未写入文件的计划、工具内部状态、审批上下文和隐藏 system prompt 不能保证带过去；handoff 只能承诺已持久化内容。
+- **权限语义不一致。** 现有 `permissionMode` 枚举虽然统一了名称，各 CLI 的实际含义仍不同。切换前需再次确认目标权限，不能静默沿用源引擎的“自动批准”。
+- **工作区和外部副作用。** 目标引擎必须在同一绝对 `cwd`、同一 Git 状态上启动；切换期间不得允许另一客户端修改文件，否则摘要/diff 与实际工作区会分叉。
+- **消息与事件幂等。** 当前 `processedCommandIds` 在执行前落盘，进程在“已记账但未完成”时崩溃会丢命令。切换命令应单独保存状态（started/completed/failed），重复投递只能返回同一结果，不能再次启动 CLI。
+- **Relay 不是主要改造点，但有顺序约束。** Relay 只转发/持久化加密 envelope；新事件要在 protocol schema 中定义，旧 Web 可忽略未知事件，同时 Agent 仍需发送兼容 `thread.snapshot`。持久化事件受每主机数量和 2 MiB envelope 限制，handoff 不能把大 diff/完整 transcript 直接塞进单个事件。
+
+### 适合先做的最小可行范围
+
+- 只支持 Codex ↔ Claude，单向或双向均可，但目标会话一律新建。
+- handoff 固定为本地生成的 `summary-recent`：原始目标、cwd、已完成/未完成事项、最近 8 轮消息、文件级 diff 摘要、最近测试结果；完整 transcript 通过历史分页按需读取。
+- 切换期间禁止新 `turn.start`、`turn.steer` 和第二个切换命令；超时或目标预检失败自动回到源 session。
+- UI 只显示 active session 的上下文；未知窗口时显示“当前引擎暂无法计算上下文”，仍可显示该 session 的累计 token（若 provider 报告）。
+
+### 开发前必须具备的验证材料
+
+- Codex、Claude 真实 CLI 版本的 stream/usage/session payload fixture，至少覆盖新会话、resume 失败、进程中断和稀疏 usage。
+- Agent 状态机测试：并发切换、重复 `commandId`、断电/重启恢复、目标失败回滚、源会话切回。
+- Web/协议兼容测试：旧客户端收到新事件、快照乱序、usage 快照晚到，以及切换边界消息不重复。
+- 一次真实端到端演练：在同一工作区先由引擎 A 修改文件，再切到引擎 B，验证摘要、diff、权限和最终 Git 状态一致。
