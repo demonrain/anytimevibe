@@ -567,6 +567,15 @@ type QueuedTurnStart = {
   reasoningEffort?: ReasoningEffort;
 };
 const turnQueueByThread = new Map<string, QueuedTurnStart[]>();
+type PendingCodexSteering = {
+  queued: QueuedTurnStart;
+  interruptedTurnId: string;
+  phase: "interrupting" | "priorityStarting" | "priority" | "resumingStarting" | "resuming";
+  priorityTurnId?: string;
+  resumeTurnId?: string;
+};
+/** A priority queue item temporarily owns the thread while the original turn is resumed. */
+const pendingCodexSteeringByThread = new Map<string, PendingCodexSteering>();
 /** Prevent two steering requests from consuming the same queued item concurrently. */
 const queueSteeringInFlight = new Set<string>();
 /** Covers the gap between accepting turn.start and activeTurnByThread being set. */
@@ -872,6 +881,54 @@ async function steerCodexTurn(
   await persistAndPublishRunInfo(threadId, turnId, await codexRunInfo(storedForRunInfo?.model, storedForRunInfo?.reasoningEffort));
 }
 
+async function restoreSteeringQueueItem(threadId: string, item: QueuedTurnStart): Promise<void> {
+  const list = turnQueueByThread.get(threadId) ?? [];
+  if (!list.some((queued) => queued.commandId === item.commandId)) {
+    turnQueueByThread.set(threadId, [item, ...list]);
+    queuedCommandIds.add(item.commandId);
+    await persistTurnQueue();
+    await publishTurnQueueUpdated(threadId);
+  }
+}
+
+async function startCodexSteeringFollowUp(threadId: string, steering: PendingCodexSteering): Promise<void> {
+  const queued = steering.queued;
+  steering.phase = "priorityStarting";
+  queuedCommandIds.delete(queued.commandId);
+  const queuedCommand: ClientCommand = {
+    type: "turn.start",
+    commandId: queued.commandId,
+    threadId,
+    prompt: queued.prompt,
+    ...(queued.permissionMode ? { permissionMode: queued.permissionMode } : {}),
+    ...(queued.model ? { model: queued.model } : {}),
+    ...(queued.reasoningEffort ? { reasoningEffort: queued.reasoningEffort } : {})
+  };
+  await handleCommandImpl(queuedCommand);
+  const priorityTurnId = activeTurnByThread.get(threadId);
+  if (!priorityTurnId) throw new Error("插队任务未能启动");
+  steering.priorityTurnId = priorityTurnId;
+  steering.phase = "priority";
+}
+
+async function resumeCodexOriginalTask(threadId: string, steering: PendingCodexSteering): Promise<void> {
+  steering.phase = "resumingStarting";
+  const resumeCommand: ClientCommand = {
+    type: "turn.start",
+    commandId: crypto.randomUUID(),
+    threadId,
+    // The original Codex thread retains its transcript and file state. Make the
+    // handoff explicit so the model continues instead of treating the priority
+    // request as a replacement for the original task.
+    prompt: "Continue the original task from before the priority task. Review the previous context and finish any remaining work without repeating completed work."
+  };
+  await handleCommandImpl(resumeCommand);
+  const resumeTurnId = activeTurnByThread.get(threadId);
+  if (!resumeTurnId) throw new Error("原任务恢复回合未能启动");
+  steering.resumeTurnId = resumeTurnId;
+  steering.phase = "resuming";
+}
+
 // ── Deleted task tombstones (skip on future sync/import) ─────────────────
 let deletedThreadsFilePath = "";
 const deletedThreadIds = new Set<string>();
@@ -921,6 +978,7 @@ async function deleteLocalThread(threadId: string): Promise<void> {
   activityOutputBuffers.delete(threadId);
   activityItemsByThread.delete(threadId);
   activeTurnByThread.delete(threadId);
+  pendingCodexSteeringByThread.delete(threadId);
   turnStartingByThread.delete(threadId);
   await publish({
     type: "thread.deleted",
@@ -988,7 +1046,7 @@ function scheduleDrainTurnQueue(threadId: string): void {
 }
 
 async function drainTurnQueue(threadId: string): Promise<void> {
-  if (isThreadTurnBusy(threadId)) return;
+  if (isThreadTurnBusy(threadId) || pendingCodexSteeringByThread.has(threadId)) return;
   if (isThreadDeleted(threadId)) {
     await clearTurnQueue(threadId);
     return;
@@ -4571,16 +4629,32 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
     if (queueSteeringInFlight.has(command.queueCommandId)) {
       throw new Error("鎸囧畾鐨勬帓闃熸寚浠ｅ凡鍦ㄥ鐞嗕腑");
     }
+    if (pendingCodexSteeringByThread.has(command.threadId)) {
+      throw new Error("当前已有插队任务正在执行，请稍后再试");
+    }
     queueSteeringInFlight.add(command.queueCommandId);
     try {
-      await steerCodexTurn(command.threadId, command.turnId, queued.prompt, command.commandId);
-      const current = turnQueueByThread.get(command.threadId) ?? [];
-      const next = current.filter((item) => item.commandId !== command.queueCommandId);
+      if (activeTurnByThread.get(command.threadId) !== command.turnId) {
+        throw new Error("当前任务回合已发生变化，请刷新后重试");
+      }
+      const next = list.filter((item) => item.commandId !== command.queueCommandId);
       if (next.length) turnQueueByThread.set(command.threadId, next);
       else turnQueueByThread.delete(command.threadId);
-      queuedCommandIds.delete(command.queueCommandId);
       await persistTurnQueue();
       await publishTurnQueueUpdated(command.threadId);
+      pendingCodexSteeringByThread.set(command.threadId, {
+        queued,
+        interruptedTurnId: command.turnId,
+        phase: "interrupting"
+      });
+      await ensureCodex();
+      await codex!.request("thread/resume", { threadId: command.threadId });
+      await codex!.request("turn/interrupt", { threadId: command.threadId, turnId: command.turnId });
+      logInfo("已请求中断当前回合并准备插队运行", command.threadId.slice(0, 8));
+    } catch (error) {
+      pendingCodexSteeringByThread.delete(command.threadId);
+      await restoreSteeringQueueItem(command.threadId, queued);
+      throw error;
     } finally {
       queueSteeringInFlight.delete(command.queueCommandId);
     }
@@ -4926,6 +5000,7 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
       // Stop cancels both the active turn and any durable follow-ups for this thread.
       logWarn("收到 turn.interrupt，停止任务并清空队列", command.threadId.slice(0, 8));
       await clearTurnQueue(command.threadId);
+      pendingCodexSteeringByThread.delete(command.threadId);
       const stored = taskStore.get(command.threadId);
       const listed = publicState.tasks.find((item) => item.threadId === command.threadId);
       const engine = stored?.engine || listed?.engine;
@@ -5367,6 +5442,49 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     // Refresh snapshot so final assistant text / lastDiff / system errors are complete.
     // Touch updatedAt so web/agent lists reorder by last activity (not create time).
     try { await publishThread(threadId, { touch: true }); } catch { /* ignore */ }
+    const steering = pendingCodexSteeringByThread.get(threadId);
+    if (steering?.phase === "interrupting" && steering.interruptedTurnId === turnId) {
+      try {
+        await startCodexSteeringFollowUp(threadId, steering);
+      } catch (error) {
+        pendingCodexSteeringByThread.delete(threadId);
+        await restoreSteeringQueueItem(threadId, steering.queued).catch(() => undefined);
+        await publish({
+          type: "error",
+          eventId: crypto.randomUUID(),
+          occurredAt: new Date().toISOString(),
+          threadId,
+          message: `插队任务启动失败：${error instanceof Error ? error.message : String(error)}`
+        }, true).catch(() => undefined);
+      }
+      return;
+    }
+    if (steering?.phase === "priorityStarting") {
+      steering.priorityTurnId = turnId;
+      steering.phase = "priority";
+    }
+    if (steering?.phase === "priority" && steering.priorityTurnId === turnId) {
+      try {
+        await resumeCodexOriginalTask(threadId, steering);
+      } catch (error) {
+        pendingCodexSteeringByThread.delete(threadId);
+        await publish({
+          type: "error",
+          eventId: crypto.randomUUID(),
+          occurredAt: new Date().toISOString(),
+          threadId,
+          message: `原任务恢复失败：${error instanceof Error ? error.message : String(error)}`
+        }, true).catch(() => undefined);
+      }
+      return;
+    }
+    if (steering?.phase === "resumingStarting") {
+      steering.resumeTurnId = turnId;
+      steering.phase = "resuming";
+    }
+    if (steering?.phase === "resuming" && steering.resumeTurnId === turnId) {
+      pendingCodexSteeringByThread.delete(threadId);
+    }
     // Codex turn finished — drain durable follow-up prompts for this thread.
     scheduleDrainTurnQueue(threadId);
     void maybeReloadCodexAppServerWhenIdle().catch(handleError);

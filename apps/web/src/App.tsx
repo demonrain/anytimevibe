@@ -4188,10 +4188,47 @@ function DiffView({ diff }: { diff: string }) {
   }
   const selected = files.find((file) => file.path === selectedPath) || files[0];
   const patch = selected?.patch || "# 该文件暂无可展开的 patch";
+  const totalAdditions = files.reduce((sum, file) => sum + file.additions, 0);
+  const totalDeletions = files.reduce((sum, file) => sum + file.deletions, 0);
+  const selectedStatus = selected?.status === "added"
+    ? "新增"
+    : selected?.status === "deleted"
+      ? "删除"
+      : selected?.status === "renamed"
+        ? "重命名"
+        : "修改";
   return (
     <div className="diff-panel">
+      <header className="diff-header">
+        <div className="diff-header-title">
+          <strong>Diff</strong>
+          <span>{files.length} files</span>
+        </div>
+        <div className="diff-total-stats" aria-label="Diff totals">
+          <span className="add">+{totalAdditions}</span>
+          <span className="remove">-{totalDeletions}</span>
+        </div>
+      </header>
       {files.length > 0 && (
-        <div className="diff-file-list">
+        <>
+          <div className="diff-mobile-toolbar">
+            <label htmlFor="diff-file-select">File</label>
+            <select
+              id="diff-file-select"
+              className="diff-file-select"
+              value={selected?.path || ""}
+              onChange={(event) => setSelectedPath(event.target.value)}
+            >
+              {files.map((file) => (
+                <option key={file.path} value={file.path}>{file.path}</option>
+              ))}
+            </select>
+            <div className="diff-file-summary">
+              <span className={`diff-file-status ${selected?.status || "unknown"}`}>{selectedStatus}</span>
+              <small>+{selected?.additions || 0} -{selected?.deletions || 0}</small>
+            </div>
+          </div>
+          <div className="diff-file-list">
           <strong>变更文件（{files.length}）</strong>
           <ul>
             {files.map((file) => (
@@ -4204,7 +4241,8 @@ function DiffView({ diff }: { diff: string }) {
               </li>
             ))}
           </ul>
-        </div>
+          </div>
+        </>
       )}
       <div className="diff-view">
         {sanitizeDisplayText(patch).split("\n").map((line, index) => {

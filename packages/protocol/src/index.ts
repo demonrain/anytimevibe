@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.103";
+export const PRODUCT_VERSION = "0.4.104";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -358,7 +358,7 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     /** Target queued turn's commandId (not the cancel command's own commandId). */
     queueCommandId: z.string().uuid().optional()
   }),
-  /** Apply Codex native steering to one durable queued follow-up atomically. */
+  /** Run one durable queued follow-up ahead of the remaining queue, preserving the active task. */
   commandBase.extend({
     type: z.literal("turn.queue.steer"),
     threadId: z.string().min(1),
