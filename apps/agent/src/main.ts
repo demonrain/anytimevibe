@@ -67,7 +67,7 @@ import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn, normalizeSystemErrorText } from "./cli/headless-runner";
 import { isCodexModelsManagerNoise } from "./cli/log-noise";
 import { importLocalCliSessions, sanitizeTranscriptMessages } from "./cli/import-sessions";
-import { discoverEngineCapabilities, resolveModelContextWindow, type EngineCapability } from "./cli/model-catalog";
+import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
 import { startEngineConfigWatch } from "./cli/engine-config-watch";
 import { appendEngineDiffChunk, buildTurnDiff, captureTurnDiffBaseline, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
 import { TaskStore } from "./cli/task-store";
@@ -5155,16 +5155,6 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
   }
 }
 
-/**
- * Context window for a codex thread, so the token gauge has a denominator.
- *
- * The app-server usage block does not always carry `context_window`; when it
- * does, `normalizeContextUsage` prefers it over this value.
- */
-function codexContextWindow(threadId: string): number | undefined {
-  return resolveModelContextWindow("codex", taskStore.get(threadId)?.model);
-}
-
 async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   const methodName = String(message.method || "").toLowerCase();
   // A notification about a thread with a live turn IS proof of life, whether or
@@ -5177,10 +5167,8 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const threadId = String(params.threadId ?? params.thread_id ?? "");
     const usage = normalizeContextUsage(
       // Keep the complete envelope: Codex may place both last_token_usage and
-      // total_token_usage beside each other. The normalizer must see both and
-      // choose the current-turn block for the context gauge.
-      params.tokenUsage ?? params.token_usage ?? params.usage ?? params,
-      codexContextWindow(threadId)
+      // total_token_usage beside each other, with the native window alongside.
+      params
     );
     if (threadId && usage) {
       await recordUsageUpdate(threadId, usage);
@@ -5221,10 +5209,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       if (patch) appendEngineDiffChunk(threadId, patch);
     }
     if (threadId) {
-      const usage = normalizeContextUsage(
-        item.usage ?? item.tokenUsage ?? item.metrics ?? params.usage,
-        codexContextWindow(threadId)
-      );
+      const usage = normalizeContextUsage(params);
       if (usage) {
         await recordUsageUpdate(threadId, usage);
       }
@@ -5302,13 +5287,8 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const turnStatus = String(params.turn?.status ?? params.status ?? "unknown");
     const contextUsage = normalizeContextUsage(
       // Keep the complete envelope for last_token_usage/total_token_usage
-      // precedence instead of selecting the cumulative block prematurely.
-      params.usage
-      ?? params.turn?.usage
-      ?? params.turn?.tokenUsage
-      ?? params.turn?.contextUsage
-      ?? params,
-      codexContextWindow(threadId)
+      // precedence and the native context window alongside the usage block.
+      params
     );
     const errorMessage = extractCodexTurnError(params.turn) || extractCodexTurnError(params);
     finishLocalActivity(threadId, turnStatus);

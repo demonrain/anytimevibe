@@ -68,11 +68,11 @@ describe("normalizeContextUsage — Anthropic-family cache fields are additive",
     expect(fromEvent).toEqual(fromBlock);
   });
 
-  it("reports a nearly-full window instead of ~0%", () => {
-    const usage = normalizeContextUsage(CLAUDE_ASSISTANT_EVENT.message.usage, 200_000);
+  it("reports a nearly-full native window", () => {
+    const usage = normalizeContextUsage({ ...CLAUDE_ASSISTANT_EVENT.message.usage, context_window: 210_000 });
     const totals = resolveContextUsageTotals(usage!);
-    expect(totals.usedPercent).toBe(100);
-    expect(totals.remainingTokens).toBe(0);
+    expect(totals.usedPercent).toBe(98);
+    expect(totals.remainingTokens).toBe(4_496);
   });
 
   it("treats an ambiguously-named cache field as additive when it exceeds input", () => {
@@ -89,6 +89,7 @@ describe("normalizeContextUsage — OpenAI-family cache fields are a subset", ()
     expect(usage?.outputTokens).toBe(700);
     expect(usage?.cachedInputTokens).toBe(15_000);
     expect(usage?.contextWindow).toBe(272_000);
+    expect(usage?.contextWindowSource).toBe("provider");
     expect(usage?.totalTokens).toBe(18_700);
   });
 
@@ -156,15 +157,14 @@ describe("normalizeContextUsage — value reading", () => {
     expect(usage?.contextWindow).toBe(1_000_000);
   });
 
-  it("falls back to the caller's window when the payload omits one", () => {
-    // Claude Code's stream-json carries no window size — the catalog must fill it.
+  it("does not infer a window when the payload omits one", () => {
     const usage = normalizeContextUsage({ input_tokens: 10, output_tokens: 5 }, 200_000);
-    expect(usage?.contextWindow).toBe(200_000);
+    expect(usage?.contextWindow).toBeUndefined();
   });
 
-  it("falls back when the payload reports an unusable zero window", () => {
+  it("does not infer a window from an unusable zero value", () => {
     const usage = normalizeContextUsage({ input_tokens: 10, context_window: 0 }, 200_000);
-    expect(usage?.contextWindow).toBe(200_000);
+    expect(usage?.contextWindow).toBeUndefined();
   });
 
   it("returns undefined when nothing usable is present", () => {
@@ -176,7 +176,7 @@ describe("normalizeContextUsage — value reading", () => {
 
 describe("mergeContextUsage", () => {
   it("recomputes the total when a later sample raises input", () => {
-    const previous = normalizeContextUsage({ input_tokens: 100_000, output_tokens: 0 }, 200_000);
+    const previous = normalizeContextUsage({ input_tokens: 100_000, output_tokens: 0, context_window: 200_000 });
     const merged = mergeContextUsage(previous, { outputTokens: 500 });
     expect(merged.inputTokens).toBe(100_000);
     expect(merged.outputTokens).toBe(500);
@@ -187,7 +187,7 @@ describe("mergeContextUsage", () => {
 
   it("keeps total and remaining consistent with the window", () => {
     const merged = mergeContextUsage(
-      { contextWindow: 200_000, remainingTokens: 150_000, totalTokens: 50_000 },
+      { contextWindow: 200_000, contextWindowSource: "provider", remainingTokens: 150_000, totalTokens: 50_000 },
       { inputTokens: 80_000, outputTokens: 1_000 }
     );
     expect(merged.totalTokens).toBe(81_000);
@@ -196,7 +196,7 @@ describe("mergeContextUsage", () => {
   });
 
   it("does not let a sparse sample erase the known window size", () => {
-    const previous = normalizeContextUsage(CODEX_TURN_USAGE, 272_000);
+    const previous = normalizeContextUsage({ ...CODEX_TURN_USAGE, context_window: 272_000 });
     const merged = mergeContextUsage(previous, { outputTokens: 900 });
     expect(merged.contextWindow).toBe(272_000);
   });
@@ -207,7 +207,7 @@ describe("mergeContextUsage", () => {
   });
 
   it("derives totals when there is no previous sample", () => {
-    const merged = mergeContextUsage(undefined, { inputTokens: 10, outputTokens: 5, contextWindow: 100 });
+    const merged = mergeContextUsage(undefined, { inputTokens: 10, outputTokens: 5, contextWindow: 100, contextWindowSource: "provider" });
     expect(merged.totalTokens).toBe(15);
     expect(merged.remainingTokens).toBe(85);
   });
@@ -216,8 +216,8 @@ describe("mergeContextUsage", () => {
 describe("resolveContextUsageTotals", () => {
   it("clamps used percent into 0-100", () => {
     const over = resolveContextUsageTotals({ inputTokens: 300_000, contextWindow: 200_000 });
-    expect(over.usedPercent).toBe(100);
-    expect(over.remainingTokens).toBe(0);
+    expect(over.usedPercent).toBeNull();
+    expect(over.remainingTokens).toBeNull();
   });
 
   it("reports nulls when the window is unknown", () => {
@@ -257,7 +257,7 @@ describe("accumulating over an event stream", () => {
     const window = 200_000;
     // Turn 1: small prompt, nothing cached yet.
     let usage = normalizeContextUsage(
-      { input_tokens: 8_200, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 420 },
+      { input_tokens: 8_200, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 420, context_window: 200_000 },
       window
     )!;
     expect(resolveContextUsageTotals(usage).usedPercent).toBe(4);
@@ -266,7 +266,7 @@ describe("accumulating over an event stream", () => {
     usage = mergeContextUsage(
       usage,
       normalizeContextUsage(
-        { input_tokens: 12, cache_creation_input_tokens: 3_500, cache_read_input_tokens: 148_000, output_tokens: 600 },
+        { input_tokens: 12, cache_creation_input_tokens: 3_500, cache_read_input_tokens: 148_000, output_tokens: 600, context_window: 200_000 },
         window
       )!
     );
@@ -280,7 +280,7 @@ describe("accumulating over an event stream", () => {
   it("survives a sparse follow-up sample without blanking the gauge", () => {
     const window = 200_000;
     const first = normalizeContextUsage(
-      { input_tokens: 4, cache_creation_input_tokens: 25_000, cache_read_input_tokens: 90_000, output_tokens: 500 },
+      { input_tokens: 4, cache_creation_input_tokens: 25_000, cache_read_input_tokens: 90_000, output_tokens: 500, context_window: 200_000 },
       window
     )!;
     // A `result` event that only carries an output count and no window.
@@ -293,13 +293,13 @@ describe("accumulating over an event stream", () => {
 
   it("keeps codex totals stable across repeated turn usage payloads", () => {
     const window = 272_000;
-    let usage = normalizeContextUsage(CODEX_TURN_USAGE, window)!;
+    let usage = normalizeContextUsage({ ...CODEX_TURN_USAGE, context_window: window })!;
     expect(resolveContextUsageTotals(usage).totalTokens).toBe(12_400);
     // Next turn reports a larger cumulative total.
     usage = mergeContextUsage(
       usage,
       normalizeContextUsage(
-        { input_tokens: 30_000, cached_input_tokens: 24_000, output_tokens: 900, total_tokens: 44_300 },
+        { input_tokens: 30_000, cached_input_tokens: 24_000, output_tokens: 900, total_tokens: 44_300, context_window: window },
         window
       )!
     );

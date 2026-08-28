@@ -14,8 +14,9 @@ import type { ContextUsage } from "./index";
  * - `outputTokens`      — the full completion, including reasoning/thinking.
  * - `reasoningTokens`   — the reasoning portion of `outputTokens`. A SUBSET;
  *                         display-only, never summed.
- * - `totalTokens`       — `inputTokens + outputTokens`. Context occupancy.
- * - `remainingTokens`   — `contextWindow - totalTokens`, floored at 0.
+ * - `totalTokens`       — `inputTokens + outputTokens`, the consumed amount
+ *                         shown by the clients.
+ * - `remainingTokens`   — derived only for a valid provider-reported window.
  *
  * `totalTokens` and `remainingTokens` are DERIVED — never carried over from an
  * earlier sample, always recomputed. Treating them as stored values is what let
@@ -56,6 +57,9 @@ const CONTAINER_KEYS = [
   "total",
   "last",
   "message",
+  "result",
+  "response",
+  "step_update",
   "prompt_tokens_details",
   "promptTokensDetails",
   "input_tokens_details",
@@ -130,6 +134,7 @@ const MEASURED_KEYS = [
   "cachedInputTokens",
   "reasoningTokens",
   "contextWindow",
+  "contextWindowSource",
   "planRemaining",
   "planLimit",
   "planLabel"
@@ -218,7 +223,7 @@ export type ContextUsageTotals = {
   totalTokens: number | null;
   contextWindow: number | null;
   remainingTokens: number | null;
-  /** 0-100, or null when the window size is unknown. */
+  /** 0-100, or null when the window is unknown or the sample is invalid. */
   usedPercent: number | null;
 };
 
@@ -226,10 +231,10 @@ export type ContextUsageTotals = {
  * Resolve the derived numbers from any `ContextUsage`.
  *
  * `totalTokens` takes the larger of `inputTokens + outputTokens` and any total
- * the producer reported. Reported totals can be session-cumulative (codex's
- * `total_token_usage`) and therefore larger; a stale stored total is always
- * smaller than the current input+output. Taking the max keeps both fresh and
- * never silently shrinks a gauge whose job is to warn before the window fills.
+ * the producer reported. This is the consumed amount shown in the UI. Context
+ * occupancy is only valid when that amount fits inside the provider-reported
+ * window; an impossible sample is left unpercentaged instead of being clipped
+ * to a misleading 100%.
  */
 export function resolveContextUsageTotals(usage: ContextUsage): ContextUsageTotals {
   const summed = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
@@ -238,9 +243,10 @@ export function resolveContextUsageTotals(usage: ContextUsage): ContextUsageTota
   const hasTotal = usage.inputTokens != null || usage.outputTokens != null || usage.totalTokens != null;
   const totalTokens = hasTotal ? total : null;
   const contextWindow = usage.contextWindow != null && usage.contextWindow > 0 ? usage.contextWindow : null;
-  const remainingTokens = contextWindow != null ? Math.max(0, contextWindow - total) : null;
-  const usedPercent = contextWindow != null
-    ? Math.max(0, Math.min(100, Math.round((total / contextWindow) * 100)))
+  const contextSampleValid = contextWindow != null && total <= contextWindow;
+  const remainingTokens = contextSampleValid ? contextWindow! - total : null;
+  const usedPercent = contextSampleValid
+    ? Math.round((total / contextWindow!) * 100)
     : null;
   return { totalTokens, contextWindow, remainingTokens, usedPercent };
 }
@@ -275,12 +281,14 @@ export function withDerivedTotals(usage: ContextUsage): ContextUsage {
 /**
  * Parse a raw CLI usage payload into the normalized `ContextUsage` contract.
  *
- * `fallbackContextWindow` is used when the payload itself does not carry a
- * window size (callers usually read it from the model catalog).
+ * A context window is accepted only when the CLI payload reports it. Model
+ * catalog guesses are intentionally not accepted here because they can make
+ * a session look full when the provider is using a different window.
  */
 export function normalizeContextUsage(
   raw: unknown,
-  fallbackContextWindow?: number
+  /** @deprecated retained for callers compiled against older protocol versions; ignored. */
+  _fallbackContextWindow?: number
 ): ContextUsage | undefined {
   const root = asRecord(raw);
   if (!root) return undefined;
@@ -324,14 +332,10 @@ export function normalizeContextUsage(
   // Display-only breakdown: what was served from cache.
   const cachedInputTokens = cacheRead ?? cacheSubset;
 
-  // A window the payload itself reports is authoritative — it reflects the model
-  // actually serving the turn. `fallbackContextWindow` is a caller-side default
-  // (model catalog) and must only fill the gap, never override a live value.
+  // Only a window reported by the CLI is authoritative. Do not infer one from
+  // a model family or catalog: a wrong denominator is worse than no gauge.
   const reportedWindow = readNumber(sources, CONTEXT_WINDOW_KEYS);
-  const windowCandidate = (reportedWindow != null && reportedWindow > 0)
-    ? reportedWindow
-    : fallbackContextWindow;
-  const contextWindow = windowCandidate != null && windowCandidate > 0 ? windowCandidate : undefined;
+  const contextWindow = reportedWindow != null && reportedWindow > 0 ? reportedWindow : undefined;
 
   const planRemaining = readNumber(sources, PLAN_REMAINING_KEYS);
   const planLimitCandidate = readNumber(sources, PLAN_LIMIT_KEYS);
@@ -358,6 +362,7 @@ export function normalizeContextUsage(
     ...(reasoningTokens != null ? { reasoningTokens } : {}),
     ...(reportedTotal != null ? { totalTokens: reportedTotal } : {}),
     ...(contextWindow != null ? { contextWindow } : {}),
+    ...(contextWindow != null ? { contextWindowSource: "provider" as const } : {}),
     ...(planRemaining != null ? { planRemaining } : {}),
     ...(planLimit != null ? { planLimit } : {}),
     ...(planLabel != null ? { planLabel } : {})

@@ -9,7 +9,7 @@ import { mergeContextUsage, normalizeContextUsage } from "@anytimevibe/protocol"
 import { cloudProxyChildEnv, collectLocalProxyEnv, ensureCursorHttp1ForProxy } from "../local-proxy";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { resolveCursorSpawnTarget, resolveEngineBinary } from "./detect";
-import { formatAgySpawnArgs, formatCursorModelArg, parseCursorModelRef, resolveModelContextWindow } from "./model-catalog";
+import { formatAgySpawnArgs, formatCursorModelArg, parseCursorModelRef } from "./model-catalog";
 import { explainGrokSerializationError, prepareGrokResponsesCompat } from "./grok-responses-compat";
 import { isCodexModelsManagerNoise, stripAnsi } from "./log-noise";
 import { headlessPermissionArgs } from "./permission-args";
@@ -657,7 +657,7 @@ function handleClaudeLine(
   captureReportedDiff(options.threadId, parsed);
   const type = String(parsed.type || "");
   noteClaudeSessionId(state, parsed);
-  const liveUsage = normalizeContextUsage(parsed.usage ?? parsed.message?.usage ?? parsed.usage_metadata, Number(parsed.context_window ?? parsed.contextWindow) || resolveModelContextWindow("claude", options.model));
+  const liveUsage = normalizeContextUsage(parsed);
   if (liveUsage) {
     state.contextUsage = mergeContextUsage(state.contextUsage, liveUsage);
     onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
@@ -785,10 +785,7 @@ function handleClaudeLine(
   }
   if (type === "result") {
     noteClaudeSessionId(state, parsed);
-    const usage = normalizeContextUsage(
-      parsed.usage ?? parsed.result?.usage ?? parsed.message?.usage ?? parsed,
-      Number(parsed.context_window ?? parsed.contextWindow) || resolveModelContextWindow("claude", options.model)
-    );
+    const usage = normalizeContextUsage(parsed);
     if (usage) {
       state.contextUsage = mergeContextUsage(state.contextUsage, usage);
       // Publish the accumulated snapshot rather than this single sample: a sparse
@@ -850,7 +847,7 @@ function handleCursorLine(
   captureReportedDiff(options.threadId, parsed);
   const type = String(parsed.type || "");
   if (parsed.session_id) state.sessionId = String(parsed.session_id);
-  const liveUsage = normalizeContextUsage(parsed.usage ?? parsed.metrics, Number(parsed.context_window ?? parsed.contextWindow) || resolveModelContextWindow("cursor", options.model));
+  const liveUsage = normalizeContextUsage(parsed);
   if (liveUsage) {
     state.contextUsage = mergeContextUsage(state.contextUsage, liveUsage);
     onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
@@ -1061,10 +1058,7 @@ function handleCursorLine(
       emitDelta(onEvent, options, "assistant", "assistant", parsed.result);
     }
     const duration = Number(parsed.duration_ms || 0);
-    const usage = normalizeContextUsage(
-      parsed.usage ?? parsed.result?.usage ?? parsed.metrics ?? parsed,
-      Number(parsed.context_window ?? parsed.contextWindow) || resolveModelContextWindow("cursor", options.model)
-    );
+    const usage = normalizeContextUsage(parsed);
     if (usage) {
       state.contextUsage = mergeContextUsage(state.contextUsage, usage);
       // Publish the accumulated snapshot rather than this single sample: a sparse
@@ -1098,7 +1092,7 @@ function handleGrokLine(
   }
   captureReportedDiff(options.threadId, parsed);
   const type = String(parsed.type || "");
-  const liveUsage = normalizeContextUsage(parsed.usage ?? parsed.response?.usage ?? parsed.result?.usage, Number(parsed.context_window ?? parsed.contextWindow) || resolveModelContextWindow("grok", options.model));
+  const liveUsage = normalizeContextUsage(parsed);
   if (liveUsage) {
     state.contextUsage = mergeContextUsage(state.contextUsage, liveUsage);
     onEvent({ type: "usage", threadId: options.threadId, contextUsage: state.contextUsage });
@@ -1131,10 +1125,7 @@ function handleGrokLine(
   }
   if (type === "end") {
     if (parsed.sessionId) state.sessionId = String(parsed.sessionId);
-    const usage = normalizeContextUsage(
-      parsed.usage ?? parsed.response?.usage ?? parsed.result?.usage ?? parsed.metrics ?? parsed,
-      Number(parsed.context_window ?? parsed.contextWindow) || resolveModelContextWindow("grok", options.model)
-    );
+    const usage = normalizeContextUsage(parsed);
     if (usage) {
       state.contextUsage = mergeContextUsage(state.contextUsage, usage);
       // Publish the accumulated snapshot rather than this single sample: a sparse
@@ -1405,7 +1396,7 @@ function handleAntigravityLine(
     const conversationId = String(step.conversation_id || parsed.conversation_id || "").trim();
     if (conversationId) state.sessionId = conversationId;
     const stepType = String(step.step_type || "").toLowerCase();
-    const usage = normalizeContextUsage(step.usage, resolveModelContextWindow("antigravity", options.model));
+    const usage = normalizeContextUsage(parsed);
     if (usage) {
       state.contextUsage = mergeContextUsage(state.contextUsage, usage);
       // Publish the accumulated snapshot rather than this single sample: a sparse
@@ -1466,7 +1457,7 @@ function handleAntigravityLine(
       return;
     }
     if (resultConversationId) state.sessionId = resultConversationId;
-    const usage = normalizeContextUsage(result.usage, resolveModelContextWindow("antigravity", options.model));
+    const usage = normalizeContextUsage(parsed);
     if (usage) {
       state.contextUsage = mergeContextUsage(state.contextUsage, usage);
       // Publish the accumulated snapshot rather than this single sample: a sparse
