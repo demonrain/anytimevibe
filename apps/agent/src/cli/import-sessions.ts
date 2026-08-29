@@ -712,6 +712,7 @@ function parseGrokSessionsTable(stdout: string): Array<{ id: string; summary: st
 
 async function walkSessionDirs(root: string, depth: number, hits: Array<{ id: string; dir: string; mtime: number }>): Promise<void> {
   if (depth > 5) return;
+  if (!canProbePathWithoutPrompt(root)) return;
   let entries: string[] = [];
   try {
     entries = await fs.readdir(root);

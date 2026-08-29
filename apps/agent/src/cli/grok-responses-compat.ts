@@ -157,17 +157,10 @@ function resolveGrokCustomResponsesUpstream(configText: string): {
   return { modelId: preferred.id, upstream: baseUrl.replace(/\/+$/, "") };
 }
 
-async function pathExists(target: string): Promise<boolean> {
-  try {
-    await fs.access(target);
-    return true;
-  } catch {
-    return false;
-  }
-}
+import { safePathExists } from "./macos-fs";
 
 async function copyFileIfExists(src: string, dest: string): Promise<void> {
-  if (!(await pathExists(src))) return;
+  if (!(await safePathExists(src))) return;
   await fs.mkdir(path.dirname(dest), { recursive: true });
   await fs.copyFile(src, dest);
 }

@@ -1,5 +1,6 @@
 import os from "node:os";
 import path from "node:path";
+import { promises as fs } from "node:fs";
 
 /**
  * macOS TCC “Files and Folders” protected locations.
@@ -98,6 +99,11 @@ export function isMacFsProbeSafePath(target: string): boolean {
     home ? `${home}/.volta` : "",
     home ? `${home}/.asdf` : "",
     home ? `${home}/.codex` : "",
+    home ? `${home}/.gemini` : "",
+    home ? `${home}/.npm` : "",
+    home ? `${home}/.cargo` : "",
+    home ? `${home}/.config` : "",
+    home ? `${home}/Library/Application Support/Codex` : "",
     home ? `${home}/Library/Application Support/Claude` : "",
     home ? `${home}/Library/Application Support/Cursor` : "",
     home ? `${home}/Library/Application Support/AnytimeVibe` : "",
@@ -147,4 +153,45 @@ export function canProbePathWithoutPrompt(target: string, allowedRoots: string[]
     return false;
   }
   return true;
+}
+
+/** Whether a PATH segment is safe to include when probing binaries on macOS. */
+export function filterMacLoginPathSegment(segment: string): boolean {
+  if (process.platform !== "darwin") return Boolean(segment.trim());
+  const trimmed = segment.trim();
+  if (!trimmed) return false;
+  if (isMacTccProtectedPath(trimmed)) return false;
+  if (isMacFsProbeSafePath(trimmed)) return true;
+  const home = os.homedir().replace(/\\/g, "/").toLowerCase();
+  const lower = trimmed.replace(/\\/g, "/").toLowerCase();
+  // Other $HOME paths may still trigger privacy prompts — keep them off synthetic PATH.
+  if (home && lower.startsWith(home + "/")) return false;
+  return true;
+}
+
+/** fs.access wrapper that skips macOS TCC-protected locations unless already granted. */
+export async function safePathExists(
+  target: string,
+  allowedRoots: string[] = []
+): Promise<boolean> {
+  if (!canProbePathWithoutPrompt(target, allowedRoots)) return false;
+  try {
+    await fs.access(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** fs.stat.isDirectory wrapper with the same macOS privacy guard as safePathExists. */
+export async function safePathIsDirectory(
+  target: string,
+  allowedRoots: string[] = []
+): Promise<boolean> {
+  if (!canProbePathWithoutPrompt(target, allowedRoots)) return false;
+  try {
+    return (await fs.stat(target)).isDirectory();
+  } catch {
+    return false;
+  }
 }

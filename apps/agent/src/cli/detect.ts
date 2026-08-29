@@ -10,6 +10,7 @@ import {
   windowsExecutableRank,
   windowsLauncherCandidates
 } from "../windows-command";
+import { safePathExists, canProbePathWithoutPrompt } from "./macos-fs";
 
 const execFileAsync = promisify(execFile);
 
@@ -18,15 +19,6 @@ const resolvedCommandCache = new Map<string, string | null>();
 /** Clear binary resolution cache (call after install / recheck). */
 export function clearEngineBinaryCache(): void {
   resolvedCommandCache.clear();
-}
-
-async function pathExists(filePath: string): Promise<boolean> {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -45,7 +37,7 @@ async function preferWindowsExecutable(hits: string[]): Promise<string | null> {
   }
   const existing: string[] = [];
   for (const candidate of expanded) {
-    if (await pathExists(candidate)) existing.push(candidate);
+    if (await safePathExists(candidate)) existing.push(candidate);
   }
   if (!existing.length) return null;
   existing.sort((a, b) => windowsExecutableRank(a) - windowsExecutableRank(b));
@@ -164,7 +156,7 @@ async function listWindowsCommandHits(command: string): Promise<string[]> {
   const expanded: string[] = [];
   for (const hit of hits) {
     for (const candidate of windowsLauncherCandidates(hit)) {
-      if (!expanded.includes(candidate) && await pathExists(candidate)) expanded.push(candidate);
+      if (!expanded.includes(candidate) && await safePathExists(candidate)) expanded.push(candidate);
     }
   }
   expanded.sort((a, b) => {
@@ -192,7 +184,7 @@ export async function resolveCommandPath(command: string): Promise<string | null
         resolvedCommandCache.set(command, preferred);
         return preferred;
       }
-    } else if (await pathExists(command)) {
+    } else if (await safePathExists(command)) {
       resolvedCommandCache.set(command, command);
       return command;
     }
@@ -233,7 +225,7 @@ export async function resolveCommandPath(command: string): Promise<string | null
         maxBuffer: 256_000
       });
       const hit = stdout.trim().split(/\r?\n/).map((line) => line.trim()).find(Boolean);
-      if (hit && await pathExists(hit)) {
+      if (hit && await safePathExists(hit)) {
         resolvedCommandCache.set(command, hit);
         return hit;
       }
@@ -279,7 +271,7 @@ export async function resolveCommandPath(command: string): Promise<string | null
     }
   } else {
     for (const candidate of candidates) {
-      if (candidate && await pathExists(candidate)) {
+      if (candidate && await safePathExists(candidate)) {
         resolvedCommandCache.set(command, candidate);
         return candidate;
       }
@@ -295,7 +287,7 @@ export async function resolveCommandPath(command: string): Promise<string | null
         if (!/ClaudeCode|Anthropic/i.test(entry)) continue;
         // Package layout varies: claude.exe may be nested
         const direct = path.join(wingetRoot, entry, "claude.exe");
-        if (await pathExists(direct)) {
+        if (await safePathExists(direct)) {
           resolvedCommandCache.set(command, direct);
           return direct;
         }
@@ -303,7 +295,7 @@ export async function resolveCommandPath(command: string): Promise<string | null
           const nested = await fs.readdir(path.join(wingetRoot, entry));
           for (const name of nested) {
             const exe = path.join(wingetRoot, entry, name, "claude.exe");
-            if (await pathExists(exe)) {
+            if (await safePathExists(exe)) {
               resolvedCommandCache.set(command, exe);
               return exe;
             }
@@ -457,11 +449,11 @@ async function firstCursorBinary(candidates: Array<string | null | undefined>): 
     if (!candidate || seen.has(candidate)) continue;
     seen.add(candidate);
     if (isGrokInstallPath(candidate) || isCrossEngineBinary("cursor", candidate)) continue;
-    if (!(await pathExists(candidate)) && !path.isAbsolute(candidate)) {
+    if (!(await safePathExists(candidate)) && !path.isAbsolute(candidate)) {
       // Allow resolveCommandPath results that already exist; skip missing locals.
       continue;
     }
-    if (path.isAbsolute(candidate) && !(await pathExists(candidate))) continue;
+    if (path.isAbsolute(candidate) && !(await safePathExists(candidate))) continue;
     if (await looksLikeCursorAgent(candidate)) return candidate;
   }
   return null;
@@ -691,7 +683,7 @@ export async function resolveCursorSpawnTarget(): Promise<CursorSpawnTarget | nu
     const nodeName = process.platform === "win32" ? "node.exe" : "node";
     const nodePath = path.join(versionDir, nodeName);
     const indexPath = path.join(versionDir, "index.js");
-    if ((await pathExists(nodePath)) && (await pathExists(indexPath))) {
+    if ((await safePathExists(nodePath)) && (await safePathExists(indexPath))) {
       return { command: nodePath, prefixArgs: [indexPath] };
     }
     return null;
@@ -708,6 +700,9 @@ export async function resolveCursorSpawnTarget(): Promise<CursorSpawnTarget | nu
 
   // .../cursor-agent/cursor-agent.cmd → pick newest versions/*
   const versionsRoot = path.join(dir, "versions");
+  if (!canProbePathWithoutPrompt(versionsRoot)) {
+    return { command: binary, prefixArgs: [] };
+  }
   try {
     const entries = await fs.readdir(versionsRoot, { withFileTypes: true });
     const versionDirs = entries

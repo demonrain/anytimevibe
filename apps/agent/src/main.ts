@@ -75,8 +75,8 @@ import { normalizeCliEngine, isHeadlessCliEngine, type BackendStreamEvent } from
 import { handoffPermissionArgs, normalizePermissionMode } from "./cli/permission-args";
 import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
 import { assertCodexLocalGatewayReady, readCodexCredentialFingerprint, repairCodexModelProviderConfig, resolveCodexOpenaiBaseUrlForEnv, resolveCodexProviderBaseUrl, sanitizeCodexRelayAuth, syncCodexRelayConfigForTurn } from "./cli/codex-gateway";
-import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt } from "./cli/macos-fs";
-import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyShellPrefix, proxyClearShellLines, stripProxyFromEnv, applyProcessProxyEnv, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
+import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt, filterMacLoginPathSegment, safePathExists } from "./cli/macos-fs";
+import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyClearShellLines, applyProcessProxyEnv, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 
 const execFileAsync = promisify(execFile);
@@ -2268,13 +2268,7 @@ let cachedMacLoginPath: string | null = null;
 let cachedWindowsPath: string | null = null;
 
 async function pathExists(filePath: string): Promise<boolean> {
-  if (!canProbePathWithoutPrompt(filePath, workspaceAllowRoots())) return false;
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
+  return safePathExists(filePath, workspaceAllowRoots());
 }
 
 // ---- macOS PATH (login shell + Homebrew/nvm) ----
@@ -2282,7 +2276,9 @@ async function pathExists(filePath: string): Promise<boolean> {
 /** GUI apps on macOS often miss Homebrew/nvm PATH; rebuild from login shell + common locations. */
 async function resolveMacLoginPath(): Promise<string> {
   if (cachedMacLoginPath) return cachedMacLoginPath;
-  const parts = new Set((process.env.PATH ?? "").split(":").filter(Boolean));
+  const parts = new Set(
+    (process.env.PATH ?? "").split(":").filter((segment) => filterMacLoginPathSegment(segment))
+  );
   const home = os.homedir();
   for (const dir of [
     "/opt/homebrew/bin",
@@ -2307,7 +2303,7 @@ async function resolveMacLoginPath(): Promise<string> {
         maxBuffer: 1024 * 1024
       });
       for (const segment of String(result.stdout).trim().split(":")) {
-        if (segment) parts.add(segment);
+        if (segment && filterMacLoginPathSegment(segment)) parts.add(segment);
       }
       break;
     } catch {
@@ -2746,12 +2742,27 @@ async function proxyShellLines(platform: "win32" | "darwin" | "powershell"): Pro
   return entries.map(([key, value]) => `export ${key}=${JSON.stringify(value)}`);
 }
 
+/** Launch a `.command` file in Terminal via `open` — avoids AppleScript / System Events automation prompts. */
+async function launchMacTerminalScriptFile(scriptPath: string): Promise<void> {
+  const child = spawn("/usr/bin/open", ["-a", "Terminal", scriptPath], {
+    detached: true,
+    stdio: "ignore",
+    env: process.env
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once("error", (error) => reject(new Error(`无法打开 Terminal：${error.message}`)));
+    child.once("spawn", () => resolve());
+    setTimeout(() => resolve(), 800);
+  });
+  child.unref();
+}
+
 /** macOS Terminal: run a multi-line bash script (proxy + PATH already injected). */
 async function openMacTerminalScript(scriptBody: string): Promise<void> {
   await applyMacLoginPathToProcess();
   const proxyLines = await proxyShellLines("darwin");
   const stamp = Date.now();
-  const scriptPath = path.join(os.tmpdir(), `anytimevibe-install-${stamp}.sh`);
+  const scriptPath = path.join(os.tmpdir(), `anytimevibe-install-${stamp}.command`);
   const full = [
     "#!/bin/bash",
     "set +e",
@@ -2769,9 +2780,7 @@ async function openMacTerminalScript(scriptBody: string): Promise<void> {
   } catch {
     // ignore
   }
-  const launch = `bash ${JSON.stringify(scriptPath)}`;
-  await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(launch)}`]);
-  await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+  await launchMacTerminalScriptFile(scriptPath);
 }
 
 /** Windows: visible PowerShell window (never WSL/bash — those install Linux binaries). */
@@ -6171,25 +6180,31 @@ async function openExternalTerminal(
     return;
   }
   if (process.platform === "darwin") {
+    const workdir = cwd && cwd.trim() ? cwd : os.homedir();
+    const stamp = Date.now();
+    const scriptPath = path.join(os.tmpdir(), `anytimevibe-relay-${stamp}.command`);
+    const scriptLines = [
+      "#!/bin/bash",
+      "set +e",
+      `cd ${shellQuote(workdir)} || exit 1`
+    ];
     if (proxyMode === "inject") {
+      scriptLines.push(...(await proxyShellLines("darwin")));
       const proxy = await collectLocalProxyEnv();
-      const prefix = proxyShellPrefix(proxy);
-      const nodeProxy = "export NODE_USE_ENV_PROXY=1 && ";
-      const fullCommand = `${prefix}${Object.keys(proxy).length ? nodeProxy : ""}${commandLine}`;
-      const command = `cd ${shellQuote(cwd || os.homedir())} && ${fullCommand}`;
-      await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`], {
-        env: mergeProxyIntoEnv({ ...process.env }, proxy)
-      });
+      if (Object.keys(proxy).length) {
+        scriptLines.push("export NODE_USE_ENV_PROXY=1");
+      }
     } else {
-      const clearLines = proxyClearShellLines("darwin");
-      const prefix = clearLines.length ? `${clearLines.join(" && ")} && ` : "";
-      const fullCommand = `${prefix}${commandLine}`;
-      const command = `cd ${shellQuote(cwd || os.homedir())} && ${fullCommand}`;
-      await execFileAsync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`], {
-        env: stripProxyFromEnv(process.env)
-      });
+      scriptLines.push(...proxyClearShellLines("darwin"));
     }
-    await execFileAsync("osascript", ["-e", "tell application \"Terminal\" to activate"]);
+    scriptLines.push(commandLine);
+    await fs.writeFile(scriptPath, `${scriptLines.join("\n")}\n`, "utf8");
+    try {
+      await fs.chmod(scriptPath, 0o755);
+    } catch {
+      // ignore
+    }
+    await launchMacTerminalScriptFile(scriptPath);
     return;
   }
   throw new Error("当前系统暂不支持启动接力终端。");

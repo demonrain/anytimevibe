@@ -11,18 +11,10 @@ import { ENGINE_QUOTA_DETAIL_MAX, type CliEngine, type EngineQuota } from "@anyt
 import { windowsCmdArguments } from "../windows-command";
 import { resolveEngineBinary } from "./detect";
 import { cloudProxyChildEnv } from "../local-proxy";
+import { safePathExists } from "./macos-fs";
 
 const execFileAsync = promisify(execFile);
 const DETAIL_MAX = ENGINE_QUOTA_DETAIL_MAX;
-
-async function pathExists(filePath: string): Promise<boolean> {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 export async function runCliText(
   command: string,
@@ -217,7 +209,7 @@ async function readCursorAccessFromVscdb(): Promise<{ userId?: string; accessTok
       ? [path.join(os.homedir(), "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb")]
       : [path.join(os.homedir(), ".config", "Cursor", "User", "globalStorage", "state.vscdb")];
   const dbPath = candidates.find((p) => p) || "";
-  if (!dbPath || !(await pathExists(dbPath))) return null;
+  if (!dbPath || !(await safePathExists(dbPath))) return null;
 
   // Prefer python sqlite3 (handles large DBs); avoid loading multi-GB files into Node.
   const py = process.platform === "win32" ? "python" : "python3";
@@ -526,7 +518,7 @@ async function queryGrokQuota(binary: string): Promise<EngineQuota> {
   }
   try {
     const authPath = path.join(os.homedir(), ".grok", "auth.json");
-    if (await pathExists(authPath)) {
+    if (await safePathExists(authPath)) {
       const raw = await fs.readFile(authPath, "utf8");
       const auth = JSON.parse(raw) as Record<string, unknown>;
       chunks.push(`auth_entries: ${Object.keys(auth).length}`);
@@ -559,7 +551,7 @@ async function queryAntigravityQuota(binary: string): Promise<EngineQuota> {
   if (version.text) chunks.push(`# agy --version\n${version.text}`);
   try {
     const settingsPath = path.join(os.homedir(), ".gemini", "antigravity-cli", "settings.json");
-    if (await pathExists(settingsPath)) {
+    if (await safePathExists(settingsPath)) {
       const raw = await fs.readFile(settingsPath, "utf8");
       const settings = JSON.parse(raw) as Record<string, unknown>;
       const model = typeof settings.model === "string" ? settings.model : "";
