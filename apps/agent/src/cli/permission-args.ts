@@ -53,6 +53,16 @@ export function headlessPermissionArgs(engine: CliEngine, mode: PermissionMode):
     // Codex remote path uses app-server RPC, not these CLI flags.
     return [];
   }
+  if (engine === "pi") {
+    // Pi built-in tools: read, bash, edit, write, grep, find, ls
+    if (normalized === "read-only") {
+      return ["--tools", "read,grep,find,ls"];
+    }
+    if (normalized === "ask-for-approval") {
+      return ["--tools", "read,grep,find,ls,bash,edit,write"];
+    }
+    return [];
+  }
   // grok
   if (normalized === "read-only") {
     return ["--permission-mode", "dontAsk", "--tools", "read_file,grep,list_dir"];
@@ -95,6 +105,10 @@ export function handoffPermissionArgs(engine: CliEngine, mode: PermissionMode | 
     if (normalized === "ask-for-approval") return ["--mode", "plan"];
     if (normalized === "approve-for-me") return ["--mode", "accept-edits"];
     return ["--dangerously-skip-permissions"];
+  }
+  if (engine === "pi") {
+    if (normalized === "read-only") return ["--tools", "read,grep,find,ls"];
+    return ["--approve"];
   }
   // grok
   if (normalized === "read-only") {

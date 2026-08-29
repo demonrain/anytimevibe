@@ -1526,7 +1526,8 @@ function rendererHtml(): string {
     claude: vendorLogo("claude"),
     grok: vendorLogo("grok"),
     cursor: vendorLogo("cursor"),
-    antigravity: vendorLogo("antigravity")
+    antigravity: vendorLogo("antigravity"),
+    pi: vendorLogo("pi")
   }).replace(/</g, "\\u003c");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>随码</title><style>
   :root{font-family:"Bahnschrift","Aptos","Segoe UI",sans-serif;color:#17211b}
@@ -1966,10 +1967,10 @@ function rendererHtml(): string {
       var hay=((task.title||'')+' '+(task.cwd||'')+' '+(task.status||'')+' '+(eng||'')).toLowerCase();
       return hay.indexOf(q)>=0;
     });
-    var counts={codex:0,claude:0,grok:0,cursor:0,antigravity:0};
+    var counts={codex:0,claude:0,grok:0,cursor:0,antigravity:0,pi:0};
     lastTasks.forEach(function(task){ var e=detectEngine(task); if(counts[e]!=null) counts[e]+=1; });
     var filterBar='<div class="engine-filter" role="toolbar" aria-label="engine filter">'
-      +['codex','claude','grok','cursor','antigravity'].map(function(eng){
+      +['codex','claude','grok','cursor','antigravity','pi'].map(function(eng){
         return '<button type="button" class="engine-filter-btn'+(engineFilter===eng?' active':'')+'" data-engine-filter="'+eng+'" title="'+eng+' · '+counts[eng]+'">'
           +engineLogo(eng)+'<span>'+counts[eng]+'</span></button>';
       }).join('')
@@ -3127,7 +3128,37 @@ echo "Install finished. Run: agy  (sign in)"
   throw new Error("当前系统暂不支持一键安装 Antigravity CLI。");
 }
 
-async function installEnvironment(target: "node" | "codex" | "claude" | "grok" | "cursor" | "antigravity"): Promise<void> {
+async function installPiCli(): Promise<void> {
+  updateState({ detail: "正在打开 Pi CLI 安装窗口…" });
+  const scriptBody = process.platform === "win32"
+    ? [
+        "echo   AnytimeVibe - install Pi CLI",
+        "echo   https://pi.dev/docs/latest/quickstart",
+        "echo.",
+        "npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
+        "echo.",
+        "echo Done. Run `pi` and `/login`, then click 重新检测 in AnytimeVibe."
+      ].join("\r\n")
+    : [
+        "echo \"   AnytimeVibe - install Pi CLI\"",
+        "echo \"   https://pi.dev/docs/latest/quickstart\"",
+        "echo",
+        "npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
+        "echo",
+        "echo \"Done. Run pi and /login, then click 重新检测 in AnytimeVibe.\""
+      ].join("\n");
+  if (process.platform === "win32") {
+    await openWindowsPowerShellScript(scriptBody);
+    return;
+  }
+  if (process.platform === "darwin") {
+    await openMacTerminalScript(scriptBody);
+    return;
+  }
+  throw new Error("当前系统暂不支持一键安装 Pi CLI。");
+}
+
+async function installEnvironment(target: "node" | "codex" | "claude" | "grok" | "cursor" | "antigravity" | "pi"): Promise<void> {
   if (target === "node") {
     if (process.platform === "win32") {
       await installNodeOnWindows();
@@ -3167,6 +3198,10 @@ async function installEnvironment(target: "node" | "codex" | "claude" | "grok" |
   }
   if (target === "antigravity") {
     await installAntigravity();
+    return;
+  }
+  if (target === "pi") {
+    await installPiCli();
     return;
   }
   // Strict platform split: do not share install implementation across OS.
@@ -5652,6 +5687,7 @@ function publishAgentMeta(fields: {
   grokVersion?: string;
   cursorVersion?: string;
   antigravityVersion?: string;
+  piVersion?: string;
   platform?: string;
   agentVersion?: string;
 } = {}): void {
@@ -5662,7 +5698,8 @@ function publishAgentMeta(fields: {
       || fields.claudeVersion != null
       || fields.grokVersion != null
       || fields.cursorVersion != null
-      || fields.antigravityVersion != null;
+      || fields.antigravityVersion != null
+      || fields.piVersion != null;
     socket.send(JSON.stringify({
       type: "agent.meta",
       name: fields.name ?? resolvedDisplayName(),
@@ -5674,7 +5711,8 @@ function publishAgentMeta(fields: {
           claudeVersion: fields.claudeVersion ?? resolveReportedEngineVersion("claude"),
           grokVersion: fields.grokVersion ?? resolveReportedEngineVersion("grok"),
           cursorVersion: fields.cursorVersion ?? resolveReportedEngineVersion("cursor"),
-          antigravityVersion: fields.antigravityVersion ?? resolveReportedEngineVersion("antigravity")
+          antigravityVersion: fields.antigravityVersion ?? resolveReportedEngineVersion("antigravity"),
+          piVersion: fields.piVersion ?? resolveReportedEngineVersion("pi")
         }
         : {}),
       platform: fields.platform ?? `${process.platform} ${os.release()}`,
@@ -6018,11 +6056,12 @@ async function listCodexThreadsForSync(options: {
 /** Publish up to `limit` recent non-Codex tasks for each multi-CLI engine. */
 async function publishRecentMultiCliSnapshots(limit: number, query?: string): Promise<number> {
   const q = query?.trim().toLowerCase() ?? "";
-  const counts: Record<"claude" | "grok" | "cursor" | "antigravity", number> = {
+  const counts: Record<"claude" | "grok" | "cursor" | "antigravity" | "pi", number> = {
     claude: 0,
     grok: 0,
     cursor: 0,
-    antigravity: 0
+    antigravity: 0,
+    pi: 0
   };
   const toPublish: string[] = [];
   // Scan enough of the index to fill `limit` per engine; publish still caps per engine.
@@ -6393,6 +6432,29 @@ async function relayTaskToCli(threadId: string): Promise<void> {
           ...(model ? ["--model", shellQuote(model)] : []),
           "--workspace", shellQuote(accessCwd)
         ].join(" "),
+        "inject"
+      );
+    }
+    return;
+  }
+
+  if (engine === "pi") {
+    const binary = await resolveEngineBinary("pi");
+    if (!binary) throw new Error("未找到 Pi CLI（pi），无法接力。安装：npm install -g --ignore-scripts @earendil-works/pi-coding-agent");
+    const sessionId = providerSessionId && providerSessionId !== threadId ? providerSessionId : "";
+    const args = [
+      ...handoffPermissionArgs("pi", permissionMode),
+      ...(sessionId ? ["--session", sessionId] : []),
+      ...(stored?.model ? ["--model", stored.model] : []),
+      ...(stored?.reasoningEffort ? ["--thinking", stored.reasoningEffort] : [])
+    ];
+    console.log(`[relay] pi permission=${permissionMode} session=${sessionId || "(new)"}`);
+    if (process.platform === "win32") {
+      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
+    } else {
+      await openExternalTerminal(
+        accessCwd,
+        [shellQuote(binary), ...args.map((part) => (part.startsWith("-") ? part : shellQuote(part)))].join(" "),
         "inject"
       );
     }
@@ -7222,8 +7284,8 @@ function registerIpc(): void {
     }
     return publicState;
   });
-  ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex" | "claude" | "grok" | "cursor" | "antigravity") => {
-    if (target !== "node" && target !== "codex" && target !== "claude" && target !== "grok" && target !== "cursor" && target !== "antigravity") {
+  ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex" | "claude" | "grok" | "cursor" | "antigravity" | "pi") => {
+    if (target !== "node" && target !== "codex" && target !== "claude" && target !== "grok" && target !== "cursor" && target !== "antigravity" && target !== "pi") {
       throw new Error("未知的安装目标");
     }
     try {

@@ -579,13 +579,26 @@ async function queryAntigravityQuota(binary: string): Promise<EngineQuota> {
 
 // ── Public entry ────────────────────────────────────────────────────────
 
+async function queryPiQuota(binary: string): Promise<EngineQuota> {
+  const version = await runCliText(binary, ["--version"], { timeoutMs: 12_000 });
+  const chunks: string[] = [];
+  if (version.text) chunks.push(`# pi --version\n${version.text}`);
+  chunks.push("Pi 订阅/API 额度取决于所选 provider（Claude / OpenAI / Google 等），请见对应账号页。");
+  return {
+    engine: "pi",
+    label: "Pi",
+    detail: compactDetail(chunks.join("\n\n")),
+    checkedAt: nowIso()
+  };
+}
+
 export async function queryEngineQuotas(
   filter?: CliEngine,
   options?: { codexInstalled?: boolean }
 ): Promise<EngineQuota[]> {
   const engines: CliEngine[] = filter
     ? [filter]
-    : ["codex", "claude", "grok", "cursor", "antigravity"];
+    : ["codex", "claude", "grok", "cursor", "antigravity", "pi"];
   const results: EngineQuota[] = [];
 
   for (const engine of engines) {
@@ -609,6 +622,7 @@ export async function queryEngineQuotas(
       else if (engine === "claude") results.push(sanitizeEngineQuota(await queryClaudeQuota(binary)));
       else if (engine === "grok") results.push(sanitizeEngineQuota(await queryGrokQuota(binary)));
       else if (engine === "antigravity") results.push(sanitizeEngineQuota(await queryAntigravityQuota(binary)));
+      else if (engine === "pi") results.push(sanitizeEngineQuota(await queryPiQuota(binary)));
     } catch (error) {
       results.push(sanitizeEngineQuota({
         engine,

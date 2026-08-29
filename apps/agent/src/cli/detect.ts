@@ -370,7 +370,32 @@ function isAntigravityInstallPath(command: string): boolean {
   return base === "agy" || base === "agy.exe" || base === "agy.cmd" || base === "agy.bat";
 }
 
-function isCrossEngineBinary(engine: "claude" | "grok" | "cursor" | "antigravity", command: string): boolean {
+function isPiInstallPath(command: string): boolean {
+  const n = command.replace(/\\/g, "/").toLowerCase();
+  return n.includes("/pi-coding-agent/") || n.includes("/@earendil-works/pi") || n.includes("/.pi/");
+}
+
+function parsePiVersion(text: string | null | undefined): string | undefined {
+  if (!text?.trim()) return undefined;
+  const match = text.match(/\b(\d+\.\d+\.\d+(?:[-\w.]*)?)\b/);
+  return match?.[1] ?? (text.length < 80 ? text.trim() : text.trim().slice(0, 80));
+}
+
+async function looksLikePiCli(command: string): Promise<boolean> {
+  if (isGrokInstallPath(command) || looksLikeClaudePath(command) || isAntigravityInstallPath(command)) return false;
+  if (isCursorInstallPath(command)) return false;
+  const base = path.basename(command.replace(/\\/g, "/")).toLowerCase();
+  if (base !== "pi" && base !== "pi.cmd" && base !== "pi.exe" && base !== "pi.ps1") {
+    if (!isPiInstallPath(command)) return false;
+  }
+  const help = await runCommandText(command, ["--help"]);
+  const version = await runVersion(command, ["--version"]);
+  const text = `${help || ""}\n${version || ""}`;
+  if (!text.trim()) return false;
+  return /--mode\s+rpc|pi-coding-agent|earendil-works\/pi|Usage:\s*pi\b/i.test(text);
+}
+
+function isCrossEngineBinary(engine: "claude" | "grok" | "cursor" | "antigravity" | "pi", command: string): boolean {
   const n = command.replace(/\\/g, "/").toLowerCase();
   const base = path.basename(n);
   if (engine === "claude") {
@@ -392,6 +417,11 @@ function isCrossEngineBinary(engine: "claude" | "grok" | "cursor" | "antigravity
     if (base === "agent" || base === "agent.exe" || base.includes("cursor-agent") || base.includes("claude") || base === "grok" || base === "grok.exe") {
       return true;
     }
+  }
+  if (engine === "pi") {
+    if (isGrokInstallPath(command) || isCursorInstallPath(command) || looksLikeClaudePath(command)) return true;
+    if (isAntigravityInstallPath(command)) return true;
+    if (base === "agent" || base === "agent.exe" || base === "claude" || base === "grok") return true;
   }
   return false;
 }
@@ -468,6 +498,7 @@ export async function detectAvailableEngines(options: {
   let grokPath = await resolveEngineBinary("grok");
   let cursorPath = await resolveEngineBinary("cursor");
   let antigravityPath = await resolveEngineBinary("antigravity");
+  let piPath = await resolveEngineBinary("pi");
   // Claude path/name is authoritative — do not run Cursor fingerprinting on it.
   if (claudePath && isCrossEngineBinary("claude", claudePath)) {
     claudePath = null;
@@ -486,15 +517,22 @@ export async function detectAvailableEngines(options: {
   if (antigravityPath && isCrossEngineBinary("antigravity", antigravityPath)) {
     antigravityPath = null;
   }
+  if (piPath && isCrossEngineBinary("pi", piPath)) {
+    piPath = null;
+  } else if (piPath && !(await looksLikePiCli(piPath))) {
+    piPath = null;
+  }
 
   const claudeRaw = claudePath ? await runVersion(claudePath, ["--version"]) : null;
   const grokRaw = grokPath ? await runVersion(grokPath, ["--version"]) : null;
   const cursorRaw = cursorPath ? await runVersion(cursorPath, ["--version"]) : null;
   const antigravityRaw = antigravityPath ? await runVersion(antigravityPath, ["--version"]) : null;
+  const piRaw = piPath ? await runVersion(piPath, ["--version"]) : null;
   const claudeVersion = parseClaudeVersion(claudeRaw);
   const grokVersion = parseGrokVersion(grokRaw);
   const cursorVersion = parseCursorVersion(cursorRaw);
   const antigravityVersion = parseAntigravityVersion(antigravityRaw);
+  const piVersion = parsePiVersion(piRaw);
 
   return [
     {
@@ -546,6 +584,17 @@ export async function detectAvailableEngines(options: {
           detail: antigravityPath
             ? (antigravityRaw ? `agy 已找到（版本原文：${String(antigravityRaw).slice(0, 60)}）` : "agy 已找到但无法读取版本")
             : "未检测到 Antigravity CLI（agy），请安装并登录"
+        })
+    },
+    {
+      engine: "pi",
+      ready: Boolean(piPath),
+      ...(piVersion
+        ? { version: piVersion }
+        : {
+          detail: piPath
+            ? (piRaw ? `pi 已找到（版本原文：${String(piRaw).slice(0, 60)}）` : "pi 已找到但无法读取版本")
+            : "未检测到 Pi CLI。安装：npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
         })
     }
   ];
@@ -634,12 +683,26 @@ export async function resolveEngineBinary(engine: Exclude<CliEngine, "codex">): 
       || (await resolveCommandPath(path.join(process.env.LOCALAPPDATA || "", "agy", "bin", process.platform === "win32" ? "agy.exe" : "agy")))
       || (await resolveCommandPath(path.join(home, ".local", "bin", process.platform === "win32" ? "agy.exe" : "agy")));
   }
-  if (process.env.GROK_COMMAND) return resolveCommandPath(process.env.GROK_COMMAND);
-  // Prefer the dedicated `grok` binary — never the shared `agent` name (Cursor collision).
-  return (await resolveCommandPath("grok"))
-    || (await resolveCommandPath("grok.exe"))
-    || (await resolveCommandPath("grok.cmd"))
-    || (await resolveCommandPath(path.join(os.homedir(), ".grok", "bin", process.platform === "win32" ? "grok.exe" : "grok")));
+  if (engine === "pi") {
+    if (process.env.PI_COMMAND) {
+      const hit = await resolveCommandPath(process.env.PI_COMMAND);
+      if (hit && !isCrossEngineBinary("pi", hit)) return hit;
+    }
+    const home = os.homedir();
+    return (await resolveCommandPath("pi"))
+      || (await resolveCommandPath("pi.cmd"))
+      || (await resolveCommandPath("pi.exe"))
+      || (await resolveCommandPath(path.join(home, ".local", "bin", process.platform === "win32" ? "pi.cmd" : "pi")))
+      || (await resolveCommandPath(path.join(process.env.APPDATA || "", "npm", process.platform === "win32" ? "pi.cmd" : "pi")));
+  }
+  if (engine === "grok") {
+    if (process.env.GROK_COMMAND) return resolveCommandPath(process.env.GROK_COMMAND);
+    return (await resolveCommandPath("grok"))
+      || (await resolveCommandPath("grok.exe"))
+      || (await resolveCommandPath("grok.cmd"))
+      || (await resolveCommandPath(path.join(os.homedir(), ".grok", "bin", process.platform === "win32" ? "grok.exe" : "grok")));
+  }
+  return null;
 }
 
 /** @deprecated use resolveEngineBinary */
@@ -656,6 +719,9 @@ export function resolveEngineCommand(engine: Exclude<CliEngine, "codex">): strin
     return process.env.AGY_COMMAND
       || process.env.ANTIGRAVITY_COMMAND
       || (process.platform === "win32" ? "agy.exe" : "agy");
+  }
+  if (engine === "pi") {
+    return process.env.PI_COMMAND || (process.platform === "win32" ? "pi.cmd" : "pi");
   }
   return process.env.GROK_COMMAND || (process.platform === "win32" ? "grok.exe" : "grok");
 }

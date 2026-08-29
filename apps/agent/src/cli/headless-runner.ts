@@ -15,6 +15,7 @@ import { isCodexModelsManagerNoise, stripAnsi } from "./log-noise";
 import { headlessPermissionArgs } from "./permission-args";
 import { appendEngineDiffChunk, extractFileChangeDiff } from "./task-diff";
 import type { ApprovalPlan, ApprovalQuestion, BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult, StreamDeltaKind } from "./types";
+import { runPiRpcTurn, interruptPiThread, isPiThreadActive } from "./pi-rpc-runner";
 import { ensureWorkspaceTrusted } from "./workspace-trust";
 
 type ActiveRun = {
@@ -1475,6 +1476,9 @@ export async function runHeadlessTurn(
   options: HeadlessRunOptions,
   onEvent: (event: BackendStreamEvent) => void | Promise<void>
 ): Promise<HeadlessRunResult> {
+  if (engine === "pi") {
+    return runPiRpcTurn(options, onEvent);
+  }
   const existing = activeByThread.get(options.threadId);
   if (existing) {
     existing.interrupted = true;
@@ -2047,6 +2051,7 @@ export async function runHeadlessTurn(
 }
 
 export function interruptHeadlessThread(threadId: string): boolean {
+  if (interruptPiThread(threadId)) return true;
   const active = activeByThread.get(threadId);
   if (!active) return false;
   active.interrupted = true;
@@ -2057,5 +2062,5 @@ export function interruptHeadlessThread(threadId: string): boolean {
 
 /** Whether a headless CLI is currently running for this thread. */
 export function isHeadlessThreadActive(threadId: string): boolean {
-  return activeByThread.has(threadId);
+  return isPiThreadActive(threadId) || activeByThread.has(threadId);
 }

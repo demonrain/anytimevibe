@@ -187,7 +187,7 @@ function modelOptionsFromHost(
 function usesPerModelEffort(engine: CliEngine): boolean {
   // Cursor / Antigravity / Grok / Codex expose per-model effort lists.
   // Claude keeps a shared engine-level effort dropdown.
-  return engine === "cursor" || engine === "antigravity" || engine === "grok" || engine === "codex";
+  return engine === "cursor" || engine === "antigravity" || engine === "grok" || engine === "codex" || engine === "pi";
 }
 
 function effortOptionsFromHost(
@@ -611,7 +611,7 @@ function scrollWindowTop(): void {
 }
 
 function normalizeCliEngine(value: string | null | undefined): CliEngine {
-  if (value === "claude" || value === "grok" || value === "codex" || value === "cursor" || value === "antigravity") {
+  if (value === "claude" || value === "grok" || value === "codex" || value === "cursor" || value === "antigravity" || value === "pi") {
     return value;
   }
   return "codex";
@@ -622,6 +622,7 @@ function cliEngineLabel(engine: CliEngine): string {
   if (engine === "grok") return "Grok Build";
   if (engine === "cursor") return "Cursor";
   if (engine === "antigravity") return "Antigravity";
+  if (engine === "pi") return "Pi";
   return "Codex";
 }
 
@@ -631,6 +632,7 @@ function assistantEngineBadge(engine: CliEngine): string {
   if (engine === "grok") return "GROK";
   if (engine === "cursor") return "CURSOR";
   if (engine === "antigravity") return "AGY";
+  if (engine === "pi") return "PI";
   return "CODEX";
 }
 
@@ -708,6 +710,19 @@ function permissionOptionsForEngine(engine: CliEngine, locale: "zh-CN" | "en"): 
           { value: "ask-for-approval", label: "计划模式 (--mode plan)" },
           { value: "approve-for-me", label: "接受编辑 (--mode accept-edits)" },
           { value: "full-access", label: "跳过权限确认 (--dangerously-skip-permissions)" }
+        ];
+  }
+  if (engine === "pi") {
+    return locale === "en"
+      ? [
+          { value: "read-only", label: "Read-only tools (read,grep,find,ls)" },
+          { value: "ask-for-approval", label: "Standard tools (incl. bash/edit/write)" },
+          { value: "full-access", label: "All built-in tools (--approve)" }
+        ]
+      : [
+          { value: "read-only", label: "只读工具 (read,grep,find,ls)" },
+          { value: "ask-for-approval", label: "标准工具（含 bash/edit/write）" },
+          { value: "full-access", label: "全部内置工具 (--approve)" }
         ];
   }
   // codex
@@ -1608,7 +1623,7 @@ const ConversationComposer = memo(function ConversationComposer({
         </label>
       )}
       <label className="composer-permission">
-        {taskEngine === "cursor" || taskEngine === "antigravity" ? "Effort" : (locale === "en" ? "Effort" : "推理强度")}
+        {taskEngine === "cursor" || taskEngine === "antigravity" || taskEngine === "pi" ? "Effort" : (locale === "en" ? "Effort" : "推理强度")}
         <select
           value={reasoningEffort}
           onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
@@ -2179,7 +2194,8 @@ const featuredEngines: Array<{ engine: CliEngine; vendor: string; product: strin
   { engine: "claude", vendor: "Anthropic", product: "Claude Code" },
   { engine: "grok", vendor: "xAI", product: "Grok Build" },
   { engine: "cursor", vendor: "Cursor", product: "Cursor Agent" },
-  { engine: "antigravity", vendor: "Google", product: "Antigravity" }
+  { engine: "antigravity", vendor: "Google", product: "Antigravity" },
+  { engine: "pi", vendor: "Pi", product: "Coding Agent" }
 ];
 
 function FeaturedEngines() {
@@ -2892,7 +2908,7 @@ export function App() {
           <div className="connection-note"><span className={`status-dot ${activeRuntime.online ? "online" : ""}`} />{activeRuntime.online === true ? t("hostOnline") : activeRuntime.online === false ? t("hostOffline") : t("hostChecking")}</div>
           {activeHost && keyAuthorizationStatus[activeHost.id] && <div className="key-authorization-note"><div><strong>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "正在授权此浏览器" : "此浏览器尚未取得主机密钥"}</strong><span>{activeRuntime.online === true ? "电脑端会自动完成端到端密钥授权。" : "请先让电脑端客户端上线，再重新授权。"}</span></div><button disabled={keyAuthorizationStatus[activeHost.id] === "authorizing" || activeRuntime.online !== true} onClick={() => authorizeExistingHost(activeHost.id).catch((authorizationError) => setError(authorizationError.message))}>{keyAuthorizationStatus[activeHost.id] === "authorizing" ? "授权中…" : "授权此浏览器"}</button></div>}
           <div className="engine-filter" role="toolbar" aria-label="按编码引擎筛选任务">
-            {(["codex", "claude", "grok", "cursor", "antigravity"] as CliEngine[]).map((engine) => {
+            {(["codex", "claude", "grok", "cursor", "antigravity", "pi"] as CliEngine[]).map((engine) => {
               const count = tasks.filter((task) => normalizeCliEngine(task.cliEngine) === engine).length;
               const active = engineFilter === engine;
               return (
@@ -4453,7 +4469,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
     <div className="engine-picker">
       <span className="engine-picker-label">编码引擎</span>
       <div className="engine-picker-grid" role="radiogroup" aria-label="编码引擎">
-        {(["codex", "claude", "grok", "cursor", "antigravity"] as CliEngine[]).map((item) => {
+        {(["codex", "claude", "grok", "cursor", "antigravity", "pi"] as CliEngine[]).map((item) => {
           const info = availableEngines.find((entry) => entry.engine === item);
           const isReady = Boolean(info?.ready);
           const selected = engine === item;
@@ -4514,7 +4530,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
         <small style={{ color: "#6f756e" }}>启用模型的扩展思考变体（如 Claude Thinking）</small>
       </label>
     )}
-    <label>{engineId === "cursor" || engineId === "antigravity" ? "Effort（--effort）" : "推理强度"}
+    <label>{engineId === "cursor" || engineId === "antigravity" || engineId === "pi" ? "Effort（--effort）" : "推理强度"}
       <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)} disabled={!engine || !effortOptions.length}>
         {!effortOptions.length && <option value="">{usesPerModelEffort(engineId) ? "当前模型无 --effort" : "—"}</option>}
         {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
