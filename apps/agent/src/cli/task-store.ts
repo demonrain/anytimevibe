@@ -17,7 +17,7 @@ export class TaskStore {
     try {
       const raw = JSON.parse(await fs.readFile(this.filePath, "utf8")) as TaskStoreData;
       this.data = {
-        defaultEngine: raw.defaultEngine === "claude" || raw.defaultEngine === "grok" || raw.defaultEngine === "codex" || raw.defaultEngine === "cursor" || raw.defaultEngine === "antigravity"
+        defaultEngine: raw.defaultEngine === "claude" || raw.defaultEngine === "grok" || raw.defaultEngine === "codex" || raw.defaultEngine === "cursor" || raw.defaultEngine === "antigravity" || raw.defaultEngine === "pi"
           ? raw.defaultEngine
           : "codex",
         tasks: raw.tasks && typeof raw.tasks === "object" ? raw.tasks : {}

@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { resolveEngineBinary } from "./detect";
 import { canProbePathWithoutPrompt, isMacTccProtectedPath } from "./macos-fs";
+import { piDefaultSessionsRoot } from "./pi-rpc-runner";
 import type { TaskStore } from "./task-store";
 import type { StoredTask } from "./types";
 
@@ -52,7 +53,7 @@ function mergeImportStatus(existing: StoredTask | undefined): string {
 function resolveExistingForProviderSession(
   store: TaskStore,
   providerSessionId: string,
-  engine: "claude" | "grok" | "cursor" | "antigravity"
+  engine: "claude" | "grok" | "cursor" | "antigravity" | "pi"
 ): StoredTask | undefined {
   return store.findByProviderSession(providerSessionId, engine) || store.get(providerSessionId);
 }
@@ -1551,7 +1552,7 @@ export async function dedupeMultiCliTasks(store: TaskStore): Promise<number> {
   const groups = new Map<string, StoredTask[]>();
   // list(1000) is enough for agent index size; import only keeps a recent window anyway.
   for (const task of store.list(1000)) {
-    if (task.engine !== "claude" && task.engine !== "grok" && task.engine !== "cursor" && task.engine !== "antigravity") continue;
+    if (task.engine !== "claude" && task.engine !== "grok" && task.engine !== "cursor" && task.engine !== "antigravity" && task.engine !== "pi") continue;
     const native = (task.providerSessionId || task.threadId || "").trim();
     if (!native) continue;
     const key = `${task.engine}:${native}`;
@@ -1620,6 +1621,131 @@ export function listStaleNativeImportThreadIds(store: TaskStore, limit: number):
   return stale;
 }
 
+export type PiSessionImportMetadata = {
+  id: string;
+  cwd: string;
+  timestamp?: number;
+  title?: string;
+};
+
+/** Parse the session header and first user prompt from a Pi JSONL transcript. */
+export function parsePiSessionFile(contents: string, fallbackId: string, fallbackMtime: number): PiSessionImportMetadata | undefined {
+  const lines = contents.split(/\r?\n/).filter(Boolean);
+  if (!lines.length) return undefined;
+  let header: Record<string, unknown> | undefined;
+  let title = "";
+  for (const line of lines.slice(0, 200)) {
+    let entry: Record<string, unknown>;
+    try {
+      entry = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (!header && entry.type === "session") header = entry;
+    if (!title && entry.type === "message") {
+      const message = entry.message as Record<string, unknown> | undefined;
+      if (message?.role === "user") {
+        const content = message.content;
+        if (typeof content === "string") title = content.trim();
+        else if (Array.isArray(content)) {
+          title = content
+            .map((part) => typeof part === "string" ? part : (part && typeof part === "object" ? String((part as Record<string, unknown>).text || "") : ""))
+            .join("")
+            .trim();
+        }
+      }
+    }
+    if (header?.cwd && title) break;
+  }
+  const cwd = typeof header?.cwd === "string" ? header.cwd.trim() : "";
+  if (!cwd || !path.isAbsolute(cwd)) return undefined;
+  const id = typeof header?.id === "string" && header.id.trim() ? header.id.trim() : fallbackId;
+  const rawTimestamp = header?.timestamp;
+  const parsedTimestamp = typeof rawTimestamp === "number"
+    ? rawTimestamp
+    : typeof rawTimestamp === "string" ? Date.parse(rawTimestamp) / 1000 : NaN;
+  return {
+    id,
+    cwd,
+    timestamp: Number.isFinite(parsedTimestamp) && parsedTimestamp > 0 ? parsedTimestamp : fallbackMtime,
+    ...(title ? { title: title.slice(0, 120) } : {})
+  };
+}
+
+/** Import recent Pi sessions from ~/.pi/agent/sessions (JSONL). */
+async function importPiSessions(store: TaskStore, limit: number): Promise<number> {
+  const root = piDefaultSessionsRoot();
+  type Hit = { id: string; file: string; mtime: number; cwd: string; title: string };
+  const hits: Hit[] = [];
+
+  async function walk(dir: string, depth: number): Promise<void> {
+    if (depth > 6 || !canProbePathWithoutPrompt(dir)) return;
+    let entries: string[] = [];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry);
+      if (entry.endsWith(".jsonl")) {
+        try {
+          const st = await fs.stat(full);
+          const base = entry.replace(/\.jsonl$/i, "");
+          const contents = await fs.readFile(full, "utf8");
+          const metadata = parsePiSessionFile(contents, base, st.mtimeMs / 1000);
+          if (!metadata || !canProbePathWithoutPrompt(metadata.cwd)) continue;
+          try {
+            const cwdStat = await fs.stat(metadata.cwd);
+            if (!cwdStat.isDirectory()) continue;
+          } catch {
+            continue;
+          }
+          hits.push({
+            id: metadata.id,
+            file: full,
+            mtime: st.mtimeMs / 1000,
+            cwd: metadata.cwd,
+            title: metadata.title || metadata.id.slice(0, 8)
+          });
+        } catch {
+          // ignore
+        }
+        continue;
+      }
+      try {
+        const st = await fs.stat(full);
+        if (st.isDirectory()) await walk(full, depth + 1);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  await walk(root, 0);
+  hits.sort((a, b) => b.mtime - a.mtime);
+  let added = 0;
+  for (const hit of hits.slice(0, Math.max(limit * 3, limit))) {
+    const existing = resolveExistingForProviderSession(store, hit.id, "pi");
+    if (existing) continue;
+    const threadId = crypto.randomUUID();
+    const task: StoredTask = {
+      threadId,
+      engine: "pi",
+      providerSessionId: hit.id,
+      cwd: hit.cwd,
+      title: `Pi ${hit.title}`,
+      status: "completed",
+      createdAt: hit.mtime,
+      updatedAt: hit.mtime,
+      messages: []
+    };
+    await store.upsert(task);
+    added += 1;
+  }
+  return added;
+}
+
 /** Import local Claude/Grok/Cursor CLI sessions into the agent task index for web sync. */
 export async function importLocalCliSessions(
   store: TaskStore,
@@ -1630,16 +1756,18 @@ export async function importLocalCliSessions(
   claude: number;
   cursor: number;
   antigravity: number;
+  pi: number;
   junkCursorIds: string[];
   junkGrokIds: string[];
   junkAgyIds: string[];
   staleNativeIds: string[];
 }> {
-  const [grok, claude, cursor, agy] = await Promise.all([
+  const [grok, claude, cursor, agy, pi] = await Promise.all([
     importGrokSessions(store, limit),
     importClaudeSessions(store, limit, allowedRoots),
     importCursorSessions(store, limit),
-    importAntigravitySessions(store, limit)
+    importAntigravitySessions(store, limit),
+    importPiSessions(store, limit)
   ]);
   try {
     await dedupeMultiCliTasks(store);
@@ -1658,6 +1786,7 @@ export async function importLocalCliSessions(
     claude,
     cursor,
     antigravity: agy.added,
+    pi,
     junkCursorIds,
     junkGrokIds,
     junkAgyIds,

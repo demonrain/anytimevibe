@@ -99,6 +99,7 @@ export function isMacFsProbeSafePath(target: string): boolean {
     home ? `${home}/.volta` : "",
     home ? `${home}/.asdf` : "",
     home ? `${home}/.codex` : "",
+    home ? `${home}/.pi` : "",
     home ? `${home}/.gemini` : "",
     home ? `${home}/.npm` : "",
     home ? `${home}/.cargo` : "",

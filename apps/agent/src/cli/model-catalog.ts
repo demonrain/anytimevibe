@@ -1316,16 +1316,67 @@ export function resolveModelContextWindow(engine: CliEngine, model?: string): nu
   return undefined;
 }
 
+async function discoverPiCapability(): Promise<EngineCapability> {
+  const models: EngineModelOption[] = [];
+  const seen = new Set<string>();
+  let currentModel: string | undefined;
+  let currentReasoningEffort: ReasoningEffort | undefined;
+  const settingsRaw = await readText(path.join(os.homedir(), ".pi", "agent", "settings.json"));
+  if (settingsRaw) {
+    try {
+      const settings = JSON.parse(settingsRaw) as Record<string, unknown>;
+      const model = typeof settings.defaultModel === "string" ? settings.defaultModel.trim() : "";
+      if (model) {
+        currentModel = model;
+        models.push({ id: model, label: model });
+        seen.add(model);
+      }
+      const thinking = typeof settings.defaultThinkingLevel === "string"
+        ? normalizeEffort(settings.defaultThinkingLevel)
+        : undefined;
+      if (thinking) currentReasoningEffort = thinking;
+    } catch {
+      // ignore
+    }
+  }
+  try {
+    const { resolveEngineBinary } = await import("./detect");
+    const binary = await resolveEngineBinary("pi");
+    if (binary) {
+      const { runCliText } = await import("./engine-quota");
+      const listed = await runCliText(binary, ["--list-models"], { timeoutMs: 20_000 });
+      if (listed.text) {
+        for (const line of listed.text.split(/\r?\n/)) {
+          const id = line.trim();
+          if (!id || seen.has(id)) continue;
+          seen.add(id);
+          models.push({ id, label: id });
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return {
+    engine: "pi",
+    models,
+    ...(currentModel ? { currentModel } : {}),
+    ...(currentReasoningEffort ? { currentReasoningEffort } : {}),
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]
+  };
+}
+
 /** Collect model + effort options from local CLI configs/caches on this machine. */
 export async function discoverEngineCapabilities(): Promise<EngineCapability[]> {
-  const [codex, claude, grok, cursor, antigravity] = await Promise.all([
+  const [codex, claude, grok, cursor, antigravity, pi] = await Promise.all([
     discoverCodexCapability(),
     discoverClaudeCapability(),
     discoverGrokCapability(),
     discoverCursorCapability(),
-    discoverAntigravityCapability()
+    discoverAntigravityCapability(),
+    discoverPiCapability()
   ]);
-  const capabilities = [codex, claude, grok, cursor, antigravity];
+  const capabilities = [codex, claude, grok, cursor, antigravity, pi];
   lastDiscoveredCapabilities = capabilities;
   return capabilities;
 }

@@ -7,11 +7,11 @@
 ![Latest tag](https://img.shields.io/github/v/tag/demonrain/anytimevibe?sort=semver&style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-22%2B-3c873a?style=flat-square)
 
-**在自己的电脑上跑 Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity，用手机随时续上任务——不是远程桌面，也不把源码和凭据交给云端。**
+**在自己的电脑上跑 Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity / Pi，用手机随时续上任务——不是远程桌面，也不把源码和凭据交给云端。**
 
-## 35 秒看懂（五引擎版）
+## 35 秒看懂（六引擎版）
 
-> 最新宣传片已同步 Google Antigravity：手机下发任务、电脑端执行、`agy` 原生会话接力，和 Codex / Claude Code / Grok Build / Cursor Agent 一起在同一条任务流中完成。
+> 最新宣传片已同步 Google Antigravity 与 Pi：手机下发任务、电脑端执行、`agy` 或 Pi 原生会话接力，和 Codex / Claude Code / Grok Build / Cursor Agent 一起在同一条任务流中完成。
 
 <p align="center">
   <img src="docs/media/anytimevibe-promo.gif" alt="随码 35 秒产品预览" width="100%" />
@@ -40,7 +40,7 @@
 | --- | --- |
 | 1 | [下载 Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest) 并安装，添加白名单工作区 |
 | 2 | 打开 [体验站](https://vibe.demonrain.top/) 或自建 Web PWA，登录并输入客户端配对码 |
-| 3 | 新建任务时选择 **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity**，在手机上查看进度、继续对话与审批 |
+| 3 | 新建任务时选择 **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity / Pi**，在手机上查看进度、继续对话与审批 |
 
 自建中继见下方 [Docker 部署](#docker-部署)。本地开发见 [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md)。
 
@@ -48,7 +48,7 @@
 
 1. **任务式远程，而不是整机远控** — 只同步任务状态、流式回复、审批与 Diff，不必盯着桌面画面。
 2. **引擎在你自己的电脑上** — Agent 本机调用已安装的 CLI；源码、API Key、会话文件不上传中继。
-3. **五引擎同一工作台** — 每个任务绑定引擎与原生会话，可筛选、接力，刷新浏览器也不丢上下文。
+3. **六引擎同一工作台** — 每个任务绑定引擎与原生会话，可筛选、接力，刷新浏览器也不丢上下文。
 
 ## 为什么不用 SSH、远程桌面或 Tailscale？
 
@@ -56,32 +56,28 @@
 | --- | --- | --- | --- | --- |
 | 手机上的体验 | 任务卡片、流式回复、审批按钮 | 小屏敲终端 | 看整屏桌面、点鼠标 | 只解决网络连通 |
 | 代码与凭据 | 留在本机；中继只存密文事件 | 取决于你怎么用 | 画面在远端，风险面更大 | 不负责任务与审批 |
-| 多 CLI | Codex / Claude / Grok / Cursor / Antigravity 统一列表 | 自己切工具 | 自己开窗口 | 无 |
+| 多 CLI | Codex / Claude / Grok / Cursor / Antigravity / Pi 统一列表 | 自己切工具 | 自己开窗口 | 无 |
 | 典型场景 | 通勤续任务、审批、看进度 | 运维与脚本 | 需要完整 GUI 时 | 需要安全组网时 |
 
 随码**不替代** SSH 或 RDP：当你需要完整终端或桌面时，用「电脑接力」回到本机原生 CLI。它补的是「离开工位后仍能驱动本机 AI 编程任务」这一段。
 
 ## 产品截图
 
-| Web 任务列表与已配对主机 | 客户端任务与原生 CLI 接力 |
+| 桌面端登录与六引擎矩阵 | 移动端登录与响应式六引擎矩阵 |
 | --- | --- |
-| ![真实 Web 任务列表、已配对主机与编码引擎筛选](docs/media/remote-command.png) | ![真实客户端任务页、执行输出与任务接力入口](docs/media/cli-handoff.png) |
-
-| Codex 会话与运行信息 | 会话控制与权限设置 |
-| --- | --- |
-| ![真实 Codex 会话消息流、模型、Effort 与 Endpoint](docs/media/task-stream.png) | ![真实会话底部的模型、Effort、权限与发送控件](docs/media/permissions.png) |
+| ![随码桌面端登录页与 Codex、Claude、Grok、Cursor、Antigravity、Pi](docs/media/anytimevibe-desktop-latest.png) | ![随码移动端登录页与六种受支持的编程引擎](docs/media/anytimevibe-mobile-latest.png) |
 
 ## 核心工作流
 
 1. 在手机或桌面浏览器登录 Web PWA，选择已配对的电脑和白名单工作区。
-2. 新建任务时选择 Codex、Claude Code、Grok Build、Cursor Agent 或 Google Antigravity，并使用该引擎对应的权限模式。
+2. 新建任务时选择 Codex、Claude Code、Grok Build、Cursor Agent、Google Antigravity 或 Pi，并使用该引擎对应的权限模式。
 3. Windows / macOS Agent 在本机启动选定 CLI，实时同步阶段日志、回复和任务状态。
 4. 需要完整终端体验时，点击「电脑接力」，Agent 使用对应引擎的原生会话 ID 恢复任务。
 
 ## 能做什么（摘要）
 
 - 多用户隔离、多主机配对、工作区白名单。
-- 五引擎创建任务、流式输出、权限映射、原生会话接力。
+- 六引擎创建任务、流式输出、权限映射、原生会话接力。
 - 任务列表按最后活动时间排序；可按引擎筛选。
 - Web Push 审批 / 完成通知；多浏览器授权同一主机密钥。
 - 客户端环境检测、引擎安装指引、自动更新。
@@ -97,6 +93,7 @@
 | Grok Build | `grok -p --output-format streaming-json` | 只读工具、接受文件编辑、全自动批准 | 导入 Grok sessions，并通过 `grok --resume` 接力 |
 | Cursor Agent | `agent -p --output-format stream-json --stream-partial-output` | 仅提议、允许改文件、全自动写盘 | 通过 `--workspace` 绑定工作区，并通过 `agent --resume` 接力 |
 | Antigravity | `agy -p --output-format stream-json` | 沙箱 (`--sandbox`)、计划模式 (`--mode plan`)、接受编辑 (`--mode accept-edits`)、跳过权限确认 (`--dangerously-skip-permissions`) | 导入 `~/.gemini/antigravity-cli/brain` 会话记录，并通过 `agy --conversation <id>` 接力 |
+| Pi | `pi --mode rpc --approve` | 只读工具、审批或完全访问映射为 Pi 工具集 | 导入 `~/.pi/agent/sessions`，通过 `--session <id>` 恢复，并支持原生 CLI 接力 |
 
 任务创建页只允许选择当前主机已检测为可用的引擎。Claude / Grok / Cursor / Antigravity 可以通过 `CLAUDE_MODEL`、`ANTHROPIC_MODEL`、`GROK_MODEL`、`XAI_MODEL`、`CURSOR_MODEL` 或 `AGY_MODEL`/`ANTIGRAVITY_MODEL` 指定模型；未设置时使用对应 CLI 的本机默认配置（Cursor 默认为 Composer 2.5）。Cursor 和 Antigravity 还支持按模型选择 Effort（思考深度），Cursor 支持部分模型的 Fast 模式；二进制可通过 `CURSOR_COMMAND` / `CURSOR_AGENT_COMMAND` 或 `AGY_COMMAND` 覆盖。
 
@@ -112,11 +109,13 @@ flowchart LR
     Router <-->|streaming-json| Grok[Grok Build]
     Router <-->|stream-json| Cursor[Cursor Agent]
     Router <-->|stream-json| Antigravity[Google Antigravity]
+    Router <-->|JSONL RPC| Pi[Pi Coding Agent]
     Codex --> Workspace[白名单工作区]
     Claude --> Workspace
     Grok --> Workspace
     Cursor --> Workspace
     Antigravity --> Workspace
+    Pi --> Workspace
     Relay --> DB[(PostgreSQL)]
     Relay --> Push[Web Push]
 ```
@@ -128,8 +127,8 @@ flowchart LR
 | Web PWA | React 19、TypeScript、Vite 6、Service Worker、IndexedDB | 登录、主机、任务、会话、审批、Diff 和移动端布局 |
 | Relay 服务 | Node.js、Fastify 5、WebSocket、Zod、Argon2id、Web Push | 认证、用户隔离、在线路由、加密事件存储和通知 |
 | 数据库 | PostgreSQL 16 | 账号、会话、主机、配对、Push 订阅和加密事件元数据 |
-| 桌面 Agent | Electron 36、WebSocket、electron-updater | 托盘常驻、配对、五引擎检测、本地会话导入、自动更新和进程管理 |
-| 多引擎适配 | Codex app-server、Claude stream-json、Grok streaming-json、Cursor stream-json、Antigravity stream-json | 引擎选择、权限映射、流式事件、会话恢复、停止任务和原生 CLI 接力 |
+| 桌面 Agent | Electron 36、WebSocket、electron-updater | 托盘常驻、配对、六引擎检测、本地会话导入、自动更新和进程管理 |
+| 多引擎适配 | Codex app-server、Claude stream-json、Grok streaming-json、Cursor stream-json、Antigravity stream-json、Pi RPC | 引擎选择、权限映射、流式事件、会话恢复、停止任务和原生 CLI 接力 |
 | 部署 | Docker Compose、Caddy 2.8 | Relay、Web、PostgreSQL、HTTPS 和证书自动续期 |
 
 ## 安全模型
@@ -143,7 +142,7 @@ flowchart LR
 
 ## 快速开始
 
-环境要求：Node.js 22+、pnpm 10+、Git；运行服务端还需要 Docker Engine 和 Docker Compose。执行远程任务至少需要在 Agent 主机上安装并登录 Codex CLI `0.144.x` / `0.145.x`、Claude Code CLI、Grok Build CLI、Cursor Agent CLI（`agent` / `cursor-agent`，可用 `agent login` 登录）或 Google Antigravity CLI（`agy`，先运行一次交互式 `agy` 登录）中的一种。
+环境要求：Node.js 22+、pnpm 10+、Git；运行服务端还需要 Docker Engine 和 Docker Compose。执行远程任务至少需要在 Agent 主机上安装并登录 Codex CLI `0.144.x` / `0.145.x`、Claude Code CLI、Grok Build CLI、Cursor Agent CLI（`agent` / `cursor-agent`，可用 `agent login` 登录）、Google Antigravity CLI（`agy`，先运行一次交互式 `agy` 登录）或 Pi CLI（`pi`，按其 provider 配置完成登录）中的一种。
 
 ```bash
 git clone https://github.com/demonrain/anytimevibe.git

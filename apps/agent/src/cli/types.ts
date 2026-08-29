@@ -91,6 +91,11 @@ export type HeadlessRunOptions = {
    * (stale / deleted / sidechain session id → "No conversation found with session ID").
    */
   claudeResumeRetried?: boolean;
+  /**
+   * Internal: Pi retry without --session already attempted
+   * (stale / missing session id).
+   */
+  piResumeRetried?: boolean;
 };
 
 export type HeadlessRunResult = {
@@ -106,7 +111,7 @@ export type HeadlessRunResult = {
 };
 
 export function normalizeCliEngine(value: string | null | undefined): CliEngine {
-  if (value === "claude" || value === "grok" || value === "codex" || value === "cursor" || value === "antigravity") {
+  if (value === "claude" || value === "grok" || value === "codex" || value === "cursor" || value === "antigravity" || value === "pi") {
     return value;
   }
   return "codex";
@@ -121,5 +126,6 @@ export function cliEngineDisplayName(engine: CliEngine): string {
   if (engine === "grok") return "Grok Build";
   if (engine === "cursor") return "Cursor Agent";
   if (engine === "antigravity") return "Antigravity";
+  if (engine === "pi") return "Pi";
   return "Codex";
 }

@@ -7,14 +7,14 @@
 ![Latest tag](https://img.shields.io/github/v/tag/demonrain/anytimevibe?sort=semver&style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-22%2B-3c873a?style=flat-square)
 
-**Run Codex, Claude Code, Grok Build, Cursor Agent, or Google Antigravity on your own machine—and keep the task moving from your phone. Not a remote desktop. Not a cloud that holds your source or API keys.**
+**Run Codex, Claude Code, Grok Build, Cursor Agent, Google Antigravity, or Pi on your own machine—and keep the task moving from your phone. Not a remote desktop. Not a cloud that holds your source or API keys.**
 
-## 35-second overview (five-engine edition)
+## 35-second overview (six-engine edition)
 
-> This updated cut includes Google Antigravity end to end: dispatch from your phone, run on the paired computer, and hand off to the native `agy` conversation alongside Codex, Claude Code, Grok Build, and Cursor Agent.
+> This updated cut includes Google Antigravity and Pi end to end: dispatch from your phone, run on the paired computer, and hand off to the native `agy` or Pi RPC session alongside Codex, Claude Code, Grok Build, and Cursor Agent.
 
 <p align="center">
-  <img src="docs/media/anytimevibe-promo.gif" alt="AnytimeVibe 35-second five-engine product preview" width="100%" />
+  <img src="docs/media/anytimevibe-promo.gif" alt="AnytimeVibe 35-second six-engine product preview" width="100%" />
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@
 | --- | --- |
 | 1 | [Download the Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest), install it, and add allow-listed workspaces |
 | 2 | Open the [demo site](https://vibe.demonrain.top/) or your self-hosted Web PWA, sign in, and enter the pairing code from the agent |
-| 3 | Create a task with **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity**, then follow progress, continue the chat, and approve from your phone |
+| 3 | Create a task with **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity / Pi**, then follow progress, continue the chat, and approve from your phone |
 
 Self-host the relay via [Docker deployment](#docker-deployment). Local development: [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md).
 
@@ -48,7 +48,7 @@ Self-host the relay via [Docker deployment](#docker-deployment). Local developme
 
 1. **Task-native remote, not full desktop control** — stream replies, status, approvals, and diffs without babysitting a remote screen.
 2. **Engines stay on your PC** — the Agent runs installed CLIs locally; source, keys, and session files never go to the relay as plaintext.
-3. **One workbench for five engines** — each task keeps its engine and native session; filter, hand off, and resume across browsers.
+3. **One workbench for six engines** — each task keeps its engine and native session; filter, hand off, and resume across browsers.
 
 ## Why not just SSH, remote desktop, or Tailscale?
 
@@ -56,32 +56,28 @@ Self-host the relay via [Docker deployment](#docker-deployment). Local developme
 | --- | --- | --- | --- | --- |
 | Phone UX | Task cards, streaming, approval buttons | Tiny terminal | Full desktop | Connectivity only |
 | Code & secrets | Stay local; relay stores encrypted envelopes | Depends on you | Larger GUI attack surface | No task/approval layer |
-| Multi-CLI | Codex / Claude / Grok / Cursor / Antigravity in one list | You switch tools | You open windows | N/A |
+| Multi-CLI | Codex / Claude / Grok / Cursor / Antigravity / Pi in one list | You switch tools | You open windows | N/A |
 | Best for | Continue coding tasks away from the desk | Ops & scripts | Full GUI work | Secure networking |
 
 AnytimeVibe does **not** replace SSH or RDP. Use “Handoff to computer” when you need a full native CLI. It fills the gap between leaving your desk and still driving local AI coding agents.
 
 ## Screenshots
 
-| Web task list and paired host | Client tasks and native CLI handoff |
+| Desktop sign-in and six-engine matrix | Mobile sign-in and responsive six-engine matrix |
 | --- | --- |
-| ![Live Web task list, paired host, and engine filters](docs/media/remote-command.png) | ![Live client task page with execution output and handoff entry point](docs/media/cli-handoff.png) |
-
-| Codex conversation and run details | Conversation controls and permissions |
-| --- | --- |
-| ![Live Codex conversation with model, Effort, and Endpoint details](docs/media/task-stream.png) | ![Live model, Effort, permission, and send controls](docs/media/permissions.png) |
+| ![AnytimeVibe desktop sign-in with Codex, Claude, Grok, Cursor, Antigravity, and Pi](docs/media/anytimevibe-desktop-latest.png) | ![AnytimeVibe mobile sign-in with the six supported coding engines](docs/media/anytimevibe-mobile-latest.png) |
 
 ## Core workflow
 
 1. Sign in to the Web PWA and choose a paired computer plus an allow-listed workspace.
-2. Create a task with Codex, Claude Code, Grok Build, Cursor Agent, or Google Antigravity and a matching permission mode.
+2. Create a task with Codex, Claude Code, Grok Build, Cursor Agent, Google Antigravity, or Pi and a matching permission mode.
 3. The Agent starts the selected local CLI and streams stages, replies, and status.
 4. For a full terminal, hand off to the provider-native session on the computer.
 
 ## Features (summary)
 
 - Multi-user isolation, multi-host pairing, workspace allow-lists.
-- Five engines, streaming output, permission mapping, native session handoff.
+- Six engines, streaming output, permission mapping, native session handoff.
 - Task list ordered by last activity; filter by engine.
 - Web Push for approvals/completion; multi-browser host-key authorization.
 - Client environment detection, install helpers, auto-update.
@@ -97,6 +93,7 @@ Boundary: CLI capabilities differ and are mapped into one UX. No arbitrary termi
 | Grok Build | `grok -p --output-format streaming-json` | Read-only tools, Accept edits, Always approve | Imports Grok sessions and hands off with `grok --resume` |
 | Cursor Agent | `agent -p --output-format stream-json --stream-partial-output` | Propose only, Apply changes, Full auto | Binds `--workspace` and hands off with `agent --resume` |
 | Antigravity | `agy -p --output-format stream-json` | Sandbox (`--sandbox`), Plan (`--mode plan`), Accept edits (`--mode accept-edits`), Skip permissions (`--dangerously-skip-permissions`) | Imports `~/.gemini/antigravity-cli/brain` and hands off with `agy --conversation <id>` |
+| Pi | `pi --mode rpc --approve` | Read-only tools, approval, or full access mapped to Pi tools | Imports `~/.pi/agent/sessions`, resumes with `--session <id>`, and supports native CLI handoff |
 
 The task dialog only enables engines detected as ready on the selected host. Claude, Grok, Cursor, and Antigravity models can be overridden with `CLAUDE_MODEL`, `ANTHROPIC_MODEL`, `GROK_MODEL`, `XAI_MODEL`, `CURSOR_MODEL`, or `AGY_MODEL`/`ANTIGRAVITY_MODEL`; otherwise each CLI keeps its local default (Cursor defaults to Composer 2.5). Cursor and Antigravity also support per-model Effort (thinking depth), and Cursor supports Fast mode where available; override the binary with `CURSOR_COMMAND` / `CURSOR_AGENT_COMMAND` or `AGY_COMMAND`.
 
@@ -112,11 +109,13 @@ flowchart LR
     Router <-->|streaming-json| Grok[Grok Build]
     Router <-->|stream-json| Cursor[Cursor Agent]
     Router <-->|stream-json| Antigravity[Google Antigravity]
+    Router <-->|JSONL RPC| Pi[Pi Coding Agent]
     Codex --> Workspace[Allow-listed workspace]
     Claude --> Workspace
     Grok --> Workspace
     Cursor --> Workspace
     Antigravity --> Workspace
+    Pi --> Workspace
     Relay --> DB[(PostgreSQL)]
     Relay --> Push[Web Push]
 ```
@@ -128,8 +127,8 @@ flowchart LR
 | Web PWA | React 19, TypeScript, Vite 6, Service Worker, IndexedDB | Authentication, hosts, tasks, conversations, approvals, diffs, and mobile layout |
 | Relay | Node.js, Fastify 5, WebSocket, Zod, Argon2id, Web Push | Authentication, isolation, online routing, encrypted event storage, and notifications |
 | Database | PostgreSQL 16 | Accounts, sessions, hosts, pairing records, Push subscriptions, and encrypted event metadata |
-| Desktop Agent | Electron 36, WebSocket, electron-updater | Tray app, pairing, five-engine detection, local session import, updates, and process management |
-| Multi-engine adapters | Codex app-server, Claude stream-json, Grok streaming-json, Cursor stream-json, Antigravity stream-json | Engine selection, permission mapping, streaming events, session resume, interruption, and native CLI handoff |
+| Desktop Agent | Electron 36, WebSocket, electron-updater | Tray app, pairing, six-engine detection, local session import, updates, and process management |
+| Multi-engine adapters | Codex app-server, Claude stream-json, Grok streaming-json, Cursor stream-json, Antigravity stream-json, Pi RPC | Engine selection, permission mapping, streaming events, session resume, interruption, and native CLI handoff |
 | Operations | Docker Compose, Caddy 2.8 | Relay, Web, PostgreSQL, HTTPS, and automatic certificate renewal |
 
 ## Security Model
@@ -143,7 +142,7 @@ flowchart LR
 
 ## Quick Start
 
-Requirements: Node.js 22+, pnpm 10+, and Git. Docker Engine and Docker Compose are required for the production stack. The Agent host needs at least one authenticated engine: Codex CLI `0.144.x` / `0.145.x`, Claude Code CLI, Grok Build CLI, Cursor Agent CLI (`agent` / `cursor-agent`, sign in with `agent login`), or Google Antigravity CLI (`agy`).
+Requirements: Node.js 22+, pnpm 10+, and Git. Docker Engine and Docker Compose are required for the production stack. The Agent host needs at least one authenticated engine: Codex CLI `0.144.x` / `0.145.x`, Claude Code CLI, Grok Build CLI, Cursor Agent CLI (`agent` / `cursor-agent`, sign in with `agent login`), Google Antigravity CLI (`agy`), or Pi CLI (`pi`, sign in through its normal provider setup).
 
 ```bash
 git clone https://github.com/demonrain/anytimevibe.git
