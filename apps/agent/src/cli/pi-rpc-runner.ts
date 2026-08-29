@@ -53,7 +53,7 @@ function writeRpc(child: ChildProcess, payload: Record<string, unknown>): void {
   child.stdin?.write(`${JSON.stringify(payload)}\n`);
 }
 
-function parsePiModelRef(raw: string | undefined): { provider?: string; modelId?: string; thinking?: ReasoningEffort } {
+export function parsePiModelRef(raw: string | undefined): { provider?: string; modelId?: string; thinking?: ReasoningEffort } {
   const text = String(raw || "").trim();
   if (!text) return {};
   const colonIdx = text.lastIndexOf(":");
@@ -74,7 +74,7 @@ function parsePiModelRef(raw: string | undefined): { provider?: string; modelId?
   return { modelId: text };
 }
 
-function contextUsageFromPi(event: PiRpcLine): ContextUsage | undefined {
+export function contextUsageFromPi(event: PiRpcLine): ContextUsage | undefined {
   const usage = event.usage;
   if (!usage || typeof usage !== "object") return undefined;
   const u = usage as Record<string, unknown>;
@@ -89,7 +89,7 @@ function contextUsageFromPi(event: PiRpcLine): ContextUsage | undefined {
   };
 }
 
-function buildPiSpawnArgs(options: HeadlessRunOptions): string[] {
+export function buildPiSpawnArgs(options: HeadlessRunOptions): string[] {
   const args = ["--mode", "rpc", "--approve"];
   const resumeId = String(options.providerSessionId || "").trim();
   if (resumeId && resumeId !== options.threadId) {

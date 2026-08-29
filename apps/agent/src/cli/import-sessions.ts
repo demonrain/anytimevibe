@@ -1621,6 +1621,57 @@ export function listStaleNativeImportThreadIds(store: TaskStore, limit: number):
   return stale;
 }
 
+export type PiSessionImportMetadata = {
+  id: string;
+  cwd: string;
+  timestamp?: number;
+  title?: string;
+};
+
+/** Parse the session header and first user prompt from a Pi JSONL transcript. */
+export function parsePiSessionFile(contents: string, fallbackId: string, fallbackMtime: number): PiSessionImportMetadata | undefined {
+  const lines = contents.split(/\r?\n/).filter(Boolean);
+  if (!lines.length) return undefined;
+  let header: Record<string, unknown> | undefined;
+  let title = "";
+  for (const line of lines.slice(0, 200)) {
+    let entry: Record<string, unknown>;
+    try {
+      entry = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (!header && entry.type === "session") header = entry;
+    if (!title && entry.type === "message") {
+      const message = entry.message as Record<string, unknown> | undefined;
+      if (message?.role === "user") {
+        const content = message.content;
+        if (typeof content === "string") title = content.trim();
+        else if (Array.isArray(content)) {
+          title = content
+            .map((part) => typeof part === "string" ? part : (part && typeof part === "object" ? String((part as Record<string, unknown>).text || "") : ""))
+            .join("")
+            .trim();
+        }
+      }
+    }
+    if (header?.cwd && title) break;
+  }
+  const cwd = typeof header?.cwd === "string" ? header.cwd.trim() : "";
+  if (!cwd || !path.isAbsolute(cwd)) return undefined;
+  const id = typeof header?.id === "string" && header.id.trim() ? header.id.trim() : fallbackId;
+  const rawTimestamp = header?.timestamp;
+  const parsedTimestamp = typeof rawTimestamp === "number"
+    ? rawTimestamp
+    : typeof rawTimestamp === "string" ? Date.parse(rawTimestamp) / 1000 : NaN;
+  return {
+    id,
+    cwd,
+    timestamp: Number.isFinite(parsedTimestamp) && parsedTimestamp > 0 ? parsedTimestamp : fallbackMtime,
+    ...(title ? { title: title.slice(0, 120) } : {})
+  };
+}
+
 /** Import recent Pi sessions from ~/.pi/agent/sessions (JSONL). */
 async function importPiSessions(store: TaskStore, limit: number): Promise<number> {
   const root = piDefaultSessionsRoot();
@@ -1641,12 +1692,21 @@ async function importPiSessions(store: TaskStore, limit: number): Promise<number
         try {
           const st = await fs.stat(full);
           const base = entry.replace(/\.jsonl$/i, "");
+          const contents = await fs.readFile(full, "utf8");
+          const metadata = parsePiSessionFile(contents, base, st.mtimeMs / 1000);
+          if (!metadata || !canProbePathWithoutPrompt(metadata.cwd)) continue;
+          try {
+            const cwdStat = await fs.stat(metadata.cwd);
+            if (!cwdStat.isDirectory()) continue;
+          } catch {
+            continue;
+          }
           hits.push({
-            id: base,
+            id: metadata.id,
             file: full,
             mtime: st.mtimeMs / 1000,
-            cwd: path.basename(path.dirname(full)),
-            title: base.slice(0, 8)
+            cwd: metadata.cwd,
+            title: metadata.title || metadata.id.slice(0, 8)
           });
         } catch {
           // ignore
