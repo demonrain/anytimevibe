@@ -757,6 +757,7 @@ async function main(): Promise<void> {
             grokVersion: z.string().trim().min(1).max(80).optional(),
             cursorVersion: z.string().trim().min(1).max(80).optional(),
             antigravityVersion: z.string().trim().min(1).max(80).optional(),
+            piVersion: z.string().trim().min(1).max(80).optional(),
             platform: z.string().trim().min(1).max(120).optional(),
             agentVersion: z.string().trim().min(1).max(40).optional()
           }).parse(parsed);
@@ -766,6 +767,7 @@ async function main(): Promise<void> {
           const nextGrok = meta.grokVersion?.trim();
           const nextCursor = meta.cursorVersion?.trim();
           const nextAntigravity = meta.antigravityVersion?.trim();
+          const nextPi = meta.piVersion?.trim();
           const nextPlatform = meta.platform?.trim();
           const nextAgentVersion = meta.agentVersion?.trim();
           await sql`
@@ -776,6 +778,7 @@ async function main(): Promise<void> {
               grok_version = CASE WHEN ${nextGrok ?? null}::text IS NULL THEN grok_version ELSE ${nextGrok ?? null} END,
               cursor_version = CASE WHEN ${nextCursor ?? null}::text IS NULL THEN cursor_version ELSE ${nextCursor ?? null} END,
               antigravity_version = CASE WHEN ${nextAntigravity ?? null}::text IS NULL THEN antigravity_version ELSE ${nextAntigravity ?? null} END,
+              pi_version = CASE WHEN ${nextPi ?? null}::text IS NULL THEN pi_version ELSE ${nextPi ?? null} END,
               platform = COALESCE(${nextPlatform ?? null}, platform),
               agent_version = COALESCE(${nextAgentVersion ?? null}, agent_version),
               last_seen_at = now()
@@ -789,6 +792,7 @@ async function main(): Promise<void> {
             ...(nextGrok ? { grokVersion: nextGrok } : {}),
             ...(nextCursor ? { cursorVersion: nextCursor } : {}),
             ...(nextAntigravity ? { antigravityVersion: nextAntigravity } : {}),
+            ...(nextPi ? { piVersion: nextPi } : {}),
             ...(nextPlatform ? { platform: nextPlatform } : {}),
             ...(nextAgentVersion ? { agentVersion: nextAgentVersion } : {})
           }));

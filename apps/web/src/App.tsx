@@ -672,10 +672,11 @@ function assistantEngineBadge(engine: CliEngine): string {
 }
 
 function EngineLogo({ engine, size = 14, className = "" }: { engine: CliEngine; size?: number; className?: string }) {
+  const extension = engine === "pi" ? "svg" : "png";
   return (
     <img
       className={`engine-logo ${className}`.trim()}
-      src={`/vendors/${engine}.png`}
+      src={`/vendors/${engine}.${extension}`}
       alt={cliEngineLabel(engine)}
       title={cliEngineLabel(engine)}
       width={size}
@@ -2248,7 +2249,7 @@ function FeaturedEngines() {
   return <section className="featured-engines" aria-label="支持的 AI 编程引擎">
     <div className="featured-engines-head">
       <span>主流模型厂商</span>
-      <strong>五款均已支持 · 一台主机自由选择</strong>
+      <strong>六款均已支持 · 一台主机自由选择</strong>
     </div>
     <div className="featured-engine-grid" role="list">
       {featuredEngines.map((item) => <article className={`featured-engine featured-engine-${item.engine}`} role="listitem" key={item.engine}>
@@ -2292,7 +2293,7 @@ function AuthScreen({ health, onAuthenticated }: { health: Health; onAuthenticat
     <section className="auth-story">
       <p className="eyebrow">随码 · 随时续码</p>
       <h1><span>随时随地，</span><span>灵感不断。</span></h1>
-      <p>随时从手机发起或继续电脑上的 AI 编程任务。Codex、Claude Code、Grok Build、Cursor Agent 与 Google Antigravity 在你的 Windows 或 macOS 主机上运行；云端仅转发加密消息，源码、凭据与工作区始终留在本机。</p>
+      <p>随时从手机发起或继续电脑上的 AI 编程任务。Codex、Claude Code、Grok Build、Cursor Agent、Google Antigravity 与 Pi 在你的 Windows 或 macOS 主机上运行；云端仅转发加密消息，源码、凭据与工作区始终留在本机。</p>
       <FeaturedEngines />
       <div className="signal-line"><span />端到端加密 · 本机执行</div>
       <ClientDownloads downloads={health.clientDownloads} />

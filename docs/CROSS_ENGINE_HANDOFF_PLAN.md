@@ -8,7 +8,7 @@ AnytimeVibe 可以实现跨引擎任务接力，但目标应定义为：
 
 > 同一个产品任务切换执行引擎，使用结构化 handoff 上下文创建或恢复目标引擎会话。
 
-这不是 Codex、Claude、Cursor、Grok 和 Antigravity 原生会话之间的无缝 resume。各引擎的会话 ID、transcript 格式、权限模型和工具协议都不兼容，不能把一个 provider session id 直接交给另一个引擎。
+这不是 Codex、Claude、Cursor、Grok、Antigravity 和 Pi 原生会话之间的无缝 resume。各引擎的会话 ID、transcript 格式、权限模型和工具协议都不兼容，不能把一个 provider session id 直接交给另一个引擎。
 
 推荐保留产品级 `threadId`，并在任务下维护多个引擎 session。切换时保留旧 session，目标引擎使用新的 provider session 或其已有 session，从而支持切回、审计和失败回退。
 
@@ -28,7 +28,7 @@ StoredTask {
 
 现有能力：
 
-- 创建任务时选择 Codex、Claude、Grok、Cursor 或 Antigravity。
+- 创建任务时选择 Codex、Claude、Grok、Cursor、Antigravity 或 Pi。
 - 同一引擎内继续任务和恢复原生 session。
 - Agent 统一处理流式输出、停止、权限映射、diff 和本地 CLI 接力。
 - Web 使用共享协议模块计算 token/context 显示。
@@ -274,7 +274,7 @@ type ContextUsage = {
 
 ### 阶段四：全引擎和切回
 
-- 加入 Cursor、Grok、Antigravity。
+- 加入 Cursor、Grok、Antigravity、Pi。
 - 允许在已有目标 session 上恢复。
 - 增加每个 session 的 usage、错误和 handoff 历史。
 
@@ -341,7 +341,7 @@ Web 层：
 
 ### P4：全引擎和稳定性
 
-- 接入 Cursor、Grok、Antigravity。
+- 接入 Cursor、Grok、Antigravity、Pi。
 - 增加断线恢复、并发 fencing、长摘要压缩和诊断日志。
 - 完成真实 CLI 版本矩阵验证。
 
@@ -389,7 +389,7 @@ Web 层：
 
 ### 开发前必须具备的验证材料
 
-- Codex、Claude 真实 CLI 版本的 stream/usage/session payload fixture，至少覆盖新会话、resume 失败、进程中断和稀疏 usage。
+- Codex、Claude、Pi 真实 CLI 版本的 stream/usage/session payload fixture，至少覆盖新会话、resume 失败、进程中断和稀疏 usage。
 - Agent 状态机测试：并发切换、重复 `commandId`、断电/重启恢复、目标失败回滚、源会话切回。
 - Web/协议兼容测试：旧客户端收到新事件、快照乱序、usage 快照晚到，以及切换边界消息不重复。
 - 一次真实端到端演练：在同一工作区先由引擎 A 修改文件，再切到引擎 B，验证摘要、diff、权限和最终 Git 状态一致。

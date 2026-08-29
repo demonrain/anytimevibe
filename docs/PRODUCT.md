@@ -1,9 +1,9 @@
 # 随码产品文档
 
-> 2026-08 更新：产品已支持 **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity 五引擎**、开放注册、多用户隔离、管理员后台（封禁 / 审计）、macOS/Windows Agent、多浏览器密钥授权、客户端自动更新与模型/推理强度选择。容量规划见 [CAPACITY.md](CAPACITY.md)。
+> 2026-08 更新：产品已支持 **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity / Pi 六引擎**、开放注册、多用户隔离、管理员后台（封禁 / 审计）、macOS/Windows Agent、多浏览器密钥授权、客户端自动更新与模型/推理强度选择。容量规划见 [CAPACITY.md](CAPACITY.md)。
 
 - 文档版本：`v0.6`
-- 产品状态：五引擎可用
+- 产品状态：六引擎可用
 - 更新日期：2026-08-16
 - 中文产品名：随码
 - 工程 / 英文代号：AnytimeVibe
@@ -13,7 +13,7 @@
 
 **随码**是面向个人开发者与小团队的**远程 AI 编程工作台**。主 slogan：**离开电脑，任务不用停。** 副 slogan：**随时续上你的代码。**
 
-用户通过手机或桌面浏览器中的 PWA，连接自己的 Windows / macOS 电脑，选择 **Codex、Claude Code、Grok Build、Cursor Agent 或 Google Antigravity** 在本机执行任务，并同步任务状态、流式回复、会话记录、审批与完成通知。
+用户通过手机或桌面浏览器中的 PWA，连接自己的 Windows / macOS 电脑，选择 **Codex、Claude Code、Grok Build、Cursor Agent、Google Antigravity 或 Pi** 在本机执行任务，并同步任务状态、流式回复、会话记录、审批与完成通知。
 
 产品**不是**远程桌面，也不把项目源码或引擎凭据上传到中继。桌面 Agent 在用户电脑上调用已安装的编码 CLI；VPS 中继只负责身份验证、在线路由、Web Push 与端到端加密事件的存储。
 
@@ -27,7 +27,7 @@
 ### 1.2 核心价值
 
 - 连续性：离开电脑后仍可继续任务与对话。
-- 多引擎：同一工作台管理 Codex / Claude / Grok / Cursor / Antigravity 任务，可筛选与接力。
+- 多引擎：同一工作台管理 Codex / Claude / Grok / Cursor / Antigravity / Pi 任务，可筛选与接力。
 - 可控性：审批与权限模式可在手机上完成。
 - 安全性：白名单工作区 + 业务内容端到端加密。
 
@@ -35,7 +35,7 @@
 
 ### 2.1 目标用户
 
-- 日常使用 Codex CLI、Claude Code、Grok Build、Cursor Agent 或 Google Antigravity 编写、调试或重构。
+- 日常使用 Codex CLI、Claude Code、Grok Build、Cursor Agent、Google Antigravity 或 Pi 编写、调试或重构。
 - 有一台可保持登录的 Windows 或 macOS 开发电脑。
 - 希望在通勤、会议间隙继续处理任务或处理审批。
 - 能自行或请人部署带域名与 HTTPS 的 VPS（公开服务）。
@@ -54,7 +54,7 @@
 
 - 用户名密码登录；支持开放注册与用户级数据隔离。
 - 多台 Windows / macOS 主机配对、自定义名称。
-- 白名单工作区内创建 **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity** 任务。
+- 白名单工作区内创建 **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity / Pi** 任务。
 - 流式回复、继续任务、追加方向、停止任务；列表按最后活动时间排序。
 - 引擎检测、权限模式映射、模型 / 推理强度选择（按引擎能力）。
 - 多浏览器主机密钥授权；Web Push 审批与完成通知。
@@ -80,11 +80,13 @@ flowchart LR
     Router <-->|streaming-json| Grok[Grok Build]
     Router <-->|stream-json| Cursor[Cursor Agent]
     Router <-->|stream-json| Antigravity[Google Antigravity]
+    Router <-->|JSONL RPC| Pi[Pi Coding Agent]
     Codex --> Workspace[白名单工作区]
     Claude --> Workspace
     Grok --> Workspace
     Cursor --> Workspace
     Antigravity --> Workspace
+    Pi --> Workspace
     Relay --> DB[(PostgreSQL)]
     Relay --> Push[Web Push]
 ```
@@ -106,7 +108,7 @@ flowchart LR
 
 - Electron 托盘（Windows / macOS）。
 - `safeStorage` 保护令牌与密钥；工作区白名单。
-- 检测并调用 Codex / Claude / Grok / Cursor / Antigravity；本地会话导入；并发远程任务 Tab 与引擎筛选。
+- 检测并调用 Codex / Claude / Grok / Cursor / Antigravity / Pi；本地会话导入；并发远程任务 Tab 与引擎筛选。
 - 原生 CLI 接力与自动更新。
 
 ### 4.4 多引擎适配
@@ -118,6 +120,7 @@ flowchart LR
 | Grok Build | `grok -p --output-format streaming-json` | sessions · `--resume` |
 | Cursor Agent | `agent -p --output-format stream-json --stream-partial-output` | `~/.cursor/chats` · `--resume` |
 | Antigravity | `agy -p --output-format stream-json` | `~/.gemini/antigravity-cli/brain` · `--conversation <id>` |
+| Pi | `pi --mode rpc --approve` | `~/.pi/agent/sessions` · `--session <id>` |
 
 任务绑定引擎与可选模型 / 推理强度；列表按 **最后活动时间** 倒序。
 
@@ -162,7 +165,7 @@ flowchart LR
 
 ### 5.4 任务与对话
 
-一个产品任务对应一台主机、一个白名单工作区和一个**引擎原生会话**（Codex thread / Claude session / Grok session）。
+一个产品任务对应一台主机、一个白名单工作区和一个**引擎原生会话**（Codex thread / Claude session / Grok session / Pi session）。
 
 - 新任务：选择引擎，创建或恢复原生会话并发送第一条用户指令。
 - 继续任务：对空闲会话发起新回合；列表按最后活动时间排序。

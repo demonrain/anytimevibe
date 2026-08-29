@@ -1719,12 +1719,16 @@ function rendererHtml(): string {
     if(/^\\[grok\\]/i.test(title)) return 'grok';
     if(/^\\[cursor\\]/i.test(title)) return 'cursor';
     if(/^\\[antigravity\\]/i.test(title)) return 'antigravity';
+    if(/^\\[pi\\]/i.test(title)) return 'pi';
     return 'codex';
   }
   var I18N={
     'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',logs:'日志',logTitle:'运行日志',logRefresh:'刷新',logCopy:'复制',logClear:'清空',logOpenFile:'打开文件',logClose:'关闭',logEmpty:'暂无日志',logFooter:'最近运行记录 · 便于排查连接与任务问题',logCopied:'已复制到剪贴板',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',expand:'展开',collapse:'收起',open:'接力',tabGuide:'指引',tabEnv:'环境',tabPair:'配对',tabWs:'工作区',tabTasks:'任务',guideTitle:'快速上手',guideTip:'按下面步骤完成后，即可在网页端远程下发任务到本机编码引擎。',envTitle:'本机环境',envHint:'先安装 Node（Codex 需要）与至少一个编码引擎 CLI，再去做配对。',pairTitle:'中继与配对',pairHint:'保存中继地址后生成配对码，在 Web 端输入即可绑定本机。',relayLabel:'中继服务器',nameLabel:'客户端名称',wsTitle:'允许的工作区',wsHint:'只有白名单目录可被远程任务读写。至少添加一个项目路径。',stepEnv:'安装前置环境',stepEnvDesc:'安装 Node.js（Codex 需要）以及 Codex / Claude / Grok / Cursor / Antigravity 中至少一个 CLI 并登录。',stepRelay:'配置中继服务器',stepRelayDesc:'确认中继地址正确并保存（默认体验站可用）。',stepPair:'生成配对码并绑定',stepPairDesc:'点击生成配对码，在网页「添加主机」中输入。码约 10 分钟有效。',stepWs:'添加工作区目录',stepWsDesc:'允许至少一个本机项目目录，远程任务才能在该路径执行。',stepReady:'开始使用',stepReadyDesc:'网页端在线后即可新建任务。本页「任务」可接力到本机终端。',goEnv:'去环境',goPair:'去配对',goWs:'去工作区',goTasks:'看任务',done:'完成',todo:'待办',onlineReady:'已在线，可在网页下发任务。'},
     en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',logs:'Logs',logTitle:'Runtime logs',logRefresh:'Refresh',logCopy:'Copy',logClear:'Clear',logOpenFile:'Open file',logClose:'Close',logEmpty:'No logs yet',logFooter:'Recent runtime events for troubleshooting',logCopied:'Copied to clipboard',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',expand:'Expand',collapse:'Collapse',open:'Open',tabGuide:'Guide',tabEnv:'Setup',tabPair:'Pair',tabWs:'Folders',tabTasks:'Tasks',guideTitle:'Get started',guideTip:'Finish the steps below so the web app can send coding tasks to this machine.',envTitle:'Local environment',envHint:'Install Node (for Codex) and at least one coding CLI, then pair.',pairTitle:'Relay & pairing',pairHint:'Save the relay URL, generate a code, and enter it on the web.',relayLabel:'Relay server',nameLabel:'Client name',wsTitle:'Allowed workspaces',wsHint:'Only allowlisted folders can be used by remote tasks. Add at least one project path.',stepEnv:'Install prerequisites',stepEnvDesc:'Install Node.js (needed for Codex) and at least one of Codex / Claude / Grok / Cursor / Antigravity CLI, then sign in.',stepRelay:'Configure relay',stepRelayDesc:'Confirm and save the relay URL (public demo works by default).',stepPair:'Pair with the web app',stepPairDesc:'Generate a pairing code and enter it under Add host on the web. Codes expire in ~10 minutes.',stepWs:'Allow a workspace folder',stepWsDesc:'Add at least one local project directory for remote tasks to run in.',stepReady:'You are ready',stepReadyDesc:'When online, create tasks from the web. Use Tasks here to hand off to a local terminal.',goEnv:'Setup',goPair:'Pair',goWs:'Folders',goTasks:'Tasks',done:'Done',todo:'Todo',onlineReady:'Online — send tasks from the web.'}
   };
+  // Keep the setup checklist aligned with all supported coding engines.
+  I18N['zh-CN'].stepEnvDesc=I18N['zh-CN'].stepEnvDesc.replace('Antigravity','Antigravity / Pi');
+  I18N.en.stepEnvDesc=I18N.en.stepEnvDesc.replace('Antigravity CLI','Antigravity / Pi CLI');
   var locale=(function(){try{return localStorage.getItem('anytimevibe-locale')==='en'?'en':'zh-CN';}catch(e){return 'zh-CN';}})();
   function t(key){return (I18N[locale]&&I18N[locale][key])||I18N.en[key]||key}
   var activeTab=(function(){try{return localStorage.getItem('anytimevibe-tab')||'guide';}catch(e){return 'guide';}})();
@@ -1870,7 +1874,7 @@ function rendererHtml(): string {
       var codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">'+(env.codexInstalled?'安装兼容版':'一键安装')+'</button>':'';
       if(environment){
         var engineExtra=engines.filter(function(item){return item.engine!=='codex';}).map(function(item){
-          var label=item.engine==='claude'?'Claude Code':item.engine==='cursor'?'Cursor Agent':item.engine==='antigravity'?'Antigravity':'Grok Build';
+          var label=item.engine==='claude'?'Claude Code':item.engine==='cursor'?'Cursor Agent':item.engine==='antigravity'?'Antigravity':item.engine==='pi'?'Pi':item.engine==='grok'?'Grok Build':'Codex';
           var action=!item.ready?'<button data-install="'+escapeHtml(item.engine)+'" class="secondary">一键安装</button>':'';
           return '<div class="check '+(item.ready?'ok':'')+'"><b>'+escapeHtml(label)+'</b><span>'+escapeHtml(item.version||item.detail||(item.ready?'就绪':'未安装'))+'</span>'+action+'</div>';
         }).join('');
@@ -2081,7 +2085,7 @@ function rendererHtml(): string {
     if((el=document.querySelector('#addWorkspace'))&&api) el.addEventListener('click',function(){api.addWorkspace();});
     if((el=document.querySelector('#recheck'))&&api) el.addEventListener('click',function(){
       el.disabled=true;
-      if(detail) detail.textContent=locale==='en'?'Detecting Node / Codex / Claude / Grok / Cursor / Antigravity…':'正在检测 Node / Codex / Claude / Grok / Cursor / Antigravity…';
+      if(detail) detail.textContent=locale==='en'?'Detecting Node / Codex / Claude / Grok / Cursor / Antigravity / Pi…':'正在检测 Node / Codex / Claude / Grok / Cursor / Antigravity / Pi…';
       Promise.resolve(api.checkEnvironment()).then(function(state){
         if(state) paint(state);
       }).catch(function(error){
@@ -2550,7 +2554,7 @@ async function findCodex(): Promise<void> {
   }
 }
 
-/** True when at least one of Codex / Claude / Grok is usable for remote tasks. */
+/** True when at least one supported coding engine is usable for remote tasks. */
 function anyCodingEngineReady(
   environment: EnvironmentState = publicState.environment,
   engines: CliEngineInfo[] = publicState.availableEngines
@@ -6026,7 +6030,7 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   updateState({ tasks });
 }
 
-/** Recent tasks to fully sync per coding engine (Codex / Claude / Grok / Cursor / Antigravity each). */
+/** Recent tasks to fully sync per supported coding engine. */
 const DEFAULT_SYNC_LIMIT = 10;
 /** Codex thread/list page size / max matches published for one search. */
 const SEARCH_LIST_LIMIT = 100;
@@ -7326,7 +7330,7 @@ function registerIpc(): void {
       codexVersion: environment.codexVersion || publicState.codexVersion,
       status: statusForEngineAvailability({ environment, engines: availableEngines, paired }),
       detail: !ready
-        ? "未检测到可用编码引擎。请安装 Codex / Claude Code / Grok Build / Cursor / Antigravity 任意一种后重试。"
+        ? "未检测到可用编码引擎。请安装 Codex / Claude Code / Grok Build / Cursor / Antigravity / Pi 任意一种后重试。"
         : `环境检测完成：${readyLabels || "就绪"}${paired ? "。主机引擎能力已同步到网页。" : "。"}${
           !environment.codexCompatible ? "（未安装 Codex 也可连接中继）" : ""
         }`
@@ -7538,7 +7542,7 @@ app.whenReady().then(async () => {
   });
   if (config.pairing) schedulePairingPoll();
   // Connect immediately when paired — never wait on Codex/env probes (those can hang PATH shells).
-  // Any of Codex / Claude / Grok is enough; missing Codex must not prevent relay.
+  // Any supported coding engine is enough; missing Codex must not prevent relay.
   if (config.hostId) void connect().catch(handleError);
   // Background env detect (Codex optional; failures must not block relay).
   void (async () => {

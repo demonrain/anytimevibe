@@ -49,6 +49,7 @@ type AdminHost = {
   grokVersion?: string | null;
   cursorVersion?: string | null;
   antigravityVersion?: string | null;
+  piVersion?: string | null;
   agentVersion?: string | null;
   /** Sync envelopes created in the last 24 hours (activity signal). */
   events24h?: number;
@@ -423,7 +424,7 @@ export function AdminApp() {
           </div>
         </header>
         <p className="admin-hint" style={{ margin: "0 0 12px" }}>
-          「客户端」与「编码引擎」版本由桌面 Agent 上线后自动上报（Codex / Claude / Grok / Cursor / Antigravity）。
+          「客户端」与「编码引擎」版本由桌面 Agent 上线后自动上报（Codex / Claude / Grok / Cursor / Antigravity / Pi）。
           「24h 活跃」为近 24 小时同步信封数；「累计吞吐」为该主机已上报的最大 sequence（历史总量代理，不受 1 万条缓冲上限影响）。
           「撤销」仅禁用配对；「删除」永久移除主机与同步密文。
         </p>
@@ -468,6 +469,7 @@ export function AdminApp() {
                       <div><span>Grok</span><code title={String(host.grokVersion || "")}>{formatEngineVersion(host.grokVersion)}</code></div>
                       <div><span>Cursor</span><code title={String(host.cursorVersion || "")}>{formatEngineVersion(host.cursorVersion)}</code></div>
                       <div><span>Antigravity</span><code title={String(host.antigravityVersion || "")}>{formatEngineVersion(host.antigravityVersion)}</code></div>
+                      <div><span>Pi</span><code title={String(host.piVersion || "")}>{formatEngineVersion(host.piVersion)}</code></div>
                     </div>
                   </td>
                   <td title={`${host.events24h ?? 0} 条 / 24h`}>{formatHostCounter(host.events24h)}</td>

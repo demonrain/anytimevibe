@@ -95,7 +95,7 @@
 | Antigravity | `agy -p --output-format stream-json` | 沙箱 (`--sandbox`)、计划模式 (`--mode plan`)、接受编辑 (`--mode accept-edits`)、跳过权限确认 (`--dangerously-skip-permissions`) | 导入 `~/.gemini/antigravity-cli/brain` 会话记录，并通过 `agy --conversation <id>` 接力 |
 | Pi | `pi --mode rpc --approve` | 只读工具、审批或完全访问映射为 Pi 工具集 | 导入 `~/.pi/agent/sessions`，通过 `--session <id>` 恢复，并支持原生 CLI 接力 |
 
-任务创建页只允许选择当前主机已检测为可用的引擎。Claude / Grok / Cursor / Antigravity 可以通过 `CLAUDE_MODEL`、`ANTHROPIC_MODEL`、`GROK_MODEL`、`XAI_MODEL`、`CURSOR_MODEL` 或 `AGY_MODEL`/`ANTIGRAVITY_MODEL` 指定模型；未设置时使用对应 CLI 的本机默认配置（Cursor 默认为 Composer 2.5）。Cursor 和 Antigravity 还支持按模型选择 Effort（思考深度），Cursor 支持部分模型的 Fast 模式；二进制可通过 `CURSOR_COMMAND` / `CURSOR_AGENT_COMMAND` 或 `AGY_COMMAND` 覆盖。
+任务创建页只允许选择当前主机已检测为可用的引擎。Claude / Grok / Cursor / Antigravity 可以通过 `CLAUDE_MODEL`、`ANTHROPIC_MODEL`、`GROK_MODEL`、`XAI_MODEL`、`CURSOR_MODEL` 或 `AGY_MODEL`/`ANTIGRAVITY_MODEL` 指定模型；未设置时使用对应 CLI 的本机默认配置（Cursor 默认为 Composer 2.5）。Pi 使用其本机 provider/model 配置，并通过 RPC 报告 usage；Cursor 和 Antigravity 还支持按模型选择 Effort（思考深度），Cursor 支持部分模型的 Fast 模式；二进制可通过 `CURSOR_COMMAND` / `CURSOR_AGENT_COMMAND` 或 `AGY_COMMAND` 覆盖。
 
 ## 系统架构
 

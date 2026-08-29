@@ -22,7 +22,7 @@
 
 | 能力项 | 随码（AnytimeVibe） | Paseo |
 |---|---|---|
-| 多引擎接入 | Codex / Claude / Grok / Cursor / Antigravity（五引擎） | Claude / Codex / Copilot / OpenCode / Pi 等 |
+| 多引擎接入 | Codex / Claude / Grok / Cursor / Antigravity / Pi（六引擎） | Claude / Codex / Copilot / OpenCode / Pi 等 |
 | 手机端续任务 | 强（产品主线） | 强 |
 | 任务审批流 | 强（移动端审批 + Push） | 有权限与交互机制，但产品重心更偏编排通用性 |
 | 多用户与管理后台 | 有（注册、封禁、审计） | 文档侧重个人/团队编排，后台治理不是主卖点 |

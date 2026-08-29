@@ -22,6 +22,10 @@
 | 原生任务列表/历史 | `thread/list`、`thread/read` | 主要依赖本地 session 文件导入 | `grok sessions` + 本地索引 | 本地 chat 文件导入 | brain/conversation 文件导入 |
 | 原生终端接力 | `codex resume`，需释放 app-server writer | `claude --resume` | `grok --resume` | `agent --resume` | `agy --conversation` |
 
+### Pi Coding Agent 补充
+
+Pi 通过 `pi --mode rpc --approve` 接入，使用 `~/.pi/agent/sessions` JSONL 会话文件和 `--session <id>` 恢复。RPC usage 可用于显示已消耗 token；Pi 当前没有可依赖的原生上下文窗口字段，因此窗口占用百分比保持隐藏。Pi 暂无与 Codex `turn/steer` 等价的原生 steering，产品层应使用等待队列或插队运行语义。
+
 ## 2. 用户提到的三类能力
 
 ### 2.1 GPT/Codex 的目标引导（steering）

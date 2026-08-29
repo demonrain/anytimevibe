@@ -1,6 +1,6 @@
 # 本地测试环境
 
-用于在**发版前**完整联调：Web ↔ Relay ↔ Agent ↔ 本机 Codex。  
+用于在**发版前**完整联调：Web ↔ Relay ↔ Agent ↔ 本机编码引擎（Codex 或 Pi）。
 本地环境与线上隔离（独立数据库、独立 Agent 用户数据目录）。
 
 ## 架构
@@ -14,7 +14,7 @@
         ├── PostgreSQL 127.0.0.1:5432  (Docker)
         │
         └── Agent Electron  (ANYTIMEVIBE_RELAY_URL=http://127.0.0.1:8787)
-                 └── 本机 Codex CLI
+                 └── 本机 Codex / Pi CLI
 ```
 
 ## 依赖
@@ -26,6 +26,7 @@
 | 本地 Postgres | **推荐无需 Docker**：`pnpm dev:pg`（embedded）或本机安装 PostgreSQL 16 |
 | Docker Desktop | 可选；若一直卡在 Starting the Docker Engine，可不用 |
 | Codex CLI 0.144.x / 0.145.x | Agent 执行任务需要 |
+| Pi CLI | 可选，用于验证 Pi RPC 任务与会话导入 |
 
 > **不要用「管理员身份」终端跑 embedded Postgres**（PostgreSQL 禁止以 Administrator 启动）。用普通 Windows Terminal / PowerShell 即可。
 

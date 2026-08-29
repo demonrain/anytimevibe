@@ -89,7 +89,7 @@ pnpm --filter @anytimevibe/agent package:mac
 
 - 手册版本：`v0.6`
 - 适用产品：随码（AnytimeVibe）
-- 支持引擎：Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity
+- 支持引擎：Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity / Pi Coding Agent
 
 ## 1. 使用前准备
 
@@ -108,6 +108,7 @@ pnpm --filter @anytimevibe/agent package:mac
   - xAI Grok Build CLI (`grok`)
   - Cursor Agent CLI (`agent` / `cursor-agent`)
   - Google Antigravity CLI (`agy`)
+  - Pi Coding Agent CLI (`pi`)
 - 开发电脑能够主动访问随码服务地址。
 - 系统用户会保持登录；锁屏可以，注销或关机会使代理离线。
 
