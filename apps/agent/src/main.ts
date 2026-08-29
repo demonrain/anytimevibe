@@ -46,7 +46,10 @@ import {
   type Workspace,
   PRODUCT_VERSION,
   mergeContextUsage,
-  normalizeContextUsage
+  normalizeContextUsage,
+  normalizeSessionContextUsage,
+  normalizeTurnContextUsage,
+  resolveContextUsageTotals
 } from "@anytimevibe/protocol";
 import {
   CodexAdapter,
@@ -328,6 +331,7 @@ function noteThreadProgress(threadId: string): void {
 
 const usageFlushTimers = new Map<string, NodeJS.Timeout>();
 const pendingUsageByThread = new Map<string, ContextUsage>();
+const turnUsageByThread = new Map<string, ContextUsage>();
 const queuedCommandIds = new Set<string>();
 const pendingRequestTypes = new Map<string, "command" | "file" | "permission" | "input" | "plan" | "question" | "elicitation">();
 
@@ -4069,10 +4073,15 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
   if (event.type === "turn.started") {
     activeTurnByThread.set(event.threadId, event.turnId);
     lastProgressAtByThread.set(event.threadId, Date.now() / 1000);
+    turnUsageByThread.delete(event.threadId);
     clearEngineDiffChunks(event.threadId);
     // Headless path already upserts the user message + snapshot before spawning the CLI.
     // Omitting prompt here avoids the web adding a second YOU bubble for the same turn.
     const stored = taskStore.get(event.threadId);
+    if (stored) {
+      delete stored.turnContextUsage;
+      await taskStore.upsert(stored);
+    }
     await captureTurnDiffBaseline(event.threadId, stored?.cwd);
     const lastUser = stored
       ? [...stored.messages].reverse().find((message) => message.role === "user")
@@ -4140,7 +4149,9 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     return;
   }
   if (event.type === "usage") {
-    await recordUsageUpdate(event.threadId, event.contextUsage);
+    await recordUsageUpdate(event.threadId, event.contextUsage, {
+      turnUsage: event.turnContextUsage ?? event.contextUsage
+    });
     return;
   }
   if (event.type === "error") {
@@ -4196,8 +4207,14 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     const waitingApproval = isApprovalPause;
     const statusForStore = waitingApproval ? "active" : event.status;
     const pendingUsage = pendingUsageByThread.get(event.threadId);
+    const finalTurnUsage = turnUsageByThread.get(event.threadId)
+      ?? event.turnContextUsage
+      ?? (event.contextUsage && resolveContextUsageTotals(event.contextUsage).totalTokens != null
+        ? event.contextUsage
+        : undefined);
     activeTurnByThread.delete(event.threadId);
     lastProgressAtByThread.delete(event.threadId);
+    turnUsageByThread.delete(event.threadId);
     const usageTimer = usageFlushTimers.get(event.threadId);
     if (usageTimer) clearTimeout(usageTimer);
     usageFlushTimers.delete(event.threadId);
@@ -4215,6 +4232,7 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
         } else if (pendingUsage) {
           task.contextUsage = mergeContextUsage(task.contextUsage, pendingUsage);
         }
+        if (finalTurnUsage) task.turnContextUsage = finalTurnUsage;
         await taskStore.upsert(task);
       }
     }
@@ -4250,6 +4268,7 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
       turnId: event.turnId,
       status: waitingApproval ? "active" : event.status,
       ...(event.contextUsage ? { contextUsage: event.contextUsage } : {}),
+      ...(finalTurnUsage ? { turnContextUsage: finalTurnUsage } : {}),
       ...(failedSystemText ? { errorMessage: failedSystemText } : {})
     }, true, "completed");
     // Collect workspace / engine diffs for the Diff tab (Claude / Grok headless path).
@@ -4347,6 +4366,7 @@ async function publishStoredTaskSnapshot(
     ...(task.thinking !== undefined ? { thinking: task.thinking } : {}),
     ...(task.runInfo ? { runInfo: task.runInfo } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
+    ...(task.turnContextUsage ? { turnContextUsage: task.turnContextUsage } : {}),
     ...(!options.lightweight && task.lastDiff !== undefined ? { diff: task.lastDiff } : {}),
     messages: options.lightweight ? [] : windowed.messages,
     ...(!options.lightweight ? {
@@ -4494,6 +4514,9 @@ async function runHeadlessTaskTurn(options: {
     // The headless parser accumulates this turn only. Merge it with the task
     // snapshot so a sparse final event cannot reset prior context metadata.
     latest.contextUsage = mergeContextUsage(latest.contextUsage, result.contextUsage);
+    if (resolveContextUsageTotals(result.contextUsage).totalTokens != null) {
+      latest.turnContextUsage = result.contextUsage;
+    }
   }
   if (result.model) latest.model = result.model;
   // Cursor plan/question pause ends as interrupted — keep task active until Web resolves.
@@ -4624,10 +4647,27 @@ async function handleCommand(command: ClientCommand): Promise<void> {
   }
 }
 
-async function recordUsageUpdate(threadId: string, usage: ContextUsage): Promise<void> {
+async function recordUsageUpdate(
+  threadId: string,
+  usage: ContextUsage,
+  options?: { raw?: unknown; turnUsage?: ContextUsage }
+): Promise<void> {
   const task = taskStore.get(threadId);
   if (!task) return;
-  const merged = mergeContextUsage(pendingUsageByThread.get(threadId), usage);
+
+  const turnSample = options?.turnUsage
+    ?? (options?.raw ? normalizeTurnContextUsage(options.raw) : undefined)
+    ?? usage;
+  if (turnSample && resolveContextUsageTotals(turnSample).totalTokens != null) {
+    const mergedTurn = mergeContextUsage(turnUsageByThread.get(threadId), turnSample);
+    turnUsageByThread.set(threadId, mergedTurn);
+    task.turnContextUsage = mergedTurn;
+  }
+
+  const sessionSample = options?.raw ? normalizeSessionContextUsage(options.raw) : undefined;
+  const contextSample = sessionSample ? mergeContextUsage(usage, sessionSample) : usage;
+
+  const merged = mergeContextUsage(pendingUsageByThread.get(threadId), contextSample);
   pendingUsageByThread.set(threadId, mergeContextUsage(task.contextUsage, merged));
   lastProgressAtByThread.set(threadId, Date.now() / 1000);
   if (usageFlushTimers.has(threadId)) return;
@@ -4636,9 +4676,11 @@ async function recordUsageUpdate(threadId: string, usage: ContextUsage): Promise
     void (async () => {
       const current = taskStore.get(threadId);
       const latest = pendingUsageByThread.get(threadId);
+      const liveTurn = turnUsageByThread.get(threadId);
       pendingUsageByThread.delete(threadId);
       if (!current || !latest) return;
       current.contextUsage = mergeContextUsage(current.contextUsage, latest);
+      if (liveTurn) current.turnContextUsage = liveTurn;
       current.updatedAt = Date.now() / 1000;
       await taskStore.upsert(current);
       // thread.snapshot is understood by old v1 Web clients and carries the
@@ -5290,7 +5332,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       params
     );
     if (threadId && usage) {
-      await recordUsageUpdate(threadId, usage);
+      await recordUsageUpdate(threadId, usage, { raw: params });
     }
   }
   if (message.method === "item/started") {
@@ -5330,7 +5372,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     if (threadId) {
       const usage = normalizeContextUsage(params);
       if (usage) {
-        await recordUsageUpdate(threadId, usage);
+        await recordUsageUpdate(threadId, usage, { raw: params });
       }
     }
   }
@@ -5374,15 +5416,21 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const threadId = String(params.threadId ?? params.turn?.threadId ?? "");
     const turnId = String(params.turnId ?? params.turn?.id ?? "");
     if (threadId && turnId) activeTurnByThread.set(threadId, turnId);
-    if (threadId) lastProgressAtByThread.set(threadId, Date.now() / 1000);
+    if (threadId) {
+      lastProgressAtByThread.set(threadId, Date.now() / 1000);
+      turnUsageByThread.delete(threadId);
+    }
     if (threadId) {
       clearEngineDiffChunks(threadId);
       touchAgentTask(threadId, { status: "active", engine: "codex" });
       // Persist active so usage heartbeats / lightweight snapshots do not keep
       // broadcasting the previous turn's "completed" status mid-stream.
       const storedForStatus = taskStore.get(threadId);
-      if (storedForStatus && storedForStatus.status !== "active") {
-        storedForStatus.status = "active";
+      if (storedForStatus) {
+        delete storedForStatus.turnContextUsage;
+        if (storedForStatus.status !== "active") {
+          storedForStatus.status = "active";
+        }
         storedForStatus.updatedAt = Date.now() / 1000;
         await taskStore.upsert(storedForStatus);
       }
@@ -5409,12 +5457,16 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       // precedence and the native context window alongside the usage block.
       params
     );
+    const turnContextUsage = normalizeTurnContextUsage(params);
+    const sessionUsage = normalizeSessionContextUsage(params);
     const errorMessage = extractCodexTurnError(params.turn) || extractCodexTurnError(params);
     finishLocalActivity(threadId, turnStatus);
     await flushRemoteDeltas();
     const pendingUsage = pendingUsageByThread.get(threadId);
+    const finalTurnUsage = turnUsageByThread.get(threadId) ?? turnContextUsage;
     activeTurnByThread.delete(threadId);
     lastProgressAtByThread.delete(threadId);
+    turnUsageByThread.delete(threadId);
     const usageTimer = usageFlushTimers.get(threadId);
     if (usageTimer) clearTimeout(usageTimer);
     usageFlushTimers.delete(threadId);
@@ -5423,17 +5475,21 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const completedStored = taskStore.get(threadId);
     if (completedStored) {
       completedStored.status = turnStatus;
-      if (pendingUsage || contextUsage) {
+      if (pendingUsage || contextUsage || sessionUsage) {
         // Keep the durable snapshot as the base. A final Codex event can be
         // sparse (or cumulative-only), and must not erase a better live sample.
         const withPending = pendingUsage
           ? mergeContextUsage(completedStored.contextUsage, pendingUsage)
           : completedStored.contextUsage;
-        const mergedUsage = contextUsage
-          ? mergeContextUsage(withPending, contextUsage)
+        const withSession = sessionUsage
+          ? mergeContextUsage(withPending, sessionUsage)
           : withPending;
+        const mergedUsage = contextUsage
+          ? mergeContextUsage(withSession, contextUsage)
+          : withSession;
         if (mergedUsage) completedStored.contextUsage = mergedUsage;
       }
+      if (finalTurnUsage) completedStored.turnContextUsage = finalTurnUsage;
       completedStored.updatedAt = Date.now() / 1000;
       await taskStore.upsert(completedStored);
     }
@@ -5467,6 +5523,9 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
         message: `任务失败（${turnStatus}）。本机 Codex 未返回详细错误信息，请在客户端「任务 → 接力」查看终端输出。`
       }, true);
     }
+    const publishedContextUsage = sessionUsage
+      ? mergeContextUsage(contextUsage, sessionUsage)
+      : contextUsage;
     await publish({
       type: "turn.completed",
       eventId: crypto.randomUUID(),
@@ -5474,7 +5533,8 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       threadId: params.threadId,
       turnId: params.turn?.id ?? turnId,
       status: turnStatus,
-      ...(contextUsage ? { contextUsage } : {}),
+      ...(publishedContextUsage ? { contextUsage: publishedContextUsage } : {}),
+      ...(finalTurnUsage ? { turnContextUsage: finalTurnUsage } : {}),
       ...(errorMessage ? { errorMessage } : {})
     }, true, "completed");
     // Workspace git diff + any fileChange patches → Diff tab.
@@ -5830,6 +5890,7 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     ...(stored?.model ? { model: stored.model } : {}),
     ...(stored?.reasoningEffort ? { reasoningEffort: stored.reasoningEffort } : {}),
     ...(stored?.contextUsage ? { contextUsage: stored.contextUsage } : {}),
+    ...(stored?.turnContextUsage ? { turnContextUsage: stored.turnContextUsage } : {}),
     ...(stored?.lastDiff !== undefined ? { diff: stored.lastDiff } : {}),
     ...(stored?.providerSessionId ? { providerSessionId: stored.providerSessionId } : { providerSessionId: threadId }),
     ...(liveTurnId ? { activeTurnId: liveTurnId } : {})

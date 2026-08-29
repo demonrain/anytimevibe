@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.4.107";
+export const PRODUCT_VERSION = "0.5.0";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -195,6 +195,8 @@ export type ContextUsage = z.infer<typeof contextUsageSchema>;
  */
 export {
   normalizeContextUsage,
+  normalizeTurnContextUsage,
+  normalizeSessionContextUsage,
   mergeContextUsage,
   withDerivedTotals,
   resolveContextUsageTotals,
@@ -484,6 +486,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     thinking: z.boolean().optional(),
     runInfo: runInfoSchema.optional(),
     contextUsage: contextUsageSchema.optional(),
+    /** Current-turn token consumption when the CLI reports it separately from session cumulative. */
+    turnContextUsage: contextUsageSchema.optional(),
     /** Unified diff / git status for the task Diff tab (optional; may be large). */
     diff: z.string().max(500_000).optional(),
     messages: z.array(z.object({
@@ -538,13 +542,15 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     turnId: z.string(),
     status: z.string(),
     contextUsage: contextUsageSchema.optional(),
+    turnContextUsage: contextUsageSchema.optional(),
     /** Failure reason when status is failed / systemerror / error. */
     errorMessage: z.string().max(4000).optional()
   }),
   eventBase.extend({
     type: z.literal("usage.updated"),
     threadId: z.string(),
-    contextUsage: contextUsageSchema
+    contextUsage: contextUsageSchema,
+    turnContextUsage: contextUsageSchema.optional()
   }),
   eventBase.extend({
     type: z.literal("command.status"),

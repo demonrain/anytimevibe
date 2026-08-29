@@ -20,10 +20,10 @@ export type BackendStreamEvent =
   | { type: "delta"; threadId: string; turnId: string; itemId: string; kind: StreamDeltaKind; delta: string }
   | { type: "turn.started"; threadId: string; turnId: string; prompt?: string }
   | { type: "turn.info"; threadId: string; turnId: string; runInfo: RunInfo }
-  | { type: "turn.completed"; threadId: string; turnId: string; status: string; contextUsage?: ContextUsage }
+  | { type: "turn.completed"; threadId: string; turnId: string; status: string; contextUsage?: ContextUsage; turnContextUsage?: ContextUsage }
   | { type: "session"; threadId: string; providerSessionId: string }
   | { type: "error"; threadId?: string; message: string }
-  | { type: "usage"; threadId: string; contextUsage: ContextUsage }
+  | { type: "usage"; threadId: string; contextUsage: ContextUsage; turnContextUsage?: ContextUsage }
   | {
       type: "approval.requested";
       threadId: string;
@@ -57,6 +57,8 @@ export type StoredTask = {
   /** Last web permission mode — reused by interactive CLI handoff. */
   permissionMode?: PermissionMode;
   contextUsage?: ContextUsage;
+  /** Current-turn token consumption when reported separately from session cumulative. */
+  turnContextUsage?: ContextUsage | undefined;
   /** Last known unified diff / git status for the Diff tab (persisted across reconnect). */
   lastDiff?: string;
   messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string }>;

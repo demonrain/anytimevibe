@@ -188,6 +188,66 @@ function findCumulativeUsageSources(sources: Record<string, unknown>[]): Set<Rec
   return cumulative;
 }
 
+/** Parse measured token fields from an explicit source list (shared by scope helpers). */
+function normalizeMeasuredUsage(
+  measurementSources: Record<string, unknown>[],
+  windowSources: Record<string, unknown>[]
+): ContextUsage | undefined {
+  const reportedInput = readNumber(measurementSources, INPUT_KEYS);
+  const outputTokens = readNumber(measurementSources, OUTPUT_KEYS);
+  const cacheRead = readNumber(measurementSources, CACHE_READ_ADDITIVE_KEYS);
+  const cacheCreation = readNumber(measurementSources, CACHE_CREATION_KEYS);
+  const cacheSubset = readNumber(measurementSources, CACHE_SUBSET_KEYS);
+  const reasoningTokens = readNumber(measurementSources, REASONING_KEYS);
+  const reportedTotal = readNumber(measurementSources, REPORTED_TOTAL_KEYS);
+
+  const anthropicStyle = cacheRead != null || cacheCreation != null;
+  const subsetInvariantBroken =
+    cacheSubset != null && reportedInput != null && cacheSubset > reportedInput;
+
+  let inputTokens: number | undefined;
+  if (anthropicStyle) {
+    inputTokens = (reportedInput ?? 0) + (cacheRead ?? 0) + (cacheCreation ?? 0);
+  } else if (subsetInvariantBroken) {
+    inputTokens = (reportedInput ?? 0) + (cacheSubset ?? 0);
+  } else {
+    inputTokens = reportedInput;
+  }
+
+  const cachedInputTokens = cacheRead ?? cacheSubset;
+  const reportedWindow = readNumber(windowSources, CONTEXT_WINDOW_KEYS);
+  const contextWindow = reportedWindow != null && reportedWindow > 0 ? reportedWindow : undefined;
+  const planRemaining = readNumber(windowSources, PLAN_REMAINING_KEYS);
+  const planLimitCandidate = readNumber(windowSources, PLAN_LIMIT_KEYS);
+  const planLimit = planLimitCandidate != null && planLimitCandidate > 0 ? planLimitCandidate : undefined;
+  const planLabel = readString(windowSources, PLAN_LABEL_KEYS);
+
+  const hasAnything =
+    inputTokens != null
+    || outputTokens != null
+    || cachedInputTokens != null
+    || reasoningTokens != null
+    || reportedTotal != null
+    || contextWindow != null
+    || planRemaining != null
+    || planLimit != null
+    || planLabel != null;
+  if (!hasAnything) return undefined;
+
+  return withDerivedTotals({
+    ...(inputTokens != null ? { inputTokens } : {}),
+    ...(outputTokens != null ? { outputTokens } : {}),
+    ...(cachedInputTokens != null ? { cachedInputTokens } : {}),
+    ...(reasoningTokens != null ? { reasoningTokens } : {}),
+    ...(reportedTotal != null ? { totalTokens: reportedTotal } : {}),
+    ...(contextWindow != null ? { contextWindow } : {}),
+    ...(contextWindow != null ? { contextWindowSource: "provider" as const } : {}),
+    ...(planRemaining != null ? { planRemaining } : {}),
+    ...(planLimit != null ? { planLimit } : {}),
+    ...(planLabel != null ? { planLabel } : {})
+  });
+}
+
 /**
  * First finite non-negative number found under any of `keys`.
  *
@@ -306,67 +366,45 @@ export function normalizeContextUsage(
       ? sources.filter((source) => !cumulativeSources.has(source))
       : sources;
 
-  const reportedInput = readNumber(measurementSources, INPUT_KEYS);
-  const outputTokens = readNumber(measurementSources, OUTPUT_KEYS);
-  const cacheRead = readNumber(measurementSources, CACHE_READ_ADDITIVE_KEYS);
-  const cacheCreation = readNumber(measurementSources, CACHE_CREATION_KEYS);
-  const cacheSubset = readNumber(measurementSources, CACHE_SUBSET_KEYS);
-  const reasoningTokens = readNumber(measurementSources, REASONING_KEYS);
-  const reportedTotal = readNumber(measurementSources, REPORTED_TOTAL_KEYS);
+  return normalizeMeasuredUsage(measurementSources, sources);
+}
 
-  // Anthropic-family: input_tokens excludes cache hits, so add them back in.
-  const anthropicStyle = cacheRead != null || cacheCreation != null;
-  // Ambiguous spelling that provably cannot be a subset of input.
-  const subsetInvariantBroken =
-    cacheSubset != null && reportedInput != null && cacheSubset > reportedInput;
-
-  let inputTokens: number | undefined;
-  if (anthropicStyle) {
-    inputTokens = (reportedInput ?? 0) + (cacheRead ?? 0) + (cacheCreation ?? 0);
-  } else if (subsetInvariantBroken) {
-    inputTokens = (reportedInput ?? 0) + (cacheSubset ?? 0);
-  } else {
-    inputTokens = reportedInput;
+/**
+ * Current-turn token consumption only. Returns undefined when the payload is
+ * cumulative-only (Codex `total_token_usage` without `last_token_usage`).
+ */
+export function normalizeTurnContextUsage(raw: unknown): ContextUsage | undefined {
+  const root = asRecord(raw);
+  if (!root) return undefined;
+  const sources = collectSources(root);
+  const lastUsageSource = findLastUsageSource(sources);
+  if (lastUsageSource) {
+    return normalizeMeasuredUsage([lastUsageSource], sources);
   }
+  const cumulativeSources = findCumulativeUsageSources(sources);
+  if (cumulativeSources.size > 0) {
+    const nonCumulative = sources.filter((source) => !cumulativeSources.has(source));
+    const hasTurnMeasured = readNumber(nonCumulative, INPUT_KEYS) != null
+      || readNumber(nonCumulative, OUTPUT_KEYS) != null
+      || readNumber(nonCumulative, REPORTED_TOTAL_KEYS) != null;
+    if (!hasTurnMeasured) return undefined;
+  }
+  const usage = normalizeContextUsage(raw);
+  if (!usage) return undefined;
+  return resolveContextUsageTotals(usage).totalTokens != null ? usage : undefined;
+}
 
-  // Display-only breakdown: what was served from cache.
-  const cachedInputTokens = cacheRead ?? cacheSubset;
-
-  // Only a window reported by the CLI is authoritative. Do not infer one from
-  // a model family or catalog: a wrong denominator is worse than no gauge.
-  const reportedWindow = readNumber(sources, CONTEXT_WINDOW_KEYS);
-  const contextWindow = reportedWindow != null && reportedWindow > 0 ? reportedWindow : undefined;
-
-  const planRemaining = readNumber(sources, PLAN_REMAINING_KEYS);
-  const planLimitCandidate = readNumber(sources, PLAN_LIMIT_KEYS);
-  // Schema requires a positive limit; 0 is not a meaningful ceiling.
-  const planLimit = planLimitCandidate != null && planLimitCandidate > 0 ? planLimitCandidate : undefined;
-  const planLabel = readString(sources, PLAN_LABEL_KEYS);
-
-  const hasAnything =
-    inputTokens != null
-    || outputTokens != null
-    || cachedInputTokens != null
-    || reasoningTokens != null
-    || reportedTotal != null
-    || contextWindow != null
-    || planRemaining != null
-    || planLimit != null
-    || planLabel != null;
-  if (!hasAnything) return undefined;
-
-  return withDerivedTotals({
-    ...(inputTokens != null ? { inputTokens } : {}),
-    ...(outputTokens != null ? { outputTokens } : {}),
-    ...(cachedInputTokens != null ? { cachedInputTokens } : {}),
-    ...(reasoningTokens != null ? { reasoningTokens } : {}),
-    ...(reportedTotal != null ? { totalTokens: reportedTotal } : {}),
-    ...(contextWindow != null ? { contextWindow } : {}),
-    ...(contextWindow != null ? { contextWindowSource: "provider" as const } : {}),
-    ...(planRemaining != null ? { planRemaining } : {}),
-    ...(planLimit != null ? { planLimit } : {}),
-    ...(planLabel != null ? { planLabel } : {})
-  });
+/**
+ * Provider session cumulative consumption (Codex `total_token_usage` when present).
+ */
+export function normalizeSessionContextUsage(raw: unknown): ContextUsage | undefined {
+  const root = asRecord(raw);
+  if (!root) return undefined;
+  const sources = collectSources(root);
+  const cumulativeSources = findCumulativeUsageSources(sources);
+  if (cumulativeSources.size === 0) return undefined;
+  const cumulative = [...cumulativeSources][0]!;
+  return normalizeMeasuredUsage([cumulative], sources);
 }
 
 /**

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   mergeContextUsage,
   normalizeContextUsage,
+  normalizeSessionContextUsage,
+  normalizeTurnContextUsage,
   resolveContextUsageTotals,
   withDerivedTotals
 } from "./context-usage";
@@ -50,6 +52,38 @@ const CODEX_TOKEN_USAGE_EVENT = {
   },
   model_context_window: 272_000
 } as const;
+
+describe("normalizeTurnContextUsage / normalizeSessionContextUsage", () => {
+  it("splits Codex last vs session cumulative blocks", () => {
+    const turn = normalizeTurnContextUsage(CODEX_TOKEN_USAGE_EVENT);
+    const session = normalizeSessionContextUsage(CODEX_TOKEN_USAGE_EVENT);
+    expect(turn?.totalTokens).toBe(18_700);
+    expect(session?.totalTokens).toBe(249_000);
+  });
+
+  it("returns undefined for turn when only cumulative is reported", () => {
+    expect(normalizeTurnContextUsage({
+      total_token_usage: {
+        input_tokens: 240_000,
+        output_tokens: 9_000,
+        total_tokens: 249_000
+      }
+    })).toBeUndefined();
+    expect(normalizeSessionContextUsage({
+      total_token_usage: {
+        input_tokens: 240_000,
+        output_tokens: 9_000,
+        total_tokens: 249_000
+      }
+    })?.totalTokens).toBe(249_000);
+  });
+
+  it("treats headless usage payloads as turn consumption", () => {
+    const turn = normalizeTurnContextUsage(CLAUDE_ASSISTANT_EVENT.message.usage);
+    expect(turn?.totalTokens).toBe(205_504);
+    expect(normalizeSessionContextUsage(CLAUDE_ASSISTANT_EVENT.message.usage)).toBeUndefined();
+  });
+});
 
 describe("normalizeContextUsage — Anthropic-family cache fields are additive", () => {
   it("counts cache reads and cache writes toward the prompt size", () => {

@@ -110,6 +110,8 @@ type Task = {
   /** Last effective coding-engine runtime configuration. */
   runInfo?: RunInfo;
   contextUsage?: ContextUsage;
+  /** Current-turn token consumption when reported separately from session cumulative. */
+  turnContextUsage?: ContextUsage | undefined;
   /** Follow-up prompts waiting on the agent (not yet started). */
   queuedTurns?: QueuedTurnItem[];
   /** Agent index has turns older than the current in-memory tip. */
@@ -406,7 +408,7 @@ function contextUsageTitle(view: ContextUsageView): string {
       `上下文已用 ${view.usedPercent}%（${compactTokenCount(view.totalTokens || 0)} / ${compactTokenCount(view.contextWindow)}）`
     );
   } else if (view.totalTokens != null) {
-    parts.push(`已用约 ${compactTokenCount(view.totalTokens)} tokens`);
+    parts.push(`累计约 ${compactTokenCount(view.totalTokens)} tokens`);
   }
   if (view.remainingTokens != null && view.contextWindow != null) {
     parts.push(`上下文剩余 ${compactTokenCount(view.remainingTokens)}`);
@@ -427,6 +429,39 @@ function contextUsageTitle(view: ContextUsageView): string {
   }
   return parts.join(" · ");
 }
+
+function contextTurnUsageTitle(view: ContextUsageView): string {
+  const parts: string[] = [];
+  if (view.totalTokens != null) {
+    parts.push(`本次运行约 ${compactTokenCount(view.totalTokens)} tokens`);
+  }
+  if (view.inputTokens != null) parts.push(`输入 ${compactTokenCount(view.inputTokens)}`);
+  if (view.outputTokens != null) parts.push(`输出 ${compactTokenCount(view.outputTokens)}`);
+  if (view.cachedInputTokens != null) parts.push(`缓存 ${compactTokenCount(view.cachedInputTokens)}`);
+  if (view.reasoningTokens != null) parts.push(`思考 ${compactTokenCount(view.reasoningTokens)}`);
+  return parts.join(" · ");
+}
+
+function contextUsageTitleCombined(sessionView: ContextUsageView | null, turnView: ContextUsageView | null): string {
+  const parts: string[] = [];
+  if (sessionView) parts.push(contextUsageTitle(sessionView));
+  if (turnView) parts.push(contextTurnUsageTitle(turnView));
+  if (parts.length) return parts.join(" · ");
+  return "上下文用量";
+}
+
+function contextUsageSummary(sessionView: ContextUsageView | null, turnView: ContextUsageView | null): string {
+  const sessionToken = sessionView?.totalTokens;
+  const turnToken = turnView?.totalTokens;
+  if (sessionToken != null && turnToken != null) {
+    return `${compactTokenCount(sessionToken)} / ${compactTokenCount(turnToken)}`;
+  }
+  if (turnToken != null) return compactTokenCount(turnToken);
+  if (sessionToken != null) return compactTokenCount(sessionToken);
+  if (sessionView?.usedPercent != null) return `${sessionView.usedPercent}%`;
+  return "—";
+}
+
 type HostRuntime = {
   online: boolean | null;
   workspaces: Workspace[];
@@ -1856,7 +1891,12 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const task = next.tasks[event.threadId];
     // Merge, don't replace: a sample that omits the window size or input count
     // must not erase what we already learned, or the context chip blanks out.
-    if (task) task.contextUsage = mergeContextUsage(task.contextUsage, event.contextUsage);
+    if (task) {
+      task.contextUsage = mergeContextUsage(task.contextUsage, event.contextUsage);
+      if (event.turnContextUsage) {
+        task.turnContextUsage = mergeContextUsage(task.turnContextUsage, event.turnContextUsage);
+      }
+    }
     return next;
   }
   if (event.type === "thread.heartbeat") {
@@ -1909,6 +1949,9 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const contextUsage = event.contextUsage
       ? mergeContextUsage(existing?.contextUsage, event.contextUsage)
       : existing?.contextUsage;
+    const turnContextUsage = event.turnContextUsage
+      ? mergeContextUsage(existing?.turnContextUsage, event.turnContextUsage)
+      : existing?.turnContextUsage;
     const providerSessionId = event.providerSessionId ?? existing?.providerSessionId;
     // Never let a stale snapshot push a recently active task down the list.
     const updatedAt = Math.max(
@@ -1989,6 +2032,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       ...(reasoningEffort ? { reasoningEffort } : {}),
       ...(runInfo ? { runInfo } : {}),
       ...(contextUsage ? { contextUsage } : {}),
+      ...(turnContextUsage ? { turnContextUsage } : {}),
       // Preserve agent queue state — snapshots do not carry it and must not wipe it.
       // Use !== undefined so an empty [] (queue finished) is kept and not treated as "missing".
       ...(existing?.queuedTurns !== undefined ? { queuedTurns: existing.queuedTurns } : {})
@@ -2091,6 +2135,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
   if (event.type === "turn.started") {
     task.status = "active";
     task.activeTurnId = event.turnId;
+    task.turnContextUsage = undefined;
     // Snapshot / prior turn.started may already include the user turn. Avoid duplicate YOU bubbles
     // (especially when a durable-queued follow-up starts right after the previous turn).
     // Headless path often omits prompt when the user message was already snapshotted — still drop
@@ -2139,6 +2184,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       task.queuedTurns = [];
     }
     if (event.contextUsage) task.contextUsage = mergeContextUsage(task.contextUsage, event.contextUsage);
+    if (event.turnContextUsage) task.turnContextUsage = mergeContextUsage(task.turnContextUsage, event.turnContextUsage);
     const errText = event.errorMessage?.trim();
     if (errText) {
       const norm = normalizeSystemErrorText(errText).toLowerCase();
@@ -3198,18 +3244,29 @@ function formatEngineQuotaChip(quota: EngineQuota): string {
 }
 
 /** Render consumed tokens, and a context gauge only when the CLI reported it. */
-function ContextUsagePanel({ view }: { view: ContextUsageView | null }) {
+function ContextUsagePanel({
+  view,
+  turnView
+}: {
+  view: ContextUsageView | null;
+  turnView?: ContextUsageView | null;
+}) {
   const { locale } = useI18n();
   const isEnglish = locale === "en";
   const isMobile = useIsMobileConversation();
   const [expanded, setExpanded] = useState(false);
   const hasToken = view?.totalTokens != null;
+  const hasTurnToken = turnView?.totalTokens != null;
   const hasContext = view?.usedPercent != null && view.contextWindow != null;
   const hasBreakdown = view?.inputTokens != null
     || view?.outputTokens != null
     || view?.cachedInputTokens != null
     || view?.reasoningTokens != null;
-  const hasUsage = hasToken || hasContext || hasBreakdown;
+  const hasTurnBreakdown = turnView?.inputTokens != null
+    || turnView?.outputTokens != null
+    || turnView?.cachedInputTokens != null
+    || turnView?.reasoningTokens != null;
+  const hasUsage = hasToken || hasTurnToken || hasContext || hasBreakdown || hasTurnBreakdown;
 
   useEffect(() => {
     if (!isMobile) setExpanded(false);
@@ -3218,12 +3275,10 @@ function ContextUsagePanel({ view }: { view: ContextUsageView | null }) {
   if (!hasUsage) return null;
 
   const title = isEnglish ? "Usage" : "用量";
-  const tooltip = view ? contextUsageTitle(view) : title;
-  const summary = hasToken
-    ? compactTokenCount(view!.totalTokens!)
-    : hasContext
-      ? `${view!.usedPercent}%`
-      : "—";
+  const turnTitle = isEnglish ? "This run" : "本次";
+  const sessionTitle = isEnglish ? "Session" : "累计";
+  const tooltip = contextUsageTitleCombined(view, turnView ?? null);
+  const summary = contextUsageSummary(view, turnView ?? null);
   const summaryHot = hasContext && view!.usedPercent! >= 85
     ? " hot"
     : hasContext && view!.usedPercent! >= 60
@@ -3231,7 +3286,8 @@ function ContextUsagePanel({ view }: { view: ContextUsageView | null }) {
       : "";
   const detailChips = (
     <div className="run-info-chips context-usage-chips">
-      {hasToken ? <span className="run-info-chip"><em>Token</em><strong>{compactTokenCount(view!.totalTokens!)}</strong></span> : null}
+      {hasToken ? <span className="run-info-chip"><em>{sessionTitle}</em><strong>{compactTokenCount(view!.totalTokens!)}</strong></span> : null}
+      {hasTurnToken ? <span className="run-info-chip"><em>{turnTitle}</em><strong>{compactTokenCount(turnView!.totalTokens!)}</strong></span> : null}
       {hasContext ? <span className="run-info-chip"><em>{isEnglish ? "Context" : "上下文"}</em><strong>{view!.usedPercent}%</strong></span> : null}
       {view?.remainingTokens != null && hasContext ? (
         <span className="run-info-chip"><em>{isEnglish ? "Remaining" : "余窗"}</em><strong>{compactTokenCount(view.remainingTokens)}</strong></span>
@@ -3240,6 +3296,10 @@ function ContextUsagePanel({ view }: { view: ContextUsageView | null }) {
       {view?.outputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Output" : "输出"}</em><strong>{compactTokenCount(view.outputTokens)}</strong></span> : null}
       {view?.cachedInputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Cached" : "缓存"}</em><strong>{compactTokenCount(view.cachedInputTokens)}</strong></span> : null}
       {view?.reasoningTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Thinking" : "思考"}</em><strong>{compactTokenCount(view.reasoningTokens)}</strong></span> : null}
+      {turnView?.inputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Run input" : "本次输入"}</em><strong>{compactTokenCount(turnView.inputTokens)}</strong></span> : null}
+      {turnView?.outputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Run output" : "本次输出"}</em><strong>{compactTokenCount(turnView.outputTokens)}</strong></span> : null}
+      {turnView?.cachedInputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Run cached" : "本次缓存"}</em><strong>{compactTokenCount(turnView.cachedInputTokens)}</strong></span> : null}
+      {turnView?.reasoningTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Run thinking" : "本次思考"}</em><strong>{compactTokenCount(turnView.reasoningTokens)}</strong></span> : null}
     </div>
   );
 
@@ -3272,7 +3332,8 @@ function ContextUsagePanel({ view }: { view: ContextUsageView | null }) {
 
   return (
     <>
-      {hasToken ? <span className="meta-chip meta-chip-context" title={tooltip}><em>Token</em><strong>{compactTokenCount(view!.totalTokens!)}</strong></span> : null}
+      {hasToken ? <span className="meta-chip meta-chip-context" title={tooltip}><em>{sessionTitle}</em><strong>{compactTokenCount(view!.totalTokens!)}</strong></span> : null}
+      {hasTurnToken ? <span className="meta-chip meta-chip-context" title={contextTurnUsageTitle(turnView!)}><em>{turnTitle}</em><strong>{compactTokenCount(turnView!.totalTokens!)}</strong></span> : null}
       {hasContext ? (
         <span className={`meta-chip meta-chip-context${view!.usedPercent! >= 85 ? " hot" : view!.usedPercent! >= 60 ? " warm" : ""}`} title={tooltip}>
           <em>{isEnglish ? "Context" : "上下文"}</em>
@@ -3529,6 +3590,10 @@ function TaskConversation({
   const contextView = useMemo(
     () => parseContextUsageView(task.contextUsage),
     [task.contextUsage]
+  );
+  const turnContextView = useMemo(
+    () => parseContextUsageView(task.turnContextUsage),
+    [task.turnContextUsage]
   );
   const taskQuota = useMemo(
     () => engineQuotas.find((item) => item.engine === taskEngine),
@@ -4003,9 +4068,9 @@ function TaskConversation({
         <code title={task.cwd}>{task.cwd}</code>
         <div
           className="thread-meta-chips"
-          title={contextView ? contextUsageTitle(contextView) : "上下文用量"}
+          title={contextUsageTitleCombined(contextView, turnContextView)}
         >
-          <ContextUsagePanel view={contextView} />
+          <ContextUsagePanel view={contextView} turnView={turnContextView} />
           {QUOTA_QUERY_ENABLED && taskQuota ? (
             <span
               className="meta-chip meta-chip-quota"
