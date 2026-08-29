@@ -3137,6 +3137,7 @@ echo "Install finished. Run: agy  (sign in)"
 }
 
 async function installPiCli(): Promise<void> {
+  // Official Pi Quickstart: https://pi.dev/docs/latest/quickstart#install
   updateState({ detail: "正在打开 Pi CLI 安装窗口…" });
   const scriptBody = process.platform === "win32"
     ? [
