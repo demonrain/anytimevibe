@@ -14,6 +14,8 @@ export type EngineCapability = {
   currentReasoningEffort?: ReasoningEffort;
   /** Cursor: whether the currently selected model has thinking enabled. */
   currentThinking?: boolean;
+  /** Codex: whether fast (priority tier) mode is enabled in local config. */
+  currentFast?: boolean;
 };
 
 function parseTomlString(content: string, key: string): string | undefined {
@@ -21,6 +23,31 @@ function parseTomlString(content: string, key: string): string | undefined {
   const re = new RegExp(`^\\s*${key}\\s*=\\s*"([^"]+)"`, "mi");
   const match = content.match(re);
   return match?.[1]?.trim() || undefined;
+}
+
+function parseTomlBoolean(content: string, key: string): boolean | undefined {
+  const match = content.match(new RegExp(`^\\s*${key}\\s*=\\s*(true|false)\\s*$`, "mi"));
+  if (!match?.[1]) return undefined;
+  return match[1].toLowerCase() === "true";
+}
+
+function codexModelSupportsFast(row: Record<string, any>): boolean {
+  const tiers = row.service_tiers || row.serviceTiers;
+  if (Array.isArray(tiers)) {
+    if (tiers.some((tier) => {
+      const id = typeof tier === "string" ? tier : String(tier?.id || tier?.tier || "").trim();
+      return id === "priority" || id === "fast";
+    })) return true;
+  }
+  const speedTiers = row.additional_speed_tiers || row.additionalSpeedTiers;
+  if (Array.isArray(speedTiers)) {
+    if (speedTiers.some((tier) => {
+      const value = String(tier || "").trim().toLowerCase();
+      return value === "priority" || value === "fast" || value.includes("fast");
+    })) return true;
+  }
+  const slug = String(row.slug || row.id || row.model || "").trim().toLowerCase();
+  return /gpt-5|codex|o3|o4/.test(slug);
 }
 
 function normalizeEffort(value: string | undefined): ReasoningEffort | undefined {
@@ -69,6 +96,7 @@ function ingestCodexCatalogRows(
       row.supported_reasoning_levels || row.reasoning_efforts || row.supported_efforts
     );
     for (const effort of modelEfforts) effortUnion.add(effort);
+    const supportsFast = codexModelSupportsFast(row);
 
     if (seen.has(id)) {
       const existing = models.find((item) => item.id === id);
@@ -80,6 +108,7 @@ function ingestCodexCatalogRows(
       }
       if (!existing.contextWindow && contextWindow) existing.contextWindow = contextWindow;
       if (existing.label === existing.id && label !== id) existing.label = label;
+      if (supportsFast) existing.supportsFast = true;
       continue;
     }
     seen.add(id);
@@ -87,7 +116,8 @@ function ingestCodexCatalogRows(
       id,
       label,
       ...(contextWindow ? { contextWindow } : {}),
-      ...(modelEfforts.length ? { reasoningEfforts: modelEfforts } : {})
+      ...(modelEfforts.length ? { reasoningEfforts: modelEfforts } : {}),
+      ...(supportsFast ? { supportsFast: true } : {})
     });
   }
 }
@@ -107,12 +137,14 @@ async function discoverCodexCapability(): Promise<EngineCapability> {
   const seen = new Set<string>();
   let currentModel: string | undefined;
   let currentReasoningEffort: ReasoningEffort | undefined;
+  let currentFast: boolean | undefined;
   const effortUnion = new Set<ReasoningEffort>(["low", "medium", "high", "xhigh"]);
 
   const configText = await readText(path.join(codexHome, "config.toml"));
   if (configText) {
     currentModel = parseTomlString(configText, "model");
     currentReasoningEffort = normalizeEffort(parseTomlString(configText, "model_reasoning_effort"));
+    currentFast = parseTomlBoolean(configText, "fast_mode");
   }
 
   // Prefer live Codex cache + Cockpit Local Access catalog; CCSwitch is a fallback.
@@ -158,7 +190,8 @@ async function discoverCodexCapability(): Promise<EngineCapability> {
     models,
     reasoningEfforts: reasoningEfforts.length ? reasoningEfforts : ["low", "medium", "high", "xhigh"],
     ...(currentModel ? { currentModel } : {}),
-    ...(currentReasoningEffort ? { currentReasoningEffort } : {})
+    ...(currentReasoningEffort ? { currentReasoningEffort } : {}),
+    ...(currentFast !== undefined ? { currentFast } : {})
   };
 }
 

@@ -20,10 +20,10 @@ export type BackendStreamEvent =
   | { type: "delta"; threadId: string; turnId: string; itemId: string; kind: StreamDeltaKind; delta: string }
   | { type: "turn.started"; threadId: string; turnId: string; prompt?: string }
   | { type: "turn.info"; threadId: string; turnId: string; runInfo: RunInfo }
-  | { type: "turn.completed"; threadId: string; turnId: string; status: string; contextUsage?: ContextUsage; turnContextUsage?: ContextUsage }
+  | { type: "turn.completed"; threadId: string; turnId: string; status: string; contextUsage?: ContextUsage; sessionContextUsage?: ContextUsage; turnContextUsage?: ContextUsage }
   | { type: "session"; threadId: string; providerSessionId: string }
   | { type: "error"; threadId?: string; message: string }
-  | { type: "usage"; threadId: string; contextUsage: ContextUsage; turnContextUsage?: ContextUsage }
+  | { type: "usage"; threadId: string; contextUsage: ContextUsage; sessionContextUsage?: ContextUsage; turnContextUsage?: ContextUsage }
   | {
       type: "approval.requested";
       threadId: string;
@@ -52,11 +52,15 @@ export type StoredTask = {
   reasoningEffort?: ReasoningEffort;
   /** Cursor: extended-thinking variant enabled for this thread. */
   thinking?: boolean;
+  /** Codex: priority (fast) service tier enabled for this thread. */
+  fast?: boolean;
   /** Last effective coding-engine runtime configuration. */
   runInfo?: RunInfo;
   /** Last web permission mode — reused by interactive CLI handoff. */
   permissionMode?: PermissionMode;
   contextUsage?: ContextUsage;
+  /** Provider session cumulative consumption when reported (Codex total_token_usage). */
+  sessionContextUsage?: ContextUsage | undefined;
   /** Current-turn token consumption when reported separately from session cumulative. */
   turnContextUsage?: ContextUsage | undefined;
   /** Last known unified diff / git status for the Diff tab (persisted across reconnect). */

@@ -100,6 +100,27 @@ export function threadResumeParams(threadId: string, permissionMode: PermissionM
   return Object.keys(policy).length ? { threadId, ...policy } : { threadId };
 }
 
+/**
+ * Optional turn/thread config overrides for Codex app-server.
+ * Fast mode maps to OpenAI priority service tier (`priority` vs `default`).
+ */
+export function codexTurnConfigExtras(options?: {
+  model?: string;
+  reasoningEffort?: string;
+  fast?: boolean;
+}): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (options?.model?.trim()) out.model = options.model.trim();
+  if (options?.reasoningEffort) {
+    // Legacy + v2 spellings — app-server accepts either on recent builds.
+    out.modelReasoningEffort = options.reasoningEffort;
+    out.effort = options.reasoningEffort;
+  }
+  if (options?.fast === true) out.serviceTierForTurn = "priority";
+  else if (options?.fast === false) out.serviceTierForTurn = "default";
+  return out;
+}
+
 export class CodexAdapter {
   private process: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;

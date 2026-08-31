@@ -107,9 +107,13 @@ type Task = {
   reasoningEffort?: ReasoningEffort;
   /** Cursor: extended-thinking variant active for this thread. */
   thinking?: boolean;
+  /** Codex: priority (fast) service tier active for this thread. */
+  fast?: boolean;
   /** Last effective coding-engine runtime configuration. */
   runInfo?: RunInfo;
   contextUsage?: ContextUsage;
+  /** Provider session cumulative consumption (Codex total_token_usage). */
+  sessionContextUsage?: ContextUsage | undefined;
   /** Current-turn token consumption when reported separately from session cumulative. */
   turnContextUsage?: ContextUsage | undefined;
   /** Follow-up prompts waiting on the agent (not yet started). */
@@ -400,23 +404,67 @@ function parseContextUsageView(usage?: ContextUsage): ContextUsageView | null {
   };
 }
 
-/** Compact title/tooltip for context chips. */
-function contextUsageTitle(view: ContextUsageView): string {
+/** Token consumption chip only — no context-window percentage. */
+function parseTokenUsageView(usage?: ContextUsage): ContextUsageView | null {
+  if (!usage) return null;
+  const { totalTokens } = resolveContextUsageTotals(usage);
+  if (totalTokens == null) return null;
+  return {
+    usedPercent: null,
+    remainingTokens: null,
+    contextWindow: null,
+    totalTokens,
+    inputTokens: usage.inputTokens ?? null,
+    outputTokens: usage.outputTokens ?? null,
+    cachedInputTokens: usage.cachedInputTokens ?? null,
+    reasoningTokens: usage.reasoningTokens ?? null,
+    planLabel: null,
+    planRemaining: null,
+    planLimit: null,
+    planUsedPercent: null
+  };
+}
+
+/** Context window gauge only — never reuse session cumulative totals. */
+function parseContextGaugeView(usage?: ContextUsage): ContextUsageView | null {
+  if (!usage || usage.contextWindowSource !== "provider") return null;
+  const totals = resolveContextUsageTotals(usage);
+  const planRemaining = usage.planRemaining ?? null;
+  const planLimit = usage.planLimit ?? null;
+  const planUsedPercent = planLimit != null && planLimit > 0 && planRemaining != null
+    ? Math.max(0, Math.min(100, Math.round(((planLimit - planRemaining) / planLimit) * 100)))
+    : null;
+  const planLabel = usage.planLabel?.trim() || null;
+  if (totals.usedPercent == null && totals.remainingTokens == null && !planLabel && planRemaining == null) {
+    return null;
+  }
+  return {
+    usedPercent: totals.usedPercent,
+    remainingTokens: totals.remainingTokens,
+    contextWindow: totals.contextWindow,
+    totalTokens: totals.totalTokens,
+    inputTokens: usage.inputTokens ?? null,
+    outputTokens: usage.outputTokens ?? null,
+    cachedInputTokens: usage.cachedInputTokens ?? null,
+    reasoningTokens: usage.reasoningTokens ?? null,
+    planLabel,
+    planRemaining,
+    planLimit,
+    planUsedPercent
+  };
+}
+
+/** Compact title/tooltip for context window gauge. */
+function contextGaugeTitle(view: ContextUsageView): string {
   const parts: string[] = [];
   if (view.usedPercent != null && view.contextWindow != null) {
     parts.push(
       `上下文已用 ${view.usedPercent}%（${compactTokenCount(view.totalTokens || 0)} / ${compactTokenCount(view.contextWindow)}）`
     );
-  } else if (view.totalTokens != null) {
-    parts.push(`累计约 ${compactTokenCount(view.totalTokens)} tokens`);
   }
   if (view.remainingTokens != null && view.contextWindow != null) {
     parts.push(`上下文剩余 ${compactTokenCount(view.remainingTokens)}`);
   }
-  if (view.inputTokens != null) parts.push(`输入 ${compactTokenCount(view.inputTokens)}`);
-  if (view.outputTokens != null) parts.push(`输出 ${compactTokenCount(view.outputTokens)}`);
-  if (view.cachedInputTokens != null) parts.push(`缓存 ${compactTokenCount(view.cachedInputTokens)}`);
-  if (view.reasoningTokens != null) parts.push(`思考 ${compactTokenCount(view.reasoningTokens)}`);
   if (view.planLabel || view.planRemaining != null) {
     const plan = view.planLabel || "订阅额度";
     if (view.planRemaining != null && view.planLimit != null) {
@@ -427,6 +475,18 @@ function contextUsageTitle(view: ContextUsageView): string {
       parts.push(plan);
     }
   }
+  return parts.join(" · ");
+}
+
+function contextSessionUsageTitle(view: ContextUsageView): string {
+  const parts: string[] = [];
+  if (view.totalTokens != null) {
+    parts.push(`会话累计约 ${compactTokenCount(view.totalTokens)} tokens`);
+  }
+  if (view.inputTokens != null) parts.push(`输入 ${compactTokenCount(view.inputTokens)}`);
+  if (view.outputTokens != null) parts.push(`输出 ${compactTokenCount(view.outputTokens)}`);
+  if (view.cachedInputTokens != null) parts.push(`缓存 ${compactTokenCount(view.cachedInputTokens)}`);
+  if (view.reasoningTokens != null) parts.push(`思考 ${compactTokenCount(view.reasoningTokens)}`);
   return parts.join(" · ");
 }
 
@@ -442,23 +502,35 @@ function contextTurnUsageTitle(view: ContextUsageView): string {
   return parts.join(" · ");
 }
 
-function contextUsageTitleCombined(sessionView: ContextUsageView | null, turnView: ContextUsageView | null): string {
+function contextUsageTitleCombined(
+  sessionView: ContextUsageView | null,
+  turnView: ContextUsageView | null,
+  gaugeView: ContextUsageView | null,
+  legacyTokenView: ContextUsageView | null
+): string {
   const parts: string[] = [];
-  if (sessionView) parts.push(contextUsageTitle(sessionView));
+  if (sessionView) parts.push(contextSessionUsageTitle(sessionView));
   if (turnView) parts.push(contextTurnUsageTitle(turnView));
+  if (gaugeView) parts.push(contextGaugeTitle(gaugeView));
+  if (legacyTokenView) parts.push(contextSessionUsageTitle(legacyTokenView));
   if (parts.length) return parts.join(" · ");
   return "上下文用量";
 }
 
-function contextUsageSummary(sessionView: ContextUsageView | null, turnView: ContextUsageView | null): string {
-  const sessionToken = sessionView?.totalTokens;
+function contextUsageSummary(
+  sessionView: ContextUsageView | null,
+  turnView: ContextUsageView | null,
+  gaugeView: ContextUsageView | null,
+  legacyTokenView: ContextUsageView | null
+): string {
+  const sessionToken = sessionView?.totalTokens ?? legacyTokenView?.totalTokens;
   const turnToken = turnView?.totalTokens;
   if (sessionToken != null && turnToken != null) {
     return `${compactTokenCount(sessionToken)} / ${compactTokenCount(turnToken)}`;
   }
   if (turnToken != null) return compactTokenCount(turnToken);
   if (sessionToken != null) return compactTokenCount(sessionToken);
-  if (sessionView?.usedPercent != null) return `${sessionView.usedPercent}%`;
+  if (gaugeView?.usedPercent != null) return `${gaugeView.usedPercent}%`;
   return "—";
 }
 
@@ -1612,11 +1684,11 @@ const ConversationComposer = memo(function ConversationComposer({
   const settingsSummary = [
     modelLabel,
     reasoningEffort || null,
-    taskEngine === "cursor" && modelMeta?.supportsFast && fastMode ? "Fast" : null,
+    (taskEngine === "cursor" || taskEngine === "codex") && modelMeta?.supportsFast && fastMode ? "Fast" : null,
     taskEngine === "cursor" && supportsThinking ? `Thinking ${thinkingMode ? "On" : "Off"}` : null,
     permissionOptions.find((option) => option.value === permissionMode)?.label || null
   ].filter(Boolean).join(" · ");
-  const compactModeLabel = taskEngine === "cursor" && modelMeta?.supportsFast && fastMode
+  const compactModeLabel = (taskEngine === "cursor" || taskEngine === "codex") && modelMeta?.supportsFast && fastMode
     ? "Fast"
     : taskEngine === "cursor" && supportsThinking
       ? `Think ${thinkingMode ? "On" : "Off"}`
@@ -1638,7 +1710,7 @@ const ConversationComposer = memo(function ConversationComposer({
           {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
         </select>
       </label>
-      {taskEngine === "cursor" && modelMeta?.supportsFast && (
+      {(taskEngine === "cursor" || taskEngine === "codex") && modelMeta?.supportsFast && (
         <label className="composer-permission composer-fast-toggle">
           Fast
           <input
@@ -1894,6 +1966,9 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     // must not erase what we already learned, or the context chip blanks out.
     if (task) {
       task.contextUsage = mergeContextUsage(task.contextUsage, event.contextUsage);
+      if (event.sessionContextUsage) {
+        task.sessionContextUsage = mergeContextUsage(task.sessionContextUsage, event.sessionContextUsage);
+      }
       if (event.turnContextUsage) {
         task.turnContextUsage = mergeContextUsage(task.turnContextUsage, event.turnContextUsage);
       }
@@ -1934,6 +2009,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const engine = event.cliEngine ?? existing?.cliEngine;
     const model = event.model ?? existing?.model;
     const reasoningEffort = event.reasoningEffort ?? existing?.reasoningEffort;
+    const fast = event.fast ?? existing?.fast;
     const incomingRunInfo = event.runInfo;
     const existingRunInfo = existing?.runInfo;
     const runInfo = incomingRunInfo
@@ -1953,6 +2029,9 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     const turnContextUsage = event.turnContextUsage
       ? mergeContextUsage(existing?.turnContextUsage, event.turnContextUsage)
       : existing?.turnContextUsage;
+    const sessionContextUsage = event.sessionContextUsage
+      ? mergeContextUsage(existing?.sessionContextUsage, event.sessionContextUsage)
+      : existing?.sessionContextUsage;
     const providerSessionId = event.providerSessionId ?? existing?.providerSessionId;
     // Never let a stale snapshot push a recently active task down the list.
     const updatedAt = Math.max(
@@ -2031,8 +2110,11 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       ...(providerSessionId ? { providerSessionId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(event.thinking !== undefined ? { thinking: event.thinking } : (existing?.thinking !== undefined ? { thinking: existing.thinking } : {})),
+      ...(fast !== undefined ? { fast } : {}),
       ...(runInfo ? { runInfo } : {}),
       ...(contextUsage ? { contextUsage } : {}),
+      ...(sessionContextUsage ? { sessionContextUsage } : {}),
       ...(turnContextUsage ? { turnContextUsage } : {}),
       // Preserve agent queue state — snapshots do not carry it and must not wipe it.
       // Use !== undefined so an empty [] (queue finished) is kept and not treated as "missing".
@@ -2131,6 +2213,7 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
     if (event.runInfo.model) task.model = event.runInfo.model;
     if (event.runInfo.reasoningEffort) task.reasoningEffort = event.runInfo.reasoningEffort;
     if (event.runInfo.thinking !== undefined) task.thinking = event.runInfo.thinking;
+    if (event.runInfo.fast !== undefined) task.fast = event.runInfo.fast;
     return next;
   }
   if (event.type === "turn.started") {
@@ -2185,6 +2268,9 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
       task.queuedTurns = [];
     }
     if (event.contextUsage) task.contextUsage = mergeContextUsage(task.contextUsage, event.contextUsage);
+    if (event.sessionContextUsage) {
+      task.sessionContextUsage = mergeContextUsage(task.sessionContextUsage, event.sessionContextUsage);
+    }
     if (event.turnContextUsage) task.turnContextUsage = mergeContextUsage(task.turnContextUsage, event.turnContextUsage);
     const errText = event.errorMessage?.trim();
     if (errText) {
@@ -3059,13 +3145,14 @@ export function App() {
       engineCapabilities={activeRuntime.engineCapabilities ?? []}
       onClose={() => setComposerOpen(false)}
       onRefreshWorkspaces={() => sendCommand(activeHost.id, { type: "host.refresh", commandId: randomUuid() })}
-      onCreate={async (cwd, prompt, title, engine, mode, model, reasoningEffort, thinking) => {
+      onCreate={async (cwd, prompt, title, engine, mode, model, reasoningEffort, thinking, fast) => {
         setPermissionMode(mode);
         localStorage.setItem("permission-mode", mode);
         // Remember existing threads so the first new threadId from the host is selected.
         markExpectingNewTask(activeHost.id, Object.keys(activeRuntime.tasks), {
           ...(model ? { model } : {}),
-          ...(reasoningEffort ? { reasoningEffort } : {})
+          ...(reasoningEffort ? { reasoningEffort } : {}),
+          ...(fast !== undefined ? { fast } : {})
         });
         // Clear engine filter so the new task is visible in the list immediately.
         setEngineFilter(null);
@@ -3080,7 +3167,8 @@ export function App() {
           ...(title ? { title } : {}),
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
-          ...(thinking !== undefined ? { thinking } : {})
+          ...(thinking !== undefined ? { thinking } : {}),
+          ...(fast !== undefined ? { fast } : {})
         });
         setComposerOpen(false);
       }}
@@ -3246,28 +3334,38 @@ function formatEngineQuotaChip(quota: EngineQuota): string {
 
 /** Render consumed tokens, and a context gauge only when the CLI reported it. */
 function ContextUsagePanel({
-  view,
-  turnView
+  gaugeView,
+  sessionView,
+  turnView,
+  legacyTokenView
 }: {
-  view: ContextUsageView | null;
-  turnView?: ContextUsageView | null;
+  gaugeView: ContextUsageView | null;
+  sessionView: ContextUsageView | null;
+  turnView: ContextUsageView | null;
+  legacyTokenView: ContextUsageView | null;
 }) {
   const { locale } = useI18n();
   const isEnglish = locale === "en";
   const isMobile = useIsMobileConversation();
   const [expanded, setExpanded] = useState(false);
-  const hasToken = view?.totalTokens != null;
+  const hasSessionToken = sessionView?.totalTokens != null;
+  const hasLegacyToken = legacyTokenView?.totalTokens != null;
   const hasTurnToken = turnView?.totalTokens != null;
-  const hasContext = view?.usedPercent != null && view.contextWindow != null;
-  const hasBreakdown = view?.inputTokens != null
-    || view?.outputTokens != null
-    || view?.cachedInputTokens != null
-    || view?.reasoningTokens != null;
+  const hasContext = gaugeView?.usedPercent != null && gaugeView.contextWindow != null;
+  const hasBreakdown = gaugeView?.inputTokens != null
+    || gaugeView?.outputTokens != null
+    || gaugeView?.cachedInputTokens != null
+    || gaugeView?.reasoningTokens != null;
   const hasTurnBreakdown = turnView?.inputTokens != null
     || turnView?.outputTokens != null
     || turnView?.cachedInputTokens != null
     || turnView?.reasoningTokens != null;
-  const hasUsage = hasToken || hasTurnToken || hasContext || hasBreakdown || hasTurnBreakdown;
+  const hasSessionBreakdown = sessionView?.inputTokens != null
+    || sessionView?.outputTokens != null
+    || sessionView?.cachedInputTokens != null
+    || sessionView?.reasoningTokens != null;
+  const hasUsage = hasSessionToken || hasLegacyToken || hasTurnToken || hasContext
+    || hasBreakdown || hasTurnBreakdown || hasSessionBreakdown;
 
   useEffect(() => {
     if (!isMobile) setExpanded(false);
@@ -3278,25 +3376,28 @@ function ContextUsagePanel({
   const title = isEnglish ? "Usage" : "用量";
   const turnTitle = isEnglish ? "This run" : "本次";
   const sessionTitle = isEnglish ? "Session" : "累计";
-  const tooltip = contextUsageTitleCombined(view, turnView ?? null);
-  const summary = contextUsageSummary(view, turnView ?? null);
-  const summaryHot = hasContext && view!.usedPercent! >= 85
+  const tooltip = contextUsageTitleCombined(sessionView, turnView, gaugeView, legacyTokenView);
+  const summary = contextUsageSummary(sessionView, turnView, gaugeView, legacyTokenView);
+  const summaryHot = hasContext && gaugeView!.usedPercent! >= 85
     ? " hot"
-    : hasContext && view!.usedPercent! >= 60
+    : hasContext && gaugeView!.usedPercent! >= 60
       ? " warm"
       : "";
   const detailChips = (
     <div className="run-info-chips context-usage-chips">
-      {hasToken ? <span className="run-info-chip"><em>{sessionTitle}</em><strong>{compactTokenCount(view!.totalTokens!)}</strong></span> : null}
+      {hasSessionToken ? <span className="run-info-chip"><em>{sessionTitle}</em><strong>{compactTokenCount(sessionView!.totalTokens!)}</strong></span> : null}
+      {hasLegacyToken ? <span className="run-info-chip"><em>Token</em><strong>{compactTokenCount(legacyTokenView!.totalTokens!)}</strong></span> : null}
       {hasTurnToken ? <span className="run-info-chip"><em>{turnTitle}</em><strong>{compactTokenCount(turnView!.totalTokens!)}</strong></span> : null}
-      {hasContext ? <span className="run-info-chip"><em>{isEnglish ? "Context" : "上下文"}</em><strong>{view!.usedPercent}%</strong></span> : null}
-      {view?.remainingTokens != null && hasContext ? (
-        <span className="run-info-chip"><em>{isEnglish ? "Remaining" : "余窗"}</em><strong>{compactTokenCount(view.remainingTokens)}</strong></span>
+      {hasContext ? <span className="run-info-chip"><em>{isEnglish ? "Context" : "上下文"}</em><strong>{gaugeView!.usedPercent}%</strong></span> : null}
+      {gaugeView?.remainingTokens != null && hasContext ? (
+        <span className="run-info-chip"><em>{isEnglish ? "Remaining" : "余窗"}</em><strong>{compactTokenCount(gaugeView.remainingTokens)}</strong></span>
       ) : null}
-      {view?.inputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Input" : "输入"}</em><strong>{compactTokenCount(view.inputTokens)}</strong></span> : null}
-      {view?.outputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Output" : "输出"}</em><strong>{compactTokenCount(view.outputTokens)}</strong></span> : null}
-      {view?.cachedInputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Cached" : "缓存"}</em><strong>{compactTokenCount(view.cachedInputTokens)}</strong></span> : null}
-      {view?.reasoningTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Thinking" : "思考"}</em><strong>{compactTokenCount(view.reasoningTokens)}</strong></span> : null}
+      {sessionView?.inputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Session in" : "累计输入"}</em><strong>{compactTokenCount(sessionView.inputTokens)}</strong></span> : null}
+      {sessionView?.outputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Session out" : "累计输出"}</em><strong>{compactTokenCount(sessionView.outputTokens)}</strong></span> : null}
+      {gaugeView?.inputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Prompt" : "上下文输入"}</em><strong>{compactTokenCount(gaugeView.inputTokens)}</strong></span> : null}
+      {gaugeView?.outputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Completion" : "上下文输出"}</em><strong>{compactTokenCount(gaugeView.outputTokens)}</strong></span> : null}
+      {gaugeView?.cachedInputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Cached" : "缓存"}</em><strong>{compactTokenCount(gaugeView.cachedInputTokens)}</strong></span> : null}
+      {gaugeView?.reasoningTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Thinking" : "思考"}</em><strong>{compactTokenCount(gaugeView.reasoningTokens)}</strong></span> : null}
       {turnView?.inputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Run input" : "本次输入"}</em><strong>{compactTokenCount(turnView.inputTokens)}</strong></span> : null}
       {turnView?.outputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Run output" : "本次输出"}</em><strong>{compactTokenCount(turnView.outputTokens)}</strong></span> : null}
       {turnView?.cachedInputTokens != null ? <span className="run-info-chip"><em>{isEnglish ? "Run cached" : "本次缓存"}</em><strong>{compactTokenCount(turnView.cachedInputTokens)}</strong></span> : null}
@@ -3333,13 +3434,14 @@ function ContextUsagePanel({
 
   return (
     <>
-      {hasToken ? <span className="meta-chip meta-chip-context" title={tooltip}><em>{sessionTitle}</em><strong>{compactTokenCount(view!.totalTokens!)}</strong></span> : null}
+      {hasSessionToken ? <span className="meta-chip meta-chip-context" title={contextSessionUsageTitle(sessionView!)}><em>{sessionTitle}</em><strong>{compactTokenCount(sessionView!.totalTokens!)}</strong></span> : null}
+      {hasLegacyToken ? <span className="meta-chip meta-chip-context" title={contextSessionUsageTitle(legacyTokenView!)}><em>Token</em><strong>{compactTokenCount(legacyTokenView!.totalTokens!)}</strong></span> : null}
       {hasTurnToken ? <span className="meta-chip meta-chip-context" title={contextTurnUsageTitle(turnView!)}><em>{turnTitle}</em><strong>{compactTokenCount(turnView!.totalTokens!)}</strong></span> : null}
       {hasContext ? (
-        <span className={`meta-chip meta-chip-context${view!.usedPercent! >= 85 ? " hot" : view!.usedPercent! >= 60 ? " warm" : ""}`} title={tooltip}>
+        <span className={`meta-chip meta-chip-context${gaugeView!.usedPercent! >= 85 ? " hot" : gaugeView!.usedPercent! >= 60 ? " warm" : ""}`} title={contextGaugeTitle(gaugeView!)}>
           <em>{isEnglish ? "Context" : "上下文"}</em>
-          <span className="ctx-bar" aria-hidden="true"><span style={{ width: `${view!.usedPercent}%` }} /></span>
-          <strong>{view!.usedPercent}%</strong>
+          <span className="ctx-bar" aria-hidden="true"><span style={{ width: `${gaugeView!.usedPercent}%` }} /></span>
+          <strong>{gaugeView!.usedPercent}%</strong>
         </span>
       ) : null}
     </>
@@ -3360,6 +3462,11 @@ function RunInfoPanel({ info }: { info: RunInfo }) {
     : info.thinking === false
       ? (isEnglish ? "Off" : "关闭")
       : info.engine === "cursor" ? missing : notApplicable;
+  const fast = info.fast === true
+    ? (isEnglish ? "On" : "开启")
+    : info.fast === false
+      ? (isEnglish ? "Off" : "关闭")
+      : (info.engine === "codex" || info.engine === "cursor") ? missing : notApplicable;
   const title = isEnglish ? "Runtime" : "本轮运行";
   const endpoint = value(info.endpoint);
   const chips = (
@@ -3368,6 +3475,9 @@ function RunInfoPanel({ info }: { info: RunInfo }) {
       <span className="run-info-chip"><em>{isEnglish ? "Model" : "模型"}</em><strong>{value(info.model)}</strong></span>
       <span className="run-info-chip"><em>Effort</em><strong>{effort}</strong></span>
       <span className="run-info-chip"><em>Thinking</em><strong>{thinking}</strong></span>
+      {(info.engine === "codex" || info.engine === "cursor") ? (
+        <span className="run-info-chip"><em>Fast</em><strong>{fast}</strong></span>
+      ) : null}
       <span className="run-info-chip">
         <em>Endpoint</em>
         <strong
@@ -3510,6 +3620,9 @@ function TaskConversation({
     ...(task.runInfo?.thinking !== undefined || task.thinking !== undefined
       ? { thinking: task.runInfo?.thinking ?? task.thinking }
       : {}),
+    ...(task.runInfo?.fast !== undefined || task.fast !== undefined
+      ? { fast: task.runInfo?.fast ?? task.fast }
+      : {}),
     // Keep endpoint even when later snapshots omit it.
     ...(task.runInfo?.endpoint?.trim() ? { endpoint: task.runInfo.endpoint.trim() } : {})
   };
@@ -3557,7 +3670,9 @@ function TaskConversation({
   const [fastMode, setFastMode] = useState<boolean>(() => {
     const fromModel = parseFastFromModelId(task.model || uiPrefs.model);
     if (fromModel !== undefined) return fromModel;
+    if (task.fast !== undefined) return task.fast;
     if (uiPrefs.fast !== undefined) return uiPrefs.fast;
+    if (taskEngine === "codex" && cap?.currentFast !== undefined) return cap.currentFast;
     // Composer defaults to Fast on Cursor CLI; other models default off.
     const base = (task.model || uiPrefs.model || cap?.currentModel || "").split("[")[0] || "";
     return /composer/i.test(base);
@@ -3588,14 +3703,22 @@ function TaskConversation({
     () => permissionOptionsForEngine(taskEngine, locale),
     [taskEngine, locale]
   );
-  const contextView = useMemo(
-    () => parseContextUsageView(task.contextUsage),
+  const gaugeView = useMemo(
+    () => parseContextGaugeView(task.contextUsage),
     [task.contextUsage]
   );
-  const turnContextView = useMemo(
-    () => parseContextUsageView(task.turnContextUsage),
+  const sessionView = useMemo(
+    () => parseTokenUsageView(task.sessionContextUsage),
+    [task.sessionContextUsage]
+  );
+  const turnView = useMemo(
+    () => parseTokenUsageView(task.turnContextUsage),
     [task.turnContextUsage]
   );
+  const legacyTokenView = useMemo(() => {
+    if (sessionView || turnView) return null;
+    return parseTokenUsageView(task.contextUsage);
+  }, [sessionView, turnView, task.contextUsage]);
   const taskQuota = useMemo(
     () => engineQuotas.find((item) => item.engine === taskEngine),
     [engineQuotas, taskEngine]
@@ -3633,6 +3756,7 @@ function TaskConversation({
       saveTaskUiPrefs(task.threadId, { model: base });
       const parsedFast = parseFastFromModelId(task.model);
       if (parsedFast !== undefined) setFastMode(parsedFast);
+      else if (task.fast !== undefined) setFastMode(task.fast);
     } else if (prefs.model) {
       const known = taskEngine === "cursor"
         ? resolveCursorModelFamily(modelOptions, prefs.model)
@@ -3710,7 +3834,8 @@ function TaskConversation({
       permissionMode,
       ...(outboundModel ? { model: outboundModel } : {}),
       ...(effort ? { reasoningEffort: effort as ReasoningEffort } : {}),
-      ...(supportsThinking ? { thinking: thinkingMode } : {})
+      ...(supportsThinking ? { thinking: thinkingMode } : {}),
+      ...(taskEngine === "codex" && modelMeta?.supportsFast ? { fast: fastMode } : {})
     };
   }
 
@@ -4069,9 +4194,14 @@ function TaskConversation({
         <code title={task.cwd}>{task.cwd}</code>
         <div
           className="thread-meta-chips"
-          title={contextUsageTitleCombined(contextView, turnContextView)}
+          title={contextUsageTitleCombined(sessionView, turnView, gaugeView, legacyTokenView)}
         >
-          <ContextUsagePanel view={contextView} turnView={turnContextView} />
+          <ContextUsagePanel
+            gaugeView={gaugeView}
+            sessionView={sessionView}
+            turnView={turnView}
+            legacyTokenView={legacyTokenView}
+          />
           {QUOTA_QUERY_ENABLED && taskQuota ? (
             <span
               className="meta-chip meta-chip-quota"
@@ -4396,7 +4526,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
   engineCapabilities: EngineCapability[];
   onClose(): void;
   onRefreshWorkspaces(): Promise<void>;
-  onCreate(cwd: string, prompt: string, title: string, engine: CliEngine, permissionMode: PermissionMode, model?: string, reasoningEffort?: ReasoningEffort, thinking?: boolean): Promise<void>;
+  onCreate(cwd: string, prompt: string, title: string, engine: CliEngine, permissionMode: PermissionMode, model?: string, reasoningEffort?: ReasoningEffort, thinking?: boolean, fast?: boolean): Promise<void>;
 }) {
   const { locale } = useI18n();
   const ready = readyEngines(availableEngines);
@@ -4428,7 +4558,10 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(
     cap?.currentReasoningEffort || effortOptions[0] || ""
   );
-  const [fastMode, setFastMode] = useState(() => /composer/i.test(cap?.currentModel || modelOptions[0]?.id || ""));
+  const [fastMode, setFastMode] = useState(() => {
+    if (engineId === "codex" && cap?.currentFast !== undefined) return cap.currentFast;
+    return /composer/i.test(cap?.currentModel || modelOptions[0]?.id || "");
+  });
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
@@ -4480,6 +4613,9 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
     });
     if (engineId === "cursor") {
       setFastMode(/composer/i.test(model));
+    } else if (engineId === "codex") {
+      const nextCap = capabilityForEngine(engineCapabilities, engineId);
+      if (nextCap?.currentFast !== undefined) setFastMode(nextCap.currentFast);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model, engineId, engineCapabilities]);
@@ -4522,7 +4658,8 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
         taskPermission,
         outboundModel,
         effort,
-        supportsThinking ? thinkingMode : undefined
+        supportsThinking ? thinkingMode : undefined,
+        engineId === "codex" && modelMeta?.supportsFast ? fastMode : undefined
       );
     } catch (createError) {
       setError(createError instanceof Error ? createError.message : "任务创建失败");
@@ -4571,11 +4708,15 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
         {modelOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
       </select>
     </label>
-    {engineId === "cursor" && modelMeta?.supportsFast && (
+    {(engineId === "cursor" || engineId === "codex") && modelMeta?.supportsFast && (
       <label className="composer-fast-toggle" style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <span>Fast 模式</span>
         <input type="checkbox" checked={fastMode} onChange={(event) => setFastMode(event.target.checked)} />
-        <small style={{ color: "#6f756e" }}>部分模型（如 Composer / GPT）支持更快但更浅的推理</small>
+        <small style={{ color: "#6f756e" }}>
+          {engineId === "codex"
+            ? "启用 Codex 优先服务层级（priority tier），响应更快"
+            : "部分模型（如 Composer / GPT）支持更快但更浅的推理"}
+        </small>
       </label>
     )}
     {supportsThinking && (

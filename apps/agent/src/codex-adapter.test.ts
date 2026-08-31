@@ -9,6 +9,7 @@ import {
   normalizeUnixSeconds,
   threadResumeParams,
   threadStartParams,
+  codexTurnConfigExtras,
   threadToSnapshot
 } from "./codex-adapter";
 
@@ -153,6 +154,23 @@ describe("threadToSnapshot", () => {
       turns: [{ startedAt: 200, completedAt: 300, items: [] }]
     });
     expect(snapshot.updatedAt).toBe(300);
+  });
+});
+
+describe("codexTurnConfigExtras", () => {
+  it("maps fast mode to priority service tier", () => {
+    expect(codexTurnConfigExtras({ fast: true })).toEqual({ serviceTierForTurn: "priority" });
+    expect(codexTurnConfigExtras({ fast: false })).toEqual({ serviceTierForTurn: "default" });
+    expect(codexTurnConfigExtras({})).toEqual({});
+  });
+
+  it("includes model, effort, and fast together", () => {
+    expect(codexTurnConfigExtras({ model: "gpt-5.4", reasoningEffort: "high", fast: true })).toEqual({
+      model: "gpt-5.4",
+      modelReasoningEffort: "high",
+      effort: "high",
+      serviceTierForTurn: "priority"
+    });
   });
 });
 

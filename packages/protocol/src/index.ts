@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.5.2";
+export const PRODUCT_VERSION = "0.5.3";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -119,6 +119,8 @@ export const runInfoSchema = z.object({
   reasoningEffort: reasoningEffortSchema.optional(),
   /** Whether extended thinking is enabled for this turn. */
   thinking: z.boolean().optional(),
+  /** Codex: priority (fast) service tier for this turn. */
+  fast: z.boolean().optional(),
   /** Effective provider API root; sanitized by the agent before publication. */
   endpoint: z.string().trim().max(500).optional()
 });
@@ -133,6 +135,7 @@ export const engineModelOptionSchema = z.object({
    * Cursor (and similar): model supports a Fast variant.
    * Web may send `id[fast=true|false]`; agent rewrites to CLI slugs
    * (`gpt-5.6-sol-medium-fast`) before spawn.
+   * Codex: model advertises a priority service tier — UI toggles `serviceTierForTurn`.
    */
   supportsFast: z.boolean().optional(),
   /**
@@ -162,7 +165,9 @@ export const engineCapabilitySchema = z.object({
   currentModel: z.string().optional(),
   currentReasoningEffort: reasoningEffortSchema.optional(),
   /** Cursor: whether the currently selected model has thinking enabled. */
-  currentThinking: z.boolean().optional()
+  currentThinking: z.boolean().optional(),
+  /** Codex: whether fast (priority tier) mode is enabled in local config. */
+  currentFast: z.boolean().optional()
 });
 export type EngineCapability = z.infer<typeof engineCapabilitySchema>;
 
@@ -323,7 +328,9 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     /** Optional reasoning effort (Codex/Claude/Grok naming mapped server-side). */
     reasoningEffort: reasoningEffortSchema.optional(),
     /** Cursor: enable the model's extended-thinking variant when available. */
-    thinking: z.boolean().optional()
+    thinking: z.boolean().optional(),
+    /** Codex: enable priority (fast) service tier when the model supports it. */
+    fast: z.boolean().optional()
   }),
   commandBase.extend({
     type: z.literal("thread.resume"),
@@ -337,7 +344,9 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     model: z.string().trim().min(1).max(120).optional(),
     reasoningEffort: reasoningEffortSchema.optional(),
     /** Cursor: enable the model's extended-thinking variant when available. */
-    thinking: z.boolean().optional()
+    thinking: z.boolean().optional(),
+    /** Codex: enable priority (fast) service tier when the model supports it. */
+    fast: z.boolean().optional()
   }),
   commandBase.extend({
     type: z.literal("turn.steer"),
@@ -484,8 +493,12 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     reasoningEffort: reasoningEffortSchema.optional(),
     /** Cursor: whether the extended-thinking variant is active for this thread. */
     thinking: z.boolean().optional(),
+    /** Codex: whether priority (fast) service tier is active for this thread. */
+    fast: z.boolean().optional(),
     runInfo: runInfoSchema.optional(),
     contextUsage: contextUsageSchema.optional(),
+    /** Provider session cumulative token consumption (Codex total_token_usage). */
+    sessionContextUsage: contextUsageSchema.optional(),
     /** Current-turn token consumption when the CLI reports it separately from session cumulative. */
     turnContextUsage: contextUsageSchema.optional(),
     /** Unified diff / git status for the task Diff tab (optional; may be large). */
@@ -542,6 +555,7 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     turnId: z.string(),
     status: z.string(),
     contextUsage: contextUsageSchema.optional(),
+    sessionContextUsage: contextUsageSchema.optional(),
     turnContextUsage: contextUsageSchema.optional(),
     /** Failure reason when status is failed / systemerror / error. */
     errorMessage: z.string().max(4000).optional()
@@ -550,6 +564,7 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     type: z.literal("usage.updated"),
     threadId: z.string(),
     contextUsage: contextUsageSchema,
+    sessionContextUsage: contextUsageSchema.optional(),
     turnContextUsage: contextUsageSchema.optional()
   }),
   eventBase.extend({

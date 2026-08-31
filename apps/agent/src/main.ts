@@ -62,6 +62,7 @@ import {
   normalizeUnixSeconds,
   threadResumeParams,
   threadStartParams,
+  codexTurnConfigExtras,
   threadToSnapshot,
   mergeSnapshotUserPrompts
 } from "./codex-adapter";
@@ -569,6 +570,7 @@ type QueuedTurnStart = {
   permissionMode?: PermissionMode;
   model?: string;
   reasoningEffort?: ReasoningEffort;
+  fast?: boolean;
 };
 const turnQueueByThread = new Map<string, QueuedTurnStart[]>();
 type PendingCodexSteering = {
@@ -763,6 +765,8 @@ async function loadTurnQueue(userDataDir: string): Promise<void> {
         ) {
           entry.reasoningEffort = effort;
         }
+        const fast = (item as QueuedTurnStart).fast;
+        if (fast === true || fast === false) entry.fast = fast;
         cleaned.push(entry);
       }
       if (cleaned.length) turnQueueByThread.set(threadId, cleaned);
@@ -792,6 +796,7 @@ async function enqueueTurnStart(command: Extract<ClientCommand, { type: "turn.st
   if (command.permissionMode) entry.permissionMode = command.permissionMode;
   if (command.model) entry.model = command.model;
   if (command.reasoningEffort) entry.reasoningEffort = command.reasoningEffort;
+  if (command.fast === true || command.fast === false) entry.fast = command.fast;
   list.push(entry);
   turnQueueByThread.set(command.threadId, list);
   await persistTurnQueue();
@@ -882,7 +887,11 @@ async function steerCodexTurn(
     prompt
   }, true);
   const storedForRunInfo = taskStore.get(threadId);
-  await persistAndPublishRunInfo(threadId, turnId, await codexRunInfo(storedForRunInfo?.model, storedForRunInfo?.reasoningEffort));
+  await persistAndPublishRunInfo(
+    threadId,
+    turnId,
+    await codexRunInfo(storedForRunInfo?.model, storedForRunInfo?.reasoningEffort, storedForRunInfo?.fast)
+  );
 }
 
 async function restoreSteeringQueueItem(threadId: string, item: QueuedTurnStart): Promise<void> {
@@ -906,7 +915,8 @@ async function startCodexSteeringFollowUp(threadId: string, steering: PendingCod
     prompt: queued.prompt,
     ...(queued.permissionMode ? { permissionMode: queued.permissionMode } : {}),
     ...(queued.model ? { model: queued.model } : {}),
-    ...(queued.reasoningEffort ? { reasoningEffort: queued.reasoningEffort } : {})
+    ...(queued.reasoningEffort ? { reasoningEffort: queued.reasoningEffort } : {}),
+    ...(queued.fast === true || queued.fast === false ? { fast: queued.fast } : {})
   };
   await handleCommandImpl(queuedCommand);
   const priorityTurnId = activeTurnByThread.get(threadId);
@@ -1070,7 +1080,8 @@ async function drainTurnQueue(threadId: string): Promise<void> {
     prompt: next.prompt,
     ...(next.permissionMode ? { permissionMode: next.permissionMode } : {}),
     ...(next.model ? { model: next.model } : {}),
-    ...(next.reasoningEffort ? { reasoningEffort: next.reasoningEffort } : {})
+    ...(next.reasoningEffort ? { reasoningEffort: next.reasoningEffort } : {}),
+    ...(next.fast === true || next.fast === false ? { fast: next.fast } : {})
   };
   queuedCommandIds.delete(next.commandId);
   try {
@@ -4015,7 +4026,7 @@ function sanitizeRunEndpoint(raw: string | undefined | null): string | undefined
   }
 }
 
-async function codexRunInfo(model?: string, reasoningEffort?: ReasoningEffort): Promise<RunInfo> {
+async function codexRunInfo(model?: string, reasoningEffort?: ReasoningEffort, fast?: boolean): Promise<RunInfo> {
   let endpoint: string | undefined;
   try {
     const routed = await resolveCodexOpenaiBaseUrlForEnv();
@@ -4028,9 +4039,50 @@ async function codexRunInfo(model?: string, reasoningEffort?: ReasoningEffort): 
     engine: "codex",
     ...(model?.trim() ? { model: model.trim() } : {}),
     ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(fast !== undefined ? { fast } : {}),
     thinking: false,
     ...(endpoint ? { endpoint } : {})
   };
+}
+
+function buildCodexTurnPayload(options: {
+  threadId: string;
+  commandId: string;
+  prompt: string;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
+  fast?: boolean;
+}): Record<string, unknown> {
+  return {
+    threadId: options.threadId,
+    clientUserMessageId: options.commandId,
+    input: [{ type: "text", text: options.prompt, text_elements: [] }],
+    ...codexTurnConfigExtras({
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+      ...(options.fast !== undefined ? { fast: options.fast } : {})
+    })
+  };
+}
+
+async function startCodexTurn(options: {
+  threadId: string;
+  commandId: string;
+  prompt: string;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
+  fast?: boolean;
+}): Promise<any> {
+  const turnPayload = buildCodexTurnPayload(options);
+  try {
+    return await codex!.request("turn/start", turnPayload);
+  } catch {
+    return codex!.request("turn/start", {
+      threadId: options.threadId,
+      clientUserMessageId: options.commandId,
+      input: [{ type: "text", text: options.prompt, text_elements: [] }]
+    });
+  }
 }
 
 async function persistAndPublishRunInfo(threadId: string, turnId: string, runInfo: RunInfo): Promise<void> {
@@ -4154,9 +4206,11 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     return;
   }
   if (event.type === "usage") {
-    await recordUsageUpdate(event.threadId, event.contextUsage, {
-      turnUsage: event.turnContextUsage ?? event.contextUsage
-    });
+    await recordUsageUpdate(
+      event.threadId,
+      event.contextUsage,
+      event.turnContextUsage ? { turnUsage: event.turnContextUsage } : undefined
+    );
     return;
   }
   if (event.type === "error") {
@@ -4228,7 +4282,7 @@ async function handleBackendStreamEvent(event: BackendStreamEvent): Promise<void
     finishLocalActivity(event.threadId, statusForStore);
     await taskStore.setStatus(event.threadId, statusForStore);
     const failed = isTerminalTurnStatus(statusForStore) && /error|fail/i.test(statusForStore);
-    if (pendingUsage || event.contextUsage) {
+    if (pendingUsage || event.contextUsage || finalTurnUsage) {
       const task = taskStore.get(event.threadId);
       if (task) {
         if (event.contextUsage) {
@@ -4369,8 +4423,10 @@ async function publishStoredTaskSnapshot(
     ...(task.model ? { model: task.model } : {}),
     ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}),
     ...(task.thinking !== undefined ? { thinking: task.thinking } : {}),
+    ...(task.fast !== undefined ? { fast: task.fast } : {}),
     ...(task.runInfo ? { runInfo: task.runInfo } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
+    ...(task.sessionContextUsage ? { sessionContextUsage: task.sessionContextUsage } : {}),
     ...(task.turnContextUsage ? { turnContextUsage: task.turnContextUsage } : {}),
     ...(!options.lightweight && task.lastDiff !== undefined ? { diff: task.lastDiff } : {}),
     messages: options.lightweight ? [] : windowed.messages,
@@ -4655,14 +4711,14 @@ async function handleCommand(command: ClientCommand): Promise<void> {
 async function recordUsageUpdate(
   threadId: string,
   usage: ContextUsage,
-  options?: { raw?: unknown; turnUsage?: ContextUsage }
+  options?: { raw?: unknown; turnUsage?: ContextUsage | undefined }
 ): Promise<void> {
   const task = taskStore.get(threadId);
   if (!task) return;
 
   const turnSample = options?.turnUsage
     ?? (options?.raw ? normalizeTurnContextUsage(options.raw) : undefined)
-    ?? usage;
+    ?? (options?.raw ? undefined : usage);
   if (turnSample && resolveContextUsageTotals(turnSample).totalTokens != null) {
     const mergedTurn = mergeContextUsage(turnUsageByThread.get(threadId), turnSample);
     turnUsageByThread.set(threadId, mergedTurn);
@@ -4670,9 +4726,12 @@ async function recordUsageUpdate(
   }
 
   const sessionSample = options?.raw ? normalizeSessionContextUsage(options.raw) : undefined;
-  const contextSample = sessionSample ? mergeContextUsage(usage, sessionSample) : usage;
+  if (sessionSample && resolveContextUsageTotals(sessionSample).totalTokens != null) {
+    task.sessionContextUsage = mergeContextUsage(task.sessionContextUsage, sessionSample);
+  }
 
-  const merged = mergeContextUsage(pendingUsageByThread.get(threadId), contextSample);
+  // Context occupancy only — never fold session cumulative into this field.
+  const merged = mergeContextUsage(pendingUsageByThread.get(threadId), usage);
   pendingUsageByThread.set(threadId, mergeContextUsage(task.contextUsage, merged));
   lastProgressAtByThread.set(threadId, Date.now() / 1000);
   if (usageFlushTimers.has(threadId)) return;
@@ -4873,12 +4932,14 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
       // "Do you trust the contents of this directory?" prompt (no TTY in remote mode).
       const absoluteCwd = resolveAbsoluteCwd(accessCwd);
       await ensureCodexTrustedAndReady(absoluteCwd);
-      const startParams: Record<string, unknown> = { ...threadStartParams(absoluteCwd, mode) };
-      if (command.model) startParams.model = command.model;
-      if (command.reasoningEffort) {
-        // Codex app-server / config use model_reasoning_effort style values.
-        startParams.modelReasoningEffort = command.reasoningEffort;
-      }
+      const startParams: Record<string, unknown> = {
+        ...threadStartParams(absoluteCwd, mode),
+        ...codexTurnConfigExtras({
+          ...(command.model ? { model: command.model } : {}),
+          ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {}),
+          ...(command.fast !== undefined ? { fast: command.fast } : {})
+        })
+      };
       let started: any;
       try {
         started = await codex!.request("thread/start", startParams);
@@ -4902,32 +4963,23 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
         messages: [],
         permissionMode: mode,
         ...(command.model ? { model: command.model } : {}),
-        ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {})
+        ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {}),
+        ...(command.fast !== undefined ? { fast: command.fast } : {})
       });
       await appendStoredUserPrompt(thread.id, command.prompt);
       await publishThread(thread.id);
       startLocalActivity(thread.id, command.prompt, command.title || command.prompt.slice(0, 80), "codex");
-      const turnPayload: Record<string, unknown> = {
+      const turn = await startCodexTurn({
         threadId: thread.id,
-        clientUserMessageId: command.commandId,
-        input: [{ type: "text", text: command.prompt, text_elements: [] }]
-      };
-      if (command.model) turnPayload.model = command.model;
-      if (command.reasoningEffort) turnPayload.modelReasoningEffort = command.reasoningEffort;
-      let turn: any;
-      try {
-        turn = await codex!.request("turn/start", turnPayload);
-      } catch {
-        // Older app-server builds may reject model/effort fields — retry bare params.
-        turn = await codex!.request("turn/start", {
-          threadId: thread.id,
-          clientUserMessageId: command.commandId,
-          input: [{ type: "text", text: command.prompt, text_elements: [] }]
-        });
-      }
+        commandId: command.commandId,
+        prompt: command.prompt,
+        ...(command.model ? { model: command.model } : {}),
+        ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {}),
+        ...(command.fast !== undefined ? { fast: command.fast } : {})
+      });
       activeTurnByThread.set(thread.id, String(turn.turn.id));
       await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: thread.id, turnId: turn.turn.id, prompt: command.prompt }, true);
-      await persistAndPublishRunInfo(thread.id, String(turn.turn.id), await codexRunInfo(command.model, command.reasoningEffort));
+      await persistAndPublishRunInfo(thread.id, String(turn.turn.id), await codexRunInfo(command.model, command.reasoningEffort, command.fast));
       return;
     }
     if (command.type === "thread.resume") {
@@ -5044,32 +5096,27 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
           } else if (command.reasoningEffort) {
             stored.reasoningEffort = command.reasoningEffort;
           }
+          if (command.fast !== undefined) stored.fast = command.fast;
           await taskStore.upsert(stored);
         }
         await codex!.request("thread/resume", threadResumeParams(command.threadId, mode));
         await appendStoredUserPrompt(command.threadId, command.prompt);
         startLocalActivity(command.threadId, command.prompt, "继续远程任务", "codex");
-        const turnPayload: Record<string, unknown> = {
-          threadId: command.threadId,
-          clientUserMessageId: command.commandId,
-          input: [{ type: "text", text: command.prompt, text_elements: [] }]
-        };
         const model = command.model || stored?.model;
         const effort = command.model
           ? command.reasoningEffort
           : (command.reasoningEffort || stored?.reasoningEffort);
-        if (model) turnPayload.model = model;
-        if (effort) turnPayload.modelReasoningEffort = effort;
-        let result: any;
-        try {
-          result = await codex!.request("turn/start", turnPayload);
-        } catch {
-          result = await codex!.request("turn/start", {
-            threadId: command.threadId,
-            clientUserMessageId: command.commandId,
-            input: [{ type: "text", text: command.prompt, text_elements: [] }]
-          });
-        }
+        const fast = command.fast !== undefined
+          ? command.fast
+          : stored?.fast;
+        const result = await startCodexTurn({
+          threadId: command.threadId,
+          commandId: command.commandId,
+          prompt: command.prompt,
+          ...(model ? { model } : {}),
+          ...(effort ? { reasoningEffort: effort } : {}),
+          ...(fast !== undefined ? { fast } : {})
+        });
         activeTurnByThread.set(command.threadId, String(result.turn.id));
         if (stored) {
           stored.status = "active";
@@ -5077,7 +5124,7 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
           await taskStore.upsert(stored);
         }
         await publish({ type: "turn.started", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId: command.threadId, turnId: result.turn.id, prompt: command.prompt }, true);
-        await persistAndPublishRunInfo(command.threadId, String(result.turn.id), await codexRunInfo(model, effort));
+        await persistAndPublishRunInfo(command.threadId, String(result.turn.id), await codexRunInfo(model, effort, fast));
         return;
       } finally {
         turnStartingByThread.delete(command.threadId);
@@ -5448,7 +5495,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       await persistAndPublishRunInfo(
         threadId,
         turnId,
-        await codexRunInfo(nativeModel || stored?.model, stored?.reasoningEffort)
+        await codexRunInfo(nativeModel || stored?.model, stored?.reasoningEffort, stored?.fast)
       );
     }
   }
@@ -5480,23 +5527,21 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const completedStored = taskStore.get(threadId);
     if (completedStored) {
       completedStored.status = turnStatus;
-      if (pendingUsage || contextUsage || sessionUsage) {
-        // Keep the durable snapshot as the base. A final Codex event can be
-        // sparse (or cumulative-only), and must not erase a better live sample.
+      if (pendingUsage || contextUsage || sessionUsage || finalTurnUsage) {
         const withPending = pendingUsage
           ? mergeContextUsage(completedStored.contextUsage, pendingUsage)
           : completedStored.contextUsage;
-        const withSession = sessionUsage
-          ? mergeContextUsage(withPending, sessionUsage)
+        const mergedContext = contextUsage
+          ? mergeContextUsage(withPending, contextUsage)
           : withPending;
-        const mergedUsage = contextUsage
-          ? mergeContextUsage(withSession, contextUsage)
-          : withSession;
-        if (mergedUsage) completedStored.contextUsage = mergedUsage;
+        if (mergedContext) completedStored.contextUsage = mergedContext;
+        if (sessionUsage) {
+          completedStored.sessionContextUsage = mergeContextUsage(completedStored.sessionContextUsage, sessionUsage);
+        }
+        if (finalTurnUsage) completedStored.turnContextUsage = finalTurnUsage;
+        completedStored.updatedAt = Date.now() / 1000;
+        await taskStore.upsert(completedStored);
       }
-      if (finalTurnUsage) completedStored.turnContextUsage = finalTurnUsage;
-      completedStored.updatedAt = Date.now() / 1000;
-      await taskStore.upsert(completedStored);
     }
     const failed = isTerminalTurnStatus(turnStatus) && /error|fail/i.test(turnStatus);
     if (failed && errorMessage) {
@@ -5528,9 +5573,9 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
         message: `任务失败（${turnStatus}）。本机 Codex 未返回详细错误信息，请在客户端「任务 → 接力」查看终端输出。`
       }, true);
     }
-    const publishedContextUsage = sessionUsage
-      ? mergeContextUsage(contextUsage, sessionUsage)
-      : contextUsage;
+    const publishedSessionUsage = sessionUsage
+      ? mergeContextUsage(completedStored?.sessionContextUsage, sessionUsage)
+      : completedStored?.sessionContextUsage;
     await publish({
       type: "turn.completed",
       eventId: crypto.randomUUID(),
@@ -5538,7 +5583,8 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
       threadId: params.threadId,
       turnId: params.turn?.id ?? turnId,
       status: turnStatus,
-      ...(publishedContextUsage ? { contextUsage: publishedContextUsage } : {}),
+      ...(contextUsage ? { contextUsage } : {}),
+      ...(publishedSessionUsage ? { sessionContextUsage: publishedSessionUsage } : {}),
       ...(finalTurnUsage ? { turnContextUsage: finalTurnUsage } : {}),
       ...(errorMessage ? { errorMessage } : {})
     }, true, "completed");
@@ -5845,7 +5891,33 @@ async function publishActiveTurnHeartbeats(): Promise<void> {
 
 async function publishThread(threadId: string, options: { touch?: boolean } = {}): Promise<void> {
   if (isThreadDeleted(threadId)) return;
-  const result = await codex!.request("thread/read", { threadId, includeTurns: true });
+
+  async function publishLocalFallback(): Promise<void> {
+    await publishStoredTaskSnapshot(threadId, { persist: false }).catch(() => undefined);
+  }
+
+  if (!codex) {
+    try {
+      await ensureCodex();
+    } catch {
+      await publishLocalFallback();
+      return;
+    }
+  }
+  const adapter = codex;
+  if (!adapter) {
+    await publishLocalFallback();
+    return;
+  }
+
+  let result: { thread: Record<string, unknown> };
+  try {
+    result = await adapter.request("thread/read", { threadId, includeTurns: true });
+  } catch {
+    // app-server may exit/reload mid-sync (OOM, credential reload) — keep web on local store.
+    await publishLocalFallback();
+    return;
+  }
   const snapshot = threadToSnapshot(result.thread);
   const stored = taskStore.get(threadId);
   const messages = mergeSnapshotUserPrompts(snapshot.messages, stored?.messages || []);
@@ -5895,6 +5967,7 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     ...(stored?.model ? { model: stored.model } : {}),
     ...(stored?.reasoningEffort ? { reasoningEffort: stored.reasoningEffort } : {}),
     ...(stored?.contextUsage ? { contextUsage: stored.contextUsage } : {}),
+    ...(stored?.sessionContextUsage ? { sessionContextUsage: stored.sessionContextUsage } : {}),
     ...(stored?.turnContextUsage ? { turnContextUsage: stored.turnContextUsage } : {}),
     ...(stored?.lastDiff !== undefined ? { diff: stored.lastDiff } : {}),
     ...(stored?.providerSessionId ? { providerSessionId: stored.providerSessionId } : { providerSessionId: threadId }),
