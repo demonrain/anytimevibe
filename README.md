@@ -9,9 +9,7 @@
 
 **在自己的电脑上跑 Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity / Pi，用手机随时续上任务——不是远程桌面，也不把源码和凭据交给云端。**
 
-## 35 秒看懂（六引擎版）
-
-> 最新宣传片已同步 Google Antigravity 与 Pi：手机下发任务、电脑端执行、`agy` 或 Pi 原生会话接力，和 Codex / Claude Code / Grok Build / Cursor Agent 一起在同一条任务流中完成。
+## 35 秒看懂
 
 <p align="center">
   <img src="docs/media/anytimevibe-promo.gif" alt="随码 35 秒产品预览" width="100%" />
@@ -63,9 +61,13 @@
 
 ## 产品截图
 
-| 桌面端登录与六引擎矩阵 | 移动端登录与响应式六引擎矩阵 |
+| 多引擎任务选择 | 原生 CLI 接力 |
 | --- | --- |
-| ![随码桌面端登录页与 Codex、Claude、Grok、Cursor、Antigravity、Pi](docs/media/anytimevibe-desktop-latest.png) | ![随码移动端登录页与六种受支持的编程引擎](docs/media/anytimevibe-mobile-latest.png) |
+| ![选择 Codex、Claude Code、Grok Build、Cursor Agent 或 Google Antigravity 下发任务](docs/media/remote-command.png) | ![任务按所属引擎接力到原生 CLI（支持 agy 会话接力）](docs/media/cli-handoff.png) |
+
+| 多引擎任务流 | 引擎权限映射 |
+| --- | --- |
+| ![Codex、Claude、Grok、Cursor 和 Antigravity 的统一任务流](docs/media/task-stream.png) | ![五款编码引擎的权限映射](docs/media/permissions.png) |
 
 ## 核心工作流
 
