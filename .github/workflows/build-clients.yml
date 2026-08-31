@@ -27,6 +27,9 @@ jobs:
               apps/agent/release/*.zip
               apps/agent/release/latest-mac.yml
     runs-on: ${{ matrix.os }}
+    env:
+      # Pin Electron download cache inside the workspace so actions/cache can reuse it across runs.
+      ELECTRON_CACHE: ${{ github.workspace }}/.electron-cache
     steps:
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
@@ -36,7 +39,29 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - name: Cache Electron binary downloads
+        uses: actions/cache@v4
+        with:
+          path: .electron-cache
+          key: electron-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            electron-${{ runner.os }}-
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "pnpm install attempt ${attempt}/3"
+            if pnpm install --frozen-lockfile; then
+              exit 0
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              echo "Install failed (often transient Electron download errors); retrying in 20s..."
+              sleep 20
+            fi
+          done
+          echo "pnpm install failed after 3 attempts"
+          exit 1
       # Workspace packages are gitignored under dist/; build protocol before packaging the agent.
       - run: pnpm --filter @anytimevibe/protocol build
       - if: startsWith(github.ref, 'refs/tags/v')
