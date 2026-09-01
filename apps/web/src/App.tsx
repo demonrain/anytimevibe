@@ -25,9 +25,11 @@ import {
   importAesKey,
   isInProgressTaskStatus as isInProgressTaskStatusShared,
   isTaskStale,
+  isRelayControlMessage,
   mergeContextUsage,
   openEnvelope,
   parseAgentEventCompat,
+  parseEncryptedEnvelope,
   pairingClaimResponseSchema,
   randomUuid,
   resolveContextUsageTotals,
@@ -2669,7 +2671,10 @@ export function App() {
         const sync = await api<{ events: EncryptedEnvelope[]; nextSequence: number; hasMore?: boolean }>(
           `/api/sync/${host.id}?after=${after}&limit=500`
         );
-        for (const envelope of sync.events) await handleEnvelope(envelope);
+        for (const envelope of sync.events) {
+          const parsed = parseEncryptedEnvelope(envelope);
+          if (parsed) await handleEnvelope(parsed);
+        }
         const next = Number(sync.nextSequence);
         if (!sync.hasMore || !Number.isFinite(next) || next <= after) break;
         after = next;
@@ -2687,58 +2692,64 @@ export function App() {
       socketRef.current = connection;
       connection.onmessage = (message) => {
         try {
-          const parsed = JSON.parse(String(message.data));
-          if (parsed.type === "relay.host_status") {
-            const hostId = String(parsed.hostId);
-            const online = Boolean(parsed.online);
-            updateHostStatus(hostId, online);
-            if (online) void getHostKey(hostId).then((key) => {
-              if (!key) return authorizeExistingHost(hostId);
-            }).catch((authorizationError) => setError(authorizationError.message));
-            if (online) {
-              // Always re-pull allowlisted workspaces when the host comes online.
-              void getHostKey(hostId).then((key) => {
-                if (!key) return;
-                return sendCommand(hostId, { type: "host.refresh", commandId: randomUuid() });
-              }).catch(() => undefined);
+          const parsed = JSON.parse(String(message.data)) as Record<string, unknown>;
+          if (isRelayControlMessage(parsed)) {
+            if (parsed.type === "relay.host_status") {
+              const hostId = String(parsed.hostId);
+              const online = Boolean(parsed.online);
+              updateHostStatus(hostId, online);
+              if (online) void getHostKey(hostId).then((key) => {
+                if (!key) return authorizeExistingHost(hostId);
+              }).catch((authorizationError) => setError(authorizationError.message));
+              if (online) {
+                // Always re-pull allowlisted workspaces when the host comes online.
+                void getHostKey(hostId).then((key) => {
+                  if (!key) return;
+                  return sendCommand(hostId, { type: "host.refresh", commandId: randomUuid() });
+                }).catch(() => undefined);
+              }
+              if (online && !autoSyncedHostsRef.current.has(hostId)) {
+                autoSyncedHostsRef.current.add(hostId);
+                syncHostTasks(hostId, { limit: 10 }).catch((syncError) => {
+                  autoSyncedHostsRef.current.delete(hostId);
+                  setError(syncError.message);
+                });
+              }
+              return;
             }
-            if (online && !autoSyncedHostsRef.current.has(hostId)) {
-              autoSyncedHostsRef.current.add(hostId);
-              syncHostTasks(hostId, { limit: 10 }).catch((syncError) => {
-                autoSyncedHostsRef.current.delete(hostId);
-                setError(syncError.message);
-              });
+            if (parsed.type === "relay.host_meta") {
+              const hostId = String(parsed.hostId);
+              const agentVersion = typeof parsed.agentVersion === "string" ? parsed.agentVersion.trim().replace(/^v/i, "") : "";
+              setHosts((current) => current.map((host) => host.id !== hostId ? host : {
+                ...host,
+                ...(typeof parsed.name === "string" && parsed.name.trim() ? { name: parsed.name.trim() } : {}),
+                ...(typeof parsed.codexVersion === "string" && parsed.codexVersion.trim() ? { codexVersion: parsed.codexVersion.trim() } : {}),
+                ...(typeof parsed.platform === "string" && parsed.platform.trim() ? { platform: parsed.platform.trim() } : {})
+              }));
+              // agent.meta arrives unencrypted and often sooner/more often than host.status —
+              // update runtime.agentVersion immediately so update banners clear after client upgrade.
+              if (agentVersion) {
+                setRuntime((current) => {
+                  const prev = current[hostId] ?? emptyRuntime(true);
+                  if (prev.agentVersion === agentVersion) return current;
+                  return {
+                    ...current,
+                    [hostId]: { ...prev, agentVersion, online: prev.online ?? true }
+                  };
+                });
+              }
+              return;
             }
+            if (parsed.type === "relay.error") {
+              setError(parsed.error === "host_offline" ? "远程主机当前离线。" : "中继拒绝了这条消息。");
+              return;
+            }
+            // e.g. relay.key_authorized after agent wraps sync key for a new browser
             return;
           }
-          if (parsed.type === "relay.host_meta") {
-            const hostId = String(parsed.hostId);
-            const agentVersion = typeof parsed.agentVersion === "string" ? parsed.agentVersion.trim().replace(/^v/i, "") : "";
-            setHosts((current) => current.map((host) => host.id !== hostId ? host : {
-              ...host,
-              ...(typeof parsed.name === "string" && parsed.name.trim() ? { name: parsed.name.trim() } : {}),
-              ...(typeof parsed.codexVersion === "string" && parsed.codexVersion.trim() ? { codexVersion: parsed.codexVersion.trim() } : {}),
-              ...(typeof parsed.platform === "string" && parsed.platform.trim() ? { platform: parsed.platform.trim() } : {})
-            }));
-            // agent.meta arrives unencrypted and often sooner/more often than host.status —
-            // update runtime.agentVersion immediately so update banners clear after client upgrade.
-            if (agentVersion) {
-              setRuntime((current) => {
-                const prev = current[hostId] ?? emptyRuntime(true);
-                if (prev.agentVersion === agentVersion) return current;
-                return {
-                  ...current,
-                  [hostId]: { ...prev, agentVersion, online: prev.online ?? true }
-                };
-              });
-            }
-            return;
-          }
-          if (parsed.type === "relay.error") {
-            setError(parsed.error === "host_offline" ? "远程主机当前离线。" : "中继拒绝了这条消息。");
-            return;
-          }
-          handleEnvelope(parsed as EncryptedEnvelope).catch((openError) => setError(`无法解密远程事件：${openError.message}`));
+          const envelope = parseEncryptedEnvelope(parsed);
+          if (!envelope) return;
+          handleEnvelope(envelope).catch((openError) => setError(`无法解密远程事件：${openError.message}`));
         } catch {
           setError("收到无法识别的中继消息。");
         }

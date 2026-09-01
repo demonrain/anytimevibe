@@ -10,9 +10,11 @@ import {
   encryptPayload,
   generatePairingKeyPair,
   importAesKey,
+  isRelayControlMessage,
   openEnvelope,
   pageTranscriptMessagesBefore,
   parseAgentEventCompat,
+  parseEncryptedEnvelope,
   pairingClaimResponseSchema,
   randomKeyBytes,
   windowTranscriptMessages
@@ -80,6 +82,24 @@ describe("protocol crypto", () => {
 
   it("decodes URL-safe base64 keys", () => {
     expect(base64ToBytes("-_8")).toEqual(new Uint8Array([251, 255]));
+  });
+
+  it("rejects missing base64 payloads", () => {
+    expect(() => base64ToBytes("")).toThrow(/Missing base64 payload/);
+    expect(() => base64ToBytes(undefined as unknown as string)).toThrow(/Missing base64 payload/);
+  });
+
+  it("recognizes relay control frames separately from encrypted envelopes", async () => {
+    const key = await importAesKey(randomKeyBytes());
+    const envelope = await createEnvelope(crypto.randomUUID(), 1, key, {
+      type: "sync.request",
+      commandId: crypto.randomUUID()
+    });
+    expect(isRelayControlMessage({ type: "relay.host_status", hostId: crypto.randomUUID(), online: true })).toBe(true);
+    expect(isRelayControlMessage({ type: "relay.key_authorized", hostId: crypto.randomUUID(), pairingId: crypto.randomUUID() })).toBe(true);
+    expect(isRelayControlMessage(envelope)).toBe(false);
+    expect(parseEncryptedEnvelope(envelope)).toEqual(envelope);
+    expect(parseEncryptedEnvelope({ type: "relay.key_authorized", hostId: crypto.randomUUID() })).toBeNull();
   });
 
   it("normalizes legacy pairing responses that use hostId", () => {

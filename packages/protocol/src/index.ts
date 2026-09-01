@@ -70,6 +70,18 @@ export const encryptedEnvelopeSchema = z.object({
 
 export type EncryptedEnvelope = z.infer<typeof encryptedEnvelopeSchema>;
 
+/** Unencrypted relay → web control frames (must not be passed to openEnvelope). */
+export function isRelayControlMessage(value: unknown): value is Record<string, unknown> & { type: `relay.${string}` } {
+  if (!value || typeof value !== "object") return false;
+  const type = (value as { type?: unknown }).type;
+  return typeof type === "string" && type.startsWith("relay.");
+}
+
+export function parseEncryptedEnvelope(value: unknown): EncryptedEnvelope | null {
+  const result = encryptedEnvelopeSchema.safeParse(value);
+  return result.success ? result.data : null;
+}
+
 export const workspaceSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -711,6 +723,9 @@ export function bytesToBase64(bytes: Uint8Array): string {
 }
 
 export function base64ToBytes(value: string): Uint8Array {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("Missing base64 payload");
+  }
   const normalized = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
   if (typeof Buffer !== "undefined") return new Uint8Array(Buffer.from(normalized, "base64"));
   const binary = atob(normalized);
@@ -753,6 +768,9 @@ export async function decryptPayload<T>(
   payload: WrappedPayload,
   additionalData?: string
 ): Promise<T> {
+  if (!payload?.nonce?.trim() || !payload?.ciphertext?.trim()) {
+    throw new Error("Invalid encrypted payload: missing nonce or ciphertext");
+  }
   const decrypted = await crypto.subtle.decrypt(
     {
       name: "AES-GCM",
