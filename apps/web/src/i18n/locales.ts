@@ -67,6 +67,9 @@ export const messages = {
     lang: "语言",
     renameHost: "重命名",
     deleteHost: "删除",
+    moveHostUp: "上移",
+    moveHostDown: "下移",
+    dragHost: "拖动排序",
     desktopClients: "桌面客户端",
     personalSpace: "个人空间",
     administrator: "管理员"
@@ -135,6 +138,9 @@ export const messages = {
     lang: "Language",
     renameHost: "Rename",
     deleteHost: "Delete",
+    moveHostUp: "Move up",
+    moveHostDown: "Move down",
+    dragHost: "Drag to reorder",
     desktopClients: "Desktop clients",
     personalSpace: "Personal space",
     administrator: "Administrator"

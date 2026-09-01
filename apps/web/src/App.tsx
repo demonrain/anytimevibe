@@ -88,6 +88,74 @@ type Host = {
   lastSeenAt: string | null;
   online: boolean;
 };
+
+const HOST_ORDER_STORAGE_KEY = "host-order";
+
+function loadHostOrder(): string[] {
+  try {
+    const raw = localStorage.getItem(HOST_ORDER_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === "string" && item.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function saveHostOrder(order: string[]): void {
+  try {
+    localStorage.setItem(HOST_ORDER_STORAGE_KEY, JSON.stringify(order));
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+function mergeHostOrder(order: string[], hostIds: string[]): string[] {
+  const known = new Set(hostIds);
+  const next = order.filter((id) => known.has(id));
+  for (const id of hostIds) {
+    if (!next.includes(id)) next.push(id);
+  }
+  return next;
+}
+
+function sortHostsByOrder(hosts: Host[], order: string[]): Host[] {
+  if (!order.length) return hosts;
+  const index = new Map(order.map((id, position) => [id, position]));
+  return [...hosts].sort((left, right) => {
+    const leftIndex = index.get(left.id);
+    const rightIndex = index.get(right.id);
+    if (leftIndex === undefined && rightIndex === undefined) return left.name.localeCompare(right.name);
+    if (leftIndex === undefined) return 1;
+    if (rightIndex === undefined) return -1;
+    return leftIndex - rightIndex;
+  });
+}
+
+function moveHostInOrder(order: string[], fromId: string, beforeId: string): string[] {
+  if (fromId === beforeId) return order;
+  const without = order.filter((id) => id !== fromId);
+  const targetIndex = without.indexOf(beforeId);
+  if (targetIndex < 0) return [...without, fromId];
+  const next = [...without];
+  next.splice(targetIndex, 0, fromId);
+  return next;
+}
+
+function shiftHostInOrder(order: string[], hostId: string, direction: -1 | 1): string[] {
+  const index = order.indexOf(hostId);
+  if (index < 0) return order;
+  const target = index + direction;
+  if (target < 0 || target >= order.length) return order;
+  const next = [...order];
+  const currentId = next[index];
+  const swapId = next[target];
+  if (!currentId || !swapId) return order;
+  next[index] = swapId;
+  next[target] = currentId;
+  return next;
+}
 type Approval = Extract<AgentEvent, { type: "approval.requested" }>;
 type QueuedTurnItem = { commandId: string; prompt: string };
 
@@ -2414,6 +2482,9 @@ export function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [hosts, setHosts] = useState<Host[]>([]);
+  const [hostOrder, setHostOrder] = useState<string[]>(() => loadHostOrder());
+  const [draggingHostId, setDraggingHostId] = useState<string | null>(null);
+  const [dropTargetHostId, setDropTargetHostId] = useState<string | null>(null);
   const [runtime, setRuntime] = useState<Record<string, HostRuntime>>({});
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
@@ -2637,7 +2708,10 @@ export function App() {
 
   const loadHosts = useEffectEvent(async () => {
     const response = await api<{ hosts: Host[] }>("/api/hosts");
-    setHosts(response.hosts);
+    const mergedOrder = mergeHostOrder(loadHostOrder(), response.hosts.map((host) => host.id));
+    saveHostOrder(mergedOrder);
+    setHostOrder(mergedOrder);
+    setHosts(sortHostsByOrder(response.hosts, mergedOrder));
     setRuntime((current) => {
       const next = { ...current };
       for (const host of response.hosts) {
@@ -2652,7 +2726,7 @@ export function App() {
       }
       return next;
     });
-    setSelectedHostId((current) => current ?? response.hosts[0]?.id ?? null);
+    setSelectedHostId((current) => current ?? mergedOrder[0] ?? response.hosts[0]?.id ?? null);
     for (const host of response.hosts) {
       const key = await getHostKey(host.id);
       if (!key) {
@@ -2805,10 +2879,40 @@ export function App() {
     }
   }
 
+  const orderedHosts = useMemo(
+    () => sortHostsByOrder(hosts, mergeHostOrder(hostOrder, hosts.map((host) => host.id))),
+    [hosts, hostOrder]
+  );
+
+  const reorderHosts = useCallback((fromId: string, beforeId: string) => {
+    setHosts((current) => {
+      const merged = mergeHostOrder(loadHostOrder(), current.map((host) => host.id));
+      const next = moveHostInOrder(merged, fromId, beforeId);
+      saveHostOrder(next);
+      setHostOrder(next);
+      return sortHostsByOrder(current, next);
+    });
+  }, []);
+
+  const shiftHost = useCallback((hostId: string, direction: -1 | 1) => {
+    setHosts((current) => {
+      const merged = mergeHostOrder(loadHostOrder(), current.map((host) => host.id));
+      const next = shiftHostInOrder(merged, hostId, direction);
+      saveHostOrder(next);
+      setHostOrder(next);
+      return sortHostsByOrder(current, next);
+    });
+  }, []);
+
   async function deleteHost(host: Host) {
     if (!window.confirm(`确定删除设备“${host.name}”吗？该设备的云端加密同步记录也会被删除。`)) return;
     await api(`/api/hosts/${host.id}`, { method: "DELETE" });
     await removeHostKey(host.id);
+    setHostOrder((current) => {
+      const next = current.filter((item) => item !== host.id);
+      saveHostOrder(next);
+      return next;
+    });
     setHosts((current) => current.filter((item) => item.id !== host.id));
     setRuntime((current) => {
       const next = { ...current };
@@ -3001,7 +3105,7 @@ export function App() {
       <div className="rail-heading"><span>{t("remoteHosts")}</span><button onClick={() => setPairingOpen(true)}>＋</button></div>
       <div className="host-list">
         <button className="host-add-mobile" onClick={() => setPairingOpen(true)}>{t("addComputer")}</button>
-        {hosts.map((host) => {
+        {orderedHosts.map((host, index) => {
           const hostEngines = readyEngines(runtime[host.id]?.availableEngines);
           // Fallback: older agents only report codexVersion
           const engineChips = hostEngines.length
@@ -3009,32 +3113,36 @@ export function App() {
             : (host.codexVersion && host.codexVersion !== "unknown"
               ? [{ engine: "codex" as const, ready: true, version: host.codexVersion }]
               : []);
-          return <div key={host.id} className={`host-row ${host.id === selectedHostId ? "active" : ""}`}>
-            <button className="host-pill" onClick={() => { setSelectedHostId(host.id); setSelectedTaskId(null); setMobilePane("tasks"); }}>
-              <span className={`status-dot ${(runtime[host.id]?.online ?? host.online) ? "online" : ""}`} />
-              <span className="host-pill-body">
-                <strong className="host-name">{host.name}</strong>
-                {engineChips.length > 0 && (
-                  <span className="host-engine-rail" aria-label="installed engines">
-                    {engineChips.map((item) => (
-                      <span
-                        key={item.engine}
-                        className="host-engine-item"
-                        title={`${cliEngineLabel(item.engine)}${item.version ? ` · ${item.version}` : ""}`}
-                      >
-                        <EngineLogo engine={item.engine} size={16} />
-                        <span className="host-engine-ver">{item.version || "—"}</span>
-                      </span>
-                    ))}
-                  </span>
-                )}
-              </span>
-            </button>
-            <button className="host-rename" title={`${t("renameHost")} ${host.name}`} aria-label={`${t("renameHost")} ${host.name}`} onClick={() => renameHost(host).catch((renameError) => setError(renameError.message))}>✎</button>
-            <button className="host-delete" title={`${t("deleteHost")} ${host.name}`} aria-label={`${t("deleteHost")} ${host.name}`} onClick={() => deleteHost(host).catch((deleteError) => setError(deleteError.message))}>×</button>
-          </div>;
+          return (
+            <HostListRow
+              key={host.id}
+              host={host}
+              active={host.id === selectedHostId}
+              engineChips={engineChips}
+              online={runtime[host.id]?.online ?? host.online}
+              canMove={orderedHosts.length > 1}
+              canMoveUp={index > 0}
+              canMoveDown={index < orderedHosts.length - 1}
+              dragging={draggingHostId === host.id}
+              dropTarget={dropTargetHostId === host.id && draggingHostId !== host.id}
+              onSelect={() => { setSelectedHostId(host.id); setSelectedTaskId(null); setMobilePane("tasks"); }}
+              onRename={() => renameHost(host).catch((renameError) => setError(renameError.message))}
+              onDelete={() => deleteHost(host).catch((deleteError) => setError(deleteError.message))}
+              onMoveUp={() => shiftHost(host.id, -1)}
+              onMoveDown={() => shiftHost(host.id, 1)}
+              onDragStart={() => setDraggingHostId(host.id)}
+              onDragEnd={() => { setDraggingHostId(null); setDropTargetHostId(null); }}
+              onDragEnter={() => setDropTargetHostId(host.id)}
+              onDragLeave={() => setDropTargetHostId((current) => (current === host.id ? null : current))}
+              onDrop={() => {
+                if (draggingHostId && draggingHostId !== host.id) reorderHosts(draggingHostId, host.id);
+                setDraggingHostId(null);
+                setDropTargetHostId(null);
+              }}
+            />
+          );
         })}
-        {!hosts.length && <button className="empty-host" onClick={() => setPairingOpen(true)}>{t("connectFirst")}</button>}
+        {!orderedHosts.length && <button className="empty-host" onClick={() => setPairingOpen(true)}>{t("connectFirst")}</button>}
       </div>
     </aside>
 
@@ -3185,6 +3293,152 @@ export function App() {
       }}
     />}
   </div>;
+}
+
+function HostListRow({
+  host,
+  active,
+  engineChips,
+  online,
+  canMove,
+  canMoveUp,
+  canMoveDown,
+  dragging,
+  dropTarget,
+  onSelect,
+  onRename,
+  onDelete,
+  onMoveUp,
+  onMoveDown,
+  onDragStart,
+  onDragEnd,
+  onDragEnter,
+  onDragLeave,
+  onDrop
+}: {
+  host: Host;
+  active: boolean;
+  engineChips: CliEngineInfo[];
+  online: boolean;
+  canMove: boolean;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
+  dragging: boolean;
+  dropTarget: boolean;
+  onSelect(): void;
+  onRename(): void;
+  onDelete(): void;
+  onMoveUp(): void;
+  onMoveDown(): void;
+  onDragStart(): void;
+  onDragEnd(): void;
+  onDragEnter(): void;
+  onDragLeave(): void;
+  onDrop(): void;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <div
+      className={`host-row ${active ? "active" : ""} ${dragging ? "dragging" : ""} ${dropTarget ? "drop-target" : ""}`}
+      onDragOver={(event) => {
+        if (!canMove) return;
+        event.preventDefault();
+        onDragEnter();
+      }}
+      onDragLeave={onDragLeave}
+      onDrop={(event) => {
+        if (!canMove) return;
+        event.preventDefault();
+        onDrop();
+      }}
+    >
+      {canMove ? (
+        <button
+          type="button"
+          className="host-drag-handle"
+          draggable
+          aria-label={`${t("dragHost")} ${host.name}`}
+          title={t("dragHost")}
+          onDragStart={(event) => {
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", host.id);
+            onDragStart();
+          }}
+          onDragEnd={onDragEnd}
+          onClick={(event) => event.stopPropagation()}
+        >
+          ⋮⋮
+        </button>
+      ) : (
+        <span className="host-drag-spacer" aria-hidden="true" />
+      )}
+      <button type="button" className="host-pill" onClick={onSelect}>
+        <span className={`status-dot ${online ? "online" : ""}`} />
+        <span className="host-pill-body">
+          <strong className="host-name">{host.name}</strong>
+          {engineChips.length > 0 && (
+            <span className="host-engine-rail" aria-label="installed engines">
+              {engineChips.map((item) => (
+                <span
+                  key={item.engine}
+                  className="host-engine-item"
+                  title={`${cliEngineLabel(item.engine)}${item.version ? ` · ${item.version}` : ""}`}
+                >
+                  <EngineLogo engine={item.engine} size={16} />
+                  <span className="host-engine-ver">{item.version || "—"}</span>
+                </span>
+              ))}
+            </span>
+          )}
+        </span>
+      </button>
+      <div className="host-row-actions">
+        {canMove && (
+          <div className="host-move-group">
+            <button
+              type="button"
+              className="host-move"
+              disabled={!canMoveUp}
+              aria-label={`${t("moveHostUp")} ${host.name}`}
+              title={t("moveHostUp")}
+              onClick={(event) => { event.stopPropagation(); onMoveUp(); }}
+            >
+              ↑
+            </button>
+            <button
+              type="button"
+              className="host-move"
+              disabled={!canMoveDown}
+              aria-label={`${t("moveHostDown")} ${host.name}`}
+              title={t("moveHostDown")}
+              onClick={(event) => { event.stopPropagation(); onMoveDown(); }}
+            >
+              ↓
+            </button>
+          </div>
+        )}
+        <button
+          type="button"
+          className="host-rename"
+          title={`${t("renameHost")} ${host.name}`}
+          aria-label={`${t("renameHost")} ${host.name}`}
+          onClick={(event) => { event.stopPropagation(); onRename(); }}
+        >
+          ✎
+        </button>
+        <button
+          type="button"
+          className="host-delete"
+          title={`${t("deleteHost")} ${host.name}`}
+          aria-label={`${t("deleteHost")} ${host.name}`}
+          onClick={(event) => { event.stopPropagation(); onDelete(); }}
+        >
+          ×
+        </button>
+      </div>
+    </div>
+  );
 }
 
 /** Task row with desktop hover-delete + mobile swipe-to-delete. */
