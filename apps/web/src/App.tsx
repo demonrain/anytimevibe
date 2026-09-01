@@ -2507,7 +2507,8 @@ export function App() {
   const taskSearchTimerRef = useRef<number | null>(null);
   const autoSyncedHostsRef = useRef(new Set<string>());
   const [keyAuthorizationStatus, setKeyAuthorizationStatus] = useState<Record<string, "missing" | "authorizing">>({});
-  const keyAuthorizationsRef = useRef(new Set<string>());
+  /** In-flight key authorization; shared so concurrent callers can await the same run. */
+  const keyAuthorizationPromisesRef = useRef(new Map<string, Promise<void>>());
   /** After task.create, auto-select the first new threadId not in this set. */
   const pendingNewTaskRef = useRef<{
     hostId: string;
@@ -2668,42 +2669,88 @@ export function App() {
   });
 
   async function authorizeExistingHost(hostId: string): Promise<void> {
-    if (keyAuthorizationsRef.current.has(hostId)) return;
-    keyAuthorizationsRef.current.add(hostId);
-    setKeyAuthorizationStatus((current) => ({ ...current, [hostId]: "authorizing" }));
-    try {
-      const keyPair = await generatePairingKeyPair();
-      const clientPublicKey = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
-      const authorization = await api<{ pairingId: string; agentPublicKey: JsonWebKey }>(`/api/hosts/${hostId}/key-authorizations`, {
-        method: "POST",
-        body: JSON.stringify({ clientPublicKey })
-      });
-      const pairingKey = await derivePairingKey(keyPair.privateKey, authorization.agentPublicKey, authorization.pairingId);
-      let wrappedSyncKey: { nonce: string; ciphertext: string } | null = null;
-      for (let attempt = 0; attempt < 60; attempt += 1) {
-        const status = await api<{ status: string; wrappedSyncKey?: { nonce: string; ciphertext: string } }>(`/api/pairings/${authorization.pairingId}/status`);
-        if (status.status === "authorized" && status.wrappedSyncKey) {
-          wrappedSyncKey = status.wrappedSyncKey;
-          break;
+    const inFlight = keyAuthorizationPromisesRef.current.get(hostId);
+    if (inFlight) return inFlight;
+
+    const promise = (async () => {
+      setKeyAuthorizationStatus((current) => ({ ...current, [hostId]: "authorizing" }));
+      try {
+        const keyPair = await generatePairingKeyPair();
+        const clientPublicKey = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
+        const authorization = await api<{ pairingId: string; agentPublicKey: JsonWebKey }>(`/api/hosts/${hostId}/key-authorizations`, {
+          method: "POST",
+          body: JSON.stringify({ clientPublicKey })
+        });
+        const pairingKey = await derivePairingKey(keyPair.privateKey, authorization.agentPublicKey, authorization.pairingId);
+        let wrappedSyncKey: { nonce: string; ciphertext: string } | null = null;
+        for (let attempt = 0; attempt < 60; attempt += 1) {
+          const status = await api<{ status: string; wrappedSyncKey?: { nonce: string; ciphertext: string } }>(`/api/pairings/${authorization.pairingId}/status`);
+          if (status.status === "authorized" && status.wrappedSyncKey) {
+            wrappedSyncKey = status.wrappedSyncKey;
+            break;
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 1000));
         }
-        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        if (!wrappedSyncKey) throw new Error("客户端密钥授权超时，请确认电脑端保持在线。");
+        const unwrapped = await decryptPayload<{ syncKey: string }>(pairingKey, wrappedSyncKey, authorization.pairingId);
+        await saveHostKey(hostId, await importAesKey(base64ToBytes(unwrapped.syncKey)));
+        setKeyAuthorizationStatus((current) => {
+          const next = { ...current };
+          delete next[hostId];
+          return next;
+        });
+        localStorage.removeItem(`sync:${hostId}`);
+        await loadHosts();
+      } catch (authorizationError) {
+        setKeyAuthorizationStatus((current) => ({ ...current, [hostId]: "missing" }));
+        throw authorizationError;
       }
-      if (!wrappedSyncKey) throw new Error("客户端密钥授权超时，请确认电脑端保持在线。");
-      const unwrapped = await decryptPayload<{ syncKey: string }>(pairingKey, wrappedSyncKey, authorization.pairingId);
-      await saveHostKey(hostId, await importAesKey(base64ToBytes(unwrapped.syncKey)));
-      setKeyAuthorizationStatus((current) => {
-        const next = { ...current };
-        delete next[hostId];
-        return next;
-      });
-      localStorage.removeItem(`sync:${hostId}`);
-      await loadHosts();
-    } catch (authorizationError) {
-      setKeyAuthorizationStatus((current) => ({ ...current, [hostId]: "missing" }));
-      throw authorizationError;
-    } finally {
-      keyAuthorizationsRef.current.delete(hostId);
+    })();
+
+    keyAuthorizationPromisesRef.current.set(hostId, promise);
+    void promise.finally(() => {
+      if (keyAuthorizationPromisesRef.current.get(hostId) === promise) {
+        keyAuthorizationPromisesRef.current.delete(hostId);
+      }
+    });
+    return promise;
+  }
+
+  async function ensureHostKey(hostId: string): Promise<CryptoKey> {
+    let key = await getHostKey(hostId);
+    if (key) return key;
+
+    const pending = keyAuthorizationPromisesRef.current.get(hostId);
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        // Authorization failed; re-check below before surfacing an error.
+      }
+      key = await getHostKey(hostId);
+      if (key) return key;
     }
+
+    const online = runtime[hostId]?.online === true
+      || hosts.some((host) => host.id === hostId && host.online);
+
+    if (online && !keyAuthorizationPromisesRef.current.has(hostId)) {
+      try {
+        await authorizeExistingHost(hostId);
+      } catch {
+        // Fall through to a precise error message below.
+      }
+      key = await getHostKey(hostId);
+      if (key) return key;
+    }
+
+    if (keyAuthorizationPromisesRef.current.has(hostId)) {
+      throw new Error("正在为此浏览器授权密钥，请稍候…");
+    }
+    if (!online) {
+      throw new Error("此浏览器尚未取得主机密钥，请先让电脑端客户端上线后再试。");
+    }
+    throw new Error("无法取得主机解密密钥，请点击「授权此浏览器」或重新配对。");
   }
 
   const loadHosts = useEffectEvent(async () => {
@@ -2776,11 +2823,8 @@ export function App() {
                 if (!key) return authorizeExistingHost(hostId);
               }).catch((authorizationError) => setError(authorizationError.message));
               if (online) {
-                // Always re-pull allowlisted workspaces when the host comes online.
-                void getHostKey(hostId).then((key) => {
-                  if (!key) return;
-                  return sendCommand(hostId, { type: "host.refresh", commandId: randomUuid() });
-                }).catch(() => undefined);
+                // Re-pull allowlisted workspaces when the host comes online (waits for key auth if needed).
+                void sendCommand(hostId, { type: "host.refresh", commandId: randomUuid() }).catch(() => undefined);
               }
               if (online && !autoSyncedHostsRef.current.has(hostId)) {
                 autoSyncedHostsRef.current.add(hostId);
@@ -2850,8 +2894,7 @@ export function App() {
 
   async function sendCommand(hostId: string, command: ClientCommand) {
     const parsed = clientCommandSchema.parse(command);
-    const key = await getHostKey(hostId);
-    if (!key) throw new Error("此浏览器没有该主机的解密密钥，请重新配对。");
+    const key = await ensureHostKey(hostId);
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("实时连接尚未建立，请稍后重试。");
     const sequence = Number(localStorage.getItem(`command:${hostId}`) ?? 0) + 1;
