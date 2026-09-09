@@ -67,6 +67,8 @@ import {
   mergeSnapshotUserPrompts
 } from "./codex-adapter";
 import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
+import { enrichEnginesWithLatestVersions, clearEngineLatestCache } from "./cli/engine-updates";
+import { isUpdateAvailable, normalizeVersionLabel } from "./cli/version-compare";
 import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn, normalizeSystemErrorText } from "./cli/headless-runner";
 import { isCodexModelsManagerNoise } from "./cli/log-noise";
@@ -1444,9 +1446,10 @@ function createWindow(): void {
     resizable: true,
     maximizable: false,
     // Transparent frameless shell — chrome is drawn by the renderer.
+    // Windows paints a gray rectangular OS shadow around transparent windows; keep hasShadow off.
     frame: false,
     transparent: true,
-    hasShadow: true,
+    hasShadow: false,
     backgroundColor: "#00000000",
     title: "随码",
     autoHideMenuBar: true,
@@ -1549,8 +1552,8 @@ function rendererHtml(): string {
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;background:transparent}
   body{overflow:hidden}
-  .frame{height:100%;padding:10px;display:flex}
-  .shell{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px;padding:12px 12px 10px;border-radius:18px;background:rgba(242,234,219,.92);border:1px solid rgba(23,33,27,.14);box-shadow:0 18px 40px rgba(23,33,27,.18);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);overflow:hidden}
+  .frame{height:100%;padding:2px;display:flex;background:transparent}
+  .shell{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px;padding:12px 12px 10px;border-radius:18px;background:rgba(242,234,219,.92);border:1px solid rgba(23,33,27,.14);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);overflow:hidden}
   .titlebar{display:flex;align-items:center;gap:10px;-webkit-app-region:drag;app-region:drag;padding:2px 2px 4px;cursor:default;user-select:none;-webkit-user-select:none}
   .titlebar,.titlebar *{user-select:none;-webkit-user-select:none}
   .titlebar .win-actions{-webkit-app-region:no-drag;app-region:no-drag;margin-left:auto;display:flex;gap:4px;align-items:center}
@@ -1649,6 +1652,10 @@ function rendererHtml(): string {
   .footer{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 4px 0;border-top:1px solid rgba(23,33,27,.08);margin-top:2px;-webkit-app-region:no-drag;app-region:no-drag;flex-wrap:wrap}
   .footer .author{font-size:10px;color:#6b726b;line-height:1.35}
   .footer .author strong{color:#17211b}
+  .footer .author-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}
+  .footer .star-btn{display:inline-flex;align-items:center;gap:4px;border:1px solid rgba(226,88,50,.4);border-radius:999px;background:rgba(226,88,50,.08);color:#c24724;padding:3px 9px;font-size:10px;font-weight:850;cursor:pointer;line-height:1.2}
+  .footer .star-btn:hover{background:rgba(226,88,50,.16)}
+  .footer .star-btn svg{width:11px;height:11px;flex:0 0 auto}
   .footer .footer-actions{display:flex;gap:6px;align-items:center}
   .footer button.feedback{background:transparent;color:#e25832;border:1px solid rgba(226,88,50,.35);padding:5px 9px}
   .footer .lang-switch{display:inline-flex;border:1px solid rgba(23,33,27,.12);border-radius:8px;overflow:hidden}
@@ -1694,7 +1701,7 @@ function rendererHtml(): string {
     <section class="card" id="taskBox"></section>
   </div>
   </div>
-  <footer class="footer"><div class="author"><strong id="authorStrong">随码 AnytimeVibe</strong><br><span id="authorLine">作者 · demonrain · 开源项目</span></div><div class="footer-actions"><div class="lang-switch"><button type="button" id="langZh" class="active">中文</button><button type="button" id="langEn">EN</button></div><button type="button" id="feedback" class="feedback">反馈问题</button></div></footer>
+  <footer class="footer"><div class="author"><strong id="authorStrong">随码 AnytimeVibe</strong><div class="author-row"><span id="authorLine">作者 · demonrain · 开源项目</span><button type="button" id="starRepo" class="star-btn" title="Star on GitHub"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"/></svg><span id="starRepoLabel">Star</span></button></div></div><div class="footer-actions"><div class="lang-switch"><button type="button" id="langZh" class="active">中文</button><button type="button" id="langEn">EN</button></div><button type="button" id="feedback" class="feedback">反馈问题</button></div></footer>
   </main></div>
   <div id="logModal" class="log-modal-backdrop" aria-hidden="true">
     <div class="log-modal" role="dialog" aria-labelledby="logModalTitle">
@@ -1734,8 +1741,8 @@ function rendererHtml(): string {
     return 'codex';
   }
   var I18N={
-    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',feedback:'反馈问题',logs:'日志',logTitle:'运行日志',logRefresh:'刷新',logCopy:'复制',logClear:'清空',logOpenFile:'打开文件',logClose:'关闭',logEmpty:'暂无日志',logFooter:'最近运行记录 · 便于排查连接与任务问题',logCopied:'已复制到剪贴板',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',expand:'展开',collapse:'收起',open:'接力',tabGuide:'指引',tabEnv:'环境',tabPair:'配对',tabWs:'工作区',tabTasks:'任务',guideTitle:'快速上手',guideTip:'按下面步骤完成后，即可在网页端远程下发任务到本机编码引擎。',envTitle:'本机环境',envHint:'先安装 Node（Codex 需要）与至少一个编码引擎 CLI，再去做配对。',pairTitle:'中继与配对',pairHint:'保存中继地址后生成配对码，在 Web 端输入即可绑定本机。',relayLabel:'中继服务器',nameLabel:'客户端名称',wsTitle:'允许的工作区',wsHint:'只有白名单目录可被远程任务读写。至少添加一个项目路径。',stepEnv:'安装前置环境',stepEnvDesc:'安装 Node.js（Codex 需要）以及 Codex / Claude / Grok / Cursor / Antigravity 中至少一个 CLI 并登录。',stepRelay:'配置中继服务器',stepRelayDesc:'确认中继地址正确并保存（默认体验站可用）。',stepPair:'生成配对码并绑定',stepPairDesc:'点击生成配对码，在网页「添加主机」中输入。码约 10 分钟有效。',stepWs:'添加工作区目录',stepWsDesc:'允许至少一个本机项目目录，远程任务才能在该路径执行。',stepReady:'开始使用',stepReadyDesc:'网页端在线后即可新建任务。本页「任务」可接力到本机终端。',goEnv:'去环境',goPair:'去配对',goWs:'去工作区',goTasks:'看任务',done:'完成',todo:'待办',onlineReady:'已在线，可在网页下发任务。'},
-    en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',feedback:'Feedback',logs:'Logs',logTitle:'Runtime logs',logRefresh:'Refresh',logCopy:'Copy',logClear:'Clear',logOpenFile:'Open file',logClose:'Close',logEmpty:'No logs yet',logFooter:'Recent runtime events for troubleshooting',logCopied:'Copied to clipboard',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',expand:'Expand',collapse:'Collapse',open:'Open',tabGuide:'Guide',tabEnv:'Setup',tabPair:'Pair',tabWs:'Folders',tabTasks:'Tasks',guideTitle:'Get started',guideTip:'Finish the steps below so the web app can send coding tasks to this machine.',envTitle:'Local environment',envHint:'Install Node (for Codex) and at least one coding CLI, then pair.',pairTitle:'Relay & pairing',pairHint:'Save the relay URL, generate a code, and enter it on the web.',relayLabel:'Relay server',nameLabel:'Client name',wsTitle:'Allowed workspaces',wsHint:'Only allowlisted folders can be used by remote tasks. Add at least one project path.',stepEnv:'Install prerequisites',stepEnvDesc:'Install Node.js (needed for Codex) and at least one of Codex / Claude / Grok / Cursor / Antigravity CLI, then sign in.',stepRelay:'Configure relay',stepRelayDesc:'Confirm and save the relay URL (public demo works by default).',stepPair:'Pair with the web app',stepPairDesc:'Generate a pairing code and enter it under Add host on the web. Codes expire in ~10 minutes.',stepWs:'Allow a workspace folder',stepWsDesc:'Add at least one local project directory for remote tasks to run in.',stepReady:'You are ready',stepReadyDesc:'When online, create tasks from the web. Use Tasks here to hand off to a local terminal.',goEnv:'Setup',goPair:'Pair',goWs:'Folders',goTasks:'Tasks',done:'Done',todo:'Todo',onlineReady:'Online — send tasks from the web.'}
+    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',starRepo:'Star 项目',feedback:'反馈问题',logs:'日志',logTitle:'运行日志',logRefresh:'刷新',logCopy:'复制',logClear:'清空',logOpenFile:'打开文件',logClose:'关闭',logEmpty:'暂无日志',logFooter:'最近运行记录 · 便于排查连接与任务问题',logCopied:'已复制到剪贴板',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',updateCli:'升级',installCli:'一键安装',installCompat:'安装兼容版',expand:'展开',collapse:'收起',open:'接力',tabGuide:'指引',tabEnv:'环境',tabPair:'配对',tabWs:'工作区',tabTasks:'任务',guideTitle:'快速上手',guideTip:'按下面步骤完成后，即可在网页端远程下发任务到本机编码引擎。',envTitle:'本机环境',envHint:'先安装 Node（Codex 需要）与至少一个编码引擎 CLI，再去做配对。重新检测会同时查询各 CLI 是否有新版本。',pairTitle:'中继与配对',pairHint:'保存中继地址后生成配对码，在 Web 端输入即可绑定本机。',relayLabel:'中继服务器',nameLabel:'客户端名称',wsTitle:'允许的工作区',wsHint:'只有白名单目录可被远程任务读写。至少添加一个项目路径。',stepEnv:'安装前置环境',stepEnvDesc:'安装 Node.js（Codex 需要）以及 Codex / Claude / Grok / Cursor / Antigravity 中至少一个 CLI 并登录。',stepRelay:'配置中继服务器',stepRelayDesc:'确认中继地址正确并保存（默认体验站可用）。',stepPair:'生成配对码并绑定',stepPairDesc:'点击生成配对码，在网页「添加主机」中输入。码约 10 分钟有效。',stepWs:'添加工作区目录',stepWsDesc:'允许至少一个本机项目目录，远程任务才能在该路径执行。',stepReady:'开始使用',stepReadyDesc:'网页端在线后即可新建任务。本页「任务」可接力到本机终端。',goEnv:'去环境',goPair:'去配对',goWs:'去工作区',goTasks:'看任务',done:'完成',todo:'待办',onlineReady:'已在线，可在网页下发任务。'},
+    en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',starRepo:'Star',feedback:'Feedback',logs:'Logs',logTitle:'Runtime logs',logRefresh:'Refresh',logCopy:'Copy',logClear:'Clear',logOpenFile:'Open file',logClose:'Close',logEmpty:'No logs yet',logFooter:'Recent runtime events for troubleshooting',logCopied:'Copied to clipboard',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',updateCli:'Update',installCli:'Install',installCompat:'Install compatible',expand:'Expand',collapse:'Collapse',open:'Open',tabGuide:'Guide',tabEnv:'Setup',tabPair:'Pair',tabWs:'Folders',tabTasks:'Tasks',guideTitle:'Get started',guideTip:'Finish the steps below so the web app can send coding tasks to this machine.',envTitle:'Local environment',envHint:'Install Node (for Codex) and at least one coding CLI, then pair. Recheck also queries whether each CLI has a newer release.',pairTitle:'Relay & pairing',pairHint:'Save the relay URL, generate a code, and enter it on the web.',relayLabel:'Relay server',nameLabel:'Client name',wsTitle:'Allowed workspaces',wsHint:'Only allowlisted folders can be used by remote tasks. Add at least one project path.',stepEnv:'Install prerequisites',stepEnvDesc:'Install Node.js (needed for Codex) and at least one of Codex / Claude / Grok / Cursor / Antigravity CLI, then sign in.',stepRelay:'Configure relay',stepRelayDesc:'Confirm and save the relay URL (public demo works by default).',stepPair:'Pair with the web app',stepPairDesc:'Generate a pairing code and enter it under Add host on the web. Codes expire in ~10 minutes.',stepWs:'Allow a workspace folder',stepWsDesc:'Add at least one local project directory for remote tasks to run in.',stepReady:'You are ready',stepReadyDesc:'When online, create tasks from the web. Use Tasks here to hand off to a local terminal.',goEnv:'Setup',goPair:'Pair',goWs:'Folders',goTasks:'Tasks',done:'Done',todo:'Todo',onlineReady:'Online — send tasks from the web.'}
   };
   // Keep the setup checklist aligned with all supported coding engines.
   I18N['zh-CN'].stepEnvDesc=I18N['zh-CN'].stepEnvDesc.replace('Antigravity','Antigravity / Pi');
@@ -1759,6 +1766,7 @@ function rendererHtml(): string {
     if(el=document.querySelector('#brandTag')) el.textContent=t('tag');
     if(el=document.querySelector('#authorStrong')) el.textContent=t('authorStrong');
     if(el=document.querySelector('#authorLine')) el.textContent=t('authorLine');
+    if(el=document.querySelector('#starRepoLabel')) el.textContent=t('starRepo');
     if(el=document.querySelector('#feedback')) el.textContent=t('feedback');
     if(el=document.querySelector('#openLogs')) el.textContent=t('logs');
     if(el=document.querySelector('#logModalTitle')) el.textContent=t('logTitle');
@@ -1880,22 +1888,52 @@ function rendererHtml(): string {
         renderUpdate(state.update||{status:'idle'});
         return;
       }
-      var nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">一键安装</button>':'';
+      var nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">'+escapeHtml(t('installCli'))+'</button>':'';
+      var codexInfo=engines.find(function(item){return item.engine==='codex';})||null;
+      var codexNeedsUpdate=!!(env.codexCompatible&&codexInfo&&codexInfo.updateAvailable);
       // Codex install needs npm; only show after Node is present (unlike Claude/Grok).
-      var codexAction=env.nodeInstalled&&!env.codexCompatible?'<button data-install="codex" class="secondary">'+(env.codexInstalled?'安装兼容版':'一键安装')+'</button>':'';
+      var codexAction='';
+      if(env.nodeInstalled&&!env.codexCompatible){
+        codexAction='<button data-install="codex" class="secondary">'+(env.codexInstalled?escapeHtml(t('installCompat')):escapeHtml(t('installCli')))+'</button>';
+      }else if(codexNeedsUpdate){
+        codexAction='<button data-update="codex">'+escapeHtml(t('updateCli'))+'</button>';
+      }
       if(environment){
         var engineExtra=engines.filter(function(item){return item.engine!=='codex';}).map(function(item){
           var label=item.engine==='claude'?'Claude Code':item.engine==='cursor'?'Cursor Agent':item.engine==='antigravity'?'Antigravity':item.engine==='pi'?'Pi':item.engine==='grok'?'Grok Build':'Codex';
-          var action=!item.ready?'<button data-install="'+escapeHtml(item.engine)+'" class="secondary">一键安装</button>':'';
-          return '<div class="check '+(item.ready?'ok':'')+'"><b>'+escapeHtml(label)+'</b><span>'+escapeHtml(item.version||item.detail||(item.ready?'就绪':'未安装'))+'</span>'+action+'</div>';
+          var versionText=item.version||item.detail||(item.ready?(locale==='en'?'Ready':'就绪'):(locale==='en'?'Not installed':'未安装'));
+          if(item.ready&&item.latestVersion){
+            versionText=item.updateAvailable
+              ? (versionText+' → '+item.latestVersion)
+              : (versionText+(locale==='en'?' (latest)':'（已是最新）'));
+          }
+          var action=!item.ready
+            ? '<button data-install="'+escapeHtml(item.engine)+'" class="secondary">'+escapeHtml(t('installCli'))+'</button>'
+            : (item.updateAvailable?'<button data-update="'+escapeHtml(item.engine)+'">'+escapeHtml(t('updateCli'))+'</button>':'');
+          var tone=item.ready?(item.updateAvailable?'warn':'ok'):'';
+          return '<div class="check '+tone+'"><b>'+escapeHtml(label)+'</b><span>'+escapeHtml(versionText)+'</span>'+action+'</div>';
         }).join('');
-        environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+escapeHtml(env.nodeVersion||'未安装')+'</span>'+nodeAction+'</div><div class="check '+(env.codexCompatible?'ok':'')+'"><b>Codex CLI</b><span>'+escapeHtml(env.codexVersion||(env.codexInstalled?'版本不兼容':'未安装'))+'</span>'+codexAction+'</div>'+engineExtra;
+        var codexVersionText=env.codexVersion||(env.codexInstalled?(locale==='en'?'Incompatible':'版本不兼容'):(locale==='en'?'Not installed':'未安装'));
+        if(env.codexCompatible&&codexInfo&&codexInfo.latestVersion){
+          codexVersionText=codexNeedsUpdate
+            ? (codexVersionText+' → '+codexInfo.latestVersion)
+            : (codexVersionText+(locale==='en'?' (latest)':'（已是最新）'));
+        }
+        environment.innerHTML='<div class="check '+(env.nodeInstalled?'ok':'')+'"><b>Node.js</b><span>'+escapeHtml(env.nodeVersion||(locale==='en'?'Not installed':'未安装'))+'</span>'+nodeAction+'</div><div class="check '+(env.codexCompatible?(codexNeedsUpdate?'warn':'ok'):'')+'"><b>Codex CLI</b><span>'+escapeHtml(codexVersionText)+'</span>'+codexAction+'</div>'+engineExtra;
         environment.querySelectorAll('button[data-install]').forEach(function(button){
           button.addEventListener('click',function(){
             if(!api) return;
             var target=button.getAttribute('data-install');
             button.disabled=true;
             api.installEnvironment(target).catch(function(error){alert(error&&error.message?error.message:String(error));}).finally(function(){try{button.disabled=false;}catch(e){}});
+          });
+        });
+        environment.querySelectorAll('button[data-update]').forEach(function(button){
+          button.addEventListener('click',function(){
+            if(!api||!api.updateEnvironment) return;
+            var target=button.getAttribute('data-update');
+            button.disabled=true;
+            api.updateEnvironment(target).catch(function(error){alert(error&&error.message?error.message:String(error));}).finally(function(){try{button.disabled=false;}catch(e){}});
           });
         });
       }
@@ -2106,6 +2144,7 @@ function rendererHtml(): string {
     if((el=document.querySelector('#winMin'))&&api) el.addEventListener('click',function(){api.windowMinimize();});
     if((el=document.querySelector('#winClose'))&&api) el.addEventListener('click',function(){api.windowClose();});
     if((el=document.querySelector('#feedback'))&&api) el.addEventListener('click',function(){api.openFeedback();});
+    if((el=document.querySelector('#starRepo'))&&api) el.addEventListener('click',function(){api.openRepo();});
     if(el=document.querySelector('#openLogs')) el.addEventListener('click',function(){ openLogModal(); });
     if(el=document.querySelector('#logClose')) el.addEventListener('click',function(){ closeLogModal(); });
     if(logModal) logModal.addEventListener('click',function(ev){ if(ev.target===logModal) closeLogModal(); });
@@ -3234,6 +3273,161 @@ async function installEnvironment(target: "node" | "codex" | "claude" | "grok" |
     return;
   }
   throw new Error("当前系统暂不支持一键打开安装终端。");
+}
+
+/** Upgrade an already-installed coding CLI using the system/Clash proxy. */
+async function updateEnvironment(target: "codex" | "claude" | "grok" | "cursor" | "antigravity" | "pi"): Promise<void> {
+  const labels: Record<typeof target, string> = {
+    codex: "Codex CLI",
+    claude: "Claude Code",
+    grok: "Grok Build",
+    cursor: "Cursor Agent",
+    antigravity: "Antigravity",
+    pi: "Pi CLI"
+  };
+  updateState({ detail: `正在打开 ${labels[target]} 升级窗口（已注入本机系统代理）…` });
+
+  if (process.platform === "win32") {
+    const proxyLines = await proxyShellLines("win32");
+    const body: string[] = [
+      "echo ============================================",
+      `echo   AnytimeVibe - update ${labels[target]}`,
+      "echo ============================================",
+      "echo.",
+      ...proxyLines,
+      "echo HTTP_PROXY=%HTTP_PROXY%",
+      "echo HTTPS_PROXY=%HTTPS_PROXY%",
+      "echo."
+    ];
+    if (target === "codex") {
+      body.push(
+        `call npm install -g ${CODEX_INSTALL_PACKAGE}`,
+        "where codex",
+        "codex --version 2>nul"
+      );
+    } else if (target === "claude") {
+      body.push(
+        "where claude >nul 2>&1 && (",
+        "  echo [1] claude update ...",
+        "  call claude update",
+        ") || echo claude not on PATH, trying npm ...",
+        "call npm install -g @anthropic-ai/claude-code@latest",
+        "claude --version 2>nul"
+      );
+    } else if (target === "grok") {
+      body.push(
+        "where grok >nul 2>&1 && (",
+        "  echo [1] grok update ...",
+        "  call grok update",
+        ") || (",
+        "  echo grok update unavailable, re-running official installer ...",
+        "  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"irm 'https://x.ai/cli/install.ps1' | iex\"",
+        ")",
+        "set \"PATH=%USERPROFILE%\\.grok\\bin;%PATH%\"",
+        "grok --version 2>nul"
+      );
+    } else if (target === "cursor") {
+      body.push(
+        "where agent >nul 2>&1 && (",
+        "  echo [1] agent update ...",
+        "  call agent update",
+        ") || where cursor-agent >nul 2>&1 && (",
+        "  echo [1] cursor-agent update ...",
+        "  call cursor-agent update",
+        ") || (",
+        "  echo self-update unavailable, re-running official installer ...",
+        "  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"irm 'https://cursor.com/install?win32=true' | iex\"",
+        ")",
+        "agent --version 2>nul"
+      );
+    } else if (target === "antigravity") {
+      body.push(
+        "where agy >nul 2>&1 && (",
+        "  echo [1] agy update ...",
+        "  call agy update",
+        ") || (",
+        "  echo self-update unavailable, re-running official installer ...",
+        "  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"irm 'https://antigravity.google/cli/install.ps1' | iex\"",
+        ")",
+        "set \"PATH=%LOCALAPPDATA%\\agy\\bin;%PATH%\"",
+        "agy --version 2>nul"
+      );
+    } else {
+      body.push(
+        "call npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest",
+        "pi --version 2>nul"
+      );
+    }
+    body.push(
+      "echo.",
+      "echo Done. Close this window and click 重新检测 in AnytimeVibe."
+    );
+    await openWindowsVisibleConsole(body);
+  } else if (process.platform === "darwin") {
+    let script = "";
+    if (target === "codex") {
+      script = `
+echo "Updating Codex CLI…"
+npm install -g ${CODEX_INSTALL_PACKAGE}
+codex --version || true
+`;
+    } else if (target === "claude") {
+      script = `
+echo "Updating Claude Code…"
+if command -v claude >/dev/null 2>&1; then
+  claude update || npm install -g @anthropic-ai/claude-code@latest
+else
+  npm install -g @anthropic-ai/claude-code@latest
+fi
+claude --version || true
+`;
+    } else if (target === "grok") {
+      script = `
+echo "Updating Grok Build…"
+if command -v grok >/dev/null 2>&1; then
+  grok update || curl -fsSL https://x.ai/cli/install.sh | bash
+else
+  curl -fsSL https://x.ai/cli/install.sh | bash
+fi
+export PATH="$HOME/.grok/bin:$PATH"
+grok --version || true
+`;
+    } else if (target === "cursor") {
+      script = `
+echo "Updating Cursor Agent…"
+if command -v agent >/dev/null 2>&1; then
+  agent update || curl -fsS https://cursor.com/install | bash
+elif command -v cursor-agent >/dev/null 2>&1; then
+  cursor-agent update || curl -fsS https://cursor.com/install | bash
+else
+  curl -fsS https://cursor.com/install | bash
+fi
+agent --version || true
+`;
+    } else if (target === "antigravity") {
+      script = `
+echo "Updating Antigravity…"
+if command -v agy >/dev/null 2>&1; then
+  agy update || curl -fsSL https://antigravity.google/cli/install.sh | bash
+else
+  curl -fsSL https://antigravity.google/cli/install.sh | bash
+fi
+export PATH="$HOME/.local/bin:$PATH"
+agy --version || true
+`;
+    } else {
+      script = `
+echo "Updating Pi CLI…"
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest
+pi --version || true
+`;
+    }
+    await openMacTerminalScript(script);
+  } else {
+    throw new Error(`当前系统暂不支持一键升级 ${labels[target]}。`);
+  }
+
+  updateState({ detail: `已打开 ${labels[target]} 升级窗口。完成后请点击「重新检测」。` });
 }
 
 async function ensurePairingKeys(): Promise<void> {
@@ -5834,15 +6028,29 @@ function publishAgentMeta(fields: {
   }
 }
 
-async function refreshAvailableEngines(): Promise<void> {
+async function refreshAvailableEngines(options: { checkUpdates?: boolean } = {}): Promise<void> {
   const codexReady = Boolean(publicState.environment.codexCompatible || codex);
-  const [availableEngines, engineCapabilities] = await Promise.all([
+  const [detectedEngines, engineCapabilities] = await Promise.all([
     detectAvailableEngines({
       codexReady,
       codexVersion: codexVersion || publicState.environment.codexVersion || "unknown"
     }),
     discoverEngineCapabilities().catch(() => [] as EngineCapability[])
   ]);
+  // Latest-version probes use the system proxy. Skip on routine host.status publishes;
+  // recheck / update flows pass checkUpdates to refresh the outdated badges.
+  const availableEngines = options.checkUpdates
+    ? await enrichEnginesWithLatestVersions(detectedEngines, { force: true }).catch(() => detectedEngines)
+    : detectedEngines.map((item) => {
+        // Preserve previously discovered latest/update flags across non-check refreshes.
+        const previous = publicState.availableEngines.find((engine) => engine.engine === item.engine);
+        if (!previous?.latestVersion) return item;
+        return {
+          ...item,
+          latestVersion: previous.latestVersion,
+          updateAvailable: isUpdateAvailable(normalizeVersionLabel(item.version), previous.latestVersion)
+        };
+      });
   updateState({
     availableEngines,
     engineCapabilities,
@@ -7385,9 +7593,10 @@ function registerIpc(): void {
       // ignore
     }
     clearEngineBinaryCache();
+    clearEngineLatestCache();
     const environment = await detectEnvironment();
     updateState({ environment, codexVersion: environment.codexVersion || publicState.codexVersion });
-    await refreshAvailableEngines();
+    await refreshAvailableEngines({ checkUpdates: true });
     const availableEngines = publicState.availableEngines;
     const ready = anyCodingEngineReady(environment, availableEngines);
     const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
@@ -7436,10 +7645,31 @@ function registerIpc(): void {
         const availableEngines = await detectAvailableEngines({
           codexReady: environment.codexCompatible,
           codexVersion: environment.codexVersion || "unknown"
-        });
+        }).then((engines) => enrichEnginesWithLatestVersions(engines).catch(() => engines));
         updateState({ environment, availableEngines, codexVersion: environment.codexVersion || publicState.codexVersion });
       } catch {
         // optional
+      }
+    } catch (error) {
+      handleError(error);
+      throw error;
+    }
+    return publicState;
+  });
+  ipcMain.handle("agent:update-environment", async (_event, target: "codex" | "claude" | "grok" | "cursor" | "antigravity" | "pi") => {
+    if (target !== "codex" && target !== "claude" && target !== "grok" && target !== "cursor" && target !== "antigravity" && target !== "pi") {
+      throw new Error("未知的升级目标");
+    }
+    try {
+      await updateEnvironment(target);
+      try {
+        await applyLoginPathToProcess();
+        clearEngineBinaryCache();
+        const environment = await detectEnvironment();
+        await refreshAvailableEngines({ checkUpdates: true });
+        updateState({ environment, codexVersion: environment.codexVersion || publicState.codexVersion });
+      } catch {
+        // optional — user may still be finishing the upgrade terminal
       }
     } catch (error) {
       handleError(error);
@@ -7511,6 +7741,9 @@ function registerIpc(): void {
   });
   ipcMain.handle("agent:open-feedback", async () => {
     await shell.openExternal("https://github.com/demonrain/anytimevibe/issues");
+  });
+  ipcMain.handle("agent:open-repo", async () => {
+    await shell.openExternal("https://github.com/demonrain/anytimevibe");
   });
 }
 
@@ -7624,7 +7857,7 @@ app.whenReady().then(async () => {
       await applyLoginPathToProcessBounded();
       const environment = await detectEnvironment();
       updateState({ environment, codexVersion: environment.codexVersion || codexVersion });
-      await refreshAvailableEngines().catch(() => undefined);
+      await refreshAvailableEngines({ checkUpdates: true }).catch(() => undefined);
       const availableEngines = publicState.availableEngines;
       const ready = anyCodingEngineReady(environment, availableEngines);
       const readyLabels = availableEngines
