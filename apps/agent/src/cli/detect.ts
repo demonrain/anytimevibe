@@ -22,26 +22,28 @@ export function clearEngineBinaryCache(): void {
 }
 
 /**
- * Pick the best spawnable Windows path.
+ * Pick the best spawnable Windows path while preserving PATH order.
  * npm global installs often leave both `claude` (bash shim) and `claude.cmd`;
  * `where` may return the extensionless file first, which spawn() cannot run (ENOENT).
+ *
+ * Important: do NOT globally prefer every `.exe` over every `.cmd`. Doing so can pick a
+ * later WinGet `claude.exe` over an earlier npm `claude.cmd` on PATH, which makes the
+ * UI keep reporting an outdated Claude after `npm` / PATH upgrades.
  */
 async function preferWindowsExecutable(hits: string[]): Promise<string | null> {
-  const expanded: string[] = [];
   for (const hit of hits) {
     const trimmed = hit?.trim();
     if (!trimmed) continue;
+    const existing: string[] = [];
     for (const candidate of windowsLauncherCandidates(trimmed)) {
-      if (!expanded.includes(candidate)) expanded.push(candidate);
+      if (existing.includes(candidate)) continue;
+      if (await safePathExists(candidate)) existing.push(candidate);
     }
+    if (!existing.length) continue;
+    existing.sort((a, b) => windowsExecutableRank(a) - windowsExecutableRank(b));
+    return existing[0] ?? null;
   }
-  const existing: string[] = [];
-  for (const candidate of expanded) {
-    if (await safePathExists(candidate)) existing.push(candidate);
-  }
-  if (!existing.length) return null;
-  existing.sort((a, b) => windowsExecutableRank(a) - windowsExecutableRank(b));
-  return existing[0] ?? null;
+  return null;
 }
 
 async function runVersion(command: string, args: string[]): Promise<string | null> {

@@ -2701,6 +2701,74 @@ async function openWindowsVisibleConsole(lines: string[]): Promise<void> {
   child.unref();
 }
 
+/**
+ * Run a visible Windows console script and wait until it exits (no pause).
+ * Used for CLI upgrades so we can re-detect immediately afterward.
+ */
+async function runWindowsVisibleConsoleAndWait(lines: string[]): Promise<void> {
+  if (process.platform !== "win32") throw new Error("runWindowsVisibleConsoleAndWait is Windows-only");
+  const stamp = Date.now();
+  const scriptPath = path.join(app.getPath("temp"), `anytimevibe-update-${stamp}.cmd`);
+  const vbsPath = path.join(app.getPath("temp"), `anytimevibe-update-${stamp}.vbs`);
+  const script = [
+    "@echo off",
+    "setlocal EnableExtensions",
+    "chcp 65001 >nul",
+    "title AnytimeVibe Update",
+    "for /f \"tokens=2*\" %%A in ('reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\" /v Path 2^>nul') do set \"SYSPATH=%%B\"",
+    "for /f \"tokens=2*\" %%A in ('reg query \"HKCU\\Environment\" /v Path 2^>nul') do set \"USERPATH=%%B\"",
+    "set \"PATH=%SYSPATH%;%USERPATH%;%ProgramFiles%\\nodejs;%APPDATA%\\npm;%LOCALAPPDATA%\\Microsoft\\WinGet\\Links;%PATH%\"",
+    ...lines,
+    "echo.",
+    "echo Update finished. This window will close automatically.",
+    "timeout /t 2 /nobreak >nul",
+    "endlocal",
+    ""
+  ].join("\r\n");
+  await fs.writeFile(scriptPath, script, "utf8");
+  const quoted = scriptPath.replace(/"/g, '""');
+  // WaitOnReturn=True so WScript blocks until cmd /c finishes.
+  const vbs = `CreateObject("WScript.Shell").Run "cmd /c ""${quoted}""", 1, True`;
+  await fs.writeFile(vbsPath, vbs, "utf8");
+  const wscript = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(wscript, [vbsPath], {
+      stdio: "ignore",
+      windowsHide: true,
+      cwd: os.homedir()
+    });
+    child.once("error", (error) => reject(new Error(`无法打开升级窗口：${error.message}`)));
+    // Always continue after the window closes — individual package managers may exit non-zero
+    // when already up to date (e.g. winget upgrade with nothing to do).
+    child.once("close", () => resolve());
+  });
+}
+
+/** Run a macOS bash update script and wait for completion. */
+async function runMacScriptAndWait(scriptBody: string): Promise<void> {
+  await applyMacLoginPathToProcess();
+  const proxyLines = await proxyShellLines("darwin");
+  const full = [
+    "set +e",
+    ...proxyLines,
+    'export PATH="$HOME/.grok/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"',
+    "echo \"Proxy: HTTP_PROXY=${HTTP_PROXY:-none}\"",
+    scriptBody,
+    "echo \"\"",
+    "echo \"Update finished.\""
+  ].join("\n");
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("/bin/bash", ["-lc", full], {
+      env: process.env,
+      cwd: os.homedir()
+    });
+    child.stdout?.resume();
+    child.stderr?.resume();
+    child.once("error", (error) => reject(new Error(`无法执行升级脚本：${error.message}`)));
+    child.once("close", () => resolve());
+  });
+}
+
 async function installCodexOnWindows(): Promise<void> {
   if (process.platform !== "win32") throw new Error("installCodexOnWindows is Windows-only");
   await applyWindowsPathToProcess();
@@ -3285,7 +3353,7 @@ async function updateEnvironment(target: "codex" | "claude" | "grok" | "cursor" 
     antigravity: "Antigravity",
     pi: "Pi CLI"
   };
-  updateState({ detail: `正在打开 ${labels[target]} 升级窗口（已注入本机系统代理）…` });
+  updateState({ detail: `正在升级 ${labels[target]}（已注入本机系统代理，完成后自动重新检测）…` });
 
   if (process.platform === "win32") {
     const proxyLines = await proxyShellLines("win32");
@@ -3306,12 +3374,20 @@ async function updateEnvironment(target: "codex" | "claude" | "grok" | "cursor" 
         "codex --version 2>nul"
       );
     } else if (target === "claude") {
+      // Upgrade every common install channel so PATH-first detection cannot keep an old copy.
       body.push(
+        "where winget >nul 2>&1 && (",
+        "  echo [1] winget upgrade Anthropic.ClaudeCode ...",
+        "  winget upgrade --id Anthropic.ClaudeCode -e --accept-package-agreements --accept-source-agreements",
+        ")",
         "where claude >nul 2>&1 && (",
-        "  echo [1] claude update ...",
+        "  echo [2] claude update ...",
         "  call claude update",
-        ") || echo claude not on PATH, trying npm ...",
+        ")",
+        "echo [3] npm install -g @anthropic-ai/claude-code@latest ...",
         "call npm install -g @anthropic-ai/claude-code@latest",
+        "echo.",
+        "where claude",
         "claude --version 2>nul"
       );
     } else if (target === "grok") {
@@ -3358,11 +3434,7 @@ async function updateEnvironment(target: "codex" | "claude" | "grok" | "cursor" 
         "pi --version 2>nul"
       );
     }
-    body.push(
-      "echo.",
-      "echo Done. Close this window and click 重新检测 in AnytimeVibe."
-    );
-    await openWindowsVisibleConsole(body);
+    await runWindowsVisibleConsoleAndWait(body);
   } else if (process.platform === "darwin") {
     let script = "";
     if (target === "codex") {
@@ -3375,9 +3447,11 @@ codex --version || true
       script = `
 echo "Updating Claude Code…"
 if command -v claude >/dev/null 2>&1; then
-  claude update || npm install -g @anthropic-ai/claude-code@latest
-else
-  npm install -g @anthropic-ai/claude-code@latest
+  claude update || true
+fi
+npm install -g @anthropic-ai/claude-code@latest || true
+if command -v brew >/dev/null 2>&1; then
+  brew upgrade --cask claude-code 2>/dev/null || true
 fi
 claude --version || true
 `;
@@ -3422,12 +3496,12 @@ npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest
 pi --version || true
 `;
     }
-    await openMacTerminalScript(script);
+    await runMacScriptAndWait(script);
   } else {
     throw new Error(`当前系统暂不支持一键升级 ${labels[target]}。`);
   }
 
-  updateState({ detail: `已打开 ${labels[target]} 升级窗口。完成后请点击「重新检测」。` });
+  updateState({ detail: `${labels[target]} 升级命令已执行，正在重新检测…` });
 }
 
 async function ensurePairingKeys(): Promise<void> {
@@ -7522,6 +7596,51 @@ async function checkForAgentUpdate(): Promise<void> {
   return updateCheckInFlight;
 }
 
+async function recheckLocalEnvironment(): Promise<typeof publicState> {
+  try {
+    await applyLoginPathToProcess();
+  } catch {
+    // ignore
+  }
+  clearEngineBinaryCache();
+  clearEngineLatestCache();
+  const environment = await detectEnvironment();
+  updateState({ environment, codexVersion: environment.codexVersion || publicState.codexVersion });
+  await refreshAvailableEngines({ checkUpdates: true });
+  const availableEngines = publicState.availableEngines;
+  const ready = anyCodingEngineReady(environment, availableEngines);
+  const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
+  const readyLabels = availableEngines
+    .filter((item) => item.ready)
+    .map((item) => `${item.engine}${item.version ? ` ${item.version}` : ""}`)
+    .join(" · ");
+  updateState({
+    environment,
+    availableEngines,
+    engineCapabilities: publicState.engineCapabilities,
+    environmentReady: true,
+    agentVersion: agentAppVersion(),
+    codexVersion: environment.codexVersion || publicState.codexVersion,
+    status: statusForEngineAvailability({ environment, engines: availableEngines, paired }),
+    detail: !ready
+      ? "未检测到可用编码引擎。请安装 Codex / Claude Code / Grok Build / Cursor / Antigravity / Pi 任意一种后重试。"
+      : `环境检测完成：${readyLabels || "就绪"}${paired ? "。主机引擎能力已同步到网页。" : "。"}${
+        !environment.codexCompatible ? "（未安装 Codex 也可连接中继）" : ""
+      }`
+  });
+  if (paired && socket?.readyState !== WebSocket.OPEN && ready) {
+    void connect(true).catch(handleError);
+  }
+  if (socket?.readyState === WebSocket.OPEN) {
+    try {
+      await publishHostStatus();
+    } catch {
+      // ignore publish failures during local recheck
+    }
+  }
+  return publicState;
+}
+
 function registerIpc(): void {
   ipcMain.handle("agent:get-state", () => publicState);
   ipcMain.handle("agent:set-relay-url", async (_event, relayUrl: string) => {
@@ -7586,52 +7705,7 @@ function registerIpc(): void {
     logInfo("已打开日志文件", agentLogFilePath);
     return { path: agentLogFilePath };
   });
-  ipcMain.handle("agent:check-environment", async () => {
-    try {
-      await applyLoginPathToProcess();
-    } catch {
-      // ignore
-    }
-    clearEngineBinaryCache();
-    clearEngineLatestCache();
-    const environment = await detectEnvironment();
-    updateState({ environment, codexVersion: environment.codexVersion || publicState.codexVersion });
-    await refreshAvailableEngines({ checkUpdates: true });
-    const availableEngines = publicState.availableEngines;
-    const ready = anyCodingEngineReady(environment, availableEngines);
-    const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
-    const readyLabels = availableEngines
-      .filter((item) => item.ready)
-      .map((item) => `${item.engine}${item.version ? ` ${item.version}` : ""}`)
-      .join(" · ");
-    updateState({
-      environment,
-      availableEngines,
-      engineCapabilities: publicState.engineCapabilities,
-      environmentReady: true,
-      agentVersion: agentAppVersion(),
-      codexVersion: environment.codexVersion || publicState.codexVersion,
-      status: statusForEngineAvailability({ environment, engines: availableEngines, paired }),
-      detail: !ready
-        ? "未检测到可用编码引擎。请安装 Codex / Claude Code / Grok Build / Cursor / Antigravity / Pi 任意一种后重试。"
-        : `环境检测完成：${readyLabels || "就绪"}${paired ? "。主机引擎能力已同步到网页。" : "。"}${
-          !environment.codexCompatible ? "（未安装 Codex 也可连接中继）" : ""
-        }`
-    });
-    // If paired but socket down, try reconnect after engines are known (Claude/Grok-only hosts).
-    if (paired && socket?.readyState !== WebSocket.OPEN && ready) {
-      void connect(true).catch(handleError);
-    }
-    // Push engine icons/versions to the web host card when online.
-    if (socket?.readyState === WebSocket.OPEN) {
-      try {
-        await publishHostStatus();
-      } catch {
-        // ignore publish failures during local recheck
-      }
-    }
-    return publicState;
-  });
+  ipcMain.handle("agent:check-environment", async () => recheckLocalEnvironment());
   ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex" | "claude" | "grok" | "cursor" | "antigravity" | "pi") => {
     if (target !== "node" && target !== "codex" && target !== "claude" && target !== "grok" && target !== "cursor" && target !== "antigravity" && target !== "pi") {
       throw new Error("未知的安装目标");
@@ -7662,20 +7736,11 @@ function registerIpc(): void {
     }
     try {
       await updateEnvironment(target);
-      try {
-        await applyLoginPathToProcess();
-        clearEngineBinaryCache();
-        const environment = await detectEnvironment();
-        await refreshAvailableEngines({ checkUpdates: true });
-        updateState({ environment, codexVersion: environment.codexVersion || publicState.codexVersion });
-      } catch {
-        // optional — user may still be finishing the upgrade terminal
-      }
+      return await recheckLocalEnvironment();
     } catch (error) {
       handleError(error);
       throw error;
     }
-    return publicState;
   });
   ipcMain.handle("agent:check-update", async () => { await checkForAgentUpdate(); return publicState; });
   ipcMain.handle("agent:install-update", () => {
