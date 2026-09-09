@@ -47,7 +47,8 @@ function codexModelSupportsFast(row: Record<string, any>): boolean {
     })) return true;
   }
   const slug = String(row.slug || row.id || row.model || "").trim().toLowerCase();
-  return /gpt-5|codex|o3|o4/.test(slug);
+  // gpt-6-astra and future gpt-6* ships with Fast/priority tiers.
+  return /gpt-5|gpt-6|codex|o3|o4/.test(slug);
 }
 
 function normalizeEffort(value: string | undefined): ReasoningEffort | undefined {
@@ -130,6 +131,92 @@ async function readText(filePath: string): Promise<string | null> {
   }
 }
 
+const CODEX_DEBUG_MODELS_TTL_MS = 5 * 60_000;
+let codexDebugModelsCache:
+  | { checkedAt: number; rows: Array<Record<string, any>> }
+  | null = null;
+
+export function clearCodexDebugModelsCache(): void {
+  codexDebugModelsCache = null;
+}
+
+async function resolveCodexBinaryForCatalog(): Promise<string | null> {
+  if (process.env.CODEX_COMMAND?.trim()) return process.env.CODEX_COMMAND.trim();
+  const names = process.platform === "win32"
+    ? ["codex.cmd", "codex.exe", "codex"]
+    : ["codex"];
+  for (const name of names) {
+    try {
+      const { execFileWithTreeKill } = await import("./exec-file-tree-kill");
+      const { stdout, stderr } = await execFileWithTreeKill(name, ["--version"], {
+        timeoutMs: 8_000,
+        env: process.env,
+        maxBuffer: 64_000
+      });
+      if (/codex/i.test(`${stdout}\n${stderr}`)) return name;
+    } catch {
+      // try next
+    }
+  }
+  return null;
+}
+
+/**
+ * Prefer `codex debug models` over stale ~/.codex/models_cache.json.
+ * Newer models (e.g. gpt-6-astra) often exist in the live/bundled catalog while the
+ * on-disk cache still lags behind — anytimevibe previously only read the cache, so
+ * the Web new-task picker could not offer them.
+ */
+async function loadCodexDebugModelRows(): Promise<Array<Record<string, any>>> {
+  if (
+    codexDebugModelsCache
+    && Date.now() - codexDebugModelsCache.checkedAt < CODEX_DEBUG_MODELS_TTL_MS
+  ) {
+    return codexDebugModelsCache.rows;
+  }
+
+  const binary = await resolveCodexBinaryForCatalog();
+  if (!binary) return [];
+
+  const { execFileWithTreeKill } = await import("./exec-file-tree-kill");
+  const attempts: string[][] = [
+    ["debug", "models"],
+    ["debug", "models", "--bundled"]
+  ];
+
+  for (const args of attempts) {
+    try {
+      const { stdout, stderr } = await execFileWithTreeKill(binary, args, {
+        timeoutMs: 20_000,
+        env: process.env,
+        // Full catalog is large (hundreds of KB) because each row embeds instructions.
+        maxBuffer: 8 * 1024 * 1024
+      });
+      const text = `${stdout || ""}\n${stderr || ""}`;
+      const start = text.indexOf("{");
+      if (start < 0) continue;
+      const parsed = JSON.parse(text.slice(start)) as {
+        models?: Array<Record<string, any>> | Record<string, any>;
+      };
+      const rows = Array.isArray(parsed.models)
+        ? parsed.models
+        : parsed.models && typeof parsed.models === "object"
+          ? Object.entries(parsed.models).map(([id, value]) => {
+              const row = (value && typeof value === "object" ? value : {}) as Record<string, any>;
+              const info = (row.info && typeof row.info === "object" ? row.info : row) as Record<string, any>;
+              return { slug: id, ...info, ...row };
+            })
+          : [];
+      if (!rows.length) continue;
+      codexDebugModelsCache = { checkedAt: Date.now(), rows };
+      return rows;
+    } catch {
+      // try next strategy
+    }
+  }
+  return [];
+}
+
 async function discoverCodexCapability(): Promise<EngineCapability> {
   const home = os.homedir();
   const codexHome = process.env.CODEX_HOME || path.join(home, ".codex");
@@ -147,7 +234,11 @@ async function discoverCodexCapability(): Promise<EngineCapability> {
     currentFast = parseTomlBoolean(configText, "fast_mode");
   }
 
-  // Prefer live Codex cache + Cockpit Local Access catalog; CCSwitch is a fallback.
+  // 1) Live CLI catalog first — includes models missing from a stale models_cache.json.
+  const debugRows = await loadCodexDebugModelRows().catch(() => [] as Array<Record<string, any>>);
+  ingestCodexCatalogRows(debugRows, models, seen, effortUnion);
+
+  // 2) Disk caches / Cockpit / CCSwitch — may add local/custom provider models.
   const catalogFiles = [
     "models_cache.json",
     "cockpit-local-access-model-catalog.json",

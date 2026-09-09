@@ -73,7 +73,7 @@ import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn, normalizeSystemErrorText } from "./cli/headless-runner";
 import { isCodexModelsManagerNoise } from "./cli/log-noise";
 import { importLocalCliSessions, sanitizeTranscriptMessages } from "./cli/import-sessions";
-import { discoverEngineCapabilities, type EngineCapability } from "./cli/model-catalog";
+import { discoverEngineCapabilities, clearCodexDebugModelsCache, type EngineCapability } from "./cli/model-catalog";
 import { startEngineConfigWatch } from "./cli/engine-config-watch";
 import { appendEngineDiffChunk, buildTurnDiff, captureTurnDiffBaseline, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
 import { TaskStore } from "./cli/task-store";
@@ -4139,6 +4139,7 @@ function startEngineCredentialAndCatalogWatch(): void {
     onCapabilitySourcesChanged: (reason) => {
       if (capabilityRefreshInFlight) return;
       capabilityRefreshInFlight = true;
+      clearCodexDebugModelsCache();
       logInfo("检测到引擎目录/配置变更，刷新模型与 effort", reason);
       void publishHostStatus()
         .catch(handleError)
@@ -7604,6 +7605,7 @@ async function recheckLocalEnvironment(): Promise<typeof publicState> {
   }
   clearEngineBinaryCache();
   clearEngineLatestCache();
+  clearCodexDebugModelsCache();
   const environment = await detectEnvironment();
   updateState({ environment, codexVersion: environment.codexVersion || publicState.codexVersion });
   await refreshAvailableEngines({ checkUpdates: true });
