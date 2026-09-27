@@ -3103,7 +3103,7 @@ async function runWindowsVisibleConsoleAndWait(lines: string[]): Promise<void> {
     ...lines,
     "echo.",
     "echo Update finished. This window will close automatically.",
-    "timeout /t 2 /nobreak >nul",
+    "timeout /t 8 /nobreak >nul",
     "endlocal",
     ""
   ].join("\r\n");
@@ -3452,6 +3452,64 @@ async function openWindowsPowerShellScript(scriptBody: string): Promise<void> {
   child.unref();
 }
 
+/**
+ * Install or upgrade Claude Code from registry.npmjs.org into %APPDATA%\npm,
+ * then copy the win32 optional binary over the placeholder claude.exe.
+ * A plain `claude update` hits the npm shim and fails while that exe is missing.
+ */
+function windowsClaudeNpmInstallLines(): string[] {
+  return [
+    "echo [1] npm install @anthropic-ai/claude-code@latest",
+    "echo     registry https://registry.npmjs.org/  prefix %APPDATA%\\npm",
+    "set \"PREFIX=%APPDATA%\\npm\"",
+    "call npm install -g --prefix \"%PREFIX%\" --registry=https://registry.npmjs.org/ @anthropic-ai/claude-code@latest",
+    "if errorlevel 1 (",
+    "  echo npm via proxy failed, retrying direct ...",
+    "  set \"HTTP_PROXY=\"",
+    "  set \"HTTPS_PROXY=\"",
+    "  set \"http_proxy=\"",
+    "  set \"https_proxy=\"",
+    "  set \"ALL_PROXY=\"",
+    "  set \"all_proxy=\"",
+    "  set \"NODE_USE_ENV_PROXY=\"",
+    "  call npm install -g --prefix \"%PREFIX%\" --registry=https://registry.npmjs.org/ @anthropic-ai/claude-code@latest",
+    ")",
+    "set \"PKG=%PREFIX%\\node_modules\\@anthropic-ai\\claude-code\"",
+    "set \"CLAUDE_EXE=%PKG%\\bin\\claude.exe\"",
+    "if exist \"%PKG%\\install.cjs\" (",
+    "  echo [2] place native claude.exe ...",
+    "  pushd \"%PKG%\"",
+    "  call node install.cjs",
+    "  popd",
+    ")",
+    "set \"EXE_SIZE=0\"",
+    "if exist \"%CLAUDE_EXE%\" for %%I in (\"%CLAUDE_EXE%\") do set \"EXE_SIZE=%%~zI\"",
+    "if %EXE_SIZE% LSS 4096 (",
+    "  echo claude.exe missing or still a stub, reinstalling the win32 package without proxy ...",
+    "  set \"HTTP_PROXY=\"",
+    "  set \"HTTPS_PROXY=\"",
+    "  set \"http_proxy=\"",
+    "  set \"https_proxy=\"",
+    "  set \"ALL_PROXY=\"",
+    "  set \"all_proxy=\"",
+    "  set \"NODE_USE_ENV_PROXY=\"",
+    "  call npm install -g --prefix \"%PREFIX%\" --registry=https://registry.npmjs.org/ @anthropic-ai/claude-code-win32-x64@latest @anthropic-ai/claude-code@latest",
+    "  if exist \"%PKG%\\install.cjs\" (",
+    "    pushd \"%PKG%\"",
+    "    call node install.cjs",
+    "    popd",
+    "  )",
+    ")",
+    "if exist \"%CLAUDE_EXE%\" (",
+    "  > \"%PREFIX%\\claude.cmd\" echo @ECHO off",
+    "  >> \"%PREFIX%\\claude.cmd\" echo \"%%~dp0node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\" %%*",
+    ") else (",
+    "  echo claude.exe still missing under %CLAUDE_EXE%",
+    ")",
+    "set \"PATH=%USERPROFILE%\\.local\\bin;%PREFIX%;%PATH%\""
+  ];
+}
+
 async function installClaudeOnWindows(): Promise<void> {
   await applyWindowsPathToProcess();
   updateState({ detail: "正在打开 Claude Code 安装窗口…" });
@@ -3462,14 +3520,7 @@ async function installClaudeOnWindows(): Promise<void> {
     "echo ============================================",
     "echo.",
     ...proxyLines,
-    "where winget >nul 2>&1 && (",
-    "  echo [1] winget install Anthropic.ClaudeCode ...",
-    "  winget install --id Anthropic.ClaudeCode -e --accept-package-agreements --accept-source-agreements",
-    ") || echo winget not found, trying npm ...",
-    "where claude >nul 2>&1 || (",
-    "  echo [2] npm install -g @anthropic-ai/claude-code ...",
-    "  call npm install -g @anthropic-ai/claude-code",
-    ")",
+    ...windowsClaudeNpmInstallLines(),
     "echo.",
     "where claude",
     "claude --version 2>nul",
@@ -3879,22 +3930,11 @@ async function updateEnvironment(target: "codex" | "claude" | "grok" | "cursor" 
         "codex --version 2>nul"
       );
     } else if (target === "claude") {
-      // Upgrade every common install channel so PATH-first detection cannot keep an old copy.
-      body.push(
-        "where winget >nul 2>&1 && (",
-        "  echo [1] winget upgrade Anthropic.ClaudeCode ...",
-        "  winget upgrade --id Anthropic.ClaudeCode -e --accept-package-agreements --accept-source-agreements",
-        ")",
-        "where claude >nul 2>&1 && (",
-        "  echo [2] claude update ...",
-        "  call claude update",
-        ")",
-        "echo [3] npm install -g @anthropic-ai/claude-code@latest ...",
-        "call npm install -g @anthropic-ai/claude-code@latest",
-        "echo.",
-        "where claude",
-        "claude --version 2>nul"
-      );
+      // The version badge is registry.npmjs.org latest, not winget and not the user's
+      // npmrc mirror. `call claude update` follows the npm .cmd, which points at
+      // bin\claude.exe before postinstall copies the real optional binary, so cmd
+      // reports the path is not a command and the old package.json version stays.
+      body.push(...windowsClaudeNpmInstallLines(), "echo.", "where claude", "claude --version 2>nul");
     } else if (target === "grok") {
       body.push(
         "where grok >nul 2>&1 && (",
