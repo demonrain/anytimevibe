@@ -1403,12 +1403,21 @@ function updateState(patch: Partial<PublicState>): void {
   };
   // During quit/update the BrowserWindow/Tray may already be destroyed; never touch them.
   if (quitting || installingUpdate) return;
+  if (!isWindowAlive()) {
+    try { rebuildTray(); } catch { /* tray may already be destroyed */ }
+    return;
+  }
   try {
-    if (isWindowAlive()) {
-      windowRef!.webContents.send("agent:state", publicState);
-    }
-  } catch {
-    // Window can race-destroy between isDestroyed checks and send.
+    const snapshot = JSON.parse(JSON.stringify(publicState)) as PublicState;
+    windowRef!.webContents.send("agent:state", snapshot);
+  } catch (error) {
+    logWarn("界面状态发送失败", error instanceof Error ? error.message : String(error));
+  }
+  if (publicState.environmentReady) {
+    void windowRef!.webContents.executeJavaScript(
+      "var m=document.getElementById('bootMask');if(m)m.classList.add('hidden');",
+      true
+    ).catch(() => undefined);
   }
   try {
     rebuildTray();
@@ -1930,7 +1939,12 @@ function rendererHtml(): string {
   function paint(state){
     try{
       if(!state) return;
+      // getState() may resolve after a newer agent:state already marked the environment ready.
+      // Applying that older snapshot puts the boot mask back and leaves it there.
+      if(lastPaintState && lastPaintState.environmentReady && !state.environmentReady) return;
       lastPaintState=state;
+      var bootMask=document.querySelector('#bootMask');
+      if(bootMask) bootMask.classList.toggle('hidden',!!state.environmentReady);
       if(status) status.textContent=state.status||'';
       if(dot) dot.className='dot '+(state.status==='online'?'online':'');
       var nextDetail=state.detail||'';
@@ -1945,8 +1959,6 @@ function rendererHtml(): string {
       if(relay && document.activeElement!==relay) relay.value=state.relayUrl||'';
       if(displayName && document.activeElement!==displayName) displayName.value=state.displayName||'';
       if(meta) meta.textContent='\u5ba2\u6237\u7aef v'+(state.agentVersion||${JSON.stringify(PRODUCT_VERSION)})+(state.hostId?' \u00b7 '+String(state.hostId).slice(0,8):'');
-      var bootMask=document.querySelector('#bootMask');
-      if(bootMask) bootMask.classList.toggle('hidden',!!state.environmentReady);
       var env=state.environment||{nodeInstalled:false,codexCompatible:false,codexInstalled:false};
       var engines=state.availableEngines||[];
       if(!state.environmentReady){
@@ -2022,6 +2034,12 @@ function rendererHtml(): string {
     }catch(err){
       setStatusDetail('界面渲染异常：'+(err&&err.message?err.message:String(err)));
       console.error(err);
+      try{
+        if(state && state.environmentReady){
+          var stuckMask=document.querySelector('#bootMask');
+          if(stuckMask) stuckMask.classList.add('hidden');
+        }
+      }catch(e2){}
     }
   }
   function renderUpdate(update){
