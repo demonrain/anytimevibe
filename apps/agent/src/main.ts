@@ -1515,8 +1515,15 @@ function createWindow(): void {
       // ignore
     }
   });
-  windowRef.webContents.on("console-message", (_event, level, message) => {
-    if (level >= 2) console.error("[renderer]", message);
+  windowRef.webContents.on("console-message", (_event, level, message, line) => {
+    const details = level && typeof level === "object" ? level as { message?: string; level?: string | number; lineNumber?: number } : null;
+    const text = details ? String(details.message || "") : String(message || "");
+    const severity = details ? details.level : level;
+    const lineNo = details?.lineNumber ?? line;
+    const isError = severity === "error" || severity === "warning" || (typeof severity === "number" && severity >= 2);
+    if (!isError || !text) return;
+    const where = lineNo ? `:${lineNo}` : "";
+    logWarn("界面脚本", `${text.slice(0, 400)}${where}`);
   });
   windowRef.webContents.on("render-process-gone", (_event, details) => {
     logError("渲染进程退出", `${details.reason || "unknown"} · exit=${details.exitCode ?? "?"}`);
@@ -1870,7 +1877,7 @@ function rendererHtml(): string {
   function escapeHtml(value){return String(value||'').replace(/[&<>"']/g,function(char){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[char];});}
   function isLongDetail(text){
     var raw=String(text||'');
-    return raw.length>220 || raw.split(/\n/).length>4 || /操作失败|npm WARN|Unsupported|failed|错误/i.test(raw);
+    return raw.length>220 || raw.split(/\\n/).length>4 || /操作失败|npm WARN|Unsupported|failed|错误/i.test(raw);
   }
   function setStatusDetail(text){
     var raw=String(text||'');
@@ -1880,7 +1887,7 @@ function rendererHtml(): string {
   function shortAlert(error){
     var msg=error&&error.message?error.message:String(error||'');
     if(msg.length>500){
-      msg=msg.slice(0,500)+'\n…\n（完整输出见顶部「日志」）';
+      msg=msg.slice(0,500)+'\\n…\\n（完整输出见顶部「日志」）';
     }
     alert(msg);
   }
