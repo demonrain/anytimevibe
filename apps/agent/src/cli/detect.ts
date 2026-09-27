@@ -192,6 +192,10 @@ function enrichedPathEnv(): NodeJS.ProcessEnv {
         path.join(process.env.LOCALAPPDATA || "", "agy", "bin"),
         path.join(home, ".cursor", "bin"),
         path.join(home, ".local", "bin"),
+        path.join(home, ".claude", "bin"),
+        path.join(home, ".claude", "local"),
+        path.join(process.env.LOCALAPPDATA || "", "Claude"),
+        path.join(process.env.LOCALAPPDATA || "", "Programs", "Claude"),
         path.join(process.env.LOCALAPPDATA || "", "Programs", "claude"),
         path.join(process.env.LOCALAPPDATA || "", "Microsoft", "WinGet", "Links"),
         path.join(process.env.APPDATA || "", "npm"),
@@ -202,6 +206,7 @@ function enrichedPathEnv(): NodeJS.ProcessEnv {
     : [
         path.join(home, ".cursor", "bin"),
         path.join(home, ".local", "bin"),
+        path.join(home, ".claude", "bin"),
         path.join(home, ".claude", "local"),
         "/opt/homebrew/bin",
         "/usr/local/bin",
@@ -316,7 +321,7 @@ export async function resolveCommandPath(command: string): Promise<string | null
           // try next target
         }
       }
-      const preferred = await preferWindowsExecutable(hits);
+      const preferred = await preferWindowsExecutable(hits.filter((hit) => !isWindowsAppExecutionAlias(hit)));
       if (preferred) {
         resolvedCommandCache.set(command, preferred);
         return preferred;
@@ -338,33 +343,45 @@ export async function resolveCommandPath(command: string): Promise<string | null
   }
 
   const home = os.homedir();
-  const candidates = isWindows
+  const want = path.basename(command).toLowerCase().replace(/\.(exe|cmd|bat|com|ps1)$/i, "");
+  const named = (dir: string, file: string): string => path.join(dir, file);
+  // Only files whose name matches the command. A shared list used to include
+  // ~/.grok/bin/grok.exe for every lookup, so an installed Grok blocked the later
+  // Claude/WinGet search and the UI reported Claude as missing.
+  const candidates = (isWindows
     ? [
-        // Prefer .cmd/.exe first — never pick extensionless npm bash shims before them.
-        path.join(process.env.APPDATA || "", "npm", `${command}.cmd`),
-        path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs", `${command}.cmd`),
-        path.join(home, "AppData", "Local", "Microsoft", "WinGet", "Links", `${command}.exe`),
-        path.join(home, ".local", "bin", `${command}.exe`),
-        path.join(home, ".local", "bin", `${command}.cmd`),
-        path.join(home, ".grok", "bin", "grok.exe"),
-        path.join(home, ".grok", "bin", `${command}.exe`),
-        path.join(process.env.LOCALAPPDATA || "", "Programs", "claude", "claude.exe"),
-        path.join(process.env.LOCALAPPDATA || "", "agy", "bin", `${command}.exe`),
-        path.join(process.env.LOCALAPPDATA || "", "agy", "bin", `${command}.cmd`),
-        path.join(home, ".local", "bin", command),
-        path.join(home, ".grok", "bin", command)
+        named(path.join(process.env.APPDATA || "", "npm"), `${want}.cmd`),
+        named(path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs"), `${want}.cmd`),
+        named(path.join(home, "AppData", "Local", "Microsoft", "WinGet", "Links"), `${want}.exe`),
+        named(path.join(home, ".local", "bin"), `${want}.exe`),
+        named(path.join(home, ".local", "bin"), `${want}.cmd`),
+        named(path.join(home, ".claude", "bin"), `${want}.exe`),
+        named(path.join(home, ".claude", "local"), `${want}.exe`),
+        named(path.join(home, ".cursor", "bin"), `${want}.exe`),
+        named(path.join(home, ".cursor", "bin"), `${want}.cmd`),
+        named(path.join(process.env.LOCALAPPDATA || "", "cursor-agent"), `${want}.cmd`),
+        named(path.join(process.env.LOCALAPPDATA || "", "cursor-agent"), `${want}.exe`),
+        named(path.join(process.env.LOCALAPPDATA || "", "Programs", "claude"), "claude.exe"),
+        named(path.join(process.env.LOCALAPPDATA || "", "Programs", "Claude"), "claude.exe"),
+        named(path.join(process.env.LOCALAPPDATA || "", "Claude"), "claude.exe"),
+        named(path.join(process.env.LOCALAPPDATA || "", "agy", "bin"), `${want}.exe`),
+        named(path.join(process.env.LOCALAPPDATA || "", "agy", "bin"), `${want}.cmd`),
+        named(path.join(home, ".grok", "bin"), `${want}.exe`),
+        named(path.join(home, ".local", "bin"), want),
+        named(path.join(home, ".grok", "bin"), want)
       ]
     : [
-        path.join(home, ".local", "bin", command),
-        path.join(home, ".grok", "bin", "grok"),
-        path.join(home, ".grok", "bin", command),
-        path.join(home, ".claude", "local", "claude"),
-        path.join(home, ".claude", "local", command),
-        "/usr/local/bin/" + command,
-        "/opt/homebrew/bin/" + command,
-        "/opt/homebrew/bin/claude",
-        "/usr/local/bin/claude"
-      ];
+        named(path.join(home, ".local", "bin"), want),
+        named(path.join(home, ".claude", "bin"), want),
+        named(path.join(home, ".claude", "local"), want),
+        named(path.join(home, ".cursor", "bin"), want),
+        named(path.join(home, ".grok", "bin"), want),
+        "/usr/local/bin/" + want,
+        "/opt/homebrew/bin/" + want
+      ]).filter((candidate) => {
+        const base = path.basename(candidate).toLowerCase().replace(/\.(exe|cmd|bat|com|ps1)$/i, "");
+        return base === want;
+      });
 
   if (isWindows) {
     const preferred = await preferWindowsExecutable(candidates.filter(Boolean));
