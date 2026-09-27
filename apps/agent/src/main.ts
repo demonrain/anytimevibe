@@ -2726,6 +2726,21 @@ function parseNodeMajorVersion(version: string | null | undefined): number | nul
   return Number.isFinite(major) ? major : null;
 }
 
+/** Keep Node's proxy warning off the version we store and show. */
+function codexVersionFromOutput(raw: string | null | undefined): string | null {
+  const lines = String(raw || "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line
+      && !/^\(node:\d+\)/i.test(line)
+      && !/UNDICI-EHPA|ExperimentalWarning|EnvHttpProxyAgent|trace-warnings/i.test(line));
+  const text = lines.join("\n");
+  const match = text.match(/codex-cli\s+(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?)/i)
+    || text.match(/\b(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?)\b/);
+  return match?.[1] ?? null;
+}
+
 async function probeCodexVersionOutput(command: string): Promise<{ version: string | null; raw: string }> {
   try {
     const winPath = await resolveWindowsPath();
@@ -2736,8 +2751,7 @@ async function probeCodexVersionOutput(command: string): Promise<{ version: stri
       timeout: 20_000
     });
     const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
-    const version = raw.replace(/^codex-cli\s+/i, "").trim() || null;
-    return { version, raw };
+    return { version: codexVersionFromOutput(raw), raw };
   } catch (error) {
     const err = error as { stdout?: string; stderr?: string; message?: string };
     const raw = `${err.stdout ?? ""}${err.stderr ?? ""}${err.message ?? ""}`.trim();
@@ -2965,7 +2979,7 @@ async function detectEnvironment(): Promise<EnvironmentState> {
     codexCommand = process.platform === "win32" ? normalizeWindowsCommandPath(discoveredCodex) : discoveredCodex;
   }
   const codexOutput = discoveredCodex ? await commandVersion(codexCommand, ["--version"]) : null;
-  const detectedVersion = codexOutput?.replace(/^codex-cli\s+/i, "").trim();
+  const detectedVersion = codexVersionFromOutput(codexOutput);
   if (detectedVersion) codexVersion = detectedVersion;
   return {
     platform: initialEnvironment.platform,
