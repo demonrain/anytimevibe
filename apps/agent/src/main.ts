@@ -3732,6 +3732,39 @@ fi
   updateState({ detail: "已打开 Terminal 安装 Node.js。完成后请重启随码并点击「重新检测」。" });
 }
 
+function isGrokAgentPath(filePath: string): boolean {
+  return /[\\/]\.grok[\\/]/i.test(filePath);
+}
+
+/**
+ * Locate Cursor's CLI without ever selecting Grok's `agent` / `agent.exe`.
+ * Both ship a bare `agent` name; PATH order must not decide which one updates.
+ */
+function windowsCursorLocateLines(resolved: string | null): string[] {
+  const lines = ["set \"CURSOR_BIN=\""];
+  if (resolved && !isGrokAgentPath(resolved)) {
+    const file = resolved.replace(/"/g, "");
+    lines.push(`if exist "${file}" set "CURSOR_BIN=${file}"`);
+  }
+  lines.push(
+    "if not defined CURSOR_BIN if exist \"%USERPROFILE%\\.local\\bin\\cursor-agent.cmd\" set \"CURSOR_BIN=%USERPROFILE%\\.local\\bin\\cursor-agent.cmd\"",
+    "if not defined CURSOR_BIN if exist \"%USERPROFILE%\\.local\\bin\\cursor-agent.exe\" set \"CURSOR_BIN=%USERPROFILE%\\.local\\bin\\cursor-agent.exe\"",
+    "if not defined CURSOR_BIN if exist \"%USERPROFILE%\\.cursor\\bin\\cursor-agent.cmd\" set \"CURSOR_BIN=%USERPROFILE%\\.cursor\\bin\\cursor-agent.cmd\"",
+    "if not defined CURSOR_BIN if exist \"%USERPROFILE%\\.cursor\\bin\\cursor-agent.exe\" set \"CURSOR_BIN=%USERPROFILE%\\.cursor\\bin\\cursor-agent.exe\"",
+    "if not defined CURSOR_BIN if exist \"%USERPROFILE%\\.cursor\\bin\\agent.cmd\" set \"CURSOR_BIN=%USERPROFILE%\\.cursor\\bin\\agent.cmd\"",
+    "if not defined CURSOR_BIN if exist \"%USERPROFILE%\\.cursor\\bin\\agent.exe\" set \"CURSOR_BIN=%USERPROFILE%\\.cursor\\bin\\agent.exe\"",
+    "if not defined CURSOR_BIN if exist \"%LOCALAPPDATA%\\cursor-agent\\cursor-agent.cmd\" set \"CURSOR_BIN=%LOCALAPPDATA%\\cursor-agent\\cursor-agent.cmd\"",
+    "if not defined CURSOR_BIN if exist \"%LOCALAPPDATA%\\cursor-agent\\cursor-agent.exe\" set \"CURSOR_BIN=%LOCALAPPDATA%\\cursor-agent\\cursor-agent.exe\"",
+    "if not defined CURSOR_BIN if exist \"%LOCALAPPDATA%\\cursor-agent\\agent.cmd\" set \"CURSOR_BIN=%LOCALAPPDATA%\\cursor-agent\\agent.cmd\"",
+    "if not defined CURSOR_BIN if exist \"%LOCALAPPDATA%\\cursor-agent\\agent.exe\" set \"CURSOR_BIN=%LOCALAPPDATA%\\cursor-agent\\agent.exe\"",
+    "if not defined CURSOR_BIN if exist \"%USERPROFILE%\\.local\\bin\\agent.cmd\" set \"CURSOR_BIN=%USERPROFILE%\\.local\\bin\\agent.cmd\"",
+    "if not defined CURSOR_BIN if exist \"%USERPROFILE%\\.local\\bin\\agent.exe\" set \"CURSOR_BIN=%USERPROFILE%\\.local\\bin\\agent.exe\"",
+    "if not defined CURSOR_BIN for /f \"delims=\" %%A in ('where cursor-agent 2^>nul') do if not defined CURSOR_BIN set \"CURSOR_BIN=%%A\"",
+    "if not defined CURSOR_BIN for /f \"delims=\" %%A in ('where cursor-agent.cmd 2^>nul') do if not defined CURSOR_BIN set \"CURSOR_BIN=%%A\""
+  );
+  return lines;
+}
+
 async function installCursorAgent(): Promise<void> {
   updateState({ detail: "正在打开 Cursor Agent CLI 安装窗口…" });
   if (process.platform === "win32") {
@@ -3745,13 +3778,17 @@ async function installCursorAgent(): Promise<void> {
       "echo [1] Official installer (cursor.com/install) ...",
       "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"irm 'https://cursor.com/install?win32=true' | iex\"",
       "echo.",
-      "set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\"",
-      "where agent 2>nul",
-      "where cursor-agent 2>nul",
-      "agent --version 2>nul",
+      "set \"PATH=%USERPROFILE%\\.local\\bin;%USERPROFILE%\\.cursor\\bin;%LOCALAPPDATA%\\cursor-agent;%PATH%\"",
+      ...windowsCursorLocateLines(null),
       "echo.",
-      "echo If agent is Cursor CLI: run  agent login",
-      "echo Note: do not confuse with Grok's agent.exe under %%USERPROFILE%%\\.grok\\bin",
+      "if defined CURSOR_BIN (",
+      "  echo Cursor binary: %CURSOR_BIN%",
+      "  call \"%CURSOR_BIN%\" --version",
+      ") else (",
+      "  echo Cursor Agent was not found. Grok's agent.exe was not used.",
+      ")",
+      "echo.",
+      "echo If this is Cursor CLI, run: \"%CURSOR_BIN%\" login",
       "echo.",
       "echo Done. Close this window and click 重新检测 in AnytimeVibe."
     ]);
@@ -3762,9 +3799,20 @@ async function installCursorAgent(): Promise<void> {
     await openMacTerminalScript(`
 echo "Installing Cursor Agent CLI…"
 curl -fsS https://cursor.com/install | bash
-export PATH="$HOME/.local/bin:$PATH"
-agent --version || true
-echo "Install finished. Run: agent login"
+export PATH="$HOME/.local/bin:$HOME/.cursor/bin:$PATH"
+cursor_bin=""
+for candidate in "$HOME/.local/bin/cursor-agent" "$HOME/.cursor/bin/cursor-agent" "$HOME/.local/bin/agent" "$HOME/.cursor/bin/agent"; do
+  if [ -z "$cursor_bin" ] && [ -e "$candidate" ]; then
+    cursor_bin="$candidate"
+  fi
+done
+if [ -n "$cursor_bin" ]; then
+  echo "Cursor binary: $cursor_bin"
+  "$cursor_bin" --version || true
+  echo "Install finished. Run: $cursor_bin login"
+else
+  echo "Cursor Agent was not found. Grok's agent was not used."
+fi
 `);
     updateState({ detail: "已打开 Terminal 安装 Cursor Agent。完成后请执行 agent login 并点「重新检测」。" });
     return;
@@ -3948,18 +3996,25 @@ async function updateEnvironment(target: "codex" | "claude" | "grok" | "cursor" 
         "grok --version 2>nul"
       );
     } else if (target === "cursor") {
+      const resolved = await resolveEngineBinary("cursor");
       body.push(
-        "where agent >nul 2>&1 && (",
-        "  echo [1] agent update ...",
-        "  call agent update",
-        ") || where cursor-agent >nul 2>&1 && (",
-        "  echo [1] cursor-agent update ...",
-        "  call cursor-agent update",
-        ") || (",
-        "  echo self-update unavailable, re-running official installer ...",
+        "set \"PATH=%USERPROFILE%\\.local\\bin;%USERPROFILE%\\.cursor\\bin;%LOCALAPPDATA%\\cursor-agent;%PATH%\"",
+        ...windowsCursorLocateLines(resolved),
+        "if defined CURSOR_BIN (",
+        "  echo [1] Cursor update: %CURSOR_BIN%",
+        "  call \"%CURSOR_BIN%\" update",
+        ") else (",
+        "  echo Cursor Agent not found outside Grok. Running official installer ...",
         "  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"irm 'https://cursor.com/install?win32=true' | iex\"",
         ")",
-        "agent --version 2>nul"
+        ...windowsCursorLocateLines(null).slice(1),
+        "echo.",
+        "if defined CURSOR_BIN (",
+        "  echo Cursor binary: %CURSOR_BIN%",
+        "  call \"%CURSOR_BIN%\" --version",
+        ") else (",
+        "  echo Cursor Agent still not found. Grok's agent.exe was not updated.",
+        ")"
       );
     } else if (target === "antigravity") {
       body.push(
@@ -4012,16 +4067,43 @@ export PATH="$HOME/.grok/bin:$PATH"
 grok --version || true
 `;
     } else if (target === "cursor") {
+      const resolved = await resolveEngineBinary("cursor");
+      const preferred = resolved && !isGrokAgentPath(resolved) ? resolved.replace(/"/g, "") : "";
       script = `
 echo "Updating Cursor Agent…"
-if command -v agent >/dev/null 2>&1; then
-  agent update || curl -fsS https://cursor.com/install | bash
-elif command -v cursor-agent >/dev/null 2>&1; then
-  cursor-agent update || curl -fsS https://cursor.com/install | bash
-else
-  curl -fsS https://cursor.com/install | bash
+export PATH="$HOME/.local/bin:$HOME/.cursor/bin:$PATH"
+cursor_bin=""
+if [ -n ${JSON.stringify(preferred)} ] && [ -e ${JSON.stringify(preferred)} ]; then
+  cursor_bin=${JSON.stringify(preferred)}
 fi
-agent --version || true
+for candidate in "$HOME/.local/bin/cursor-agent" "$HOME/.cursor/bin/cursor-agent" "$HOME/.local/bin/agent" "$HOME/.cursor/bin/agent"; do
+  if [ -z "$cursor_bin" ] && [ -e "$candidate" ]; then
+    cursor_bin="$candidate"
+  fi
+done
+if [ -z "$cursor_bin" ] && command -v cursor-agent >/dev/null 2>&1; then
+  cursor_bin="$(command -v cursor-agent)"
+fi
+case "$cursor_bin" in
+  */.grok/*) cursor_bin="" ;;
+esac
+if [ -n "$cursor_bin" ]; then
+  echo "Cursor binary: $cursor_bin"
+  "$cursor_bin" update || curl -fsS https://cursor.com/install | bash
+else
+  echo "Cursor Agent not found outside Grok. Running official installer…"
+  curl -fsS https://cursor.com/install | bash
+  for candidate in "$HOME/.local/bin/cursor-agent" "$HOME/.cursor/bin/cursor-agent" "$HOME/.local/bin/agent" "$HOME/.cursor/bin/agent"; do
+    if [ -z "$cursor_bin" ] && [ -e "$candidate" ]; then
+      cursor_bin="$candidate"
+    fi
+  done
+fi
+if [ -n "$cursor_bin" ]; then
+  "$cursor_bin" --version || true
+else
+  echo "Cursor Agent still not found. Grok's agent was not updated."
+fi
 `;
     } else if (target === "antigravity") {
       script = `
