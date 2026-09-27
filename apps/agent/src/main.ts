@@ -1358,14 +1358,38 @@ function isWindowAlive(): boolean {
   return Boolean(windowRef && !windowRef.isDestroyed() && !windowRef.webContents.isDestroyed());
 }
 
+/** Keep status-card detail short so npm dumps cannot collapse the rest of the UI. */
+function summarizeUiStatusDetail(detail: string, maxLen = 480): string {
+  const trimmed = String(detail || "").replace(/\r/g, "").trim();
+  if (!trimmed) return "";
+  if (trimmed.length <= maxLen) return trimmed;
+
+  const lines = trimmed.split("\n").map((line) => line.trim()).filter(Boolean);
+  const interesting = lines.filter((line) => !/^npm WARN\b/i.test(line) && !/^npm notice\b/i.test(line));
+  const pick = interesting.length ? interesting : lines;
+  const head = pick[0] || trimmed.slice(0, 120);
+  const tailLines = pick.slice(-4);
+  const tail = tailLines.join("\n");
+  let summary = head;
+  if (tail && tail !== head) summary = `${head}\n…\n${tail}`;
+  if (summary.length > maxLen) {
+    summary = `${summary.slice(0, Math.max(0, maxLen - 24)).trimEnd()}…`;
+  }
+  return `${summary}\n（完整输出见顶部「日志」）`;
+}
+
 function updateState(patch: Partial<PublicState>): void {
+  const nextPatch = { ...patch };
+  if (typeof nextPatch.detail === "string") {
+    nextPatch.detail = summarizeUiStatusDetail(nextPatch.detail);
+  }
   publicState = {
     ...publicState,
-    ...patch,
+    ...nextPatch,
     relayUrl: config?.relayUrl ?? publicState.relayUrl,
     displayName: config ? resolvedDisplayName() : publicState.displayName,
     codexVersion,
-    agentVersion: patch.agentVersion ?? agentAppVersion(),
+    agentVersion: nextPatch.agentVersion ?? agentAppVersion(),
     workspaces: config?.workspaces ?? publicState.workspaces
   };
   // During quit/update the BrowserWindow/Tray may already be destroyed; never touch them.
@@ -1586,7 +1610,11 @@ function rendererHtml(): string {
   .status b{text-transform:uppercase;font-size:10px;letter-spacing:.1em}
   .dot{width:8px;height:8px;border-radius:50%;background:#999;flex:0 0 auto}
   .dot.online{background:#3bab70;box-shadow:0 0 0 4px rgba(59,171,112,.14)}
-  .detail{color:#6b726b;font-size:11px;line-height:1.4;margin:6px 0 0;white-space:pre-wrap}
+  #statusCard{flex:0 1 auto;max-height:34%;min-height:0;overflow:hidden;display:flex;flex-direction:column}
+  .detail{color:#6b726b;font-size:11px;line-height:1.4;margin:6px 0 0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;max-height:7.2em;overflow-x:hidden;overflow-y:auto;-webkit-app-region:no-drag;app-region:no-drag;min-height:0;flex:0 1 auto}
+  .detail-actions{display:none;gap:6px;margin-top:6px;flex:0 0 auto;-webkit-app-region:no-drag;app-region:no-drag}
+  .detail-actions.show{display:flex}
+  .detail-actions button{padding:4px 8px;font-size:10px;border-radius:8px}
   .meta{font:10px/1.4 "Cascadia Code",monospace;color:#687068;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .nav-tabs{display:flex;gap:4px;padding:2px;background:rgba(23,33,27,.07);border-radius:11px;flex:0 0 auto;-webkit-app-region:no-drag;app-region:no-drag}
   .nav-tabs button{flex:1 1 0;min-width:0;border:0;border-radius:9px;padding:7px 4px;background:transparent;color:#5c645c;font-size:10px;font-weight:850;cursor:pointer;white-space:nowrap}
@@ -1671,7 +1699,7 @@ function rendererHtml(): string {
   </style></head><body><div class="frame"><main class="shell" style="position:relative">
   <div id="bootMask" class="boot-mask" aria-live="polite"><div class="boot-card"><div class="spinner"></div><strong id="bootTitle">&#x6B63;&#x5728;&#x68C0;&#x6D4B;&#x672C;&#x673A;&#x7F16;&#x7801;&#x73AF;&#x5883;</strong><span id="bootHint">&#x52A0;&#x8F7D;&#x5B8C;&#x6210;&#x524D;&#x4E0D;&#x4F1A;&#x63D0;&#x793A;&#x5B89;&#x88C5;&#x524D;&#x7F6E;&#x73AF;&#x5883;&#xFF0C;&#x8BF7;&#x7A0D;&#x5019;&#x2026;</span></div></div>
   <div class="titlebar">${iconDataUrl ? `<div class="mark"><img src="${iconDataUrl}" alt=""></div>` : `<div class="mark"></div>`}<div><h1 id="brandTitle">随码</h1><p id="brandTag">随时续上你的代码 · ${platformLabel}</p></div><div class="win-actions"><button type="button" id="openLogs" class="logs-btn" title="运行日志">日志</button><button type="button" id="winMin" title="最小化">–</button><button type="button" id="winClose" class="close" title="关闭">×</button></div></div>
-  <section class="card" style="flex:0 0 auto"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div class="meta" id="meta"></div></section>
+  <section class="card" id="statusCard"><div class="status"><b id="status">loading</b><span id="dot" class="dot"></span></div><p id="detail" class="detail">正在读取状态…</p><div id="detailActions" class="detail-actions"><button type="button" id="detailOpenLogs" class="secondary">查看日志</button><button type="button" id="detailDismiss" class="secondary">收起</button></div><div class="meta" id="meta"></div></section>
   <nav class="nav-tabs" role="tablist" aria-label="客户端功能">
     <button type="button" role="tab" data-tab="guide" class="active" id="tabGuide">指引</button>
     <button type="button" role="tab" data-tab="env" id="tabEnv">环境</button>
@@ -1781,6 +1809,8 @@ function rendererHtml(): string {
     if(el=document.querySelector('#tabPair')) el.textContent=t('tabPair');
     if(el=document.querySelector('#tabWs')) el.textContent=t('tabWs');
     if(el=document.querySelector('#tabTasks')) el.textContent=t('tabTasks');
+    if(el=document.querySelector('#detailOpenLogs')) el.textContent=locale==='en'?'Open logs':'查看日志';
+    if(el=document.querySelector('#detailDismiss')) el.textContent=locale==='en'?'Dismiss':'收起';
     if(el=document.querySelector('#guideTitle')) el.textContent=t('guideTitle');
     if(el=document.querySelector('#guideTip')) el.textContent=t('guideTip');
     if(el=document.querySelector('#envTitle')) el.textContent=t('envTitle');
@@ -1797,6 +1827,9 @@ function rendererHtml(): string {
   var status=document.querySelector('#status');
   var dot=document.querySelector('#dot');
   var detail=document.querySelector('#detail');
+  var detailActions=document.querySelector('#detailActions');
+  var detailOpenLogs=document.querySelector('#detailOpenLogs');
+  var detailDismiss=document.querySelector('#detailDismiss');
   var relay=document.querySelector('#relay');
   var displayName=document.querySelector('#displayName');
   var pairBox=document.querySelector('#pairBox');
@@ -1815,7 +1848,24 @@ function rendererHtml(): string {
   var selectedActivityId=null;
   var lastPaintState=null;
   var guidedOnce=false;
+  var detailDismissedText='';
   function escapeHtml(value){return String(value||'').replace(/[&<>"']/g,function(char){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[char];});}
+  function isLongDetail(text){
+    var raw=String(text||'');
+    return raw.length>220 || raw.split(/\n/).length>4 || /操作失败|npm WARN|Unsupported|failed|错误/i.test(raw);
+  }
+  function setStatusDetail(text){
+    var raw=String(text||'');
+    if(detail) detail.textContent=raw;
+    if(detailActions) detailActions.classList.toggle('show', isLongDetail(raw));
+  }
+  function shortAlert(error){
+    var msg=error&&error.message?error.message:String(error||'');
+    if(msg.length>500){
+      msg=msg.slice(0,500)+'\n…\n（完整输出见顶部「日志」）';
+    }
+    alert(msg);
+  }
   function renderGuide(state){
     var box=document.querySelector('#guideSteps');
     if(!box) return;
@@ -1874,7 +1924,15 @@ function rendererHtml(): string {
       lastPaintState=state;
       if(status) status.textContent=state.status||'';
       if(dot) dot.className='dot '+(state.status==='online'?'online':'');
-      if(detail) detail.textContent=state.detail||'';
+      var nextDetail=state.detail||'';
+      if(detailDismissedText && nextDetail===detailDismissedText){
+        setStatusDetail(state.status==='online'
+          ? (locale==='en'?'Agent online. Long error dismissed — open Logs if needed.':'代理在线。已收起长错误，需要时可点「日志」。')
+          : (locale==='en'?'Long error dismissed — open Logs if needed.':'已收起长错误，需要时可点「日志」。'));
+      }else{
+        if(nextDetail!==detailDismissedText) detailDismissedText='';
+        setStatusDetail(nextDetail);
+      }
       if(relay && document.activeElement!==relay) relay.value=state.relayUrl||'';
       if(displayName && document.activeElement!==displayName) displayName.value=state.displayName||'';
       if(meta) meta.textContent='\u5ba2\u6237\u7aef v'+(state.agentVersion||${JSON.stringify(PRODUCT_VERSION)})+(state.hostId?' \u00b7 '+String(state.hostId).slice(0,8):'');
@@ -1902,7 +1960,7 @@ function rendererHtml(): string {
         var engineExtra=engines.filter(function(item){return item.engine!=='codex';}).map(function(item){
           var label=item.engine==='claude'?'Claude Code':item.engine==='cursor'?'Cursor Agent':item.engine==='antigravity'?'Antigravity':item.engine==='pi'?'Pi':item.engine==='grok'?'Grok Build':'Codex';
           var versionText=item.version||item.detail||(item.ready?(locale==='en'?'Ready':'就绪'):(locale==='en'?'Not installed':'未安装'));
-          if(item.ready&&item.latestVersion){
+          if(item.ready&&item.version&&item.latestVersion){
             versionText=item.updateAvailable
               ? (versionText+' → '+item.latestVersion)
               : (versionText+(locale==='en'?' (latest)':'（已是最新）'));
@@ -1925,7 +1983,7 @@ function rendererHtml(): string {
             if(!api) return;
             var target=button.getAttribute('data-install');
             button.disabled=true;
-            api.installEnvironment(target).catch(function(error){alert(error&&error.message?error.message:String(error));}).finally(function(){try{button.disabled=false;}catch(e){}});
+            api.installEnvironment(target).catch(function(error){shortAlert(error);}).finally(function(){try{button.disabled=false;}catch(e){}});
           });
         });
         environment.querySelectorAll('button[data-update]').forEach(function(button){
@@ -1933,7 +1991,7 @@ function rendererHtml(): string {
             if(!api||!api.updateEnvironment) return;
             var target=button.getAttribute('data-update');
             button.disabled=true;
-            api.updateEnvironment(target).catch(function(error){alert(error&&error.message?error.message:String(error));}).finally(function(){try{button.disabled=false;}catch(e){}});
+            api.updateEnvironment(target).catch(function(error){shortAlert(error);}).finally(function(){try{button.disabled=false;}catch(e){}});
           });
         });
       }
@@ -1953,7 +2011,7 @@ function rendererHtml(): string {
       renderTasks(state.tasks||[]);
       renderGuide(state);
     }catch(err){
-      if(detail) detail.textContent='界面渲染异常：'+(err&&err.message?err.message:String(err));
+      setStatusDetail('界面渲染异常：'+(err&&err.message?err.message:String(err)));
       console.error(err);
     }
   }
@@ -2068,9 +2126,9 @@ function rendererHtml(): string {
         if(!api) return;
         button.disabled=true;
         api.relayTask(button.getAttribute('data-relay')).then(function(){
-          if(detail) detail.textContent='已打开接力终端。';
+          setStatusDetail('已打开接力终端。');
         }).catch(function(error){
-          alert(error&&error.message?error.message:String(error));
+          shortAlert(error);
         }).finally(function(){ try{ button.disabled=false; }catch(e){} });
       });
     });
@@ -2134,11 +2192,12 @@ function rendererHtml(): string {
     if((el=document.querySelector('#addWorkspace'))&&api) el.addEventListener('click',function(){api.addWorkspace();});
     if((el=document.querySelector('#recheck'))&&api) el.addEventListener('click',function(){
       el.disabled=true;
-      if(detail) detail.textContent=locale==='en'?'Detecting Node / Codex / Claude / Grok / Cursor / Antigravity / Pi…':'正在检测 Node / Codex / Claude / Grok / Cursor / Antigravity / Pi…';
+      detailDismissedText='';
+      setStatusDetail(locale==='en'?'Detecting Node / Codex / Claude / Grok / Cursor / Antigravity / Pi…':'正在检测 Node / Codex / Claude / Grok / Cursor / Antigravity / Pi…');
       Promise.resolve(api.checkEnvironment()).then(function(state){
         if(state) paint(state);
       }).catch(function(error){
-        alert(error&&error.message?error.message:String(error));
+        shortAlert(error);
       }).finally(function(){ try{ el.disabled=false; }catch(e){} });
     });
     if((el=document.querySelector('#winMin'))&&api) el.addEventListener('click',function(){api.windowMinimize();});
@@ -2146,6 +2205,13 @@ function rendererHtml(): string {
     if((el=document.querySelector('#feedback'))&&api) el.addEventListener('click',function(){api.openFeedback();});
     if((el=document.querySelector('#starRepo'))&&api) el.addEventListener('click',function(){api.openRepo();});
     if(el=document.querySelector('#openLogs')) el.addEventListener('click',function(){ openLogModal(); });
+    if(detailOpenLogs) detailOpenLogs.addEventListener('click',function(){ openLogModal(); });
+    if(detailDismiss) detailDismiss.addEventListener('click',function(){
+      detailDismissedText=(lastPaintState&&lastPaintState.detail)|| (detail&&detail.textContent)||'';
+      setStatusDetail(locale==='en'
+        ? 'Long error dismissed — open Logs if needed.'
+        : '已收起长错误，需要时可点「日志」。');
+    });
     if(el=document.querySelector('#logClose')) el.addEventListener('click',function(){ closeLogModal(); });
     if(logModal) logModal.addEventListener('click',function(ev){ if(ev.target===logModal) closeLogModal(); });
     if(logView) logView.addEventListener('scroll',function(){
@@ -2175,14 +2241,14 @@ function rendererHtml(): string {
   function refresh(){
     if(!api||!api.getState) return;
     api.getState().then(function(state){ paint(state); }).catch(function(err){
-      if(detail) detail.textContent='读取状态失败：'+(err&&err.message?err.message:String(err));
+      setStatusDetail('读取状态失败：'+(err&&err.message?err.message:String(err)));
     });
   }
   applyLocale();
   paint(initialState);
   bindUi();
   if(!api){
-    if(detail) detail.textContent='预加载桥接失败：window.anytimeVibe 不可用。请重装客户端。';
+    setStatusDetail('预加载桥接失败：window.anytimeVibe 不可用。请重装客户端。');
   } else {
     try{ api.onState(function(state){ paint(state); }); }catch(e){ console.error(e); }
     try{
@@ -2325,6 +2391,8 @@ async function ensureMacFolderAccess(targetPath: string, reason: string): Promis
 
 let cachedMacLoginPath: string | null = null;
 let cachedWindowsPath: string | null = null;
+/** Extra dirs discovered from `npm prefix/bin -g` after install. */
+let extraWindowsPathDirs: string[] = [];
 
 async function pathExists(filePath: string): Promise<boolean> {
   return safePathExists(filePath, workspaceAllowRoots());
@@ -2479,11 +2547,30 @@ async function resolveWindowsPath(): Promise<string> {
     path.join(home, ".fnm"),
     path.join(home, "scoop", "shims"),
     path.join(home, "AppData", "Local", "Programs", "fnm"),
+    // nvm-windows keeps node/npm under NVM_HOME / NVM_SYMLINK
+    process.env.NVM_HOME || "",
+    process.env.NVM_SYMLINK || "",
+    path.join(process.env.APPDATA || "", "nvm"),
     // Antigravity grep_search shells out to `grep`; Git for Windows ships it under usr\bin.
     path.join(process.env.ProgramFiles || "C:\\Program Files", "Git", "usr", "bin"),
-    path.join(process.env.LOCALAPPDATA || "", "Programs", "Git", "usr", "bin")
+    path.join(process.env.LOCALAPPDATA || "", "Programs", "Git", "usr", "bin"),
+    ...extraWindowsPathDirs
   ]) {
     if (dir) parts.add(dir);
+  }
+  // Expand nvm version dirs one level so active installs are searchable.
+  const nvmHome = process.env.NVM_HOME || path.join(process.env.APPDATA || "", "nvm");
+  if (nvmHome) {
+    try {
+      const entries = await fs.readdir(nvmHome, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory() && /^v?\d/.test(entry.name)) {
+          parts.add(path.join(nvmHome, entry.name));
+        }
+      }
+    } catch {
+      // optional
+    }
   }
   cachedWindowsPath = [...parts].join(";");
   return cachedWindowsPath;
@@ -2493,6 +2580,267 @@ async function applyWindowsPathToProcess(): Promise<void> {
   if (process.platform !== "win32") return;
   cachedWindowsPath = null;
   process.env.PATH = await resolveWindowsPath();
+}
+
+/** Ask npm where global bins live — critical on Win10 when APPDATA\\npm is not on PATH. */
+async function resolveNpmGlobalDirs(npmCmd: string): Promise<string[]> {
+  const dirs: string[] = [];
+  const run = async (args: string[]): Promise<string> => {
+    const result = await execFileAsync(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(npmCmd, args), {
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+      env: process.env,
+      timeout: 15_000,
+      cwd: os.homedir()
+    });
+    return `${result.stdout ?? ""}`.trim().split(/\r?\n/).map((l) => l.trim()).find(Boolean) || "";
+  };
+  try {
+    const bin = await run(["bin", "-g"]);
+    if (bin) dirs.push(bin);
+  } catch {
+    // older npm may not support bin -g the same way
+  }
+  try {
+    const prefix = await run(["prefix", "-g"]);
+    if (prefix) {
+      dirs.push(prefix);
+      dirs.push(path.join(prefix, "node_modules", ".bin"));
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    const npmDir = path.dirname(normalizeWindowsCommandPath(npmCmd));
+    if (npmDir) dirs.push(npmDir);
+  } catch {
+    // ignore
+  }
+  const appdataNpm = path.join(process.env.APPDATA || "", "npm");
+  if (appdataNpm) dirs.push(appdataNpm);
+  return [...new Set(dirs.filter(Boolean))];
+}
+
+async function rememberNpmGlobalDirs(npmCmd: string): Promise<string[]> {
+  const dirs = await resolveNpmGlobalDirs(npmCmd);
+  extraWindowsPathDirs = dirs;
+  cachedWindowsPath = null;
+  await applyWindowsPathToProcess();
+  return dirs;
+}
+
+async function discoverCodexOnWindows(): Promise<string | null> {
+  await applyWindowsPathToProcess();
+  // Prefer .cmd launchers; extensionless npm shims often point at the wrong node_modules tree.
+  const hit = (await findOnWindowsPath("codex.cmd"))
+    || (await findOnWindowsPath("codex.exe"));
+  if (hit && /\.cmd$/i.test(hit)) {
+    // Reject orphan AppData shims that still point at a missing package file.
+    try {
+      const text = await fs.readFile(hit, "utf8");
+      const m = text.match(/node_modules[\\/]@openai[\\/]codex[\\/]bin[\\/]codex\.js/i)
+        || text.match(/_CODEX_JS=(.+)/i);
+      if (m) {
+        let target = "";
+        const captured = m[1];
+        if (typeof captured === "string" && m[0].startsWith("_CODEX_JS=")) {
+          target = captured.trim().replace(/^"|"$/g, "");
+        } else {
+          // Relative shim: %dp0%\node_modules\...
+          target = path.join(path.dirname(hit), "node_modules", "@openai", "codex", "bin", "codex.js");
+        }
+        if (target && !(await pathExists(target))) {
+          // fall through to other probes
+        } else if (await pathExists(hit)) {
+          return hit;
+        }
+      } else if (await pathExists(hit)) {
+        return hit;
+      }
+    } catch {
+      if (await pathExists(hit)) return hit;
+    }
+  } else if (hit) {
+    return hit;
+  }
+  const home = os.homedir();
+  const probes = [
+    ...extraWindowsPathDirs.flatMap((dir) => [
+      path.join(dir, "codex.cmd"),
+      path.join(dir, "codex.exe")
+    ]),
+    path.join(process.env.APPDATA || "", "npm", "codex.cmd"),
+    path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs", "codex.cmd"),
+    path.join(home, "AppData", "Roaming", "npm", "codex.cmd")
+  ];
+  for (const candidate of probes) {
+    if (candidate && await pathExists(candidate)) return candidate;
+  }
+  return null;
+}
+
+function parseNodeMajorVersion(version: string | null | undefined): number | null {
+  const match = String(version || "").trim().match(/^v?(\d+)/i);
+  if (!match) return null;
+  const major = Number(match[1]);
+  return Number.isFinite(major) ? major : null;
+}
+
+async function probeCodexVersionOutput(command: string): Promise<{ version: string | null; raw: string }> {
+  try {
+    const winPath = await resolveWindowsPath();
+    const result = await execFileAsync(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(command, ["--version"]), {
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+      env: { ...process.env, PATH: winPath },
+      timeout: 20_000
+    });
+    const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+    const version = raw.replace(/^codex-cli\s+/i, "").trim() || null;
+    return { version, raw };
+  } catch (error) {
+    const err = error as { stdout?: string; stderr?: string; message?: string };
+    const raw = `${err.stdout ?? ""}${err.stderr ?? ""}${err.message ?? ""}`.trim();
+    return { version: null, raw };
+  }
+}
+
+async function npmGlobalCodexPlatformReady(npmCmd: string): Promise<{ ok: boolean; detail: string }> {
+  try {
+    const root = await npmGlobalRoot(npmCmd);
+    if (!root) return { ok: false, detail: "无法读取 npm root -g" };
+    const arch = process.arch === "arm64" ? "arm64" : "x64";
+    const pkgRoot = path.join(root, "@openai", "codex");
+    const entryJs = path.join(pkgRoot, "bin", "codex.js");
+    if (!(await pathExists(entryJs))) {
+      return {
+        ok: false,
+        detail: `全局包不完整：缺少 ${entryJs}（常见于残留的 codex.cmd 启动器，或 prefix 与 %APPDATA%\\npm 不一致）`
+      };
+    }
+    const platformPkg = path.join(pkgRoot, "node_modules", "@openai", `codex-win32-${arch}`);
+    const altPkg = path.join(root, "@openai", `codex-win32-${arch}`);
+    const present = (await pathExists(platformPkg)) || (await pathExists(altPkg));
+    if (present) return { ok: true, detail: platformPkg };
+    return {
+      ok: false,
+      detail: `缺少平台包 @openai/codex-win32-${arch}（常见于 Node < 16，npm 会跳过 optionalDependencies）`
+    };
+  } catch (error) {
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function runNpmText(npmCmd: string, args: string[]): Promise<string> {
+  const result = await execFileAsync(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(npmCmd, args), {
+    windowsHide: true,
+    windowsVerbatimArguments: true,
+    env: process.env,
+    timeout: 20_000,
+    cwd: os.homedir()
+  });
+  return `${result.stdout ?? ""}`.trim().split(/\r?\n/).map((l) => l.trim()).find(Boolean) || "";
+}
+
+async function npmGlobalRoot(npmCmd: string): Promise<string> {
+  try {
+    return await runNpmText(npmCmd, ["root", "-g"]);
+  } catch {
+    return "";
+  }
+}
+
+async function npmGlobalPrefix(npmCmd: string): Promise<string> {
+  try {
+    return await runNpmText(npmCmd, ["prefix", "-g"]);
+  } catch {
+    return "";
+  }
+}
+
+/** Absolute path to the real package entry (ignores broken AppData shims). */
+async function resolveNpmGlobalCodexEntry(npmCmd: string): Promise<string | null> {
+  const root = await npmGlobalRoot(npmCmd);
+  if (!root) return null;
+  const entryJs = path.join(root, "@openai", "codex", "bin", "codex.js");
+  if (await pathExists(entryJs)) return entryJs;
+  // Some broken installs leave files only under Program Files while shim points at AppData.
+  const fallbacks = [
+    path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs", "node_modules", "@openai", "codex", "bin", "codex.js"),
+    path.join(process.env.APPDATA || "", "npm", "node_modules", "@openai", "codex", "bin", "codex.js")
+  ];
+  for (const candidate of fallbacks) {
+    if (candidate && await pathExists(candidate)) return candidate;
+  }
+  return null;
+}
+
+/** True when global @openai/codex package files are actually on disk (not just an orphan shim). */
+async function npmGlobalCodexPackageComplete(npmCmd: string): Promise<boolean> {
+  return Boolean(await resolveNpmGlobalCodexEntry(npmCmd));
+}
+
+/**
+ * Write a working launcher next to the real package when npm's AppData shim is stale.
+ * Returns the launcher path (.cmd) so Codex can be spawned without MODULE_NOT_FOUND.
+ */
+async function ensureCodexWindowsLauncher(npmCmd: string, nodeCmd: string | null): Promise<string | null> {
+  const entryJs = await resolveNpmGlobalCodexEntry(npmCmd);
+  if (!entryJs) return null;
+  const node = nodeCmd
+    || (await findOnWindowsPath("node.exe"))
+    || (await findOnWindowsPath("node"))
+    || "node";
+  const prefix = (await npmGlobalPrefix(npmCmd))
+    || path.join(process.env.APPDATA || "", "npm")
+    || path.dirname(entryJs);
+  const launcherDir = path.join(process.env.APPDATA || os.homedir(), "npm");
+  const dirs = [...new Set([launcherDir, prefix].filter(Boolean))];
+  const body = [
+    "@ECHO off",
+    `SETLOCAL`,
+    `SET "_CODEX_JS=${entryJs.replace(/"/g, "")}"`,
+    `IF NOT EXIST "%_CODEX_JS%" (`,
+    `  echo Codex package missing: %_CODEX_JS% 1>&2`,
+    `  exit /b 1`,
+    `)`,
+    `"${normalizeWindowsCommandPath(node).replace(/"/g, "")}" "%_CODEX_JS%" %*`,
+    ""
+  ].join("\r\n");
+  for (const dir of dirs) {
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      const launcher = path.join(dir, "codex.cmd");
+      await fs.writeFile(launcher, body, "utf8");
+      // Keep extensionless shim from winning over our .cmd when both exist.
+      const orphan = path.join(dir, "codex");
+      try {
+        const st = await fs.stat(orphan);
+        if (st.isFile()) await fs.unlink(orphan);
+      } catch {
+        // ignore
+      }
+      if (await pathExists(launcher)) {
+        extraWindowsPathDirs = [...new Set([...extraWindowsPathDirs, dir])];
+        cachedWindowsPath = null;
+        return launcher;
+      }
+    } catch (error) {
+      logWarn("写入 Codex 启动器失败", `${dir}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  // Last resort: invoke via absolute node + js (stored as a one-line cmd in temp).
+  try {
+    const tempDir = path.join(app.getPath("userData"), "cli-launchers");
+    await fs.mkdir(tempDir, { recursive: true });
+    const launcher = path.join(tempDir, "codex.cmd");
+    await fs.writeFile(launcher, body, "utf8");
+    extraWindowsPathDirs = [...new Set([...extraWindowsPathDirs, tempDir])];
+    cachedWindowsPath = null;
+    return launcher;
+  } catch {
+    return null;
+  }
 }
 
 async function findOnWindowsPath(command: string): Promise<string | null> {
@@ -2572,7 +2920,7 @@ async function detectEnvironment(): Promise<EnvironmentState> {
     ? (process.platform === "win32" ? normalizeWindowsCommandPath(process.env.CODEX_COMMAND) : process.env.CODEX_COMMAND)
     : null;
   const discoveredCodex = configuredCodex
-    ?? (process.platform === "win32" ? await findOnWindowsPath("codex.cmd") : await findOnMacPath("codex"));
+    ?? (process.platform === "win32" ? await discoverCodexOnWindows() : await findOnMacPath("codex"));
   if (discoveredCodex) {
     codexCommand = process.platform === "win32" ? normalizeWindowsCommandPath(discoveredCodex) : discoveredCodex;
   }
@@ -2778,22 +3126,145 @@ async function installCodexOnWindows(): Promise<void> {
     throw new Error("未找到 npm。请确认 Node.js 安装时包含 npm，然后重启随码客户端再试。");
   }
 
-  updateState({ detail: `正在安装 ${CODEX_INSTALL_PACKAGE}…\nnpm: ${npm}` });
-  await runWindowsCommand(npm, ["install", "-g", CODEX_INSTALL_PACKAGE], (log) => {
-    const tail = log.replace(/\r/g, "").split("\n").filter(Boolean).slice(-4).join(" | ");
-    updateState({ detail: `正在安装 Codex CLI… ${tail}` });
-  });
+  // Codex requires Node >= 16 (optional win32 binary is skipped on older engines).
+  const nodeCmd = (await findOnWindowsPath("node.exe")) ?? (await findOnWindowsPath("node"));
+  const nodeVersionText = nodeCmd ? await commandVersion(nodeCmd, ["--version"]) : null;
+  const nodeMajor = parseNodeMajorVersion(nodeVersionText);
+  if (nodeMajor !== null && nodeMajor < 16) {
+    throw new Error(
+      `当前 Node.js ${nodeVersionText || nodeMajor} 过旧。Codex CLI 需要 Node.js ≥ 16（建议 20 LTS）。\n请先点「一键安装」升级 Node，或从 https://nodejs.org 安装后再试。`
+    );
+  }
 
-  cachedWindowsPath = null;
-  await applyWindowsPathToProcess();
+  await rememberNpmGlobalDirs(npm);
+
+  const userNpmPrefix = path.join(process.env.APPDATA || os.homedir(), "npm");
+  try {
+    await fs.mkdir(userNpmPrefix, { recursive: true });
+  } catch {
+    // ignore
+  }
+
+  // Orphan shims (codex.cmd exists but package files missing) cause MODULE_NOT_FOUND.
+  // Always uninstall first so npm cannot report "changed 2 packages" while leaving a broken tree.
+  updateState({ detail: "正在清理旧的 Codex 全局安装…" });
+  try {
+    await runWindowsCommand(npm, ["uninstall", "-g", "@openai/codex"], (log) => {
+      const tail = log.replace(/\r/g, "").split("\n").filter(Boolean).slice(-3).join(" | ");
+      if (tail) updateState({ detail: `正在清理旧的 Codex… ${tail}` });
+    });
+  } catch {
+    // not installed yet — fine
+  }
+  // Also drop stale AppData shims that npm uninstall may leave behind.
+  for (const stale of [
+    path.join(userNpmPrefix, "codex"),
+    path.join(userNpmPrefix, "codex.cmd"),
+    path.join(userNpmPrefix, "node_modules", "@openai", "codex")
+  ]) {
+    try {
+      await fs.rm(stale, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  }
+
+  const installOnce = async (force: boolean): Promise<void> => {
+    // Pin official registry + user prefix so package and shim land in the same tree.
+    // npmmirror / Program Files prefix splits are a common MODULE_NOT_FOUND cause on Win10.
+    const args = [
+      "install",
+      "-g",
+      ...(force ? ["--force"] : []),
+      "--registry=https://registry.npmjs.org/",
+      `--prefix=${userNpmPrefix}`,
+      CODEX_INSTALL_PACKAGE
+    ];
+    updateState({ detail: `正在安装 ${CODEX_INSTALL_PACKAGE}${force ? "（强制）" : ""}…\nprefix: ${userNpmPrefix}` });
+    await runWindowsCommand(npm, args, (log) => {
+      const tail = log.replace(/\r/g, "").split("\n").filter(Boolean).slice(-4).join(" | ");
+      updateState({ detail: `正在安装 Codex CLI… ${tail}` });
+    });
+  };
+
+  await installOnce(false);
+  let packageOk = await npmGlobalCodexPackageComplete(npm);
+  if (!packageOk) {
+    // Retry without custom prefix in case the machine forbids writing there.
+    logWarn("Codex 用户 prefix 安装不完整，改用默认 prefix 重试");
+    updateState({ detail: "用户目录安装不完整，改用默认 npm 全局目录重试…" });
+    try {
+      await runWindowsCommand(npm, ["uninstall", "-g", "@openai/codex"]);
+    } catch {
+      // ignore
+    }
+    const args = ["install", "-g", "--force", "--registry=https://registry.npmjs.org/", CODEX_INSTALL_PACKAGE];
+    await runWindowsCommand(npm, args, (log) => {
+      const tail = log.replace(/\r/g, "").split("\n").filter(Boolean).slice(-4).join(" | ");
+      updateState({ detail: `正在强制安装 Codex CLI… ${tail}` });
+    });
+    packageOk = await npmGlobalCodexPackageComplete(npm);
+  }
+
+  const launcher = await ensureCodexWindowsLauncher(npm, nodeCmd);
+  if (launcher) {
+    codexCommand = normalizeWindowsCommandPath(launcher);
+    logInfo("Codex 启动器已修复", launcher);
+  }
+
+  const globalDirs = await rememberNpmGlobalDirs(npm);
+  logInfo("npm 全局目录", globalDirs.join(" | ") || "(empty)");
+  const npmRoot = await npmGlobalRoot(npm);
+  const npmPrefix = await npmGlobalPrefix(npm);
+  logInfo("npm root/prefix", `root=${npmRoot || "?"} prefix=${npmPrefix || "?"}`);
+
+  let discovered: string | null = launcher;
+  let versionProbe: { version: string | null; raw: string } = { version: null, raw: "" };
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+    cachedWindowsPath = null;
+    discovered = launcher || await discoverCodexOnWindows();
+    if (!discovered) continue;
+    codexCommand = normalizeWindowsCommandPath(discovered);
+    versionProbe = await probeCodexVersionOutput(codexCommand);
+    if (versionProbe.version) break;
+  }
+
   const environment = await detectEnvironment();
+  // Prefer the repaired launcher for subsequent Codex app-server spawns.
+  if (launcher && versionProbe.version) {
+    codexCommand = normalizeWindowsCommandPath(launcher);
+  }
   updateState({ environment });
 
   if (!environment.codexCompatible) {
+    const platform = await npmGlobalCodexPlatformReady(npm);
+    const entry = await resolveNpmGlobalCodexEntry(npm);
+    const moduleMissing = /Cannot find module|MODULE_NOT_FOUND/i.test(versionProbe.raw);
+    const hintParts = [
+      discovered
+        ? `已找到启动器：${discovered}`
+        : `未在 PATH / npm 全局目录找到 codex（已扫描：${globalDirs.join("；") || "无"}）`,
+      `npm root -g: ${npmRoot || "未知"}`,
+      `npm prefix -g: ${npmPrefix || "未知"}`,
+      entry ? `实际包入口：${entry}` : "npm root 下也没有 bin/codex.js",
+      packageOk ? "" : "全局包文件缺失（bin/codex.js 不存在）",
+      moduleMissing ? "codex 启动报 MODULE_NOT_FOUND：启动器指向的路径与真实安装目录不一致" : "",
+      versionProbe.raw ? `codex --version 输出：${versionProbe.raw.slice(0, 280)}` : "",
+      platform.ok ? "" : platform.detail,
+      "请在 cmd 依次执行：",
+      "  npm prefix -g",
+      "  npm root -g",
+      "  dir \"%APPDATA%\\npm\\node_modules\\@openai\\codex\\bin\"",
+      "  dir \"%ProgramFiles%\\nodejs\\node_modules\\@openai\\codex\\bin\"",
+      "  npm uninstall -g @openai/codex",
+      "  npm install -g --registry=https://registry.npmjs.org/ --prefix \"%APPDATA%\\npm\" @openai/codex@latest",
+      "  codex --version"
+    ].filter(Boolean);
     throw new Error(
       environment.codexInstalled
         ? `已安装但版本不兼容（当前 ${environment.codexVersion}，需要 ${CODEX_COMPAT_LABEL}）。`
-        : "npm 安装已结束，但仍未检测到 codex 命令。请重启客户端后再点「重新检测」。"
+        : `npm 安装已结束，但仍未检测到可用的 codex 命令。\n${hintParts.join("\n")}`
     );
   }
 
@@ -6695,9 +7166,7 @@ async function resolveCodexBinaryForRelay(): Promise<string> {
     // ignore
   }
   if (process.platform === "win32") {
-    const hit = (await findOnWindowsPath("codex.cmd"))
-      || (await findOnWindowsPath("codex.exe"))
-      || (await findOnWindowsPath("codex"));
+    const hit = await discoverCodexOnWindows();
     if (hit) {
       codexCommand = normalizeWindowsCommandPath(hit);
       return codexCommand;

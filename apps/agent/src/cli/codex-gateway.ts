@@ -137,9 +137,11 @@ function resolveFallbackProviderBaseUrl(text: string): string {
 
 function ensureProviderSection(text: string, provider: string, baseUrl: string): string {
   if (hasModelProviderSection(text, provider)) return text;
-  // Custom / relay gateways authenticate with experimental_bearer_token (or API key),
+  // Custom / relay gateways authenticate via env_key (OPENAI_API_KEY) + optional bearer,
   // not ChatGPT OAuth. Defaulting requires_openai_auth=true forces auth_mode=Chatgpt and
   // then fails with "refresh token was revoked" even when base_url points at a mid-proxy.
+  // Mid-proxies rarely support Responses WebSocket; WS→HTTPS fallback can drop Authorization
+  // (API_KEY_REQUIRED), so default supports_websockets=false for non-OpenAI hosts.
   let requiresOpenaiAuth = false;
   try {
     const host = new URL(baseUrl).hostname.toLowerCase();
@@ -154,6 +156,9 @@ function ensureProviderSection(text: string, provider: string, baseUrl: string):
     `base_url = "${baseUrl}"`,
     `wire_api = "responses"`,
     `requires_openai_auth = ${requiresOpenaiAuth}`,
+    ...(requiresOpenaiAuth
+      ? []
+      : [`env_key = "OPENAI_API_KEY"`, `supports_websockets = false`]),
     ""
   ].join("\n");
   const insertAt = text.search(/\n\[(?!model_providers\.)/);
@@ -232,7 +237,13 @@ function repairGluedOpenaiBaseUrlLine(text: string): string {
   );
 }
 
-function upsertProviderBearer(text: string, provider: string, apiKey: string): { text: string; changed: boolean } {
+function upsertProviderField(
+  text: string,
+  provider: string,
+  key: string,
+  value: string,
+  kind: "string" | "bool" = "string"
+): { text: string; changed: boolean } {
   const sectionRe = new RegExp(
     `(\\[model_providers\\.${provider.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\])([^\\[]*)`,
     "i"
@@ -241,22 +252,45 @@ function upsertProviderBearer(text: string, provider: string, apiKey: string): {
   if (!match) return { text, changed: false };
   const head = match[1];
   const body = match[2] ?? "";
-  const existing = parseTomlString(body, "experimental_bearer_token")?.trim() || "";
-  if (existing === apiKey) return { text, changed: false };
-  let nextBody: string;
-  if (/^\s*experimental_bearer_token\s*=/im.test(body)) {
-    nextBody = body.replace(
-      /^(\s*experimental_bearer_token\s*=\s*)"[^"]*"/im,
-      `$1"${apiKey}"`
-    );
-  } else {
-    const insert = `experimental_bearer_token = "${apiKey}"\n`;
-    nextBody = /^\s*\n/.test(body) ? `\n${insert}${body.replace(/^\s*\n/, "")}` : `\n${insert}${body}`;
+  const rendered = kind === "bool" ? value : `"${value}"`;
+  const keyRe = new RegExp(`^(\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*).*$`, "im");
+  if (keyRe.test(body)) {
+    const existing = kind === "bool"
+      ? (body.match(new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*(true|false)\\s*$`, "im"))?.[1] || "")
+      : (parseTomlString(body, key)?.trim() || "");
+    if (existing === value) return { text, changed: false };
+    return {
+      text: text.replace(sectionRe, `${head}${body.replace(keyRe, `$1${rendered}`)}`),
+      changed: true
+    };
   }
+  const insert = `${key} = ${rendered}\n`;
+  const nextBody = /^\s*\n/.test(body) ? `\n${insert}${body.replace(/^\s*\n/, "")}` : `\n${insert}${body}`;
   return {
     text: text.replace(sectionRe, `${head}${nextBody}`),
     changed: true
   };
+}
+
+function upsertProviderBearer(text: string, provider: string, apiKey: string): { text: string; changed: boolean } {
+  return upsertProviderField(text, provider, "experimental_bearer_token", apiKey, "string");
+}
+
+/** Prefer env_key auth and disable Responses WS for mid-proxies (WS fallback can drop Authorization). */
+function hardenRelayProviderAuth(text: string, provider: string): { text: string; details: string[] } {
+  const details: string[] = [];
+  let next = text;
+  const envKey = upsertProviderField(next, provider, "env_key", "OPENAI_API_KEY", "string");
+  if (envKey.changed) {
+    next = envKey.text;
+    details.push(`set env_key=OPENAI_API_KEY on ${provider}`);
+  }
+  const noWs = upsertProviderField(next, provider, "supports_websockets", "false", "bool");
+  if (noWs.changed) {
+    next = noWs.text;
+    details.push(`set supports_websockets=false on ${provider}`);
+  }
+  return { text: next, details };
 }
 
 /**
@@ -415,6 +449,8 @@ async function readBestCodexConfigBackup(): Promise<string | null> {
       if (parseTomlString(text, "openai_base_url")) score += 2;
       if (/requires_openai_auth\s*=\s*false/i.test(section)) score += 2;
       if (parseTomlString(section, "experimental_bearer_token")) score += 1;
+      if (parseTomlString(section, "env_key")) score += 1;
+      if (/supports_websockets\s*=\s*false/i.test(section)) score += 1;
       scored.push({ score, mtime: st.mtimeMs, text });
     } catch {
       /* skip */
@@ -578,8 +614,10 @@ export async function repairCodexModelProviderConfig(): Promise<{
  * prefers those tokens → auth_mode=Chatgpt, MCP codex_apps 401, refresh_token_invalidated.
  *
  * Convert to API-key mode, keep the mid-proxy key in auth.json, and ensure the active
- * custom provider has experimental_bearer_token. Pair with openai_base_url alignment so
- * sticky built-in `openai` threads do not keep posting to api.openai.com.
+ * custom provider has env_key + experimental_bearer_token, with supports_websockets=false
+ * so WS→HTTPS fallback cannot drop Authorization (API_KEY_REQUIRED). Pair with
+ * openai_base_url alignment so sticky built-in `openai` threads do not keep posting
+ * to api.openai.com.
  */
 export async function sanitizeCodexRelayAuth(configText?: string): Promise<{
   repaired: boolean;
@@ -637,6 +675,9 @@ export async function sanitizeCodexRelayAuth(configText?: string): Promise<{
 
   const details: string[] = [];
   let nextConfig = text;
+  const hardened = hardenRelayProviderAuth(nextConfig, provider);
+  nextConfig = hardened.text;
+  details.push(...hardened.details);
   const bearerUpsert = upsertProviderBearer(nextConfig, provider, apiKey);
   if (bearerUpsert.changed) {
     nextConfig = bearerUpsert.text;
@@ -753,6 +794,8 @@ export async function readCodexCredentialFingerprint(): Promise<string> {
   let providerBase = "";
   let requiresAuth = "";
   let hasBearer = false;
+  let hasEnvKey = false;
+  let supportsWs = "";
   if (provider) {
     const sectionRe = new RegExp(
       `\\[model_providers\\.${provider.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]([\\s\\S]*?)(?=\\n\\[|$)`,
@@ -762,6 +805,12 @@ export async function readCodexCredentialFingerprint(): Promise<string> {
     providerBase = parseTomlString(section, "base_url") || "";
     requiresAuth = /^\s*requires_openai_auth\s*=\s*true\s*$/im.test(section) ? "true" : "false";
     hasBearer = Boolean(parseTomlString(section, "experimental_bearer_token")?.trim());
+    hasEnvKey = Boolean(parseTomlString(section, "env_key")?.trim());
+    supportsWs = /^\s*supports_websockets\s*=\s*false\s*$/im.test(section)
+      ? "0"
+      : /^\s*supports_websockets\s*=\s*true\s*$/im.test(section)
+        ? "1"
+        : "?";
   }
   return [
     `cfg=${configMeta}`,
@@ -770,6 +819,8 @@ export async function readCodexCredentialFingerprint(): Promise<string> {
     `openaiBase=${openaiBase}`,
     `providerBase=${providerBase}`,
     `requiresAuth=${requiresAuth}`,
+    `envKey=${hasEnvKey ? "1" : "0"}`,
+    `ws=${supportsWs}`,
     `bearer=${hasBearer ? "1" : "0"}`,
     `apiKey=${hasApiKey ? "1" : "0"}`,
     `oauth=${hasOauth ? "1" : "0"}`

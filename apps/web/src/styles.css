@@ -1157,7 +1157,43 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   margin-top: 4px;
   box-shadow: 0 -12px 20px rgba(242,234,219,.95);
 }
-.error-banner { position: fixed; left: 50%; top: 14px; transform: translateX(-50%); z-index: 100; width: min(620px, calc(100% - 28px)); border: 0; border-radius: 12px; background: #a63b28; color: white; padding: 12px 15px; display: flex; justify-content: space-between; text-align: left; box-shadow: 0 15px 45px rgba(94,24,13,.28); cursor: pointer; }.error-banner span { opacity: .7; }
+.error-banner {
+  position: fixed;
+  left: 50%;
+  top: 14px;
+  transform: translateX(-50%);
+  z-index: 100;
+  width: min(620px, calc(100% - 28px));
+  max-height: min(36vh, 220px);
+  overflow: auto;
+  border: 0;
+  border-radius: 12px;
+  background: #a63b28;
+  color: white;
+  padding: 12px 15px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  text-align: left;
+  box-shadow: 0 15px 45px rgba(94,24,13,.28);
+  cursor: pointer;
+}
+.error-banner-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.error-banner-close {
+  flex: 0 0 auto;
+  opacity: .7;
+  position: sticky;
+  top: 0;
+}
 @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } } @keyframes pulse { 50% { transform: scale(.72); opacity: .45; } } @keyframes spin { to { transform: rotate(360deg); } }
 /* Large / high-DPI desktop (4K @ 150% ≈ 2560 CSS px): denser chrome, more content */
 @media (min-width: 1280px) {

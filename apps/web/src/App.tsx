@@ -2376,7 +2376,12 @@ function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
 }
 
 function ErrorBanner({ message, clear }: { message: string; clear(): void }) {
-  return <button className="error-banner" onClick={clear}>{message}<span>关闭</span></button>;
+  return (
+    <button type="button" className="error-banner" onClick={clear}>
+      <span className="error-banner-text">{message}</span>
+      <span className="error-banner-close">关闭</span>
+    </button>
+  );
 }
 
 function ClientDownloads({ downloads }: { downloads: Health["clientDownloads"] }) {

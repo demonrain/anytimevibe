@@ -31,7 +31,12 @@ export function clearEngineBinaryCache(): void {
  * UI keep reporting an outdated Claude after `npm` / PATH upgrades.
  */
 async function preferWindowsExecutable(hits: string[]): Promise<string | null> {
-  for (const hit of hits) {
+  const ordered = [...hits].sort((a, b) => {
+    const aAlias = isWindowsAppExecutionAlias(a) ? 1 : 0;
+    const bAlias = isWindowsAppExecutionAlias(b) ? 1 : 0;
+    return aAlias - bAlias;
+  });
+  for (const hit of ordered) {
     const trimmed = hit?.trim();
     if (!trimmed) continue;
     const existing: string[] = [];
@@ -46,24 +51,123 @@ async function preferWindowsExecutable(hits: string[]): Promise<string | null> {
   return null;
 }
 
+function versionTextFromExec(result: { stdout?: unknown; stderr?: unknown } | null | undefined): string | null {
+  const text = `${result?.stdout ?? ""}\n${result?.stderr ?? ""}`.replace(/\u0000/g, "").trim();
+  if (!text) return null;
+  const lines = text.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+  const branded = lines.find((line) => /claude code|\(claude code\)/i.test(line) && /\d+\.\d+/.test(line));
+  if (branded) return branded;
+  const versionLine = lines.find((line) => /\d+\.\d+\.\d+/.test(line) && !/node\.js|cannot find module/i.test(line));
+  return versionLine || lines.find((line) => /\d+\.\d+/.test(line) && !/node\.js/i.test(line)) || null;
+}
+
+function isWindowsAppExecutionAlias(filePath: string): boolean {
+  return /[/\\]microsoft[/\\]windowsapps[/\\]/i.test(filePath);
+}
+
 async function runVersion(command: string, args: string[]): Promise<string | null> {
+  const isWindows = process.platform === "win32";
+  const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
+  const finalArgs = isWindows ? windowsCmdArguments(command, args) : args;
+  const env = {
+    ...enrichedPathEnv(),
+    CI: process.env.CI || "1"
+  };
   try {
-    const isWindows = process.platform === "win32";
-    const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
-    const finalArgs = isWindows ? windowsCmdArguments(command, args) : args;
-    const { stdout, stderr } = await execFileAsync(executable, finalArgs, {
+    const result = await execFileAsync(executable, finalArgs, {
       timeout: 12_000,
       windowsHide: true,
       windowsVerbatimArguments: isWindows,
-      env: process.env,
+      env,
       maxBuffer: 256_000
     });
-    const text = `${stdout || ""}\n${stderr || ""}`.trim();
-    const line = text.split(/\r?\n/).map((item) => item.trim()).find(Boolean);
-    return line || text || null;
+    const text = versionTextFromExec(result);
+    if (text && /\d+\.\d+/.test(text)) return text;
+  } catch (error) {
+    // Non-zero exit still often includes the version on stdout (Claude Code on Win10).
+    const text = versionTextFromExec(error as { stdout?: string; stderr?: string });
+    if (text && /\d+\.\d+/.test(text)) return text;
+  }
+
+  // PowerShell is what users run interactively (`claude --version`). cmd.exe misses
+  // .ps1 shims and some native launchers that only flush a version in a console host.
+  if (isWindows) {
+    const viaPs = await runVersionViaPowerShell(command, args);
+    if (viaPs && /\d+\.\d+/.test(viaPs)) return viaPs;
+  }
+  return null;
+}
+
+async function runVersionViaPowerShell(command: string, args: string[]): Promise<string | null> {
+  const systemRoot = process.env.SystemRoot || "C:\\Windows";
+  const ps = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const literal = command.replace(/'/g, "''");
+  const argText = args.map((arg) => `'${String(arg).replace(/'/g, "''")}'`).join(" ");
+  const script = `$ErrorActionPreference='Continue'; & '${literal}' ${argText} | Out-String -Width 240`;
+  try {
+    const result = await execFileAsync(ps, [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy", "Bypass",
+      "-Command",
+      script
+    ], {
+      timeout: 15_000,
+      windowsHide: true,
+      env: { ...enrichedPathEnv(), CI: process.env.CI || "1" },
+      maxBuffer: 256_000
+    });
+    return versionTextFromExec(result);
+  } catch (error) {
+    return versionTextFromExec(error as { stdout?: string; stderr?: string });
+  }
+}
+
+/** Windows file-version resource, used when --version output cannot be captured. */
+async function readWindowsProductVersion(filePath: string): Promise<string | null> {
+  if (process.platform !== "win32" || !/\.exe$/i.test(filePath)) return null;
+  if (!(await safePathExists(filePath))) return null;
+  const systemRoot = process.env.SystemRoot || "C:\\Windows";
+  const ps = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const literal = filePath.replace(/'/g, "''");
+  const script = `(Get-Item -LiteralPath '${literal}').VersionInfo.ProductVersion`;
+  try {
+    const result = await execFileAsync(ps, [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy", "Bypass",
+      "-Command",
+      script
+    ], {
+      timeout: 8_000,
+      windowsHide: true,
+      maxBuffer: 64_000
+    });
+    const text = `${result.stdout || ""}`.trim();
+    if (!text || /^0+(\.0+)+$/.test(text)) return null;
+    return text;
   } catch {
     return null;
   }
+}
+
+/** Native / npm Claude installs keep the real version in a sibling package.json. */
+async function readClaudePackageVersion(command: string): Promise<string | null> {
+  const dir = path.dirname(command);
+  const candidates = [
+    path.join(dir, "node_modules", "@anthropic-ai", "claude-code", "package.json"),
+    path.join(dir, "..", "node_modules", "@anthropic-ai", "claude-code", "package.json"),
+    path.join(dir, "package.json")
+  ];
+  for (const file of candidates) {
+    try {
+      const json = JSON.parse(await fs.readFile(file, "utf8")) as { name?: string; version?: string };
+      if (json?.name === "@anthropic-ai/claude-code" && json.version) return json.version;
+    } catch {
+      // try next
+    }
+  }
+  return null;
 }
 
 /** Fuller CLI text for fingerprinting (help can be multi-line). */
@@ -162,6 +266,11 @@ async function listWindowsCommandHits(command: string): Promise<string[]> {
     }
   }
   expanded.sort((a, b) => {
+    // App execution aliases (WindowsApps\\*.exe) often succeed in an interactive
+    // PowerShell prompt but return empty / fail when spawned from the Electron GUI.
+    const aAlias = isWindowsAppExecutionAlias(a) ? 1 : 0;
+    const bAlias = isWindowsAppExecutionAlias(b) ? 1 : 0;
+    if (aAlias !== bAlias) return aAlias - bAlias;
     // Prefer Cursor install locations over Grok when both expose `agent`.
     const aCursor = isCursorInstallPath(a) ? 0 : 1;
     const bCursor = isCursorInstallPath(b) ? 0 : 1;
@@ -320,11 +429,11 @@ function parseClaudeVersion(raw: string | null): string | undefined {
   const text = raw.trim();
   // Ignore Cursor-style calendar versions accidentally scraped from the wrong binary.
   if (/^\d{4}\.\d{2}\.\d{2}/.test(text) && !/claude/i.test(text)) return undefined;
-  // Accept semver, prerelease (1.2.3-alpha.1), two-part (1.2), and branded lines.
-  const match = text.match(/(\d+\.\d+\.\d+(?:[-\w.]*)?)/)
+  // Accept "2.1.268 (Claude Code)" and file versions like "2.1.268.0".
+  const match = text.match(/(\d+\.\d+\.\d+)(?:\.\d+)?/)
     || text.match(/(\d+\.\d+(?:[-\w.]*)?)/)
     || text.match(/claude[^\d]*([0-9][^\s]*)/i);
-  return match?.[1] ?? text.slice(0, 80);
+  return match?.[1];
 }
 
 function parseGrokVersion(raw: string | null): string | undefined {
@@ -530,7 +639,11 @@ export async function detectAvailableEngines(options: {
   const cursorRaw = cursorPath ? await runVersion(cursorPath, ["--version"]) : null;
   const antigravityRaw = antigravityPath ? await runVersion(antigravityPath, ["--version"]) : null;
   const piRaw = piPath ? await runVersion(piPath, ["--version"]) : null;
-  const claudeVersion = parseClaudeVersion(claudeRaw);
+  let claudeVersion = parseClaudeVersion(claudeRaw);
+  if (claudePath && !claudeVersion) {
+    claudeVersion = parseClaudeVersion(await readClaudePackageVersion(claudePath))
+      || parseClaudeVersion(await readWindowsProductVersion(claudePath));
+  }
   const grokVersion = parseGrokVersion(grokRaw);
   const cursorVersion = parseCursorVersion(cursorRaw);
   const antigravityVersion = parseAntigravityVersion(antigravityRaw);

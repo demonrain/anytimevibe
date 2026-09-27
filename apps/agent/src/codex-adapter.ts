@@ -315,13 +315,22 @@ export function explainCodexUpstreamError(message: string): string {
       "处理：确认 ~/.codex/config.toml 中 model_provider 指向自定义供应商且 openai_base_url 正确；随码会尝试自动修复并注入 OPENAI_BASE_URL。可继续旧会话或新开任务验证。"
     ].join("\n");
   }
-  if (invalidApiKey) {
+  if (/API_KEY_REQUIRED|api key is required in Authorization header/i.test(raw)) {
+    return [
+      raw,
+      "",
+      "说明：中转站收到了请求，但没有 Authorization / x-api-key（不是密钥本身错误）。",
+      "常见原因：① 自定义供应商缺少 env_key=\"OPENAI_API_KEY\"；② Codex 先走 Responses WebSocket，回退 HTTPS 时丢掉鉴权头。",
+      "处理：随码会自动写入 env_key 并关闭 supports_websockets；请重启随码或新开任务后再试。"
+    ].join("\n");
+  }
+  if (invalidApiKey || /Invalid token|invalid.?token/i.test(raw)) {
     return [
       raw,
       "",
       "说明：请求已打到自定义 / 中转供应商，但对方拒绝了当前 API Key（不是打到官方 api.openai.com）。",
-      "常见原因：① 切号后 config.toml 没有 experimental_bearer_token，Codex 仍带上旧 ChatGPT token；② 切号工具里的密钥已失效。",
-      "处理：在切号工具确认当前供应商密钥有效后重新切换一次；随码会把该密钥写入供应商 bearer 并注入 Codex 进程。请重启随码或新开任务后再试。"
+      "常见原因：① 切号后密钥与当前 base_url 不匹配（例如 Demonrain 的 key 不能用在 Yunbay）；② 密钥已失效。",
+      "处理：在切号工具确认当前供应商自己的密钥有效后重新切换一次；随码会写入 env_key / bearer 并注入 Codex 进程。请重启随码或新开任务后再试。"
     ].join("\n");
   }
   if (/auth_unavailable|no auth available/i.test(raw)) {
