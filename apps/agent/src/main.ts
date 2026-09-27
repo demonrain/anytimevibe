@@ -645,13 +645,22 @@ function formatLogExtra(value: unknown): string {
   }
 }
 
+/** Local wall-clock time with numeric offset, matching the machine timezone in agent.log. */
+function formatLocalLogTimestamp(date = new Date()): string {
+  const pad = (value: number, width = 2) => String(value).padStart(width, "0");
+  const offsetMin = -date.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+}
+
 function appendAgentLog(level: AgentLogLevel, message: string, extra?: unknown): void {
   const extraText = formatLogExtra(extra);
   const full = (extraText ? `${message} ${extraText}` : message).replace(/\s+/g, " ").trim().slice(0, 4_000);
   if (!full) return;
   const entry: AgentLogEntry = {
     id: crypto.randomUUID(),
-    ts: new Date().toISOString(),
+    ts: formatLocalLogTimestamp(),
     level,
     message: full
   };
@@ -6059,7 +6068,13 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
           void refreshLocalTasks(syncLimit).catch(() => undefined);
           return syncResult;
         } catch (error) {
-          handleError(error);
+          const message = error instanceof Error ? error.message : String(error);
+          // Missing Codex must not surface as a failed operation when Claude/Grok can still sync.
+          if (/未检测到 Codex CLI|Codex 版本不兼容/i.test(message)) {
+            logInfo("同步跳过 Codex", message);
+          } else {
+            handleError(error);
+          }
           return { threadCount: 0, partial: true as const };
         }
       })();
@@ -8389,7 +8404,21 @@ app.whenReady().then(async () => {
   if (config.hostId) void connect().catch(handleError);
   // Background env detect (Codex optional; failures must not block relay).
   void (async () => {
+    // Version probes (especially hidden `claude --version`) can hang past their own
+    // timers on Windows. Lift the boot mask on a budget so the window stays usable.
+    const bootUnblock = setTimeout(() => {
+      if (publicState.environmentReady) return;
+      logWarn("启动环境检测超过 10 秒，先结束加载遮罩");
+      updateState({
+        environmentReady: true,
+        agentVersion: agentAppVersion(),
+        detail: publicState.status === "online"
+          ? publicState.detail
+          : "环境检测仍在后台进行，界面已先打开。"
+      });
+    }, 10_000);
     try {
+      logInfo("开始检测本机编码环境");
       await applyLoginPathToProcessBounded();
       const environment = await detectEnvironment();
       updateState({ environment, codexVersion: environment.codexVersion || codexVersion });
@@ -8425,10 +8454,13 @@ app.whenReady().then(async () => {
       if (socket?.readyState === WebSocket.OPEN) {
         void publishHostStatus().catch(() => undefined);
       }
+      logInfo("本机编码环境检测完成", readyLabels || "无可用引擎");
     } catch (error) {
       // Env probe failures must never force offline/incompatible over a live socket.
       logWarn("启动环境检测失败", error instanceof Error ? error.message : String(error));
       updateState({ environmentReady: true, agentVersion: agentAppVersion() });
+    } finally {
+      clearTimeout(bootUnblock);
     }
   })();
 });

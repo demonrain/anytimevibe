@@ -6,10 +6,10 @@ import { promisify } from "node:util";
 import type { CliEngine, CliEngineInfo } from "@anytimevibe/protocol";
 import { CODEX_COMPAT_LABEL } from "../codex-adapter";
 import {
-  windowsCmdArguments,
   windowsExecutableRank,
   windowsLauncherCandidates
 } from "../windows-command";
+import { execFileWithTreeKill } from "./exec-file-tree-kill";
 import { safePathExists, canProbePathWithoutPrompt } from "./macos-fs";
 
 const execFileAsync = promisify(execFile);
@@ -65,33 +65,37 @@ function isWindowsAppExecutionAlias(filePath: string): boolean {
   return /[/\\]microsoft[/\\]windowsapps[/\\]/i.test(filePath);
 }
 
+async function captureCommandText(
+  command: string,
+  args: string[],
+  timeoutMs: number,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<string | null> {
+  try {
+    const result = await execFileWithTreeKill(command, args, {
+      timeoutMs,
+      env,
+      maxBuffer: 256_000
+    });
+    return versionTextFromExec(result);
+  } catch (error) {
+    // Timeout and non-zero exit still often include the version before the CLI hangs.
+    return versionTextFromExec(error as { stdout?: string; stderr?: string });
+  }
+}
+
 async function runVersion(command: string, args: string[]): Promise<string | null> {
-  const isWindows = process.platform === "win32";
-  const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
-  const finalArgs = isWindows ? windowsCmdArguments(command, args) : args;
   const env = {
     ...enrichedPathEnv(),
     CI: process.env.CI || "1"
   };
-  try {
-    const result = await execFileAsync(executable, finalArgs, {
-      timeout: 12_000,
-      windowsHide: true,
-      windowsVerbatimArguments: isWindows,
-      env,
-      maxBuffer: 256_000
-    });
-    const text = versionTextFromExec(result);
-    if (text && /\d+\.\d+/.test(text)) return text;
-  } catch (error) {
-    // Non-zero exit still often includes the version on stdout (Claude Code on Win10).
-    const text = versionTextFromExec(error as { stdout?: string; stderr?: string });
-    if (text && /\d+\.\d+/.test(text)) return text;
-  }
+  const direct = await captureCommandText(command, args, 8_000, env);
+  if (direct && /\d+\.\d+/.test(direct)) return direct;
 
-  // PowerShell is what users run interactively (`claude --version`). cmd.exe misses
-  // .ps1 shims and some native launchers that only flush a version in a console host.
-  if (isWindows) {
+  // PowerShell is what users run interactively (`claude --version`). A hidden cmd
+  // spawn can miss .ps1 shims. Kill the whole tree on timeout so a TUI cannot
+  // hold the boot screen open.
+  if (process.platform === "win32") {
     const viaPs = await runVersionViaPowerShell(command, args);
     if (viaPs && /\d+\.\d+/.test(viaPs)) return viaPs;
   }
@@ -104,23 +108,13 @@ async function runVersionViaPowerShell(command: string, args: string[]): Promise
   const literal = command.replace(/'/g, "''");
   const argText = args.map((arg) => `'${String(arg).replace(/'/g, "''")}'`).join(" ");
   const script = `$ErrorActionPreference='Continue'; & '${literal}' ${argText} | Out-String -Width 240`;
-  try {
-    const result = await execFileAsync(ps, [
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy", "Bypass",
-      "-Command",
-      script
-    ], {
-      timeout: 15_000,
-      windowsHide: true,
-      env: { ...enrichedPathEnv(), CI: process.env.CI || "1" },
-      maxBuffer: 256_000
-    });
-    return versionTextFromExec(result);
-  } catch (error) {
-    return versionTextFromExec(error as { stdout?: string; stderr?: string });
-  }
+  return captureCommandText(ps, [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-Command",
+    script
+  ], 8_000, { ...enrichedPathEnv(), CI: process.env.CI || "1" });
 }
 
 /** Windows file-version resource, used when --version output cannot be captured. */
@@ -173,21 +167,19 @@ async function readClaudePackageVersion(command: string): Promise<string | null>
 /** Fuller CLI text for fingerprinting (help can be multi-line). */
 async function runCommandText(command: string, args: string[], maxChars = 8_000): Promise<string | null> {
   try {
-    const isWindows = process.platform === "win32";
-    const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : command;
-    const finalArgs = isWindows ? windowsCmdArguments(command, args) : args;
-    const { stdout, stderr } = await execFileAsync(executable, finalArgs, {
-      timeout: 12_000,
-      windowsHide: true,
-      windowsVerbatimArguments: isWindows,
-      env: process.env,
+    const { stdout, stderr } = await execFileWithTreeKill(command, args, {
+      timeoutMs: 8_000,
+      env: enrichedPathEnv(),
       maxBuffer: 512_000
     });
     const text = `${stdout || ""}\n${stderr || ""}`.trim();
     if (!text) return null;
     return text.length > maxChars ? text.slice(0, maxChars) : text;
-  } catch {
-    return null;
+  } catch (error) {
+    const dumped = error as { stdout?: string; stderr?: string };
+    const text = `${dumped.stdout || ""}\n${dumped.stderr || ""}`.trim();
+    if (!text) return null;
+    return text.length > maxChars ? text.slice(0, maxChars) : text;
   }
 }
 
