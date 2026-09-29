@@ -62,6 +62,7 @@ import {
   normalizeUnixSeconds,
   threadResumeParams,
   threadStartParams,
+  codexPermissionParams,
   codexTurnConfigExtras,
   threadToSnapshot,
   mergeSnapshotUserPrompts
@@ -688,6 +689,22 @@ function logInfo(message: string, extra?: unknown): void {
 function logWarn(message: string, extra?: unknown): void {
   appendAgentLog("warn", message, extra);
 }
+function threadHasFullAccess(threadId: string): boolean {
+  if (!threadId) return false;
+  return normalizePermissionMode(taskStore.get(threadId)?.permissionMode) === "full-access";
+}
+
+/** Full Access means the user already opted out of per-command prompts. */
+function acceptFullAccessApproval(requestId: unknown, threadId: unknown, kind: string): boolean {
+  const id = String(threadId ?? "");
+  if (requestId === undefined || requestId === null) return false;
+  if (typeof requestId !== "string" && typeof requestId !== "number") return false;
+  if (!codex || !threadHasFullAccess(id)) return false;
+  codex.respond(requestId, { decision: "accept" });
+  logInfo("Full Access 已自动允许审批", `thread=${id.slice(0, 8)} kind=${kind}`);
+  return true;
+}
+
 function logError(message: string, extra?: unknown): void {
   appendAgentLog("error", message, extra);
 }
@@ -4994,11 +5011,13 @@ function buildCodexTurnPayload(options: {
   model?: string;
   reasoningEffort?: ReasoningEffort;
   fast?: boolean;
+  permissionMode?: PermissionMode;
 }): Record<string, unknown> {
   return {
     threadId: options.threadId,
     clientUserMessageId: options.commandId,
     input: [{ type: "text", text: options.prompt, text_elements: [] }],
+    ...(options.permissionMode ? codexPermissionParams(options.permissionMode) : {}),
     ...codexTurnConfigExtras({
       ...(options.model ? { model: options.model } : {}),
       ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
@@ -5014,6 +5033,7 @@ async function startCodexTurn(options: {
   model?: string;
   reasoningEffort?: ReasoningEffort;
   fast?: boolean;
+  permissionMode?: PermissionMode;
 }): Promise<any> {
   const turnPayload = buildCodexTurnPayload(options);
   try {
@@ -5911,10 +5931,17 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
       await appendStoredUserPrompt(thread.id, command.prompt);
       await publishThread(thread.id);
       startLocalActivity(thread.id, command.prompt, command.title || command.prompt.slice(0, 80), "codex");
+      const appliedPolicy = started?.approvalPolicy ?? started?.approval_policy;
+      const appliedSandbox = started?.sandbox ?? started?.sandboxPolicy;
+      logInfo(
+        "Codex 会话权限",
+        `mode=${mode} approval=${JSON.stringify(appliedPolicy ?? null)} sandbox=${JSON.stringify(appliedSandbox ?? null)}`
+      );
       const turn = await startCodexTurn({
         threadId: thread.id,
         commandId: command.commandId,
         prompt: command.prompt,
+        permissionMode: mode,
         ...(command.model ? { model: command.model } : {}),
         ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {}),
         ...(command.fast !== undefined ? { fast: command.fast } : {})
@@ -6055,6 +6082,7 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
           threadId: command.threadId,
           commandId: command.commandId,
           prompt: command.prompt,
+          permissionMode: mode,
           ...(model ? { model } : {}),
           ...(effort ? { reasoningEffort: effort } : {}),
           ...(fast !== undefined ? { fast } : {})
@@ -6615,7 +6643,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     const threadId = String(params.threadId ?? "");
     const status = params.status;
     const flags = Array.isArray(status?.activeFlags) ? status.activeFlags.map(String) : [];
-    if (threadId && flags.includes("waitingOnApproval")) {
+    if (threadId && flags.includes("waitingOnApproval") && !threadHasFullAccess(threadId)) {
       appendLocalActivityStage(threadId, "⏸ 等待审批（请在网页端确认，或检查 Codex 权限模式）");
       queueRemoteDelta(threadId, "stage:approval-wait", "\n⏸ 等待审批（请在网页端确认）\n");
     }
@@ -6649,8 +6677,9 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     await publish({ type: "request.resolved", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), requestId: message.params.requestId, threadId: message.params.threadId }, true);
   }
   if (message.id !== undefined && message.method === "item/commandExecution/requestApproval") {
-    pendingRequestTypes.set(String(message.id), "command");
     const params = message.params;
+    if (await acceptFullAccessApproval(message.id, params.threadId, "命令")) return;
+    pendingRequestTypes.set(String(message.id), "command");
     await publish({
       type: "approval.requested", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), requestId: message.id,
       threadId: params.threadId, turnId: params.turnId, itemId: params.itemId, approvalType: "command",
@@ -6659,8 +6688,9 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     }, true, "approval");
   }
   if (message.id !== undefined && message.method === "item/fileChange/requestApproval") {
-    pendingRequestTypes.set(String(message.id), "file");
     const params = message.params;
+    if (await acceptFullAccessApproval(message.id, params.threadId, "文件修改")) return;
+    pendingRequestTypes.set(String(message.id), "file");
     await publish({
       type: "approval.requested", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), requestId: message.id,
       threadId: params.threadId, turnId: params.turnId, itemId: params.itemId, approvalType: "file",

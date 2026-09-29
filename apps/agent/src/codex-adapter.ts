@@ -187,7 +187,10 @@ export class CodexAdapter {
 
     await this.request("initialize", {
       clientInfo: { name: "anytimevibe-agent", title: "随码", version: PRODUCT_VERSION },
-      capabilities: { experimentalApi: false, requestAttestation: false }
+      // approvalPolicy on thread/start is experimental. Without this capability
+      // Codex 0.158 keeps config.toml (usually on-request) and still prompts
+      // even when the web task is Full Access.
+      capabilities: { experimentalApi: true, requestAttestation: false }
     });
     this.notify("initialized");
     return { relayKeySource };

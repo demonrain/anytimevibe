@@ -4862,7 +4862,14 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
   const [engine, setEngine] = useState<CliEngine | "">(ready[0]?.engine ?? "");
   const engineId = engine ? normalizeCliEngine(engine) : "codex";
   const permissionOptions = permissionOptionsForEngine(engineId, locale);
-  const [taskPermission, setTaskPermission] = useState<PermissionMode>(permissionOptions[0]?.value ?? "ask-for-approval");
+  const [taskPermission, setTaskPermission] = useState<PermissionMode>(() => {
+    const saved = normalizePermissionMode(
+      typeof localStorage === "undefined" ? null : localStorage.getItem("permission-mode")
+    );
+    return permissionOptions.some((item) => item.value === saved)
+      ? saved
+      : (permissionOptions[0]?.value ?? "ask-for-approval");
+  });
   const cap = capabilityForEngine(engineCapabilities, engineId);
   const modelOptions = modelOptionsFromHost(engineCapabilities, engineId, cap?.currentModel);
   const [model, setModel] = useState(() => {
