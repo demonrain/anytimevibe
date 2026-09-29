@@ -3453,7 +3453,7 @@ async function openWindowsPowerShellScript(scriptBody: string): Promise<void> {
     "Write-Host 'Press Enter to close...'",
     "[void](Read-Host)"
   ].join("\r\n");
-  await fs.writeFile(ps1Path, full, "utf8");
+  await fs.writeFile(ps1Path, `\uFEFF${full}`, "utf8");
   const quoted = ps1Path.replace(/"/g, '""');
   const vbs = `CreateObject("WScript.Shell").Run "powershell.exe -NoLogo -ExecutionPolicy Bypass -File ""${quoted}""", 1, False`;
   await fs.writeFile(vbsPath, vbs, "utf8");
@@ -3880,28 +3880,49 @@ echo "Install finished. Run: agy  (sign in)"
 
 async function installPiCli(): Promise<void> {
   // Official Pi Quickstart: https://pi.dev/docs/latest/quickstart#install
+  // Windows must use cmd. The previous script was cmd text (`echo.`) executed by
+  // PowerShell, which treats echo. as a missing command and backticks as escapes.
   updateState({ detail: "正在打开 Pi CLI 安装窗口…" });
-  const scriptBody = process.platform === "win32"
-    ? [
-        "echo   AnytimeVibe - install Pi CLI",
-        "echo   https://pi.dev/docs/latest/quickstart",
-        "echo.",
-        "npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
-        "echo.",
-        "echo Done. Run `pi` and `/login`, then click 重新检测 in AnytimeVibe."
-      ].join("\r\n")
-    : [
-        "echo \"   AnytimeVibe - install Pi CLI\"",
-        "echo \"   https://pi.dev/docs/latest/quickstart\"",
-        "echo",
-        "npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
-        "echo",
-        "echo \"Done. Run pi and /login, then click 重新检测 in AnytimeVibe.\""
-      ].join("\n");
   if (process.platform === "win32") {
-    await openWindowsPowerShellScript(scriptBody);
+    const proxyLines = await proxyShellLines("win32");
+    await openWindowsVisibleConsole([
+      "echo ============================================",
+      "echo   AnytimeVibe - install Pi CLI",
+      "echo   https://pi.dev/docs/latest/quickstart",
+      "echo ============================================",
+      "echo.",
+      ...proxyLines,
+      "echo [1] npm install -g @earendil-works/pi-coding-agent",
+      "call npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
+      "if errorlevel 1 (",
+      "  echo npm via proxy failed, retrying direct ...",
+      "  set \"HTTP_PROXY=\"",
+      "  set \"HTTPS_PROXY=\"",
+      "  set \"http_proxy=\"",
+      "  set \"https_proxy=\"",
+      "  set \"ALL_PROXY=\"",
+      "  set \"all_proxy=\"",
+      "  set \"NODE_USE_ENV_PROXY=\"",
+      "  call npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
+      ")",
+      "echo.",
+      "where pi",
+      "pi --version 2>nul",
+      "echo.",
+      "echo Done. In a terminal run: pi",
+      "echo Then type /login, and click Recheck in AnytimeVibe."
+    ]);
+    updateState({ detail: "已打开 Pi CLI 安装窗口。完成后请运行 pi，输入 /login，再点「重新检测」。" });
     return;
   }
+  const scriptBody = [
+    "echo \"   AnytimeVibe - install Pi CLI\"",
+    "echo \"   https://pi.dev/docs/latest/quickstart\"",
+    "echo",
+    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
+    "echo",
+    "echo \"Done. Run pi and /login, then click 重新检测 in AnytimeVibe.\""
+  ].join("\n");
   if (process.platform === "darwin") {
     await openMacTerminalScript(scriptBody);
     return;
