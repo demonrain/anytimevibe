@@ -60,8 +60,37 @@ export async function resolveCodexOpenaiBaseUrlForEnv(): Promise<string | null> 
   return toOpenaiStyleBaseUrl(resolved.baseUrl);
 }
 
-/** Relay API key for Codex child env (never log the value). */
-export async function resolveCodexRelayApiKeyForEnv(): Promise<string | null> {
+export type CodexRelayKeySource = "auth.json" | "config-bearer";
+
+/** Prefer auth.json over the toml bearer. Codex env_key reads the process env, not the file. */
+export function pickCodexRelayKey(authKey: string | undefined, bearer: string | undefined): {
+  key: string;
+  source: CodexRelayKeySource;
+} | null {
+  const fromAuth = String(authKey || "").trim();
+  if (fromAuth) return { key: fromAuth, source: "auth.json" };
+  const fromBearer = String(bearer || "").trim();
+  if (fromBearer) return { key: fromBearer, source: "config-bearer" };
+  return null;
+}
+
+/** Put the relay key on the Codex child env under env_key's name (default OPENAI_API_KEY). */
+export function assignCodexApiKeyEnv(env: NodeJS.ProcessEnv, key: string, envName?: string): void {
+  const value = key.trim();
+  if (!value) return;
+  const name = (envName || "").trim() || "OPENAI_API_KEY";
+  env[name] = value;
+  if (name !== "OPENAI_API_KEY") env.OPENAI_API_KEY = value;
+}
+
+export type CodexRelayKeyMaterial = {
+  key: string;
+  source: CodexRelayKeySource;
+  envName: string;
+};
+
+/** Relay API key for Codex child env (never log the value). auth.json wins. */
+export async function resolveCodexRelayKeyMaterial(): Promise<CodexRelayKeyMaterial | null> {
   const home = codexHomeDir();
   let text = "";
   try {
@@ -81,15 +110,24 @@ export async function resolveCodexRelayApiKeyForEnv(): Promise<string | null> {
   const baseUrl = parseTomlString(section, "base_url") || parseTomlString(text, "openai_base_url") || "";
   if (!baseUrl || isOpenaiApiHost(baseUrl)) return null;
 
+  const envName = parseTomlString(section, "env_key")?.trim() || "OPENAI_API_KEY";
   const bearer = parseTomlString(section, "experimental_bearer_token")?.trim() || "";
-  if (bearer) return bearer;
+  let authKey = "";
   try {
     const auth = JSON.parse(await fs.readFile(path.join(home, "auth.json"), "utf8")) as Record<string, unknown>;
-    const key = typeof auth.OPENAI_API_KEY === "string" ? auth.OPENAI_API_KEY.trim() : "";
-    return key || null;
+    authKey = typeof auth.OPENAI_API_KEY === "string" ? auth.OPENAI_API_KEY.trim() : "";
   } catch {
-    return null;
+    authKey = "";
   }
+  const picked = pickCodexRelayKey(authKey, bearer);
+  if (!picked) return null;
+  return { ...picked, envName };
+}
+
+/** Relay API key for Codex child env (never log the value). */
+export async function resolveCodexRelayApiKeyForEnv(): Promise<string | null> {
+  const material = await resolveCodexRelayKeyMaterial();
+  return material?.key || null;
 }
 
 /** Read active model_provider base_url from ~/.codex/config.toml (no secrets). */

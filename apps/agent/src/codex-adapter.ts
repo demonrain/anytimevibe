@@ -1,9 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
-import { windowsCmdArguments } from "./windows-command";
+import { windowsCmdArguments, windowsNeedsCmdShim } from "./windows-command";
 import { localGatewayChildEnv } from "./local-proxy";
 import { isCodexModelsManagerNoise } from "./cli/log-noise";
-import { resolveCodexOpenaiBaseUrlForEnv, resolveCodexRelayApiKeyForEnv } from "./cli/codex-gateway";
+import { assignCodexApiKeyEnv, resolveCodexOpenaiBaseUrlForEnv, resolveCodexRelayKeyMaterial, type CodexRelayKeySource } from "./cli/codex-gateway";
 import type { PermissionMode } from "@anytimevibe/protocol";
 import { PRODUCT_VERSION } from "@anytimevibe/protocol";
 
@@ -132,32 +132,37 @@ export class CodexAdapter {
     private readonly onExit: (detail: string) => void
   ) {}
 
-  async start(): Promise<void> {
-    if (this.process) return;
+  async start(): Promise<{ relayKeySource: CodexRelayKeySource | "none" }> {
+    if (this.process) return { relayKeySource: "none" };
     const isWindows = process.platform === "win32";
-    const executable = isWindows ? process.env.ComSpec ?? "cmd.exe" : this.codexCommand;
-    const args = isWindows
+    // .exe can take the env block directly. cmd.exe wrappers were dropping a
+    // newly injected OPENAI_API_KEY before Codex read env_key.
+    const useCmd = isWindows && windowsNeedsCmdShim(this.codexCommand);
+    const executable = useCmd ? process.env.ComSpec ?? "cmd.exe" : this.codexCommand;
+    const args = useCmd
       ? windowsCmdArguments(this.codexCommand, ["app-server", "--stdio"])
       : ["app-server", "--stdio"];
     const baseEnv = localGatewayChildEnv(process.env);
     // Sticky openai threads / ApiKey mode still honor OPENAI_BASE_URL for the built-in
     // provider when config.toml openai_base_url alone is flaky across Codex versions.
+    let relayKeySource: CodexRelayKeySource | "none" = "none";
     try {
       const openaiBase = await resolveCodexOpenaiBaseUrlForEnv();
       if (openaiBase) {
         baseEnv.OPENAI_BASE_URL = openaiBase;
         baseEnv.openai_base_url = openaiBase;
       }
-      const relayKey = await resolveCodexRelayApiKeyForEnv();
+      const relayKey = await resolveCodexRelayKeyMaterial();
       if (relayKey) {
-        baseEnv.OPENAI_API_KEY = relayKey;
+        assignCodexApiKeyEnv(baseEnv, relayKey.key, relayKey.envName);
+        relayKeySource = relayKey.source;
       }
     } catch {
-      // optional
+      relayKeySource = "none";
     }
     const child = spawn(executable, args, {
       windowsHide: true,
-      windowsVerbatimArguments: isWindows,
+      windowsVerbatimArguments: useCmd,
       stdio: ["pipe", "pipe", "pipe"],
       // Local Codex gateway only — never inherit Clash HTTP_PROXY.
       env: baseEnv
@@ -185,6 +190,7 @@ export class CodexAdapter {
       capabilities: { experimentalApi: false, requestAttestation: false }
     });
     this.notify("initialized");
+    return { relayKeySource };
   }
 
   stop(options?: { intentional?: boolean }): void {
@@ -321,7 +327,7 @@ export function explainCodexUpstreamError(message: string): string {
       "",
       "说明：中转站收到了请求，但没有 Authorization / x-api-key（不是密钥本身错误）。",
       "常见原因：① 自定义供应商缺少 env_key=\"OPENAI_API_KEY\"；② Codex 先走 Responses WebSocket，回退 HTTPS 时丢掉鉴权头。",
-      "处理：随码会自动写入 env_key 并关闭 supports_websockets；请重启随码或新开任务后再试。"
+      "处理：随码启动 Codex 时从 ~/.codex/auth.json 读取密钥，写入该进程的 OPENAI_API_KEY（不会改 Windows 用户环境变量）。请从托盘完全退出随码后重开，再新开任务。"
     ].join("\n");
   }
   if (invalidApiKey || /Invalid token|invalid.?token/i.test(raw)) {

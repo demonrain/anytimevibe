@@ -4567,7 +4567,12 @@ async function ensureCodex(): Promise<void> {
     // drainTurnQueue refuses to run because isThreadTurnBusy stays true.
     void recoverAfterCodexAppServerExit(detail).catch(handleError);
   });
-  await codex.start();
+  const started = await codex.start();
+  if (started.relayKeySource === "auth.json") {
+    logInfo("Codex 进程已注入 auth.json 中的密钥", "环境变量名由 env_key 决定，默认 OPENAI_API_KEY");
+  } else if (started.relayKeySource === "config-bearer") {
+    logInfo("Codex 进程已注入 config.toml 中的 bearer", "auth.json 没有 OPENAI_API_KEY");
+  }
   try {
     codexLoadedCredentialFingerprint = await readCodexCredentialFingerprint();
   } catch {
