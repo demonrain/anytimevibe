@@ -74,6 +74,12 @@ export function pickCodexRelayKey(authKey: string | undefined, bearer: string | 
   return null;
 }
 
+/**
+ * Codex reads this variable into `env_http_headers.Authorization`.
+ * `env_key` only feeds a separate auth path that 0.158 can omit on `/responses`.
+ */
+export const CODEX_AUTH_HEADER_ENV = "ANYTIMEVIBE_CODEX_AUTHORIZATION";
+
 /** Put the relay key on the Codex child env under env_key's name (default OPENAI_API_KEY). */
 export function assignCodexApiKeyEnv(env: NodeJS.ProcessEnv, key: string, envName?: string): void {
   const value = key.trim();
@@ -81,6 +87,8 @@ export function assignCodexApiKeyEnv(env: NodeJS.ProcessEnv, key: string, envNam
   const name = (envName || "").trim() || "OPENAI_API_KEY";
   env[name] = value;
   if (name !== "OPENAI_API_KEY") env.OPENAI_API_KEY = value;
+  const bearer = /^bearer\s+/i.test(value) ? value : `Bearer ${value}`;
+  env[CODEX_AUTH_HEADER_ENV] = bearer;
 }
 
 export type CodexRelayKeyMaterial = {
@@ -314,6 +322,57 @@ function upsertProviderBearer(text: string, provider: string, apiKey: string): {
   return upsertProviderField(text, provider, "experimental_bearer_token", apiKey, "string");
 }
 
+/** Point provider requests at a process env var whose value is `Bearer <key>`. */
+export function upsertProviderEnvAuthorization(text: string, provider: string): { text: string; changed: boolean } {
+  const escaped = provider.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const nestedRe = new RegExp(
+    `(\\[model_providers\\.${escaped}\\.env_http_headers\\])([^\\[]*)`,
+    "i"
+  );
+  const nested = text.match(nestedRe);
+  if (nested) {
+    const body = nested[2] ?? "";
+    const current = parseTomlString(body, "Authorization");
+    if (current === CODEX_AUTH_HEADER_ENV) return { text, changed: false };
+    const lineRe = /^(\s*Authorization\s*=\s*)(?:"[^"]*"|'[^']*')\s*$/im;
+    if (lineRe.test(body)) {
+      return {
+        text: text.replace(nestedRe, `$1${body.replace(lineRe, `$1"${CODEX_AUTH_HEADER_ENV}"`)}`),
+        changed: true
+      };
+    }
+    const gap = body.startsWith("\n") ? "" : "\n";
+    return {
+      text: text.replace(nestedRe, `$1\nAuthorization = "${CODEX_AUTH_HEADER_ENV}"${gap}${body}`),
+      changed: true
+    };
+  }
+  const sectionRe = new RegExp(`(\\[model_providers\\.${escaped}\\])([^\\[]*)`, "i");
+  const section = text.match(sectionRe);
+  if (!section || section.index == null) return { text, changed: false };
+  const body = section[2] ?? "";
+  const inlineRe = /^(\s*env_http_headers\s*=\s*\{)([^}]*)(\}\s*)$/im;
+  if (inlineRe.test(body)) {
+    const updated = body.replace(inlineRe, (_full, open: string, inner: string, close: string) => {
+      if (/Authorization\s*=/i.test(inner)) {
+        return `${open}${inner.replace(/Authorization\s*=\s*(?:"[^"]*"|'[^']*')/i, `Authorization = "${CODEX_AUTH_HEADER_ENV}"`)}${close}`;
+      }
+      const trimmed = inner.trim();
+      const extra = trimmed ? `${trimmed}, ` : "";
+      return `${open} ${extra}Authorization = "${CODEX_AUTH_HEADER_ENV}" ${close}`;
+    });
+    if (updated === body) return { text, changed: false };
+    return { text: text.replace(sectionRe, `$1${updated}`), changed: true };
+  }
+  const full = section[0];
+  const end = section.index + full.length;
+  const insertion = `\n[model_providers.${provider}.env_http_headers]\nAuthorization = "${CODEX_AUTH_HEADER_ENV}"\n`;
+  return {
+    text: `${text.slice(0, end).replace(/\s*$/, "\n")}${insertion}${text.slice(end)}`,
+    changed: true
+  };
+}
+
 /** Prefer env_key auth and disable Responses WS for mid-proxies (WS fallback can drop Authorization). */
 function hardenRelayProviderAuth(text: string, provider: string): { text: string; details: string[] } {
   const details: string[] = [];
@@ -327,6 +386,11 @@ function hardenRelayProviderAuth(text: string, provider: string): { text: string
   if (noWs.changed) {
     next = noWs.text;
     details.push(`set supports_websockets=false on ${provider}`);
+  }
+  const header = upsertProviderEnvAuthorization(next, provider);
+  if (header.changed) {
+    next = header.text;
+    details.push(`set env_http_headers.Authorization on ${provider}`);
   }
   return { text: next, details };
 }

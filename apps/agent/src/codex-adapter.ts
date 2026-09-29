@@ -327,7 +327,7 @@ export function explainCodexUpstreamError(message: string): string {
       "",
       "说明：中转站收到了请求，但没有 Authorization / x-api-key（不是密钥本身错误）。",
       "常见原因：① 自定义供应商缺少 env_key=\"OPENAI_API_KEY\"；② Codex 先走 Responses WebSocket，回退 HTTPS 时丢掉鉴权头。",
-      "处理：随码启动 Codex 时从 ~/.codex/auth.json 读取密钥，写入该进程的 OPENAI_API_KEY（不会改 Windows 用户环境变量）。请从托盘完全退出随码后重开，再新开任务。"
+      "处理：随码会把 auth.json 里的密钥写成该进程的 Authorization: Bearer，并关掉 Responses WebSocket。请更新到最新客户端后从托盘完全退出再开，然后新开任务。"
     ].join("\n");
   }
   if (invalidApiKey || /Invalid token|invalid.?token/i.test(raw)) {

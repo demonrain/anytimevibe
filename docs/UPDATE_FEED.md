@@ -68,7 +68,7 @@ docker compose restart relay
 `latest.yml` 示例：
 
 ```yaml
-version: 0.5.17
+version: 0.5.18
 files:
   - url: AnytimeVibe-Agent-Setup.exe
     sha512: <base64-sha512>

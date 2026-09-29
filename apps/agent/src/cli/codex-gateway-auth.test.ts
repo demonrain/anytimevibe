@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assignCodexApiKeyEnv, pickCodexRelayKey } from "./codex-gateway";
+import { assignCodexApiKeyEnv, CODEX_AUTH_HEADER_ENV, pickCodexRelayKey, upsertProviderEnvAuthorization } from "./codex-gateway";
 
 describe("Codex relay key injection", () => {
   it("prefers auth.json over the toml bearer", () => {
@@ -21,5 +21,22 @@ describe("Codex relay key injection", () => {
     assignCodexApiKeyEnv(env, "from-auth", "CUSTOM_API_KEY");
     expect(env.CUSTOM_API_KEY).toBe("from-auth");
     expect(env.OPENAI_API_KEY).toBe("from-auth");
+    expect(env[CODEX_AUTH_HEADER_ENV]).toBe("Bearer from-auth");
+  });
+
+  it("adds an env_http_headers entry that names the bearer env var", () => {
+    const input = [
+      'model_provider = "custom"',
+      "",
+      "[model_providers.custom]",
+      'base_url = "https://store.example"',
+      "supports_websockets = false",
+      ""
+    ].join("\n");
+    const once = upsertProviderEnvAuthorization(input, "custom");
+    expect(once.changed).toBe(true);
+    expect(once.text).toContain("[model_providers.custom.env_http_headers]");
+    expect(once.text).toContain(`Authorization = "${CODEX_AUTH_HEADER_ENV}"`);
+    expect(upsertProviderEnvAuthorization(once.text, "custom").changed).toBe(false);
   });
 });
