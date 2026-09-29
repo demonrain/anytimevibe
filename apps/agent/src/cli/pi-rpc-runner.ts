@@ -12,6 +12,7 @@ import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 import { headlessPermissionArgs } from "./permission-args";
 import type { BackendStreamEvent, HeadlessRunOptions, HeadlessRunResult } from "./types";
 import { resolveEngineBinary } from "./detect";
+import { resolvePiModelForCli } from "./model-catalog";
 
 const HEADLESS_MAX_TIMEOUT_MS = 45 * 60_000;
 
@@ -95,7 +96,7 @@ export function buildPiSpawnArgs(options: HeadlessRunOptions): string[] {
   if (resumeId && resumeId !== options.threadId) {
     args.push("--session", resumeId);
   }
-  const modelRef = parsePiModelRef(options.model);
+  const modelRef = parsePiModelRef(resolvePiModelForCli(options.model) || undefined);
   if (modelRef.provider) args.push("--provider", modelRef.provider);
   if (modelRef.modelId) args.push("--model", modelRef.modelId);
   const thinking = options.reasoningEffort || modelRef.thinking;
@@ -363,7 +364,7 @@ export async function runPiRpcTurn(
   });
 
   // Bootstrap: optional model/thinking via RPC when spawn flags are insufficient.
-  const modelRef = parsePiModelRef(options.model);
+  const modelRef = parsePiModelRef(resolvePiModelForCli(options.model) || undefined);
   if (modelRef.provider && modelRef.modelId) {
     writeRpc(child, {
       type: "set_model",

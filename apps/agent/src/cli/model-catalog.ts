@@ -1440,21 +1440,151 @@ export function resolveModelContextWindow(engine: CliEngine, model?: string): nu
   return undefined;
 }
 
+const PI_REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
+
+function parsePiTokenLabel(label: string): number | undefined {
+  const match = /^(\d+(?:\.\d+)?)([km])$/i.exec(label.trim());
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  return Math.round(value * ((match[2] || "").toLowerCase() === "m" ? 1_000_000 : 1_000));
+}
+
+/**
+ * `pi --list-models` prints a padded table, not one model id per line:
+ * `provider  model  context  max-out  thinking  images`.
+ * Treating a whole row as an id produces values like
+ * `demonrain-deepseek-v4-flash-12.8k-16.4k-no-no`, which Pi then rejects.
+ */
+export function parsePiListModelsOutput(text: string): EngineModelOption[] {
+  const options: EngineModelOption[] = [];
+  const seen = new Set<string>();
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(/\u001b\[[0-9;]*m/g, "").trim();
+    if (!line) continue;
+    const cols = line.split(/\s{2,}/).map((col) => col.trim()).filter(Boolean);
+    if (cols.length < 2) continue;
+    if (/^provider$/i.test(cols[0] || "") && /^model$/i.test(cols[1] || "")) continue;
+    const provider = cols[0] || "";
+    const modelId = cols[1] || "";
+    if (!provider || !modelId || /\s/.test(provider)) continue;
+    const id = `${provider}/${modelId}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const contextWindow = cols[2] ? parsePiTokenLabel(cols[2]) : undefined;
+    const thinking = (cols[4] || "").toLowerCase();
+    options.push({
+      id,
+      label: id,
+      ...(contextWindow ? { contextWindow } : {}),
+      ...(thinking === "yes" ? { reasoningEfforts: [...PI_REASONING_EFFORTS] } : {})
+    });
+  }
+  return options;
+}
+
+/** Map a picker value back to the `provider/model` id Pi's `--model` flag accepts. */
+export function resolvePiModelForCli(model: string | undefined, knownIds?: string[]): string {
+  const raw = (model || "").trim();
+  if (!raw) return "";
+  const known = knownIds ?? (
+    lastDiscoveredCapabilities.find((item) => item.engine === "pi")?.models.map((item) => item.id) ?? []
+  );
+  const direct = known.find((id) => id.toLowerCase() === raw.toLowerCase());
+  if (direct) return direct;
+  const cols = raw.split(/\s{2,}/).map((col) => col.trim()).filter(Boolean);
+  if (cols.length >= 2 && !/^provider$/i.test(cols[0] || "")) {
+    const fromRow = `${cols[0]}/${cols[1]}`;
+    const rowHit = known.find((id) => id.toLowerCase() === fromRow.toLowerCase());
+    if (rowHit) return rowHit;
+    if (!known.length && /^(yes|no)$/i.test(cols[4] || "") && /^(yes|no)$/i.test(cols[5] || "")) return fromRow;
+  }
+  const suffix = /-(\d+(?:\.\d+)?[km])-(\d+(?:\.\d+)?[km])-(yes|no)-(yes|no)$/i.exec(raw);
+  if (suffix && suffix.index > 0) {
+    const head = raw.slice(0, suffix.index).toLowerCase();
+    const hits = known.filter((id) => {
+      const slash = id.indexOf("/");
+      if (slash <= 0) return false;
+      return `${id.slice(0, slash)}-${id.slice(slash + 1)}`.toLowerCase() === head;
+    });
+    if (hits.length === 1) return hits[0]!;
+  }
+  return raw;
+}
+
+type PiCustomModel = {
+  id: string;
+  label?: string;
+  contextWindow?: number;
+  reasoning?: boolean;
+};
+
+async function readPiCustomModels(): Promise<Map<string, PiCustomModel>> {
+  const found = new Map<string, PiCustomModel>();
+  const raw = await readText(path.join(os.homedir(), ".pi", "agent", "models.json"));
+  if (!raw) return found;
+  try {
+    const parsed = JSON.parse(raw) as { providers?: Record<string, { models?: unknown }> };
+    const providers = parsed.providers;
+    if (!providers || typeof providers !== "object") return found;
+    for (const [provider, config] of Object.entries(providers)) {
+      const providerId = provider.trim();
+      const models = config && typeof config === "object" ? config.models : undefined;
+      if (!providerId || !Array.isArray(models)) continue;
+      for (const entry of models) {
+        if (!entry || typeof entry !== "object") continue;
+        const row = entry as Record<string, unknown>;
+        const modelId = typeof row.id === "string" ? row.id.trim() : "";
+        if (!modelId) continue;
+        const id = `${providerId}/${modelId}`;
+        const name = typeof row.name === "string" ? row.name.trim() : "";
+        const contextWindow = typeof row.contextWindow === "number" && row.contextWindow > 0
+          ? row.contextWindow
+          : undefined;
+        found.set(id, {
+          id,
+          ...(name && name !== modelId && name !== id ? { label: name } : {}),
+          ...(contextWindow ? { contextWindow } : {}),
+          reasoning: row.reasoning === true
+        });
+      }
+    }
+  } catch {
+    // ignore unreadable custom catalogs
+  }
+  return found;
+}
+
+function piCurrentModelId(provider: string, model: string, known: string[]): string | undefined {
+  if (!model && !provider) return undefined;
+  if (provider && model) {
+    const combined = model.includes("/") ? model : `${provider}/${model}`;
+    const hit = known.find((id) => id.toLowerCase() === combined.toLowerCase());
+    if (hit) return hit;
+  }
+  if (model) {
+    const exact = known.find((id) => id.toLowerCase() === model.toLowerCase());
+    if (exact) return exact;
+    const byModel = known.filter((id) => id.toLowerCase().endsWith(`/${model.toLowerCase()}`));
+    if (byModel.length === 1) return byModel[0];
+  }
+  if (provider && model) return model.includes("/") ? model : `${provider}/${model}`;
+  return model || undefined;
+}
+
 async function discoverPiCapability(): Promise<EngineCapability> {
   const models: EngineModelOption[] = [];
   const seen = new Set<string>();
-  let currentModel: string | undefined;
+  const custom = await readPiCustomModels();
+  let defaultProvider = "";
+  let defaultModel = "";
   let currentReasoningEffort: ReasoningEffort | undefined;
   const settingsRaw = await readText(path.join(os.homedir(), ".pi", "agent", "settings.json"));
   if (settingsRaw) {
     try {
       const settings = JSON.parse(settingsRaw) as Record<string, unknown>;
-      const model = typeof settings.defaultModel === "string" ? settings.defaultModel.trim() : "";
-      if (model) {
-        currentModel = model;
-        models.push({ id: model, label: model });
-        seen.add(model);
-      }
+      defaultProvider = typeof settings.defaultProvider === "string" ? settings.defaultProvider.trim() : "";
+      defaultModel = typeof settings.defaultModel === "string" ? settings.defaultModel.trim() : "";
       const thinking = typeof settings.defaultThinkingLevel === "string"
         ? normalizeEffort(settings.defaultThinkingLevel)
         : undefined;
@@ -1463,6 +1593,17 @@ async function discoverPiCapability(): Promise<EngineCapability> {
       // ignore
     }
   }
+  const add = (option: EngineModelOption) => {
+    if (!option.id || seen.has(option.id)) return;
+    const extra = custom.get(option.id);
+    seen.add(option.id);
+    models.push({
+      ...option,
+      ...(extra?.label ? { label: extra.label } : {}),
+      ...(!option.contextWindow && extra?.contextWindow ? { contextWindow: extra.contextWindow } : {}),
+      ...(!option.reasoningEfforts?.length && extra?.reasoning ? { reasoningEfforts: [...PI_REASONING_EFFORTS] } : {})
+    });
+  };
   try {
     const { resolveEngineBinary } = await import("./detect");
     const binary = await resolveEngineBinary("pi");
@@ -1470,23 +1611,30 @@ async function discoverPiCapability(): Promise<EngineCapability> {
       const { runCliText } = await import("./engine-quota");
       const listed = await runCliText(binary, ["--list-models"], { timeoutMs: 20_000 });
       if (listed.text) {
-        for (const line of listed.text.split(/\r?\n/)) {
-          const id = line.trim();
-          if (!id || seen.has(id)) continue;
-          seen.add(id);
-          models.push({ id, label: id });
-        }
+        for (const option of parsePiListModelsOutput(listed.text)) add(option);
       }
     }
   } catch {
     // ignore
   }
+  if (!models.length) {
+    for (const option of custom.values()) {
+      add({
+        id: option.id,
+        label: option.label || option.id,
+        ...(option.contextWindow ? { contextWindow: option.contextWindow } : {}),
+        ...(option.reasoning ? { reasoningEfforts: [...PI_REASONING_EFFORTS] } : {})
+      });
+    }
+  }
+  const currentModel = piCurrentModelId(defaultProvider, defaultModel, models.map((item) => item.id));
+  if (currentModel && !seen.has(currentModel)) add({ id: currentModel, label: currentModel });
   return {
     engine: "pi",
     models,
     ...(currentModel ? { currentModel } : {}),
     ...(currentReasoningEffort ? { currentReasoningEffort } : {}),
-    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]
+    reasoningEfforts: [...PI_REASONING_EFFORTS]
   };
 }
 

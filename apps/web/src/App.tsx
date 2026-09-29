@@ -203,6 +203,19 @@ function capabilityForEngine(
   return capabilities?.find((item) => item.engine === engine);
 }
 
+/**
+ * Picker value. Cursor slugs drop effort/fast suffixes.
+ * Pi ids are `provider/model` and must stay intact — spacing or a trailing
+ * `-high` is part of the id Pi accepts, not a Cursor effort suffix.
+ */
+function pickerModelId(engine: CliEngine, modelId?: string): string {
+  const raw = (modelId || "").trim();
+  if (!raw) return "";
+  const withoutWire = (raw.split("[")[0] || raw).trim();
+  if (engine === "pi") return withoutWire;
+  return cursorModelBaseId(withoutWire) || withoutWire;
+}
+
 /** Strip wire params (`id[fast=…]`) / effort-fast slugs → family id for the picker. */
 function cursorModelBaseId(modelId?: string): string {
   let raw = (modelId || "").trim();
@@ -249,7 +262,7 @@ function modelOptionsFromHost(
   const models = [...(cap?.models ?? [])];
   const seen = new Set(models.map((item) => item.id));
   // Never inject wire forms like `cursor-grok-4.5[fast=false]` as a fake first option.
-  const base = cursorModelBaseId(currentModel);
+  const base = pickerModelId(engine, currentModel);
   if (base && !seen.has(base)) {
     // If the stored value maps to a known family (by id or legacy label), don't inject a dup.
     const known = resolveCursorModelFamily(cap?.models ?? [], currentModel);
@@ -274,7 +287,7 @@ function effortOptionsFromHost(
   thinking?: boolean
 ): ReasoningEffort[] {
   const cap = capabilityForEngine(capabilities, engine);
-  const baseId = cursorModelBaseId(modelId);
+  const baseId = pickerModelId(engine, modelId);
   const modelMeta = baseId
     ? cap?.models.find((item) => item.id === baseId)
     : undefined;
@@ -307,7 +320,7 @@ function modelOptionMeta(
   engine: CliEngine,
   modelId?: string
 ): EngineModelOption | undefined {
-  const baseId = cursorModelBaseId(modelId);
+  const baseId = pickerModelId(engine, modelId);
   if (!baseId) return undefined;
   return capabilityForEngine(capabilities, engine)?.models.find((item) => item.id === baseId);
 }
@@ -3953,7 +3966,7 @@ function TaskConversation({
   const [model, setModel] = useState(
     () => {
       const raw = task.model || uiPrefs.model || cap?.currentModel || modelOptions[0]?.id || "";
-      return cursorModelBaseId(raw) || raw.split("[")[0] || raw;
+      return pickerModelId(taskEngine, raw);
     }
   );
   const modelMeta = useMemo(
@@ -4064,7 +4077,7 @@ function TaskConversation({
       const known = taskEngine === "cursor"
         ? resolveCursorModelFamily(modelOptions, task.model)
         : undefined;
-      const base = known?.id || cursorModelBaseId(task.model) || task.model.split("[")[0] || task.model;
+      const base = known?.id || pickerModelId(taskEngine, task.model);
       setModel(base);
       saveTaskUiPrefs(task.threadId, { model: base });
       const parsedFast = parseFastFromModelId(task.model);
@@ -4074,10 +4087,10 @@ function TaskConversation({
       const known = taskEngine === "cursor"
         ? resolveCursorModelFamily(modelOptions, prefs.model)
         : undefined;
-      setModel(known?.id || cursorModelBaseId(prefs.model) || prefs.model.split("[")[0] || prefs.model);
+      setModel(known?.id || pickerModelId(taskEngine, prefs.model));
       if (prefs.fast !== undefined) setFastMode(prefs.fast);
     } else {
-      setModel((current) => current || cursorModelBaseId(cap?.currentModel) || cap?.currentModel || modelOptions[0]?.id || "");
+      setModel((current) => current || pickerModelId(taskEngine, cap?.currentModel) || modelOptions[0]?.id || "");
     }
 
     if (task.reasoningEffort) {
@@ -4279,7 +4292,7 @@ function TaskConversation({
   }, [canResend, lastUserPrompt, onCommand, model, modelMeta, fastMode, thinkingMode, supportsThinking, taskEngine, effortOptions.length, reasoningEffort, permissionMode, task.threadId]);
 
   const handleModelChange = useCallback((next: string) => {
-    const normalized = cursorModelBaseId(next) || (next || "").split("[")[0]!.trim() || next;
+    const normalized = pickerModelId(taskEngine, next);
     setModel(normalized);
     if (normalized) saveTaskUiPrefs(task.threadId, { model: normalized });
     // Switching to Auto/Composer must drop prior GPT effort immediately (don't wait for effect).
@@ -5012,7 +5025,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
       <select
         value={model}
         onChange={(event) => {
-          const base = cursorModelBaseId(event.target.value) || event.target.value.split("[")[0] || event.target.value;
+          const base = pickerModelId(engineId, event.target.value);
           setModel(base);
         }}
         disabled={!engine || !modelOptions.length}

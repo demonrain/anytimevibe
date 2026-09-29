@@ -7536,10 +7536,14 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     const binary = await resolveEngineBinary("pi");
     if (!binary) throw new Error("未找到 Pi CLI（pi），无法接力。安装：npm install -g --ignore-scripts @earendil-works/pi-coding-agent");
     const sessionId = providerSessionId && providerSessionId !== threadId ? providerSessionId : "";
+    const { resolvePiModelForCli } = await import("./cli/model-catalog");
+    const { parsePiModelRef } = await import("./cli/pi-rpc-runner");
+    const modelRef = parsePiModelRef(resolvePiModelForCli(stored?.model));
     const args = [
       ...handoffPermissionArgs("pi", permissionMode),
       ...(sessionId ? ["--session", sessionId] : []),
-      ...(stored?.model ? ["--model", stored.model] : []),
+      ...(modelRef.provider ? ["--provider", modelRef.provider] : []),
+      ...(modelRef.modelId ? ["--model", modelRef.modelId] : []),
       ...(stored?.reasoningEffort ? ["--thinking", stored.reasoningEffort] : [])
     ];
     console.log(`[relay] pi permission=${permissionMode} session=${sessionId || "(new)"}`);
