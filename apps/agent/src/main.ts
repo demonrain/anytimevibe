@@ -82,6 +82,7 @@ import { discoverEngineCapabilities, clearCodexDebugModelsCache, type EngineCapa
 import { startEngineConfigWatch } from "./cli/engine-config-watch";
 import { appendEngineDiffChunk, buildTurnDiff, captureTurnDiffBaseline, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
 import { TaskStore } from "./cli/task-store";
+import { CodexThreadRegistry } from "./cli/codex-threads";
 import { normalizeCliEngine, isHeadlessCliEngine, type BackendStreamEvent } from "./cli/types";
 import { handoffPermissionArgs, normalizePermissionMode } from "./cli/permission-args";
 import { ensureWorkspaceTrusted, ensureWorkspaceTrustedForAllEngines } from "./cli/workspace-trust";
@@ -561,6 +562,16 @@ function buildCursorApprovalFollowUp(
 }
 /** threadId -> active turnId for streaming turn.delta to web */
 const activeTurnByThread = new Map<string, string>();
+const codexThreads = new CodexThreadRegistry();
+/** Product-list cleanup only; never tombstone or delete a native subagent session. */
+const hiddenCodexSubagentIds = new Set<string>();
+/** Track native lifecycle immediately, even before a new thread's identity is read. */
+const activeNativeCodexTurns = new Map<string, string>();
+/** Codex callbacks are concurrent; preserve native event order within each thread. */
+const codexMessageChains = new Map<string, Promise<void>>();
+let codexMessageGeneration = 0;
+const pendingCodexRequestOwners = new Map<string, string>();
+let subagentCleanupInFlight: Promise<void> | null = null;
 /** Per-thread local activity buffers (multi-task concurrent remote runs). */
 const activityOutputBuffers = new Map<string, string>();
 const activityFlushTimers = new Map<string, NodeJS.Timeout>();
@@ -1243,6 +1254,7 @@ function appendLocalActivityStage(threadId: string, text: string): void {
 }
 
 function touchAgentTask(threadId: string, patch: Partial<AgentTask> = {}): void {
+  if (codexThreads.isSubagent(threadId)) return;
   const now = Date.now() / 1000;
   const existing = publicState.tasks.find((item) => item.threadId === threadId);
   const stored = taskStore.get(threadId);
@@ -4404,6 +4416,7 @@ async function connect(force = false): Promise<void> {
     connecting = false;
     reconnectAttempt = 0;
     reconnectBlockedReason = null;
+    hiddenCodexSubagentIds.clear();
     logInfo("中继 WebSocket 已连接", config.relayUrl);
     // Keepalive: reverse proxies often idle-drop sockets without ping frames.
     clearPing();
@@ -4588,10 +4601,12 @@ async function startCodexAppServer(): Promise<void> {
         : "未检测到 Codex CLI（可选）；可用 Claude / Grok");
     }
   }
+  const messageGeneration = ++codexMessageGeneration;
   codex = new CodexAdapter(codexCommand, (message) => {
-    if (quitting || installingUpdate) return;
+    if (quitting || installingUpdate || messageGeneration !== codexMessageGeneration) return;
     handleCodexMessage(message).catch(handleError);
   }, (detail) => {
+    if (messageGeneration !== codexMessageGeneration) return;
     codex = null;
     codexLoadedCredentialFingerprint = null;
     // Ignore exit noise while shutting down for update/quit — UI may already be destroyed.
@@ -4627,6 +4642,9 @@ async function startCodexAppServer(): Promise<void> {
  * busy flag, and re-attempt any durable follow-up queue for those threads.
  */
 async function recoverAfterCodexAppServerExit(detail: string): Promise<void> {
+  codexMessageGeneration += 1;
+  activeNativeCodexTurns.clear();
+  pendingCodexRequestOwners.clear();
   const stuckThreadIds = new Set<string>();
   for (const threadId of activeTurnByThread.keys()) {
     // Headless Claude/Grok/Cursor own their own processes — never clear them here.
@@ -4705,6 +4723,7 @@ function noteCodexCredentialSelfWrite(ttlMs = 2_500): void {
 }
 
 function hasActiveCodexTurn(): boolean {
+  if (activeNativeCodexTurns.size) return true;
   for (const threadId of activeTurnByThread.keys()) {
     if (isHeadlessThreadActive(threadId)) continue;
     const engine = resolveActivityEngine(threadId);
@@ -4720,6 +4739,7 @@ function hasActiveCodexTurn(): boolean {
 
 /** True only when a Codex turn is already streaming — excludes the turn about to start. */
 function hasRunningCodexTurn(): boolean {
+  if (activeNativeCodexTurns.size) return true;
   for (const threadId of activeTurnByThread.keys()) {
     if (isHeadlessThreadActive(threadId)) continue;
     const engine = resolveActivityEngine(threadId);
@@ -5385,6 +5405,10 @@ async function publishStoredTaskSnapshot(
   const task = taskStore.get(threadId);
   if (!task) return;
   if (task.providerSessionId && isThreadDeleted(task.providerSessionId)) return;
+  if (task.engine === "codex" && codexThreads.isSubagent(task.providerSessionId || threadId)) {
+    await hideCodexSubagentTask(task.providerSessionId || threadId);
+    return;
+  }
   const cwd = resolveAbsoluteCwd(task.cwd);
   if (cwd && task.cwd !== cwd) {
     task.cwd = cwd;
@@ -6466,7 +6490,142 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
   }
 }
 
+async function hideCodexSubagentTask(threadId: string): Promise<void> {
+  if (!codexThreads.isSubagent(threadId)) return;
+  if (publicState.tasks.some((task) => task.threadId === threadId)
+    || publicState.activities.some((activity) => activity.threadId === threadId)) {
+    updateState({
+      tasks: publicState.tasks.filter((task) => task.threadId !== threadId),
+      activities: publicState.activities.filter((activity) => activity.threadId !== threadId)
+    });
+  }
+  // Remove buffered product output, but do not interrupt the native child or parent turn.
+  for (const key of remoteDeltaBuffers.keys()) {
+    if (key.startsWith(`${threadId}\0`)) remoteDeltaBuffers.delete(key);
+  }
+  activeTurnByThread.delete(threadId);
+  activityOutputBuffers.delete(threadId);
+  activityItemsByThread.delete(threadId);
+  const activityTimer = activityFlushTimers.get(threadId);
+  if (activityTimer) clearTimeout(activityTimer);
+  activityFlushTimers.delete(threadId);
+  if (hiddenCodexSubagentIds.has(threadId)) return;
+  // Offline deletions aren't delivered; the reconnect cleanup must retry them.
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  hiddenCodexSubagentIds.add(threadId);
+  try {
+    await publish({
+      type: "thread.deleted", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), threadId
+    }, true);
+  } catch (error) {
+    hiddenCodexSubagentIds.delete(threadId);
+    throw error;
+  }
+}
+
+/** Remove old product-list pollution, without deleting local store or native CLI history. */
+async function cleanupCodexSubagentTasks(): Promise<void> {
+  if (!codex) return;
+  if (subagentCleanupInFlight) return subagentCleanupInFlight;
+  const adapter = codex;
+  const work = (async () => {
+    // Cached/stored tasks cover older servers that do not support sourceKinds.
+    const candidates = new Set([
+      ...publicState.tasks.filter((task) => task.engine === "codex").map((task) => task.threadId),
+      ...taskStore.list(1_000).filter((task) => task.engine === "codex").map((task) => task.providerSessionId || task.threadId)
+    ]);
+    await mapPool([...candidates], 3, async (threadId) => {
+      await codexThreads.ensureThread(threadId, async (id) => {
+        const result = await adapter.request("thread/read", { threadId: id, includeTurns: false });
+        return result.thread;
+      }).catch(() => undefined);
+    });
+    // Newer servers exclude subagents from their default list. Explicitly discover
+    // them so deletions also reach browsers that cached them before this fix.
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < SEARCH_MAX_PAGES; page += 1) {
+      let response: unknown;
+      try {
+        response = await adapter.request("thread/list", {
+          limit: SEARCH_LIST_LIMIT, sortDirection: "desc", sortKey: "updated_at", modelProviders: [],
+          sourceKinds: ["subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther"],
+          ...(cursor ? { cursor } : {})
+        });
+      } catch { break; }
+      const batch = extractCodexThreadList(response);
+      for (const thread of batch) codexThreads.observeThread(thread);
+      cursor = extractCodexNextCursor(response);
+      if (!cursor || !batch.length || seenCursors.has(cursor)) break;
+      seenCursors.add(cursor);
+    }
+    for (const threadId of codexThreads.subagentIds()) {
+      await hideCodexSubagentTask(threadId).catch(handleError);
+    }
+  })();
+  subagentCleanupInFlight = work;
+  try { await work; }
+  finally { if (subagentCleanupInFlight === work) subagentCleanupInFlight = null; }
+}
+
 async function handleCodexMessage(message: Record<string, any>): Promise<void> {
+  const threadId = codexMessageThreadId(message);
+  const generation = codexMessageGeneration;
+  const turnId = String(message.params?.turn?.id ?? message.params?.turnId ?? "");
+  if (threadId && message.method === "turn/started") activeNativeCodexTurns.set(threadId, turnId);
+  if (threadId && message.method === "turn/completed"
+    && (!turnId || activeNativeCodexTurns.get(threadId) === turnId)) activeNativeCodexTurns.delete(threadId);
+  if (threadId && message.method === "thread/closed") activeNativeCodexTurns.delete(threadId);
+  // Record identity as soon as a notification arrives, including while an older
+  // turn notification is still awaiting thread/read.
+  if (message.params?.thread) codexThreads.observeThread(message.params.thread);
+  codexThreads.observeItem(message.params?.item ?? {}, threadId);
+  if (!threadId) return handleCodexMessageBody(message, generation);
+  const previous = codexMessageChains.get(threadId) ?? Promise.resolve();
+  const work = previous.catch(() => undefined).then(() => {
+    if (generation === codexMessageGeneration) return handleCodexMessageBody(message, generation);
+  });
+  codexMessageChains.set(threadId, work);
+  try { await work; }
+  finally { if (codexMessageChains.get(threadId) === work) codexMessageChains.delete(threadId); }
+}
+
+async function handleCodexMessageBody(message: Record<string, any>, generation = codexMessageGeneration): Promise<void> {
+  const nativeThreadId = codexMessageThreadId(message);
+  if (message.params?.thread) codexThreads.observeThread(message.params.thread);
+  // Spawn notifications can prove the relation before the child's first delta arrives.
+  const childIds = codexThreads.observeItem(message.params?.item ?? {}, nativeThreadId);
+  for (const childId of childIds) await hideCodexSubagentTask(childId);
+  if (nativeThreadId) {
+    await codexThreads.ensureThread(nativeThreadId, async (threadId) => {
+      if (!codex) return undefined;
+      const result = await codex.request("thread/read", { threadId, includeTurns: false });
+      return result.thread;
+    }).catch(() => undefined);
+    if (generation !== codexMessageGeneration) return;
+    if (codexThreads.isSubagent(nativeThreadId)) {
+      await hideCodexSubagentTask(nativeThreadId).catch(handleError);
+      const rootThreadId = await codexThreads.ensureRootThreadId(nativeThreadId, async (threadId) => {
+        if (!codex) return undefined;
+        const result = await codex.request("thread/read", { threadId, includeTurns: false });
+        return result.thread;
+      }).catch(() => undefined);
+      if (generation !== codexMessageGeneration) return;
+      if (rootThreadId) noteThreadProgress(rootThreadId);
+      const isRequest = message.id !== undefined;
+      const isResolution = message.method === "serverRequest/resolved";
+      if (!isRequest && !isResolution) {
+        if (message.method === "turn/completed") void maybeReloadCodexAppServerWhenIdle().catch(handleError);
+        return;
+      }
+      // Preserve RPC ids/turn ids for native responses; only the product owner changes.
+      // Without a proven owner, retain the actionable request rather than deadlocking it.
+      if (rootThreadId) {
+        if (isRequest) pendingCodexRequestOwners.set(String(message.id), rootThreadId);
+        message = { ...message, params: { ...message.params, threadId: rootThreadId } };
+      }
+    }
+  }
   const methodName = String(message.method || "").toLowerCase();
   // A notification about a thread with a live turn IS proof of life, whether or
   // not it carries text we forward. Non-streaming methods (item/started with a
@@ -6794,13 +6953,16 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
     }
   }
   if (message.method === "serverRequest/resolved") {
-    pendingRequestTypes.delete(String(message.params.requestId));
-    pendingAnswerMeta.delete(String(message.params.requestId));
-    await publish({ type: "request.resolved", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), requestId: message.params.requestId, threadId: message.params.threadId }, true);
+    const requestId = String(message.params.requestId);
+    const owner = pendingCodexRequestOwners.get(requestId);
+    pendingCodexRequestOwners.delete(requestId);
+    pendingRequestTypes.delete(requestId);
+    pendingAnswerMeta.delete(requestId);
+    await publish({ type: "request.resolved", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), requestId: message.params.requestId, threadId: owner || message.params.threadId }, true);
   }
   if (message.id !== undefined && message.method === "item/commandExecution/requestApproval") {
     const params = message.params;
-    if (await acceptFullAccessApproval(message.id, params.threadId, "命令")) return;
+    if (await acceptFullAccessApproval(message.id, nativeThreadId || params.threadId, "命令")) return;
     pendingRequestTypes.set(String(message.id), "command");
     await publish({
       type: "approval.requested", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), requestId: message.id,
@@ -6811,7 +6973,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   }
   if (message.id !== undefined && message.method === "item/fileChange/requestApproval") {
     const params = message.params;
-    if (await acceptFullAccessApproval(message.id, params.threadId, "文件修改")) return;
+    if (await acceptFullAccessApproval(message.id, nativeThreadId || params.threadId, "文件修改")) return;
     pendingRequestTypes.set(String(message.id), "file");
     await publish({
       type: "approval.requested", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), requestId: message.id,
@@ -7030,7 +7192,9 @@ function busyCodingEngines(): CliEngine[] {
     ...pendingCursorApprovalsByThread.keys(),
     ...turnQueueByThread.keys()
   ]);
-  return [...new Set([...threads].map((threadId) => resolveActivityEngine(threadId) || "codex"))];
+  const engines = [...threads].map((threadId) => resolveActivityEngine(threadId) || "codex");
+  if (activeNativeCodexTurns.size) engines.push("codex");
+  return [...new Set(engines)];
 }
 
 async function npmExecutable(): Promise<string | null> {
@@ -7193,6 +7357,10 @@ async function publishActiveTurnHeartbeats(): Promise<void> {
 
 async function publishThread(threadId: string, options: { touch?: boolean } = {}): Promise<void> {
   if (isThreadDeleted(threadId)) return;
+  if (codexThreads.isSubagent(threadId)) {
+    await hideCodexSubagentTask(threadId);
+    return;
+  }
 
   async function publishLocalFallback(): Promise<void> {
     await publishStoredTaskSnapshot(threadId, { persist: false }).catch(() => undefined);
@@ -7218,6 +7386,10 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
   } catch {
     // app-server may exit/reload mid-sync (OOM, credential reload) — keep web on local store.
     await publishLocalFallback();
+    return;
+  }
+  if (codexThreads.observeThread(result.thread)) {
+    await hideCodexSubagentTask(threadId);
     return;
   }
   const snapshot = threadToSnapshot(result.thread);
@@ -7358,27 +7530,11 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   } catch {
     // ignore import failures
   }
-  const storedTasks: AgentTask[] = taskStore.list(listLimit).map((task) => ({
-    threadId: task.threadId,
-    title: task.title,
-    cwd: resolveAbsoluteCwd(task.cwd),
-    status: task.status,
-    updatedAt: task.updatedAt,
-    engine: task.engine
-  }));
   let codexTasks: AgentTask[] = [];
   try {
     if (!codex) await ensureCodex();
-    // Codex ≥0.147 defaults thread/list to the active model_provider only.
-    // Empty modelProviders = all providers (needed after Cockpit/provider switches).
-    const response = await codex!.request("thread/list", {
-      limit: listLimit,
-      sortDirection: "desc",
-      sortKey: "updated_at",
-      modelProviders: []
-    });
-    let threads: Array<Record<string, any>> = extractCodexThreadList(response);
-    threads = [...threads].sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0));
+    await cleanupCodexSubagentTasks();
+    const threads = await listCodexThreadsForSync({ limit: listLimit });
     codexTasks = threads.map((thread) => ({
       threadId: String(thread.id),
       title: String(thread.name || thread.preview || "未命名任务"),
@@ -7390,6 +7546,12 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
   } catch {
     // Codex optional when listing Claude/Grok tasks.
   }
+  const storedTasks: AgentTask[] = taskStore.list(1_000)
+    .filter((task) => task.engine !== "codex" || !codexThreads.isSubagent(task.providerSessionId || task.threadId))
+    .slice(0, listLimit).map((task) => ({
+      threadId: task.threadId, title: task.title, cwd: resolveAbsoluteCwd(task.cwd),
+      status: task.status, updatedAt: task.updatedAt, engine: task.engine
+    }));
   const byId = new Map<string, AgentTask>();
   // Prefer the record with the newer last-activity time when the same id appears twice.
   for (const task of [...storedTasks, ...codexTasks]) {
@@ -7448,7 +7610,7 @@ function extractCodexNextCursor(response: unknown): string | undefined {
 }
 
 /**
- * List Codex threads. Plain sync: one page of `limit` newest.
+ * List top-level Codex threads, filling the recent window after excluding children.
  * Search: walk pages so older tasks remain findable (client-side case-insensitive match).
  */
 async function listCodexThreadsForSync(options: {
@@ -7459,7 +7621,7 @@ async function listCodexThreadsForSync(options: {
   const pageLimit = query
     ? SEARCH_LIST_LIMIT
     : Math.min(SEARCH_LIST_LIMIT, Math.max(1, options.limit));
-  const maxPages = query ? SEARCH_MAX_PAGES : 1;
+  const maxPages = SEARCH_MAX_PAGES;
   const collected: Array<Record<string, any>> = [];
   const seen = new Set<string>();
   let cursor: string | undefined;
@@ -7478,9 +7640,13 @@ async function listCodexThreadsForSync(options: {
       const id = String(thread?.id || "").trim();
       if (!id || seen.has(id)) continue;
       seen.add(id);
+      if (codexThreads.observeThread(thread)) {
+        await hideCodexSubagentTask(id);
+        continue;
+      }
       collected.push(thread);
     }
-    if (!query) break;
+    if (!query && collected.length >= options.limit) break;
     cursor = extractCodexNextCursor(response);
     if (!cursor || batch.length === 0) break;
   }
@@ -7546,6 +7712,7 @@ function threadMatchesQuery(thread: Record<string, any>, query: string): boolean
  */
 async function syncAllThreads(options: { limit?: number; query?: string } = {}): Promise<{ threadCount: number; partial: boolean }> {
   await ensureCodex();
+  await cleanupCodexSubagentTasks();
   const query = options.query?.trim() ?? "";
   const limit = Math.min(SEARCH_LIST_LIMIT, Math.max(1, options.limit ?? DEFAULT_SYNC_LIMIT));
   let threads = await listCodexThreadsForSync({
@@ -7590,6 +7757,18 @@ function shellQuote(value: string): string {
 
 async function resolveRelayTask(threadId: string): Promise<AgentTask & { providerSessionId?: string }> {
   const stored = taskStore.get(threadId);
+  if (!stored || stored.engine === "codex") {
+    const nativeId = stored?.providerSessionId || threadId;
+    await codexThreads.ensureThread(nativeId, async (id) => {
+      if (!codex) await ensureCodex();
+      const result = await codex!.request("thread/read", { threadId: id, includeTurns: false });
+      return result.thread;
+    }).catch(() => undefined);
+    if (codexThreads.isSubagent(nativeId)) {
+      await hideCodexSubagentTask(nativeId);
+      throw new Error("该会话属于子 agent，请从原任务进行接力。");
+    }
+  }
   if (stored) {
     return {
       threadId: stored.threadId,
@@ -7607,6 +7786,10 @@ async function resolveRelayTask(threadId: string): Promise<AgentTask & { provide
     try {
       await ensureCodex();
       const result = await codex!.request("thread/read", { threadId, includeTurns: false });
+      if (codexThreads.observeThread(result.thread)) {
+        await hideCodexSubagentTask(threadId);
+        throw new Error("该会话属于子 agent，请从原任务进行接力。");
+      }
       const snapshot = threadToSnapshot(result.thread);
       const task: AgentTask = {
         threadId: snapshot.threadId,
@@ -7623,6 +7806,7 @@ async function resolveRelayTask(threadId: string): Promise<AgentTask & { provide
       });
       return task;
     } catch {
+      if (codexThreads.isSubagent(threadId)) throw new Error("该会话属于子 agent，请从原任务进行接力。");
       if (cached) return cached;
       throw new Error("任务不存在或会话已失效");
     }
@@ -7967,6 +8151,10 @@ async function relayTaskToCli(threadId: string): Promise<void> {
 }
 
 async function publish(event: AgentEvent, persist: boolean, hint?: "approval" | "completed"): Promise<void> {
+  // A queued delta/snapshot may predate discovery of a child. Block stale product
+  // events here as well; actionable requests must still be delivered if unowned.
+  if ("threadId" in event && event.threadId && codexThreads.isSubagent(event.threadId)
+    && event.type !== "thread.deleted" && event.type !== "approval.requested" && event.type !== "request.resolved") return;
   agentEventSchema.parse(event);
   if (!socket || socket.readyState !== WebSocket.OPEN || !config.hostId || !syncKey) {
     // Socket down (sleep / network flap / closed laptop). The encrypted event is lost,

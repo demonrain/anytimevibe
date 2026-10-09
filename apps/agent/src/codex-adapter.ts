@@ -62,7 +62,8 @@ export function codexMessageThreadId(message: Record<string, any> | null | undef
     params.turn?.threadId,
     params.turn?.thread_id,
     params.item?.threadId,
-    params.item?.thread_id
+    params.item?.thread_id,
+    params.thread?.id
   ];
   for (const candidate of candidates) {
     if (typeof candidate !== "string" && typeof candidate !== "number") continue;

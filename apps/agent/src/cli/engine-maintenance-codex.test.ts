@@ -48,6 +48,7 @@ function fixture() {
   const context = {
     codex: null,
     codexVersion: "1.0.0",
+    codexMessageGeneration: 0,
     codexCommand: "codex",
     codexLoadedCredentialFingerprint: null,
     codexReloadInFlight: null,

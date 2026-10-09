@@ -1018,6 +1018,19 @@ function sanitizeDisplayText(text: string): string {
   return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u2028\u2029]/g, "");
 }
 
+/** Wait for a visible body without discarding stream chunks or code indentation. */
+function hasAssistantDisplayContent(text: string): boolean {
+  const clean = sanitizeDisplayText(text);
+  if (!clean.trim()) return false;
+  const start = clean.replace(/^(?:[ \t]*\r?\n)+/, "");
+  const opening = /^ {0,3}(`{3,}|~{3,})([^\r\n]*)(?:\r?\n|$)/.exec(start);
+  if (!opening || (opening[1]!.startsWith("`") && opening[2]!.includes("`"))) return true;
+  const body = start.slice(opening[0].length).replace(/^(?:[ \t]*\r?\n)+/, "").trimEnd();
+  if (!body.trim()) return false;
+  const fence = opening[1]!;
+  return !new RegExp(`^ {0,3}${fence[0]}{${fence.length},}[ \\t]*$`).test(body);
+}
+
 /**
  * Claude stores Edit/Read tool_result as role=user. Those must not render as YOU / 我的.
  * Keep this in sync with apps/agent/src/cli/import-sessions.ts looksLikeToolIoUserText.
@@ -1218,12 +1231,11 @@ const MARKDOWN_COMPONENTS: any = {
       </a>
     );
   },
-  pre: ({ children }: { children?: ReactNode }) => <div className="md-pre">{children}</div>,
-  code: ({ className, children, ...props }: { className?: string; children?: ReactNode }) => {
-    const inline = !className;
-    if (inline) return <code className="md-code-inline" {...props}>{children}</code>;
-    return <pre className="md-code-block"><code className={className} {...props}>{children}</code></pre>;
-  }
+  // The Markdown pre node identifies a block even when its language tag is absent.
+  pre: ({ children }: { children?: ReactNode }) => <div className="md-pre"><pre className="md-code-block">{children}</pre></div>,
+  code: ({ className, children }: { className?: string; children?: ReactNode }) => (
+    <code className={className || "md-code-inline"}>{children}</code>
+  )
 };
 
 /** Assistant reply: header (engine label + view toggle) and markdown/source body. */
@@ -1306,7 +1318,7 @@ const ChatMessageRow = memo(function ChatMessageRow({
  * Message list isolated from the composer. Typing must not re-render this tree —
  * with long transcripts ReactMarkdown cost dominates keystroke latency.
  */
-const ChatMessageStream = memo(function ChatMessageStream({
+export const ChatMessageStream = memo(function ChatMessageStream({
   messages,
   replyDetail,
   taskEngine,
@@ -1397,7 +1409,8 @@ const ChatMessageStream = memo(function ChatMessageStream({
         ? messages
         : messages.filter((message) => !isProcessStreamMessage(message))
       ).filter(
-        (message) => message.role !== "user" || (!looksLikeToolIoUserText(message.text) && !isCursorIdeAgentTranscriptNoise(message.text))
+        (message) => (message.role !== "assistant" || hasAssistantDisplayContent(message.text))
+          && (message.role !== "user" || (!looksLikeToolIoUserText(message.text) && !isCursorIdeAgentTranscriptNoise(message.text)))
       )
     ),
     [messages, replyDetail]
@@ -2030,6 +2043,7 @@ export function reduceEvent(
   event: AgentEvent,
   maintenanceCommandIds?: ReadonlySet<string>
 ): HostRuntime {
+  if (event.type === "turn.delta" && !event.delta) return runtime;
   const next = cloneRuntime(runtime);
   if (event.type === "host.status") {
     const currentAt = Date.parse(next.hostStatusAt || "") || 0;
