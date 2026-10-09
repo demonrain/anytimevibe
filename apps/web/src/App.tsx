@@ -17,6 +17,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   base64ToBytes,
+  CLI_ENGINES,
   clientCommandSchema,
   createEnvelope,
   decryptPayload,
@@ -41,6 +42,7 @@ import {
   type ContextUsage,
   type EncryptedEnvelope,
   type EngineCapability,
+  type EngineManagement,
   type EngineModelOption,
   type EngineQuota,
   type PairingPublicInfo,
@@ -623,6 +625,9 @@ type HostRuntime = {
   tasks: Record<string, Task>;
   availableEngines?: CliEngineInfo[];
   engineCapabilities?: EngineCapability[];
+  engineManagement?: EngineManagement;
+  hostStatusAt?: string;
+  engineCommandErrors?: Record<string, string>;
   /** Desktop agent version reported by host.status.agentVersion / relay.host_meta */
   agentVersion?: string;
   /** Last subscription / plan quota sample from host.quota.refresh */
@@ -630,6 +635,20 @@ type HostRuntime = {
   quotaDetail?: string;
   quotaLoading?: boolean;
 };
+
+type EngineMaintenanceRequest = {
+  commandId: string;
+  action: "update" | "refresh";
+  cliEngine?: CliEngine;
+  state: "sending" | "waiting" | "running" | "completed" | "failed";
+  error?: string;
+};
+
+export function shouldFailMissingEngineOperation(request: EngineMaintenanceRequest, runtime: HostRuntime | undefined): boolean {
+  return request.state === "running"
+    && Boolean(runtime?.hostStatusAt)
+    && runtime?.engineManagement?.operation?.commandId !== request.commandId;
+}
 
 function taskStatusMeta(status: string): { label: string; tone: string } {
   let statusType = status;
@@ -2006,17 +2025,37 @@ function pruneStaleQueueAgainstMessages(
   return next;
 }
 
-function reduceEvent(runtime: HostRuntime, event: AgentEvent): HostRuntime {
+export function reduceEvent(
+  runtime: HostRuntime,
+  event: AgentEvent,
+  maintenanceCommandIds?: ReadonlySet<string>
+): HostRuntime {
   const next = cloneRuntime(runtime);
   if (event.type === "host.status") {
+    const currentAt = Date.parse(next.hostStatusAt || "") || 0;
+    const incomingAt = Date.parse(event.occurredAt) || 0;
+    if (incomingAt && currentAt > incomingAt) return next;
     next.online = event.online;
     next.workspaces = event.workspaces;
+    next.hostStatusAt = event.occurredAt;
     if (event.availableEngines) next.availableEngines = event.availableEngines;
     if (event.engineCapabilities) next.engineCapabilities = event.engineCapabilities;
+    if (event.engineManagement) next.engineManagement = event.engineManagement;
+    else delete next.engineManagement;
     if (event.agentVersion) next.agentVersion = event.agentVersion;
     if (event.engineQuotas?.length) {
       next.engineQuotas = event.engineQuotas;
       next.quotaLoading = false;
+    }
+    return next;
+  }
+  if (event.type === "error" && event.commandId && !event.threadId) {
+    const isMaintenanceError = event.commandId === next.engineManagement?.operation?.commandId
+      || maintenanceCommandIds?.has(event.commandId) === true;
+    if (isMaintenanceError) {
+      next.engineCommandErrors = { ...(next.engineCommandErrors ?? {}), [event.commandId]: event.message };
+      const errors = Object.entries(next.engineCommandErrors);
+      if (errors.length > 20) next.engineCommandErrors = Object.fromEntries(errors.slice(-20));
     }
     return next;
   }
@@ -2508,11 +2547,14 @@ export function App() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [mobilePane, setMobilePane] = useState<"hosts" | "tasks" | "conversation">("hosts");
   const socketRef = useRef<WebSocket | null>(null);
+  const maintenanceCommandIdsRef = useRef(new Map<string, Set<string>>());
   const reconnectTimerRef = useRef<number | null>(null);
   const hostOfflineTimersRef = useRef(new Map<string, number>());
   const [error, setError] = useState("");
   const [pairingOpen, setPairingOpen] = useState(false);
   const [composerOpen, setComposerOpen] = useState(false);
+  const [engineManagementOpen, setEngineManagementOpen] = useState(false);
+  const [engineMaintenanceRequests, setEngineMaintenanceRequests] = useState<Record<string, EngineMaintenanceRequest>>({});
   const [accountOpen, setAccountOpen] = useState(false);
   const [pushStatus, setPushStatus] = useState<"idle" | "syncing" | "enabled">("idle");
   const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
@@ -2537,6 +2579,41 @@ export function App() {
   } | null>(null);
   /** In-page only: refresh shows the tip again if the client is still outdated. */
   const [clientUpdateDismissed, setClientUpdateDismissed] = useState(false);
+
+  useEffect(() => {
+    setEngineMaintenanceRequests((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const [hostId, request] of Object.entries(current)) {
+        const hostRuntime = runtime[hostId];
+        const operation = hostRuntime?.engineManagement?.operation;
+        const operationMatches = operation?.commandId === request.commandId;
+        const error = hostRuntime?.engineCommandErrors?.[request.commandId]
+          || (shouldFailMissingEngineOperation(request, hostRuntime) ? t("engineOperationLost") : undefined);
+        if (operationMatches) {
+          const state = operation.phase === "completed" || operation.phase === "failed"
+            ? operation.phase
+            : "running";
+          const detail = operation.phase === "failed" ? (error || operation.detail) : undefined;
+          if (request.state !== state || request.error !== detail) {
+            next[hostId] = { ...request, state, ...(detail ? { error: detail } : {}) };
+            if (!detail && request.error) delete next[hostId]!.error;
+            changed = true;
+          }
+          if (state === "completed" || state === "failed") {
+            maintenanceCommandIdsRef.current.get(hostId)?.delete(request.commandId);
+          }
+          continue;
+        }
+        if (error && (request.state !== "failed" || request.error !== error)) {
+          next[hostId] = { ...request, state: "failed", error };
+          maintenanceCommandIdsRef.current.get(hostId)?.delete(request.commandId);
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [runtime, t]);
   useEffect(() => {
     // Drop legacy session dismiss so "稍后" from older builds cannot hide tips forever.
     try { sessionStorage.removeItem("client-update-dismissed"); } catch { /* ignore */ }
@@ -2655,7 +2732,11 @@ export function App() {
       }
       setRuntime((current) => ({
         ...current,
-        [envelope.hostId]: reduceEvent(current[envelope.hostId] ?? emptyRuntime(), event)
+        [envelope.hostId]: reduceEvent(
+          current[envelope.hostId] ?? emptyRuntime(),
+          event,
+          maintenanceCommandIdsRef.current.get(envelope.hostId)
+        )
       }));
       // Auto-open the task just created via the new-task dialog.
       if ("threadId" in event && typeof event.threadId === "string") {
@@ -2917,7 +2998,96 @@ export function App() {
     if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("实时连接尚未建立，请稍后重试。");
     const sequence = Number(localStorage.getItem(`command:${hostId}`) ?? 0) + 1;
     localStorage.setItem(`command:${hostId}`, String(sequence));
-    socket.send(JSON.stringify(await createEnvelope(hostId, sequence, key, parsed)));
+    const isMaintenanceCommand = parsed.type === "host.engine.update" || parsed.type === "host.engine.refresh";
+    if (isMaintenanceCommand) {
+      const commandIds = maintenanceCommandIdsRef.current.get(hostId) ?? new Set<string>();
+      commandIds.add(parsed.commandId);
+      // Keep only recent command ids; operation state remains authoritative after delivery.
+      while (commandIds.size > 20) commandIds.delete(commandIds.values().next().value as string);
+      maintenanceCommandIdsRef.current.set(hostId, commandIds);
+    }
+    try {
+      socket.send(JSON.stringify(await createEnvelope(hostId, sequence, key, parsed)));
+    } catch (sendError) {
+      if (isMaintenanceCommand) maintenanceCommandIdsRef.current.get(hostId)?.delete(parsed.commandId);
+      throw sendError;
+    }
+  }
+
+  async function sendEngineMaintenance(action: "update" | "refresh", cliEngine?: CliEngine): Promise<void> {
+    if (!activeHost) return;
+    const hostId = activeHost.id;
+    const management = activeRuntime.engineManagement;
+    const engineInfo = cliEngine
+      ? activeRuntime.availableEngines?.find((engine) => engine.engine === cliEngine)
+      : undefined;
+    if (activeRuntime.online !== true) {
+      setEngineMaintenanceRequests((current) => ({
+        ...current,
+        [hostId]: { commandId: randomUuid(), action, ...(cliEngine ? { cliEngine } : {}), state: "failed", error: t("engineMaintenanceOffline") }
+      }));
+      return;
+    }
+    if (management?.supported !== true) {
+      setEngineMaintenanceRequests((current) => ({
+        ...current,
+        [hostId]: { commandId: randomUuid(), action, ...(cliEngine ? { cliEngine } : {}), state: "failed", error: t("engineMaintenanceUnsupported") }
+      }));
+      return;
+    }
+    if (cliEngine && !engineInfo?.ready) {
+      setEngineMaintenanceRequests((current) => ({
+        ...current,
+        [hostId]: { commandId: randomUuid(), action, cliEngine, state: "failed", error: t("engineMaintenanceNoEngine") }
+      }));
+      return;
+    }
+    if (management.operation && !["completed", "failed"].includes(management.operation.phase)) return;
+    if (action === "update" && cliEngine && management.busyEngines.includes(cliEngine)) {
+      setEngineMaintenanceRequests((current) => ({
+        ...current,
+        [hostId]: { commandId: randomUuid(), action, cliEngine, state: "failed", error: t("engineBusy") }
+      }));
+      return;
+    }
+
+    const commandId = randomUuid();
+    setEngineMaintenanceRequests((current) => ({
+      ...current,
+      [hostId]: { commandId, action, ...(cliEngine ? { cliEngine } : {}), state: "sending" }
+    }));
+    const command: ClientCommand = action === "update"
+      ? { type: "host.engine.update", commandId, cliEngine: cliEngine! }
+      : { type: "host.engine.refresh", commandId, ...(cliEngine ? { cliEngine } : {}), ...(!cliEngine ? { checkUpdates: true } : {}) };
+    try {
+      await sendCommand(hostId, command);
+      setEngineMaintenanceRequests((current) => {
+        const request = current[hostId];
+        if (!request || request.commandId !== commandId || request.state !== "sending") return current;
+        return { ...current, [hostId]: { ...request, state: "waiting" } };
+      });
+      window.setTimeout(() => {
+        setEngineMaintenanceRequests((current) => {
+          const request = current[hostId];
+          if (!request || request.commandId !== commandId || request.state !== "waiting") return current;
+          return { ...current, [hostId]: { ...request, state: "failed", error: t("engineNoConfirmation") } };
+        });
+      }, 30_000);
+    } catch (sendError) {
+      maintenanceCommandIdsRef.current.get(hostId)?.delete(commandId);
+      setEngineMaintenanceRequests((current) => {
+        const request = current[hostId];
+        if (!request || request.commandId !== commandId || request.state !== "sending") return current;
+        return {
+          ...current,
+          [hostId]: {
+            ...request,
+            state: "failed",
+            error: sendError instanceof Error ? sendError.message : String(sendError)
+          }
+        };
+      });
+    }
   }
 
   async function logout() {
@@ -3215,6 +3385,14 @@ export function App() {
             <div><p className="eyebrow">{t("taskStream")}</p><h1 className="host-title">{activeHost?.name ?? t("noHost")}</h1></div>
             <div className="section-actions">
               <button className="sync-tasks" disabled={!activeHost || activeRuntime.online !== true || String(syncStatus[activeHost.id] ?? "").startsWith(t("syncing"))} onClick={() => activeHost && syncHostTasks(activeHost.id, { limit: 10 }).catch((syncError) => setError(syncError.message))}>{activeHost ? syncStatus[activeHost.id] ?? t("syncTasks") : t("syncTasks")}</button>
+              <button
+                type="button"
+                className="engine-manage"
+                disabled={!activeHost}
+                aria-label={t("engineMaintenance")}
+                title={t("engineMaintenance")}
+                onClick={() => setEngineManagementOpen(true)}
+              >{t("engineMaintenance")}</button>
               <button className="new-task" disabled={!activeHost || activeRuntime.online !== true} onClick={() => setComposerOpen(true)}>{t("newTask")}</button>
             </div>
           </div>
@@ -3317,6 +3495,24 @@ export function App() {
     </main>
 
     {pairingOpen && <PairingDialog onClose={() => setPairingOpen(false)} onPaired={async () => { setPairingOpen(false); await loadHosts(); }} />}
+    {engineManagementOpen && activeHost && <EngineManagementDialog
+      host={activeHost}
+      online={activeRuntime.online === true}
+      supported={activeRuntime.engineManagement?.supported === true}
+      {...(activeRuntime.engineManagement ? { management: activeRuntime.engineManagement } : {})}
+      availableEngines={activeRuntime.availableEngines ?? []}
+      engineCapabilities={activeRuntime.engineCapabilities ?? []}
+      {...(engineMaintenanceRequests[activeHost.id] ? { request: engineMaintenanceRequests[activeHost.id] } : {})}
+      {...(() => {
+        const pending = engineMaintenanceRequests[activeHost.id];
+        const message = pending?.error ?? (pending ? activeRuntime.engineCommandErrors?.[pending.commandId] : undefined);
+        return message ? { requestError: message } : {};
+      })()}
+      onClose={() => setEngineManagementOpen(false)}
+      onUpdate={(engine) => sendEngineMaintenance("update", engine)}
+      onRefresh={(engine) => sendEngineMaintenance("refresh", engine)}
+      onRefreshAll={() => sendEngineMaintenance("refresh")}
+    />}
     {composerOpen && activeHost && <NewTaskDialog
       host={activeHost}
       workspaces={activeRuntime.workspaces}
@@ -4794,6 +4990,131 @@ function DiffView({ diff }: { diff: string }) {
       </div>
     </div>
   );
+}
+
+function EngineManagementDialog({
+  host,
+  online,
+  supported,
+  management,
+  availableEngines,
+  engineCapabilities,
+  request,
+  requestError,
+  onClose,
+  onUpdate,
+  onRefresh,
+  onRefreshAll
+}: {
+  host: Host;
+  online: boolean;
+  supported: boolean;
+  management?: EngineManagement;
+  availableEngines: CliEngineInfo[];
+  engineCapabilities: EngineCapability[];
+  request?: EngineMaintenanceRequest;
+  requestError?: string;
+  onClose(): void;
+  onUpdate(engine: CliEngine): Promise<void> | void;
+  onRefresh(engine: CliEngine): Promise<void> | void;
+  onRefreshAll(): Promise<void> | void;
+}) {
+  const { t } = useI18n();
+  const operation = management?.operation;
+  const operationActive = Boolean(operation && !["completed", "failed"].includes(operation.phase));
+  const requestActive = request?.state === "sending" || request?.state === "waiting" || request?.state === "running";
+  const globalBusy = operationActive || requestActive;
+  const sourceLabel = (source: EngineCapability["modelCatalogSource"] | undefined): string => {
+    if (source === "cli") return t("engineCatalogCli");
+    if (source === "cache") return t("engineCatalogCache");
+    if (source === "config") return t("engineCatalogConfig");
+    if (source === "fallback") return t("engineCatalogFallback");
+    return "—";
+  };
+  const phaseLabel = (phase: NonNullable<EngineManagement["operation"]>["phase"]): string => {
+    if (phase === "updating") return t("engineUpdating");
+    if (phase === "syncing") return t("engineSyncing");
+    if (phase === "verifying") return t("engineVerifying");
+    if (phase === "checking") return t("engineRefreshing");
+    if (phase === "completed") return t("engineCompleted");
+    return t("engineFailed");
+  };
+  const actionLabel = request?.state === "sending"
+    ? t("engineSending")
+    : request?.state === "waiting"
+      ? t("engineWaiting")
+      : request?.state === "running" && request.action === "update"
+        ? t("engineUpdating")
+        : request?.state === "running"
+          ? t("engineRefreshing")
+          : null;
+
+  return <div className="modal-backdrop" role="presentation">
+    <section className="modal wide engine-management-modal" role="dialog" aria-modal="true" aria-labelledby="engine-management-title">
+      <button type="button" className="modal-close" onClick={onClose} aria-label={t("close")} title={t("close")}>×</button>
+      <p className="eyebrow">CLI / MODELS</p>
+      <h2 id="engine-management-title">{t("engineMaintenanceTitle")}</h2>
+      <p>{t("engineMaintenanceHint")} <strong>{host.name}</strong></p>
+      {!online && <div className="engine-management-notice warning">{t("engineMaintenanceOffline")}</div>}
+      {online && !supported && <div className="engine-management-notice warning">{t("engineMaintenanceUnsupported")}</div>}
+      {requestError && !(operation?.phase === "failed" && operation.commandId === request?.commandId) && <div className="engine-management-notice error"><strong>{t("engineOperationFailed")}</strong><span>{requestError}</span></div>}
+      {operation && <div className={`engine-operation-status ${operation.phase}`}>
+        <div className="engine-operation-status-head">
+          <strong>{t("engineOperationDetail")}</strong>
+          <span>{phaseLabel(operation.phase)}{operation.cliEngine ? ` · ${cliEngineLabel(operation.cliEngine)}` : ""}</span>
+        </div>
+        <p>{operation.detail || (operation.version ? `${operation.previousVersion || "—"} → ${operation.version}` : "")}</p>
+      </div>}
+      <div className="engine-management-toolbar">
+        <span>{t("engineLiveStatus")}</span>
+        <button
+          type="button"
+          className="engine-refresh-all"
+          disabled={!online || !supported || globalBusy}
+          onClick={() => void onRefreshAll()}
+        >{globalBusy ? (actionLabel || t("engineRefreshing")) : t("engineRefreshAll")}</button>
+      </div>
+      <div className="engine-management-list">
+        {CLI_ENGINES.map((engine) => {
+          const info = availableEngines.find((item) => item.engine === engine);
+          const capability = engineCapabilities.find((item) => item.engine === engine);
+          const engineOperation = operation?.cliEngine === engine ? operation : undefined;
+          const engineBusy = management?.busyEngines.includes(engine) ?? false;
+          const installed = Boolean(info?.ready);
+          const upToDate = Boolean(installed && info?.latestVersion && info.updateAvailable === false);
+          const isThisRequest = request?.cliEngine === engine;
+          const rowBusy = globalBusy && (isThisRequest || engineOperation?.commandId === request?.commandId);
+          return <article className={`engine-management-row ${installed ? "installed" : "missing"}`} key={engine}>
+            <div className="engine-management-identity">
+              <EngineLogo engine={engine} size={30} />
+              <div><strong>{cliEngineLabel(engine)}</strong><span>{installed ? t("engineReady") : info ? t("engineUnavailable") : t("engineNotDetected")}</span></div>
+            </div>
+            <div className="engine-management-meta">
+              <div><span>CLI</span><code>{info?.version || t("engineVersionUnknown")}</code></div>
+              {info?.latestVersion && <div><span>{t("engineLatest")}</span><code className={info.updateAvailable ? "outdated" : ""}>{info.latestVersion}{info.updateAvailable ? ` · ${t("engineUpdateAvailable")}` : ""}</code></div>}
+              <div><span>{t("engineModelCount")}</span><code>{capability?.models.length ?? "—"}</code></div>
+              <div><span>{t("engineCatalogSource")}</span><code>{sourceLabel(capability?.modelCatalogSource)}</code></div>
+            </div>
+            <div className="engine-management-actions">
+              {engineOperation && <span className={`engine-row-phase ${engineOperation.phase}`}>{phaseLabel(engineOperation.phase)}</span>}
+              {engineBusy && <span className="engine-row-busy">{t("engineInUse")}</span>}
+              <button
+                type="button"
+                disabled={!online || !supported || !installed || upToDate || globalBusy || engineBusy}
+                onClick={() => void onUpdate(engine)}
+              >{rowBusy && request?.action === "update" ? (actionLabel || t("engineUpdating")) : upToDate ? t("engineUpToDate") : t("engineUpdate")}</button>
+              <button
+                type="button"
+                className="secondary"
+                disabled={!online || !supported || !installed || globalBusy}
+                onClick={() => void onRefresh(engine)}
+              >{rowBusy && request?.action === "refresh" ? (actionLabel || t("engineRefreshing")) : t("engineRefresh")}</button>
+            </div>
+          </article>;
+        })}
+      </div>
+    </section>
+  </div>;
 }
 
 function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): void }) {

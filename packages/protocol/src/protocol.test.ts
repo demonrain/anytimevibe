@@ -179,6 +179,64 @@ describe("protocol crypto", () => {
     });
   });
 
+  it("accepts a remote coding-engine update command", () => {
+    const command = {
+      type: "host.engine.update" as const,
+      commandId: crypto.randomUUID(),
+      cliEngine: "pi" as const
+    };
+    expect(clientCommandSchema.parse(command)).toMatchObject({
+      type: "host.engine.update",
+      cliEngine: "pi"
+    });
+  });
+
+  it("accepts targeted model refresh and update checks", () => {
+    const command = {
+      type: "host.engine.refresh",
+      commandId: crypto.randomUUID(),
+      cliEngine: "codex",
+      checkUpdates: true
+    };
+    expect(clientCommandSchema.parse(command)).toEqual(command);
+  });
+
+  it("keeps engine management progress and catalog provenance in host status", async () => {
+    const now = new Date().toISOString();
+    const event = {
+      type: "host.status" as const,
+      eventId: crypto.randomUUID(), occurredAt: now,
+      online: true, name: "DEV", platform: "win32", codexVersion: "0.158.0", workspaces: [],
+      engineManagement: {
+        supported: true as const,
+        busyEngines: ["pi" as const],
+        operation: {
+          commandId: crypto.randomUUID(), action: "update" as const, cliEngine: "codex" as const,
+          phase: "syncing" as const, startedAt: now, updatedAt: now, previousVersion: "0.157.0"
+        }
+      },
+      engineCapabilities: [{
+        engine: "claude" as const, models: [{ id: "opus", label: "opus" }], reasoningEfforts: [],
+        modelCatalogSource: "config" as const, modelCatalogCheckedAt: now
+      }]
+    };
+    const parsed = agentEventSchema.parse(event);
+    expect(parsed).toEqual(event);
+    const key = await importAesKey(randomKeyBytes());
+    const envelope = await createEnvelope(crypto.randomUUID(), 1, key, parsed);
+    expect(agentEventSchema.parse(await openEnvelope(key, envelope))).toEqual(event);
+  });
+
+  it("never accepts arbitrary engine identifiers or upgrade commands", () => {
+    expect(clientCommandSchema.safeParse({
+      type: "host.engine.update", commandId: crypto.randomUUID(), cliEngine: "npm && malicious"
+    }).success).toBe(false);
+    const parsed = clientCommandSchema.parse({
+      type: "host.engine.update", commandId: crypto.randomUUID(), cliEngine: "codex", command: "arbitrary"
+    });
+    expect(parsed).not.toHaveProperty("command");
+  });
+
   it("ignores unknown forward-compatible agent event types", () => {
     expect(parseAgentEventCompat({
       type: "future.optional.event",

@@ -1,33 +1,63 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 
-function killProcessTree(child: ChildProcess): void {
+async function killProcessTree(child: ChildProcess): Promise<void> {
   const pid = child.pid;
   if (!pid) {
     try { child.kill(); } catch { /* ignore */ }
     return;
   }
+  const closed = new Promise<void>((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) resolve();
+    else child.once("close", () => resolve());
+  });
   if (process.platform === "win32") {
-    try {
-      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
-        windowsHide: true,
-        stdio: "ignore"
-      }).on("error", () => {
-        try { child.kill(); } catch { /* ignore */ }
-      });
-      return;
-    } catch {
-      // fall through
+    await new Promise<void>((resolve) => {
+      let finished = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = (fallback: boolean) => {
+        if (finished) return;
+        finished = true;
+        if (timer) clearTimeout(timer);
+        if (fallback) try { child.kill("SIGKILL"); } catch { /* ignore */ }
+        resolve();
+      };
+      try {
+        const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+          windowsHide: true,
+          stdio: "ignore"
+        });
+        killer.once("error", () => done(true));
+        killer.once("close", (code) => done(code !== 0));
+        timer = setTimeout(() => {
+          try { killer.kill(); } catch { /* ignore */ }
+          done(true);
+        }, 5_000);
+      } catch {
+        done(true);
+      }
+    });
+  } else {
+    // The child owns a detached Unix process group. Signal the entire group,
+    // including descendants left behind after the parent accepts SIGTERM.
+    try { process.kill(-pid, "SIGTERM"); } catch {
+      try { child.kill("SIGTERM"); } catch { /* ignore */ }
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+    // child.killed means a signal was sent, not that the process/group exited.
+    try { process.kill(-pid, "SIGKILL"); } catch {
+      if (child.exitCode === null && child.signalCode === null) {
+        try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      }
     }
   }
-  try { child.kill("SIGTERM"); } catch { /* ignore */ }
-  setTimeout(() => {
-    try {
-      if (!child.killed) child.kill("SIGKILL");
-    } catch {
-      // ignore
-    }
-  }, 1_000);
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, 1_000);
+    void closed.then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 /**
@@ -42,6 +72,8 @@ export function execFileWithTreeKill(
     timeoutMs: number;
     env?: NodeJS.ProcessEnv;
     maxBuffer?: number;
+    cwd?: string;
+    onOutput?: (text: string) => void;
   }
 ): Promise<{ stdout: string; stderr: string }> {
   const maxBuffer = options.maxBuffer ?? 512_000;
@@ -53,7 +85,9 @@ export function execFileWithTreeKill(
     const child = spawn(executable, finalArgs, {
       windowsHide: true,
       windowsVerbatimArguments: useCmd,
+      detached: process.platform !== "win32",
       env: options.env || process.env,
+      ...(options.cwd ? { cwd: options.cwd } : {}),
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "";
@@ -71,18 +105,23 @@ export function execFileWithTreeKill(
 
     const timer = setTimeout(() => {
       timedOut = true;
-      killProcessTree(child);
-      finish(Object.assign(new Error(`Command timed out after ${options.timeoutMs}ms`), {
+      const timeoutError = Object.assign(new Error(`Command timed out after ${options.timeoutMs}ms`), {
         killed: true,
         code: null,
         signal: "SIGTERM",
         stdout,
         stderr
-      }));
+      });
+      // Do not release a maintenance lock until tree termination has completed.
+      void killProcessTree(child).then(
+        () => finish(timeoutError),
+        () => finish(timeoutError)
+      );
     }, Math.max(1_000, options.timeoutMs));
 
     const append = (bucket: "stdout" | "stderr", chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      options.onOutput?.(text);
       if (bucket === "stdout") {
         stdout += text;
         if (stdout.length > maxBuffer) stdout = stdout.slice(0, maxBuffer);
@@ -97,9 +136,11 @@ export function execFileWithTreeKill(
     child.on("error", (error) => finish(error));
     child.on("close", (code, signal) => {
       if (timedOut) return;
-      if (code && code !== 0) {
-        finish(Object.assign(new Error(`Command failed with exit code ${code}`), {
-          code,
+      if (code !== 0 || signal) {
+        finish(Object.assign(new Error(signal
+          ? `Command terminated by signal ${signal}`
+          : `Command failed with exit code ${code}`), {
+          code: code ?? null,
           signal,
           stdout,
           stderr,

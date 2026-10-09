@@ -16,6 +16,8 @@ export type EngineCapability = {
   currentThinking?: boolean;
   /** Codex: whether fast (priority tier) mode is enabled in local config. */
   currentFast?: boolean;
+  modelCatalogSource?: "cli" | "cache" | "config" | "fallback";
+  modelCatalogCheckedAt?: string;
 };
 
 function parseTomlString(content: string, key: string): string | undefined {
@@ -226,6 +228,7 @@ async function discoverCodexCapability(): Promise<EngineCapability> {
   let currentReasoningEffort: ReasoningEffort | undefined;
   let currentFast: boolean | undefined;
   const effortUnion = new Set<ReasoningEffort>(["low", "medium", "high", "xhigh"]);
+  let hasDiskCatalog = false;
 
   const configText = await readText(path.join(codexHome, "config.toml"));
   if (configText) {
@@ -236,6 +239,7 @@ async function discoverCodexCapability(): Promise<EngineCapability> {
 
   // 1) Live CLI catalog first — includes models missing from a stale models_cache.json.
   const debugRows = await loadCodexDebugModelRows().catch(() => [] as Array<Record<string, any>>);
+  const hasLiveCatalog = debugRows.length > 0;
   ingestCodexCatalogRows(debugRows, models, seen, effortUnion);
 
   // 2) Disk caches / Cockpit / CCSwitch — may add local/custom provider models.
@@ -260,6 +264,7 @@ async function discoverCodexCapability(): Promise<EngineCapability> {
               return { slug: id, ...info, ...row };
             })
           : [];
+      if (rows.length) hasDiskCatalog = true;
       ingestCodexCatalogRows(rows, models, seen, effortUnion);
     } catch {
       // ignore
@@ -282,7 +287,9 @@ async function discoverCodexCapability(): Promise<EngineCapability> {
     reasoningEfforts: reasoningEfforts.length ? reasoningEfforts : ["low", "medium", "high", "xhigh"],
     ...(currentModel ? { currentModel } : {}),
     ...(currentReasoningEffort ? { currentReasoningEffort } : {}),
-    ...(currentFast !== undefined ? { currentFast } : {})
+    ...(currentFast !== undefined ? { currentFast } : {}),
+    modelCatalogSource: hasLiveCatalog ? "cli" : hasDiskCatalog ? "cache" : currentModel ? "config" : "fallback",
+    modelCatalogCheckedAt: new Date().toISOString()
   };
 }
 
@@ -352,7 +359,9 @@ async function discoverClaudeCapability(): Promise<EngineCapability> {
     models,
     reasoningEfforts,
     ...(currentModel ? { currentModel } : {}),
-    ...(currentReasoningEffort ? { currentReasoningEffort } : {})
+    ...(currentReasoningEffort ? { currentReasoningEffort } : {}),
+    modelCatalogSource: settingsRaw ? "config" : "fallback",
+    modelCatalogCheckedAt: new Date().toISOString()
   };
 }
 
@@ -391,6 +400,8 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
   const seen = new Set<string>();
   let currentModel: string | undefined;
   let currentReasoningEffort: ReasoningEffort | undefined;
+  let hasCachedModels = false;
+  let hasConfigModels = false;
   let reasoningEfforts: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
   const effortUnion = new Set<ReasoningEffort>(reasoningEfforts);
 
@@ -427,6 +438,7 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
               ? { reasoningEfforts: ["low", "medium", "high", "xhigh"] as ReasoningEffort[] }
               : {})
         });
+        hasCachedModels = true;
         if (!currentReasoningEffort && defaultEffort) currentReasoningEffort = defaultEffort;
       }
     } catch {
@@ -458,6 +470,7 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
       if (!id || seen.has(id)) continue;
       seen.add(id);
       models.push({ id, label: id });
+      hasConfigModels = true;
     }
   }
   if (process.env.GROK_MODEL) currentModel = process.env.GROK_MODEL.trim();
@@ -476,7 +489,9 @@ async function discoverGrokCapability(): Promise<EngineCapability> {
     models,
     reasoningEfforts,
     ...(currentModel ? { currentModel } : {}),
-    ...(currentReasoningEffort ? { currentReasoningEffort } : {})
+    ...(currentReasoningEffort ? { currentReasoningEffort } : {}),
+    modelCatalogSource: hasCachedModels ? "cache" : hasConfigModels || currentModel ? "config" : "fallback",
+    modelCatalogCheckedAt: new Date().toISOString()
   };
 }
 
@@ -1091,7 +1106,9 @@ async function discoverCursorCapability(): Promise<EngineCapability> {
     reasoningEfforts,
     currentModel,
     ...(currentReasoningEffort ? { currentReasoningEffort } : {}),
-    ...(currentThinking ? { currentThinking: true } : {})
+    ...(currentThinking ? { currentThinking: true } : {}),
+    modelCatalogSource: liveCount ? "cli" : "fallback",
+    modelCatalogCheckedAt: new Date().toISOString()
   };
 }
 
@@ -1300,6 +1317,7 @@ async function discoverAntigravityCapability(): Promise<EngineCapability> {
   let currentModel: string | undefined;
   let currentReasoningEffort: ReasoningEffort | undefined;
 
+  let hasLiveCatalog = false;
   try {
     const { resolveEngineBinary } = await import("./detect");
     const binary = await resolveEngineBinary("antigravity");
@@ -1310,6 +1328,7 @@ async function discoverAntigravityCapability(): Promise<EngineCapability> {
         for (const item of parsed) {
           ingestAgyModelRow(item.id, item.label, models, seen);
         }
+        hasLiveCatalog = models.length > 0;
         rememberAgyCatalog(models, parsed.map((item) => item.id));
       }
     }
@@ -1365,7 +1384,9 @@ async function discoverAntigravityCapability(): Promise<EngineCapability> {
     models,
     reasoningEfforts,
     ...(currentModel ? { currentModel } : {}),
-    ...(currentReasoningEffort ? { currentReasoningEffort } : {})
+    ...(currentReasoningEffort ? { currentReasoningEffort } : {}),
+    modelCatalogSource: hasLiveCatalog ? "cli" : "fallback",
+    modelCatalogCheckedAt: new Date().toISOString()
   };
 }
 
@@ -1579,6 +1600,7 @@ async function discoverPiCapability(): Promise<EngineCapability> {
   let defaultProvider = "";
   let defaultModel = "";
   let currentReasoningEffort: ReasoningEffort | undefined;
+  let hasLiveCatalog = false;
   const settingsRaw = await readText(path.join(os.homedir(), ".pi", "agent", "settings.json"));
   if (settingsRaw) {
     try {
@@ -1611,7 +1633,9 @@ async function discoverPiCapability(): Promise<EngineCapability> {
       const { runCliText } = await import("./engine-quota");
       const listed = await runCliText(binary, ["--list-models"], { timeoutMs: 20_000 });
       if (listed.text) {
-        for (const option of parsePiListModelsOutput(listed.text)) add(option);
+        const parsed = parsePiListModelsOutput(listed.text);
+        hasLiveCatalog = parsed.length > 0;
+        for (const option of parsed) add(option);
       }
     }
   } catch {
@@ -1634,21 +1658,33 @@ async function discoverPiCapability(): Promise<EngineCapability> {
     models,
     ...(currentModel ? { currentModel } : {}),
     ...(currentReasoningEffort ? { currentReasoningEffort } : {}),
-    reasoningEfforts: [...PI_REASONING_EFFORTS]
+    reasoningEfforts: [...PI_REASONING_EFFORTS],
+    modelCatalogSource: hasLiveCatalog ? "cli" : custom.size ? "config" : "fallback",
+    modelCatalogCheckedAt: new Date().toISOString()
   };
 }
 
 /** Collect model + effort options from local CLI configs/caches on this machine. */
-export async function discoverEngineCapabilities(): Promise<EngineCapability[]> {
-  const [codex, claude, grok, cursor, antigravity, pi] = await Promise.all([
-    discoverCodexCapability(),
-    discoverClaudeCapability(),
-    discoverGrokCapability(),
-    discoverCursorCapability(),
-    discoverAntigravityCapability(),
-    discoverPiCapability()
-  ]);
-  const capabilities = [codex, claude, grok, cursor, antigravity, pi];
-  lastDiscoveredCapabilities = capabilities;
-  return capabilities;
+export async function discoverEngineCapabilities(options: { engine?: CliEngine; force?: boolean } = {}): Promise<EngineCapability[]> {
+  if (options.force && (!options.engine || options.engine === "codex")) clearCodexDebugModelsCache();
+  const discoverers: Record<CliEngine, () => Promise<EngineCapability>> = {
+    codex: discoverCodexCapability,
+    claude: discoverClaudeCapability,
+    grok: discoverGrokCapability,
+    cursor: discoverCursorCapability,
+    antigravity: discoverAntigravityCapability,
+    pi: discoverPiCapability
+  };
+  const engines: CliEngine[] = options.engine
+    ? [options.engine]
+    : ["codex", "claude", "grok", "cursor", "antigravity", "pi"];
+  const refreshed = await Promise.all(engines.map((engine) => discoverers[engine]()));
+  const byEngine = new Map(lastDiscoveredCapabilities.map((item) => [item.engine, item]));
+  for (const capability of refreshed) byEngine.set(capability.engine, capability);
+  if (!options.engine || lastDiscoveredCapabilities.length) {
+    lastDiscoveredCapabilities = ["codex", "claude", "grok", "cursor", "antigravity", "pi"]
+      .map((engine) => byEngine.get(engine as CliEngine))
+      .filter((item): item is EngineCapability => Boolean(item));
+  }
+  return options.engine ? refreshed : lastDiscoveredCapabilities;
 }

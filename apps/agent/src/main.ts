@@ -37,6 +37,7 @@ import {
   type CliEngine,
   type CliEngineInfo,
   type ClientCommand,
+  type EngineOperation,
   type EncryptedEnvelope,
   type PermissionMode,
   type ReasoningEffort,
@@ -67,9 +68,12 @@ import {
   threadToSnapshot,
   mergeSnapshotUserPrompts
 } from "./codex-adapter";
-import { clearEngineBinaryCache, detectAvailableEngines, resolveEngineBinary } from "./cli/detect";
+import { clearEngineBinaryCache, detectAvailableEngines, resolveCommandPath, resolveEngineBinary } from "./cli/detect";
 import { enrichEnginesWithLatestVersions, clearEngineLatestCache } from "./cli/engine-updates";
 import { isUpdateAvailable, normalizeVersionLabel } from "./cli/version-compare";
+import { EngineMaintenance, sanitizeEngineMaintenanceDetail } from "./cli/engine-maintenance";
+import { buildEngineUpgradeSteps, resolveNpmEnginePrefix } from "./cli/engine-upgrade";
+import { execFileWithTreeKill } from "./cli/exec-file-tree-kill";
 import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn, normalizeSystemErrorText } from "./cli/headless-runner";
 import { isCodexModelsManagerNoise } from "./cli/log-noise";
@@ -144,6 +148,7 @@ type PublicState = {
   cliEngine: CliEngine;
   availableEngines: CliEngineInfo[];
   engineCapabilities: EngineCapability[];
+  engineManagement?: import("@anytimevibe/protocol").EngineManagement;
   workspaces: Workspace[];
   environment: EnvironmentState;
   /** False until first local engine/env probe finishes ? UI shows a loading mask. */
@@ -200,6 +205,7 @@ let config: AgentConfig;
 let configPath = "";
 let codexCommand = "codex.cmd";
 let codexVersion = "unknown";
+let engineMaintenanceInstance: EngineMaintenance | null = null;
 const initialEnvironment: EnvironmentState = { platform: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "other", nodeInstalled: false, codexInstalled: false, codexCompatible: false };
 let publicState: PublicState = {
   relayUrl: DEFAULT_RELAY_URL,
@@ -210,6 +216,7 @@ let publicState: PublicState = {
   cliEngine: "codex",
   availableEngines: [],
   engineCapabilities: [],
+  engineManagement: { supported: true, busyEngines: [] },
   workspaces: [],
   environment: initialEnvironment,
   environmentReady: false,
@@ -1089,35 +1096,44 @@ function scheduleDrainTurnQueue(threadId: string): void {
 
 async function drainTurnQueue(threadId: string): Promise<void> {
   if (isThreadTurnBusy(threadId) || pendingCodexSteeringByThread.has(threadId)) return;
+  const engine = resolveActivityEngine(threadId) || "codex";
+  if (engineMaintenanceInstance?.isUpdating(engine)) return;
   if (isThreadDeleted(threadId)) {
     await clearTurnQueue(threadId);
     return;
   }
   const list = turnQueueByThread.get(threadId);
   if (!list?.length) return;
-  const next = list.shift()!;
-  if (list.length === 0) turnQueueByThread.delete(threadId);
-  else turnQueueByThread.set(threadId, list);
-  await persistTurnQueue();
-  await publishTurnQueueUpdated(threadId);
-  logInfo(`执行排队指令`, `thread=${threadId.slice(0, 8)} remaining=${list.length}`);
-  const queuedCommand: ClientCommand = {
-    type: "turn.start",
-    commandId: next.commandId,
-    threadId,
-    prompt: next.prompt,
-    ...(next.permissionMode ? { permissionMode: next.permissionMode } : {}),
-    ...(next.model ? { model: next.model } : {}),
-    ...(next.reasoningEffort ? { reasoningEffort: next.reasoningEffort } : {}),
-    ...(next.fast === true || next.fast === false ? { fast: next.fast } : {})
-  };
-  queuedCommandIds.delete(next.commandId);
+  // Reserve before removing the last queue marker: persistence/publishing may
+  // yield before handleCommandImpl registers the native task's own reservation.
+  const release = getEngineMaintenance().reserveRun(engine);
   try {
-    await handleCommandImpl(queuedCommand);
-    await publishCommandStatus(queuedCommand, "completed");
-  } catch (error) {
-    await publishCommandStatus(queuedCommand, "failed", error instanceof Error ? error.message : String(error));
-    throw error;
+    const next = list.shift()!;
+    if (list.length === 0) turnQueueByThread.delete(threadId);
+    else turnQueueByThread.set(threadId, list);
+    await persistTurnQueue();
+    await publishTurnQueueUpdated(threadId);
+    logInfo(`执行排队指令`, `thread=${threadId.slice(0, 8)} remaining=${list.length}`);
+    const queuedCommand: ClientCommand = {
+      type: "turn.start",
+      commandId: next.commandId,
+      threadId,
+      prompt: next.prompt,
+      ...(next.permissionMode ? { permissionMode: next.permissionMode } : {}),
+      ...(next.model ? { model: next.model } : {}),
+      ...(next.reasoningEffort ? { reasoningEffort: next.reasoningEffort } : {}),
+      ...(next.fast === true || next.fast === false ? { fast: next.fast } : {})
+    };
+    queuedCommandIds.delete(next.commandId);
+    try {
+      await handleCommandImpl(queuedCommand);
+      await publishCommandStatus(queuedCommand, "completed");
+    } catch (error) {
+      await publishCommandStatus(queuedCommand, "failed", error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  } finally {
+    release();
   }
 }
 
@@ -4534,7 +4550,16 @@ function scheduleReconnect(detail: string): void {
   reconnectTimer.unref?.();
 }
 
-async function ensureCodex(): Promise<void> {
+async function ensureCodex(options: { maintenance?: boolean } = {}): Promise<void> {
+  const release = options.maintenance ? undefined : getEngineMaintenance().reserveRun("codex");
+  try {
+    await startCodexAppServer();
+  } finally {
+    release?.();
+  }
+}
+
+async function startCodexAppServer(): Promise<void> {
   if (codex) return;
   await applyLoginPathToProcess();
   // Ensure historical Cockpit provider sections exist before app-server loads config.toml.
@@ -4703,7 +4728,16 @@ function hasRunningCodexTurn(): boolean {
   return false;
 }
 
-async function reloadCodexAppServer(reason: string): Promise<void> {
+async function reloadCodexAppServer(reason: string, options: { maintenance?: boolean } = {}): Promise<void> {
+  const release = options.maintenance ? undefined : getEngineMaintenance().reserveRun("codex");
+  try {
+    await performCodexAppServerReload(reason, options);
+  } finally {
+    release?.();
+  }
+}
+
+async function performCodexAppServerReload(reason: string, options: { maintenance?: boolean }): Promise<void> {
   if (codexReloadInFlight) {
     await codexReloadInFlight;
     return;
@@ -4737,7 +4771,7 @@ async function reloadCodexAppServer(reason: string): Promise<void> {
     codex = null;
     codexLoadedCredentialFingerprint = null;
     noteCodexCredentialSelfWrite();
-    await ensureCodex();
+    await ensureCodex(options);
   })();
   try {
     await codexReloadInFlight;
@@ -4748,6 +4782,7 @@ async function reloadCodexAppServer(reason: string): Promise<void> {
 
 async function maybeReloadCodexAppServerWhenIdle(): Promise<void> {
   if (!pendingCodexAppServerReload) return;
+  if (engineMaintenanceInstance?.isUpdating("codex")) return;
   if (hasActiveCodexTurn()) return;
   const reason = pendingCodexAppServerReload;
   pendingCodexAppServerReload = null;
@@ -4762,6 +4797,10 @@ let delayedCredentialReconcileTimer: ReturnType<typeof setTimeout> | null = null
  * window; dropping the watch event left the running app-server on the old key.
  */
 function scheduleCodexCredentialReload(reason: string): void {
+  if (engineMaintenanceInstance?.isUpdating("codex")) {
+    pendingCodexAppServerReload = reason;
+    return;
+  }
   const remaining = ignoreCodexCredentialWatchUntilMs - Date.now();
   if (remaining > 0) {
     if (delayedCredentialReconcileTimer) clearTimeout(delayedCredentialReconcileTimer);
@@ -4776,6 +4815,10 @@ function scheduleCodexCredentialReload(reason: string): void {
 }
 
 async function reconcileCodexCredentialsIfStale(reason: string): Promise<void> {
+  if (engineMaintenanceInstance?.isUpdating("codex")) {
+    pendingCodexAppServerReload = reason;
+    return;
+  }
   let live = "";
   try {
     const synced = await syncCodexRelayConfigForTurn();
@@ -4793,6 +4836,10 @@ async function reconcileCodexCredentialsIfStale(reason: string): Promise<void> {
 }
 
 function queueCodexCredentialReload(reason: string): void {
+  if (engineMaintenanceInstance?.isUpdating("codex")) {
+    pendingCodexAppServerReload = reason;
+    return;
+  }
   if (!codex && !publicState.environment.codexCompatible && !publicState.environment.codexInstalled) {
     void publishHostStatus().catch(() => undefined);
     return;
@@ -4827,6 +4874,7 @@ function startEngineCredentialAndCatalogWatch(): void {
       scheduleCodexCredentialReload(`切号/凭证变更:${reason}`);
     },
     onCapabilitySourcesChanged: (reason) => {
+      if (engineMaintenanceInstance?.busy) return;
       if (capabilityRefreshInFlight) return;
       capabilityRefreshInFlight = true;
       clearCodexDebugModelsCache();
@@ -5717,12 +5765,73 @@ async function recordUsageUpdate(
   usageFlushTimers.set(threadId, timer);
 }
 
+function commandEngine(command: ClientCommand): CliEngine | undefined {
+  if (command.type === "task.create") return command.cliEngine;
+  if (command.type === "sync.request") return "codex";
+  if (command.type === "approval.resolve") {
+    const pending = pendingCursorApprovals.get(String(command.requestId));
+    return pending ? resolveActivityEngine(pending.threadId) || "cursor" : undefined;
+  }
+  if ("threadId" in command && [
+    "thread.resume", "turn.start", "turn.steer", "turn.interrupt", "turn.queue.steer"
+  ].includes(command.type)) {
+    return resolveActivityEngine(command.threadId) || "codex";
+  }
+  return undefined;
+}
+
 async function handleCommandImpl(command: ClientCommand): Promise<void> {
+  const engine = commandEngine(command);
+  let release: (() => void) | undefined;
+  try {
+    if (engine) release = getEngineMaintenance().reserveRun(engine);
+  } catch (error) {
+    await publish({
+      type: "error",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      message: error instanceof Error ? error.message : "編碼引擎维护期间无法启动任务",
+      commandId: command.commandId,
+      ...( "threadId" in command ? { threadId: command.threadId } : {})
+    }, true).catch(() => undefined);
+    throw error;
+  }
+  try {
+    await handleCommandBody(command);
+  } finally {
+    release?.();
+  }
+}
+
+async function handleCommandBody(command: ClientCommand): Promise<void> {
+  if (command.type === "host.engine.update" || command.type === "host.engine.refresh") {
+    try {
+      await getEngineMaintenance().execute(command);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "编码引擎维护失败";
+      await publish({
+        type: "error",
+        eventId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(),
+        message,
+        commandId: command.commandId
+      }, true).catch(() => undefined);
+      throw error;
+    } finally {
+      scheduleDrainAllTurnQueues();
+      void maybeReloadCodexAppServerWhenIdle().catch(handleError);
+    }
+    return;
+  }
   // host.refresh: status + re-import local Claude/Grok/Cursor sessions for web list.
   if (command.type === "host.refresh") {
     // Always re-push agentVersion first so web update banners clear quickly after client upgrade.
     publishAgentMeta({ agentVersion: agentAppVersion() });
-    await publishHostStatus();
+    await publishHostStatus({ refresh: !engineMaintenanceInstance?.busy });
+    if (engineMaintenanceInstance?.busy) {
+      await publishAllTurnQueues().catch(() => undefined);
+      return;
+    }
     try {
       const imported = await importLocalCliSessions(taskStore, DEFAULT_SYNC_LIMIT, workspaceAllowRoots());
       await pruneImportedCliSessions(imported);
@@ -5832,6 +5941,13 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
     return;
   }
   if (command.type === "host.quota.refresh") {
+    if (engineMaintenanceInstance?.busy) {
+      await publish({
+        type: "error", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(),
+        message: "编码引擎升级或模型同步期间，暂不能查询额度。", commandId: command.commandId
+      }, true);
+      return;
+    }
     const quotas = (await refreshEngineQuotas(command.cliEngine)).map(sanitizeEngineQuota);
     const summaryRaw = quotas
       .map((item) => {
@@ -6229,6 +6345,7 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
       return;
     }
     if (command.type === "sync.request") {
+      if (engineMaintenanceInstance?.busy) throw new Error("编码引擎升级或模型同步期间，暂不能同步会话。");
       const hasQuery = Boolean(command.query?.trim());
       // Plain sync is always the recent window (10). Search may use a larger publish/scan budget.
       const syncLimit = hasQuery
@@ -6247,6 +6364,11 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
         cliEngine: taskStore.getDefaultEngine(),
         availableEngines: publicState.availableEngines,
         engineCapabilities: publicState.engineCapabilities,
+        engineManagement: {
+          supported: true,
+          busyEngines: engineMaintenanceInstance?.busyEngines() ?? [],
+          ...(engineMaintenanceInstance?.operation ? { operation: engineMaintenanceInstance.operation } : {})
+        },
         agentVersion: agentAppVersion(),
         ...(lastEngineQuotas.length ? { engineQuotas: lastEngineQuotas } : {})
       }, true).catch(() => undefined);
@@ -6812,15 +6934,31 @@ function publishAgentMeta(fields: {
   }
 }
 
-async function refreshAvailableEngines(options: { checkUpdates?: boolean } = {}): Promise<void> {
+async function refreshAvailableEngines(options: {
+  checkUpdates?: boolean;
+  engine?: CliEngine;
+  forceModels?: boolean;
+} = {}): Promise<void> {
   const codexReady = Boolean(publicState.environment.codexCompatible || codex);
-  const [detectedEngines, engineCapabilities] = await Promise.all([
+  const [detectedEngines, refreshedCapabilities] = await Promise.all([
     detectAvailableEngines({
       codexReady,
       codexVersion: codexVersion || publicState.environment.codexVersion || "unknown"
     }),
-    discoverEngineCapabilities().catch(() => [] as EngineCapability[])
+    options.forceModels === false
+      ? Promise.resolve([] as EngineCapability[])
+      : discoverEngineCapabilities(
+        options.engine
+          ? { engine: options.engine, ...(options.forceModels ? { force: true } : {}) }
+          : (options.forceModels ? { force: true } : {})
+      ).catch(() => [] as EngineCapability[])
   ]);
+  const engineCapabilities = refreshedCapabilities.length && options.engine
+    ? [
+      ...publicState.engineCapabilities.filter((item) => item.engine !== options.engine),
+      ...refreshedCapabilities
+    ]
+    : refreshedCapabilities.length ? refreshedCapabilities : publicState.engineCapabilities;
   // Latest-version probes use the system proxy. Skip on routine host.status publishes;
   // recheck / update flows pass checkUpdates to refresh the outdated badges.
   const availableEngines = options.checkUpdates
@@ -6838,6 +6976,11 @@ async function refreshAvailableEngines(options: { checkUpdates?: boolean } = {})
   updateState({
     availableEngines,
     engineCapabilities,
+    engineManagement: {
+      supported: true,
+      busyEngines: engineMaintenanceInstance?.busyEngines() ?? [],
+      ...(engineMaintenanceInstance?.operation ? { operation: engineMaintenanceInstance.operation } : {})
+    },
     cliEngine: taskStore.getDefaultEngine()
   });
 }
@@ -6855,9 +6998,11 @@ async function refreshEngineQuotas(filter?: CliEngine): Promise<EngineQuota[]> {
   return quotas;
 }
 
-async function publishHostStatus(): Promise<void> {
+async function publishHostStatus(options: { refresh?: boolean } = {}): Promise<void> {
   // Keep encrypted host.status for workspaces/online UX; version/name also go via agent.meta for DB.
-  await refreshAvailableEngines().catch(() => undefined);
+  if (options.refresh !== false && !engineMaintenanceInstance?.busy) {
+    await refreshAvailableEngines().catch(() => undefined);
+  }
   // Always stamp the running build version so web banners update without waiting for a full re-pair.
   publishAgentMeta({ agentVersion: agentAppVersion() });
   await publish({
@@ -6867,9 +7012,174 @@ async function publishHostStatus(): Promise<void> {
     cliEngine: taskStore.getDefaultEngine(),
     availableEngines: publicState.availableEngines,
     engineCapabilities: publicState.engineCapabilities,
+    engineManagement: {
+      supported: true,
+      busyEngines: engineMaintenanceInstance?.busyEngines() ?? [],
+      ...(engineMaintenanceInstance?.operation ? { operation: engineMaintenanceInstance.operation } : {})
+    },
     agentVersion: agentAppVersion(),
     ...(lastEngineQuotas.length ? { engineQuotas: lastEngineQuotas } : {})
   }, true);
+}
+
+function busyCodingEngines(): CliEngine[] {
+  const threads = new Set<string>([
+    ...activeTurnByThread.keys(),
+    ...turnStartingByThread,
+    ...pendingCodexSteeringByThread.keys(),
+    ...pendingCursorApprovalsByThread.keys(),
+    ...turnQueueByThread.keys()
+  ]);
+  return [...new Set([...threads].map((threadId) => resolveActivityEngine(threadId) || "codex"))];
+}
+
+async function npmExecutable(): Promise<string | null> {
+  if (process.platform === "win32") {
+    return (await resolveCommandPath("npm.cmd")) || (await resolveCommandPath("npm.exe"));
+  }
+  return (await resolveCommandPath("npm")) || null;
+}
+
+async function resolveEngineUpgradeTarget(engine: CliEngine, version: string | undefined) {
+  await applyLoginPathToProcess();
+  clearEngineBinaryCache();
+  const binary = engine === "codex"
+    ? await resolveCodexBinaryForRelay()
+    : await resolveEngineBinary(engine);
+  if (!binary) throw new Error(`未找到 ${engine} CLI，无法升级。`);
+
+  const npm = await npmExecutable();
+  let defaultPrefix = "";
+  if (npm) {
+    try {
+      const proxy = await collectLocalProxyEnv();
+      const env = mergeProxyIntoEnv({ ...process.env }, proxy);
+      const result = await execFileWithTreeKill(npm, ["prefix", "-g"], {
+        timeoutMs: 15_000, env, cwd: os.homedir(), maxBuffer: 64_000
+      });
+      defaultPrefix = result.stdout.trim().split(/\r?\n/).find(Boolean) || "";
+    } catch {
+      // A native self-updater does not require npm.
+    }
+  }
+
+  let installation: import("./cli/engine-upgrade").EngineUpgradeInstallation;
+  const realBinary = await fs.realpath(binary).catch(() => binary);
+  const normalizedBinary = realBinary.replace(/\\/g, "/").toLowerCase();
+  if (engine === "codex" && (/\/caskroom\/codex\//.test(normalizedBinary) || /\/codex\.app\/contents\/resources\//.test(normalizedBinary))) {
+    const brew = await resolveCommandPath("brew");
+    if (!brew) throw new Error("检测到 Codex 由 Homebrew Cask 安装，但未找到 brew 命令。");
+    installation = { kind: "brew", command: brew };
+  } else {
+    const prefix = npm
+      ? await resolveNpmEnginePrefix(binary, engine, defaultPrefix)
+      : null;
+    if (prefix) {
+      const repairCandidates = [
+        path.join(prefix, "node_modules", "@anthropic-ai", "claude-code", "install.cjs"),
+        path.join(prefix, "lib", "node_modules", "@anthropic-ai", "claude-code", "install.cjs")
+      ];
+      let repairScript: string | undefined;
+      let nodeCommand: string | undefined;
+      if (engine === "claude" && process.platform === "win32") {
+        for (const candidate of repairCandidates) {
+          try {
+            await fs.access(candidate);
+            repairScript = candidate;
+            break;
+          } catch {
+            // Try the other npm global layout.
+          }
+        }
+        if (repairScript) nodeCommand = (await resolveCommandPath("node.exe")) || undefined;
+      }
+      installation = {
+        kind: "npm", command: npm!, prefix,
+        ...(repairScript && nodeCommand ? { repairScript, nodeCommand } : {})
+      };
+    } else if (engine === "claude" || engine === "cursor" || engine === "grok" || engine === "antigravity") {
+      installation = { kind: "self" };
+    } else {
+      installation = { kind: "self" };
+    }
+  }
+  return { engine, binary, platform: process.platform, installation, ...(version ? { version } : {}) };
+}
+
+function getEngineMaintenance(): EngineMaintenance {
+  if (engineMaintenanceInstance) return engineMaintenanceInstance;
+  engineMaintenanceInstance = new EngineMaintenance({
+    busyEngines: busyCodingEngines,
+    installedEngine: (engine) => publicState.availableEngines.find((item) => item.engine === engine),
+    detect: async (checkUpdates, engine) => {
+      clearEngineBinaryCache();
+      if (engine === "codex") {
+        await resolveCodexBinaryForRelay();
+        const environment = await detectEnvironment();
+        updateState({ environment, codexVersion: environment.codexVersion || codexVersion });
+      } else if (engine) {
+        await resolveEngineBinary(engine);
+      }
+      await refreshAvailableEngines({ checkUpdates, forceModels: false });
+      return publicState.availableEngines;
+    },
+    prepareUpdate: async (engine) => {
+      if (engine !== "codex") return;
+      clearCodexDebugModelsCache();
+      pendingCodexAppServerReload = null;
+      try { codex?.stop({ intentional: true }); } catch { /* ignore */ }
+      codex = null;
+      codexLoadedCredentialFingerprint = null;
+    },
+    upgrade: async (engine, version, onOutput) => {
+      const target = await resolveEngineUpgradeTarget(engine, version);
+      const steps = buildEngineUpgradeSteps(target);
+      const proxy = await collectLocalProxyEnv();
+      const env = mergeProxyIntoEnv({ ...process.env }, proxy);
+      let rawOutputTail = "";
+      let lastReportedAt = 0;
+      for (const step of steps) {
+        await execFileWithTreeKill(step.command, step.args, {
+          timeoutMs: 5 * 60_000,
+          env,
+          cwd: step.cwd || os.homedir(),
+          maxBuffer: 2 * 1024 * 1024,
+          onOutput: (chunk) => {
+            // Keep raw chunks together so a credential split across chunks still
+            // retains its prefix when redacted. Only the sanitized tail is shown.
+            rawOutputTail = `${rawOutputTail}${chunk}`.slice(-64_000);
+            const outputTail = sanitizeEngineMaintenanceDetail(rawOutputTail).slice(-700);
+            const now = Date.now();
+            if (!outputTail || now - lastReportedAt < 900) return;
+            lastReportedAt = now;
+            updateState({ detail: `${engine} CLI 升级中… ${outputTail.slice(-260)}` });
+            onOutput(outputTail);
+          }
+        });
+      }
+    },
+    reload: async (engine) => {
+      clearEngineBinaryCache();
+      if (engine === "codex") await reloadCodexAppServer("CLI 升级后重载 app-server", { maintenance: true });
+    },
+    syncModels: async (engine) => {
+      clearCodexDebugModelsCache();
+      clearEngineBinaryCache();
+      await refreshAvailableEngines(engine ? { engine, forceModels: true } : { forceModels: true });
+      await publishHostStatus({ refresh: false });
+    },
+    notify: async (_operation: EngineOperation) => {
+      updateState({
+        engineManagement: {
+          supported: true,
+          busyEngines: engineMaintenanceInstance?.busyEngines() ?? [],
+          ...(engineMaintenanceInstance?.operation ? { operation: engineMaintenanceInstance.operation } : {})
+        }
+      });
+      await publishHostStatus({ refresh: false });
+    }
+  });
+  return engineMaintenanceInstance;
 }
 
 async function publishActiveTurnHeartbeats(): Promise<void> {
@@ -8448,7 +8758,12 @@ function registerIpc(): void {
       throw new Error("未知的升级目标");
     }
     try {
-      await updateEnvironment(target);
+      await getEngineMaintenance().execute({
+        type: "host.engine.update",
+        commandId: crypto.randomUUID(),
+        cliEngine: target
+      });
+      scheduleDrainAllTurnQueues();
       return await recheckLocalEnvironment();
     } catch (error) {
       handleError(error);

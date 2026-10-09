@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.5.19";
+export const PRODUCT_VERSION = "0.5.20";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -173,6 +173,9 @@ export const engineModelOptionSchema = z.object({
 });
 export type EngineModelOption = z.infer<typeof engineModelOptionSchema>;
 
+/** Provenance, not a guarantee of provider availability or account entitlement. */
+export const modelCatalogSourceSchema = z.enum(["cli", "cache", "config", "fallback"]);
+
 /** Host-reported model/effort catalog for one engine (from local CLI config/cache). */
 export const engineCapabilitySchema = z.object({
   engine: cliEngineSchema,
@@ -183,9 +186,31 @@ export const engineCapabilitySchema = z.object({
   /** Cursor: whether the currently selected model has thinking enabled. */
   currentThinking: z.boolean().optional(),
   /** Codex: whether fast (priority tier) mode is enabled in local config. */
-  currentFast: z.boolean().optional()
+  currentFast: z.boolean().optional(),
+  modelCatalogSource: modelCatalogSourceSchema.optional(),
+  modelCatalogCheckedAt: z.string().datetime().optional()
 });
 export type EngineCapability = z.infer<typeof engineCapabilitySchema>;
+
+/** Progress is carried by host.status so older Web clients can ignore these optional fields. */
+export const engineOperationSchema = z.object({
+  commandId: z.string().uuid(),
+  action: z.enum(["update", "refresh"]),
+  cliEngine: cliEngineSchema.optional(),
+  phase: z.enum(["checking", "updating", "verifying", "syncing", "completed", "failed"]),
+  startedAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  previousVersion: z.string().max(100).optional(),
+  version: z.string().max(100).optional(),
+  detail: z.string().max(1000).optional()
+});
+export type EngineOperation = z.infer<typeof engineOperationSchema>;
+export const engineManagementSchema = z.object({
+  supported: z.literal(true),
+  busyEngines: z.array(cliEngineSchema),
+  operation: engineOperationSchema.optional()
+});
+export type EngineManagement = z.infer<typeof engineManagementSchema>;
 
 export const contextUsageSchema = z.object({
   inputTokens: z.number().nonnegative().optional(),
@@ -437,6 +462,17 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
     type: z.literal("host.quota.refresh"),
     cliEngine: cliEngineSchema.optional()
   }),
+  /** Upgrade one installed coding CLI on the paired desktop agent, then refresh its catalog. */
+  commandBase.extend({
+    type: z.literal("host.engine.update"),
+    cliEngine: cliEngineSchema
+  }),
+  /** Re-query model catalogs; optionally also check vendor releases. No tasks are created. */
+  commandBase.extend({
+    type: z.literal("host.engine.refresh"),
+    cliEngine: cliEngineSchema.optional(),
+    checkUpdates: z.boolean().optional()
+  }),
   /** Set the host default coding CLI engine (persisted on the agent). */
   commandBase.extend({
     type: z.literal("host.set_cli_engine"),
@@ -466,6 +502,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     availableEngines: z.array(cliEngineInfoSchema).optional(),
     /** Per-engine model/effort catalogs from the host machine. */
     engineCapabilities: z.array(engineCapabilitySchema).optional(),
+    /** Explicit capability advertisement, upgrade/refresh progress, and active-engine guards. */
+    engineManagement: engineManagementSchema.optional(),
     /** Desktop agent app version (AnytimeVibe client). */
     agentVersion: z.string().optional(),
     /** Latest subscription / plan quotas from local CLIs (if available). */
