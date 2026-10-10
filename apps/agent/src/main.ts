@@ -2708,60 +2708,115 @@ async function resolveNpmGlobalDirs(npmCmd: string): Promise<string[]> {
 
 async function rememberNpmGlobalDirs(npmCmd: string): Promise<string[]> {
   const dirs = await resolveNpmGlobalDirs(npmCmd);
-  extraWindowsPathDirs = dirs;
+  extraWindowsPathDirs = [...new Set([...extraWindowsPathDirs, ...dirs])];
   cachedWindowsPath = null;
   await applyWindowsPathToProcess();
-  return dirs;
+  return extraWindowsPathDirs;
+}
+
+/** Read the same relative target that npm's read-cmd-shim validates on upgrades. */
+function codexWindowsNpmShimEntry(command: string, text: string): string | null {
+  const relative = /\.cmd$/i.test(command)
+    ? text.match(/"%(?:~dp0|dp0%)\\([^"\r\n]+)"\s+%\*/)?.[1]
+    : /\.ps1$/i.test(command)
+      ? text.match(/"\$basedir\/([^"\r\n]+)"\s+\$args/)?.[1]
+      : text.match(/"\$basedir\/([^"\r\n]+)"\s+"\$@"/)?.[1];
+  return relative ? path.resolve(path.dirname(command), relative.replace(/[\\/]/g, path.sep)) : null;
+}
+
+/** Recognize only the complete launcher written by older AnytimeVibe clients. */
+function legacyCodexWindowsShimEntry(text: string): string | null {
+  const match = text.match(/^@ECHO off\r?\nSETLOCAL\r?\nSET "_CODEX_JS=([^"\r\n]+)"\r?\nIF NOT EXIST "%_CODEX_JS%" \(\r?\n  echo Codex package missing: %_CODEX_JS% 1>&2\r?\n  exit \/b 1\r?\n\)\r?\n"[^"\r\n]+" "%_CODEX_JS%" %\*\r?\n?$/i);
+  const entry = match?.[1];
+  return entry && path.isAbsolute(entry) && /[\\/]node_modules[\\/]@openai[\\/]codex[\\/]bin[\\/]codex\.js$/i.test(entry)
+    ? entry : null;
+}
+
+/**
+ * Migrate our old non-npm cmd shim without --force or deleting a package tree.
+ * npm rejects that shim with EEXIST. Leave official shims for npm to update;
+ * refuse unrelated files, and keep a recoverable backup of our legacy launcher.
+ */
+async function withCodexWindowsNpmShimRepair(prefix: string, install: () => Promise<void>): Promise<void> {
+  if (!path.isAbsolute(prefix) || path.dirname(path.resolve(prefix)) === path.resolve(prefix)) {
+    throw new Error("Codex npm 安装目录无效，请重新检测 Node.js 环境。");
+  }
+  const entry = path.join(prefix, "node_modules", "@openai", "codex", "bin", "codex.js");
+  const legacy: string[] = [];
+  // Check all three shims before moving anything, including PowerShell's shim.
+  for (const name of ["codex", "codex.cmd", "codex.ps1"]) {
+    const command = path.join(prefix, name);
+    let stat;
+    try { stat = await fs.lstat(command); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    const text = stat.isFile() && stat.size <= 64_000 ? await fs.readFile(command, "utf8") : "";
+    const target = codexWindowsNpmShimEntry(command, text);
+    if (target && target.toLowerCase() === entry.toLowerCase()) continue;
+    if (name === "codex.cmd" && legacyCodexWindowsShimEntry(text)) {
+      legacy.push(command);
+      continue;
+    }
+    throw new Error(`文件 ${command} 已存在，无法确认它属于官方 Codex npm 安装。已保留原文件；请先将它改名或确认其来源后再安装。`);
+  }
+
+  const backups: Array<{ command: string; backup: string }> = [];
+  try {
+    for (const command of legacy) {
+      const backupDir = await fs.mkdtemp(path.join(prefix, ".anytimevibe-codex-backup-"));
+      const backup = path.join(backupDir, path.basename(command));
+      await fs.rename(command, backup);
+      backups.push({ command, backup });
+      logInfo("已备份旧版 Codex 启动器，交由 npm 重新生成", backup);
+    }
+    await install();
+  } catch (error) {
+    // npm normally rolls its package tree back on failure. Restore our launcher
+    // only when npm has not installed a replacement; never overwrite a new file.
+    for (const { command, backup } of backups) {
+      if (await pathExists(command)) continue;
+      try { await fs.rename(backup, command); } catch (restoreError) {
+        logWarn("恢复 Codex 启动器失败，原文件仍在备份目录", `${backup}: ${String(restoreError)}`);
+      }
+    }
+    throw error;
+  }
 }
 
 async function discoverCodexOnWindows(): Promise<string | null> {
   await applyWindowsPathToProcess();
-  // Prefer .cmd launchers; extensionless npm shims often point at the wrong node_modules tree.
-  const hit = (await findOnWindowsPath("codex.cmd"))
-    || (await findOnWindowsPath("codex.exe"));
-  if (hit && /\.cmd$/i.test(hit)) {
-    // Reject orphan AppData shims that still point at a missing package file.
-    try {
-      const text = await fs.readFile(hit, "utf8");
-      const m = text.match(/node_modules[\\/]@openai[\\/]codex[\\/]bin[\\/]codex\.js/i)
-        || text.match(/_CODEX_JS=(.+)/i);
-      if (m) {
-        let target = "";
-        const captured = m[1];
-        if (typeof captured === "string" && m[0].startsWith("_CODEX_JS=")) {
-          target = captured.trim().replace(/^"|"$/g, "");
-        } else {
-          // Relative shim: %dp0%\node_modules\...
-          target = path.join(path.dirname(hit), "node_modules", "@openai", "codex", "bin", "codex.js");
-        }
-        if (target && !(await pathExists(target))) {
-          // fall through to other probes
-        } else if (await pathExists(hit)) {
-          return hit;
-        }
-      } else if (await pathExists(hit)) {
-        return hit;
-      }
-    } catch {
-      if (await pathExists(hit)) return hit;
-    }
-  } else if (hit) {
-    return hit;
-  }
   const home = os.homedir();
+  const winPath = await resolveWindowsPath();
   const probes = [
     ...extraWindowsPathDirs.flatMap((dir) => [
       path.join(dir, "codex.cmd"),
       path.join(dir, "codex.exe")
     ]),
+    await findOnWindowsPath("codex.cmd"),
+    await findOnWindowsPath("codex.exe"),
+    ...winPath.split(";").filter(Boolean).flatMap((dir) => [
+      path.join(dir, "codex.cmd"), path.join(dir, "codex.exe")
+    ]),
     path.join(process.env.APPDATA || "", "npm", "codex.cmd"),
     path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs", "codex.cmd"),
     path.join(home, "AppData", "Roaming", "npm", "codex.cmd")
   ];
-  for (const candidate of probes) {
-    if (candidate && await pathExists(candidate)) return candidate;
+  let incompatible: string | null = null;
+  for (const candidate of new Set(probes)) {
+    if (!candidate || !(await pathExists(candidate))) continue;
+    if (/\.cmd$/i.test(candidate)) {
+      try {
+        const text = await fs.readFile(candidate, "utf8");
+        const entry = codexWindowsNpmShimEntry(candidate, text) || legacyCodexWindowsShimEntry(text);
+        if (entry && !(await pathExists(entry))) continue;
+      } catch { continue; }
+    }
+    const probe = await probeCodexVersionOutput(candidate);
+    if (isCodexCompatibleVersion(probe.version)) return candidate;
+    if (probe.version && !incompatible) incompatible = candidate;
   }
-  return null;
+  return incompatible;
 }
 
 function parseNodeMajorVersion(version: string | null | undefined): number | null {
@@ -2804,9 +2859,9 @@ async function probeCodexVersionOutput(command: string): Promise<{ version: stri
   }
 }
 
-async function npmGlobalCodexPlatformReady(npmCmd: string): Promise<{ ok: boolean; detail: string }> {
+async function npmGlobalCodexPlatformReady(npmCmd: string, prefix?: string): Promise<{ ok: boolean; detail: string }> {
   try {
-    const root = await npmGlobalRoot(npmCmd);
+    const root = prefix ? path.join(prefix, "node_modules") : await npmGlobalRoot(npmCmd);
     if (!root) return { ok: false, detail: "无法读取 npm root -g" };
     const arch = process.arch === "arm64" ? "arm64" : "x64";
     const pkgRoot = path.join(root, "@openai", "codex");
@@ -2858,11 +2913,16 @@ async function npmGlobalPrefix(npmCmd: string): Promise<string> {
 }
 
 /** Absolute path to the real package entry (ignores broken AppData shims). */
-async function resolveNpmGlobalCodexEntry(npmCmd: string): Promise<string | null> {
+async function resolveNpmGlobalCodexEntry(npmCmd: string, prefix?: string): Promise<string | null> {
+  if (prefix) {
+    const entry = path.join(prefix, "node_modules", "@openai", "codex", "bin", "codex.js");
+    return await pathExists(entry) ? entry : null;
+  }
   const root = await npmGlobalRoot(npmCmd);
-  if (!root) return null;
-  const entryJs = path.join(root, "@openai", "codex", "bin", "codex.js");
-  if (await pathExists(entryJs)) return entryJs;
+  if (root) {
+    const entryJs = path.join(root, "@openai", "codex", "bin", "codex.js");
+    if (await pathExists(entryJs)) return entryJs;
+  }
   // Some broken installs leave files only under Program Files while shim points at AppData.
   const fallbacks = [
     path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs", "node_modules", "@openai", "codex", "bin", "codex.js"),
@@ -2875,71 +2935,23 @@ async function resolveNpmGlobalCodexEntry(npmCmd: string): Promise<string | null
 }
 
 /** True when global @openai/codex package files are actually on disk (not just an orphan shim). */
-async function npmGlobalCodexPackageComplete(npmCmd: string): Promise<boolean> {
-  return Boolean(await resolveNpmGlobalCodexEntry(npmCmd));
+async function npmGlobalCodexPackageComplete(npmCmd: string, prefix?: string): Promise<boolean> {
+  return Boolean(await resolveNpmGlobalCodexEntry(npmCmd, prefix));
 }
 
 /**
- * Write a working launcher next to the real package when npm's AppData shim is stale.
- * Returns the launcher path (.cmd) so Codex can be spawned without MODULE_NOT_FOUND.
+ * Use only npm's own launcher in the installed prefix. Custom absolute-path
+ * launchers are not recognized by npm and cause EEXIST on the next upgrade.
  */
-async function ensureCodexWindowsLauncher(npmCmd: string, nodeCmd: string | null): Promise<string | null> {
-  const entryJs = await resolveNpmGlobalCodexEntry(npmCmd);
+async function ensureCodexWindowsLauncher(npmCmd: string, prefix: string): Promise<string | null> {
+  const entryJs = await resolveNpmGlobalCodexEntry(npmCmd, prefix);
   if (!entryJs) return null;
-  const node = nodeCmd
-    || (await findOnWindowsPath("node.exe"))
-    || (await findOnWindowsPath("node"))
-    || "node";
-  const prefix = (await npmGlobalPrefix(npmCmd))
-    || path.join(process.env.APPDATA || "", "npm")
-    || path.dirname(entryJs);
-  const launcherDir = path.join(process.env.APPDATA || os.homedir(), "npm");
-  const dirs = [...new Set([launcherDir, prefix].filter(Boolean))];
-  const body = [
-    "@ECHO off",
-    `SETLOCAL`,
-    `SET "_CODEX_JS=${entryJs.replace(/"/g, "")}"`,
-    `IF NOT EXIST "%_CODEX_JS%" (`,
-    `  echo Codex package missing: %_CODEX_JS% 1>&2`,
-    `  exit /b 1`,
-    `)`,
-    `"${normalizeWindowsCommandPath(node).replace(/"/g, "")}" "%_CODEX_JS%" %*`,
-    ""
-  ].join("\r\n");
-  for (const dir of dirs) {
-    try {
-      await fs.mkdir(dir, { recursive: true });
-      const launcher = path.join(dir, "codex.cmd");
-      await fs.writeFile(launcher, body, "utf8");
-      // Keep extensionless shim from winning over our .cmd when both exist.
-      const orphan = path.join(dir, "codex");
-      try {
-        const st = await fs.stat(orphan);
-        if (st.isFile()) await fs.unlink(orphan);
-      } catch {
-        // ignore
-      }
-      if (await pathExists(launcher)) {
-        extraWindowsPathDirs = [...new Set([...extraWindowsPathDirs, dir])];
-        cachedWindowsPath = null;
-        return launcher;
-      }
-    } catch (error) {
-      logWarn("写入 Codex 启动器失败", `${dir}: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  // Last resort: invoke via absolute node + js (stored as a one-line cmd in temp).
+  const launcher = path.join(prefix, "codex.cmd");
   try {
-    const tempDir = path.join(app.getPath("userData"), "cli-launchers");
-    await fs.mkdir(tempDir, { recursive: true });
-    const launcher = path.join(tempDir, "codex.cmd");
-    await fs.writeFile(launcher, body, "utf8");
-    extraWindowsPathDirs = [...new Set([...extraWindowsPathDirs, tempDir])];
-    cachedWindowsPath = null;
-    return launcher;
-  } catch {
-    return null;
-  }
+    const text = await fs.readFile(launcher, "utf8");
+    const entry = codexWindowsNpmShimEntry(launcher, text);
+    return entry?.toLowerCase() === entryJs.toLowerCase() ? launcher : null;
+  } catch { return null; }
 }
 
 async function findOnWindowsPath(command: string): Promise<string | null> {
@@ -3086,27 +3098,32 @@ async function runWindowsCommand(
 ): Promise<void> {
   if (process.platform !== "win32") throw new Error("runWindowsCommand is Windows-only");
   await applyWindowsPathToProcess();
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(process.env.ComSpec ?? "cmd.exe", windowsCmdArguments(command, args), {
-      windowsHide: true,
-      windowsVerbatimArguments: true,
-      env: process.env,
-      cwd: os.homedir()
+  // Run npm through node when possible: structured arguments preserve spaces in
+  // --prefix and avoid cmd quoting/expansion on fresh Windows installations.
+  let executable = command;
+  let commandArgs = args;
+  if (/npm\.cmd$/i.test(command)) {
+    const npmDir = path.dirname(normalizeWindowsCommandPath(command));
+    const npmCli = path.join(npmDir, "node_modules", "npm", "bin", "npm-cli.js");
+    const node = await findOnWindowsPath("node.exe");
+    if (node && await pathExists(npmCli)) {
+      executable = node;
+      commandArgs = [npmCli, ...args];
+    }
+  }
+  let combined = "";
+  try {
+    await execFileWithTreeKill(executable, commandArgs, {
+      timeoutMs: 5 * 60_000, env: process.env, cwd: os.homedir(), maxBuffer: 2 * 1024 * 1024,
+      onOutput: (text) => {
+        combined = `${combined}${text}`.slice(-4_000);
+        onChunk?.(combined);
+      }
     });
-    let combined = "";
-    const handleChunk = (buf: Buffer) => {
-      const text = buf.toString("utf8");
-      combined = `${combined}${text}`.slice(-4_000);
-      onChunk?.(combined);
-    };
-    child.stdout?.on("data", handleChunk);
-    child.stderr?.on("data", handleChunk);
-    child.once("error", (error) => reject(error));
-    child.once("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(combined.trim() || `命令失败，退出码 ${code ?? "unknown"}`));
-    });
-  });
+  } catch (error) {
+    const result = error as { stdout?: string; stderr?: string; message?: string };
+    throw new Error(combined.trim() || `${result.stdout || ""}${result.stderr || ""}`.trim() || result.message || "npm 安装失败");
+  }
 }
 
 /** Visible console from Electron GUI on Windows (WScript is more reliable than cmd start). */
@@ -3229,7 +3246,8 @@ async function installCodexOnWindows(): Promise<void> {
   const nodeCmd = (await findOnWindowsPath("node.exe")) ?? (await findOnWindowsPath("node"));
   const nodeVersionText = nodeCmd ? await commandVersion(nodeCmd, ["--version"]) : null;
   const nodeMajor = parseNodeMajorVersion(nodeVersionText);
-  if (nodeMajor !== null && nodeMajor < 16) {
+  if (nodeMajor === null) throw new Error("未检测到可用的 Node.js，请先完成 Node.js 安装并点击「重新检测」。");
+  if (nodeMajor < 16) {
     throw new Error(
       `当前 Node.js ${nodeVersionText || nodeMajor} 过旧。Codex CLI 需要 Node.js ≥ 16（建议 20 LTS）。\n请先点「一键安装」升级 Node，或从 https://nodejs.org 安装后再试。`
     );
@@ -3237,136 +3255,70 @@ async function installCodexOnWindows(): Promise<void> {
 
   await rememberNpmGlobalDirs(npm);
 
-  const userNpmPrefix = path.join(process.env.APPDATA || os.homedir(), "npm");
-  try {
-    await fs.mkdir(userNpmPrefix, { recursive: true });
-  } catch {
-    // ignore
-  }
-
-  // Orphan shims (codex.cmd exists but package files missing) cause MODULE_NOT_FOUND.
-  // Always uninstall first so npm cannot report "changed 2 packages" while leaving a broken tree.
-  updateState({ detail: "正在清理旧的 Codex 全局安装…" });
-  try {
-    await runWindowsCommand(npm, ["uninstall", "-g", "@openai/codex"], (log) => {
-      const tail = log.replace(/\r/g, "").split("\n").filter(Boolean).slice(-3).join(" | ");
-      if (tail) updateState({ detail: `正在清理旧的 Codex… ${tail}` });
-    });
-  } catch {
-    // not installed yet — fine
-  }
-  // Also drop stale AppData shims that npm uninstall may leave behind.
-  for (const stale of [
-    path.join(userNpmPrefix, "codex"),
-    path.join(userNpmPrefix, "codex.cmd"),
-    path.join(userNpmPrefix, "node_modules", "@openai", "codex")
-  ]) {
-    try {
-      await fs.rm(stale, { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
-  }
-
-  const installOnce = async (force: boolean): Promise<void> => {
-    // Pin official registry + user prefix so package and shim land in the same tree.
-    // npmmirror / Program Files prefix splits are a common MODULE_NOT_FOUND cause on Win10.
-    const args = [
-      "install",
-      "-g",
-      ...(force ? ["--force"] : []),
-      "--registry=https://registry.npmjs.org/",
-      `--prefix=${userNpmPrefix}`,
-      CODEX_INSTALL_PACKAGE
-    ];
-    updateState({ detail: `正在安装 ${CODEX_INSTALL_PACKAGE}${force ? "（强制）" : ""}…\nprefix: ${userNpmPrefix}` });
+  const userNpmPrefix = path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "npm");
+  await fs.mkdir(userNpmPrefix, { recursive: true });
+  // Keep package files, official shims and verification in the same user prefix.
+  // Explicit flags override npmrc settings that omit the native optional binary
+  // or suppress bin links; no uninstall or --force is needed for normal updates.
+  const args = [
+    "install", "-g", "--registry=https://registry.npmjs.org/", `--prefix=${userNpmPrefix}`,
+    "--include=optional", "--bin-links=true", CODEX_INSTALL_PACKAGE
+  ];
+  updateState({ detail: `正在安装 ${CODEX_INSTALL_PACKAGE}…\n安装目录：${userNpmPrefix}` });
+  await withCodexWindowsNpmShimRepair(userNpmPrefix, async () => {
     await runWindowsCommand(npm, args, (log) => {
       const tail = log.replace(/\r/g, "").split("\n").filter(Boolean).slice(-4).join(" | ");
       updateState({ detail: `正在安装 Codex CLI… ${tail}` });
     });
-  };
+  });
 
-  await installOnce(false);
-  let packageOk = await npmGlobalCodexPackageComplete(npm);
-  if (!packageOk) {
-    // Retry without custom prefix in case the machine forbids writing there.
-    logWarn("Codex 用户 prefix 安装不完整，改用默认 prefix 重试");
-    updateState({ detail: "用户目录安装不完整，改用默认 npm 全局目录重试…" });
-    try {
-      await runWindowsCommand(npm, ["uninstall", "-g", "@openai/codex"]);
-    } catch {
-      // ignore
-    }
-    const args = ["install", "-g", "--force", "--registry=https://registry.npmjs.org/", CODEX_INSTALL_PACKAGE];
-    await runWindowsCommand(npm, args, (log) => {
-      const tail = log.replace(/\r/g, "").split("\n").filter(Boolean).slice(-4).join(" | ");
-      updateState({ detail: `正在强制安装 Codex CLI… ${tail}` });
-    });
-    packageOk = await npmGlobalCodexPackageComplete(npm);
-  }
-
-  const launcher = await ensureCodexWindowsLauncher(npm, nodeCmd);
-  if (launcher) {
-    codexCommand = normalizeWindowsCommandPath(launcher);
-    logInfo("Codex 启动器已修复", launcher);
-  }
-
+  extraWindowsPathDirs = [userNpmPrefix, ...extraWindowsPathDirs.filter((dir) => dir !== userNpmPrefix)];
+  clearEngineBinaryCache();
   const globalDirs = await rememberNpmGlobalDirs(npm);
   logInfo("npm 全局目录", globalDirs.join(" | ") || "(empty)");
-  const npmRoot = await npmGlobalRoot(npm);
-  const npmPrefix = await npmGlobalPrefix(npm);
-  logInfo("npm root/prefix", `root=${npmRoot || "?"} prefix=${npmPrefix || "?"}`);
+  const npmRoot = path.join(userNpmPrefix, "node_modules");
+  const packageOk = await npmGlobalCodexPackageComplete(npm, userNpmPrefix);
+  const launcher = await ensureCodexWindowsLauncher(npm, userNpmPrefix);
+  logInfo("Codex npm 安装目录", `root=${npmRoot} prefix=${userNpmPrefix}`);
 
-  let discovered: string | null = launcher;
   let versionProbe: { version: string | null; raw: string } = { version: null, raw: "" };
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  for (let attempt = 0; launcher && attempt < 5; attempt += 1) {
     if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
     cachedWindowsPath = null;
-    discovered = launcher || await discoverCodexOnWindows();
-    if (!discovered) continue;
-    codexCommand = normalizeWindowsCommandPath(discovered);
-    versionProbe = await probeCodexVersionOutput(codexCommand);
+    versionProbe = await probeCodexVersionOutput(launcher);
     if (versionProbe.version) break;
   }
 
   const environment = await detectEnvironment();
-  // Prefer the repaired launcher for subsequent Codex app-server spawns.
-  if (launcher && versionProbe.version) {
-    codexCommand = normalizeWindowsCommandPath(launcher);
-  }
   updateState({ environment });
 
-  if (!environment.codexCompatible) {
-    const platform = await npmGlobalCodexPlatformReady(npm);
-    const entry = await resolveNpmGlobalCodexEntry(npm);
+  if (!packageOk || !launcher || !isCodexCompatibleVersion(versionProbe.version) || !environment.codexCompatible) {
+    const platform = await npmGlobalCodexPlatformReady(npm, userNpmPrefix);
+    const entry = await resolveNpmGlobalCodexEntry(npm, userNpmPrefix);
     const moduleMissing = /Cannot find module|MODULE_NOT_FOUND/i.test(versionProbe.raw);
     const hintParts = [
-      discovered
-        ? `已找到启动器：${discovered}`
+      launcher
+        ? `已找到启动器：${launcher}`
         : `未在 PATH / npm 全局目录找到 codex（已扫描：${globalDirs.join("；") || "无"}）`,
-      `npm root -g: ${npmRoot || "未知"}`,
-      `npm prefix -g: ${npmPrefix || "未知"}`,
-      entry ? `实际包入口：${entry}` : "npm root 下也没有 bin/codex.js",
+      `安装目录：${userNpmPrefix}`,
+      entry ? `实际包入口：${entry}` : `安装目录下缺少 ${path.join(npmRoot, "@openai", "codex", "bin", "codex.js")}`,
       packageOk ? "" : "全局包文件缺失（bin/codex.js 不存在）",
       moduleMissing ? "codex 启动报 MODULE_NOT_FOUND：启动器指向的路径与真实安装目录不一致" : "",
       versionProbe.raw ? `codex --version 输出：${versionProbe.raw.slice(0, 280)}` : "",
       platform.ok ? "" : platform.detail,
-      "请在 cmd 依次执行：",
-      "  npm prefix -g",
-      "  npm root -g",
-      "  dir \"%APPDATA%\\npm\\node_modules\\@openai\\codex\\bin\"",
-      "  dir \"%ProgramFiles%\\nodejs\\node_modules\\@openai\\codex\\bin\"",
-      "  npm uninstall -g @openai/codex",
-      "  npm install -g --registry=https://registry.npmjs.org/ --prefix \"%APPDATA%\\npm\" @openai/codex@latest",
-      "  codex --version"
+      "请检查网络后再次点击「一键安装」。如需手动排查，在 cmd 执行：",
+      `  npm install -g --registry=https://registry.npmjs.org/ --prefix "${userNpmPrefix}" --include=optional --bin-links=true ${CODEX_INSTALL_PACKAGE}`,
+      `  "${path.join(userNpmPrefix, "codex.cmd")}" --version`
     ].filter(Boolean);
     throw new Error(
-      environment.codexInstalled
-        ? `已安装但版本不兼容（当前 ${environment.codexVersion}，需要 ${CODEX_COMPAT_LABEL}）。`
+      versionProbe.version && !isCodexCompatibleVersion(versionProbe.version)
+        ? `已安装但版本不兼容（当前 ${versionProbe.version}，需要 ${CODEX_COMPAT_LABEL}）。`
         : `npm 安装已结束，但仍未检测到可用的 codex 命令。\n${hintParts.join("\n")}`
     );
   }
 
+  // Use the same verified CLI for app-server and login; PATH may contain an older copy.
+  if (!process.env.CODEX_COMMAND) codexCommand = normalizeWindowsCommandPath(launcher);
   updateState({ environment, detail: "Codex 安装成功，正在打开登录窗口…" });
   try {
     await openWindowsVisibleConsole([
@@ -3374,9 +3326,7 @@ async function installCodexOnWindows(): Promise<void> {
       "echo   AnytimeVibe - codex login",
       "echo ============================================",
       "echo.",
-      "where codex",
-      "echo.",
-      "call codex login",
+      `call "${normalizeWindowsCommandPath(codexCommand)}" login`,
       "echo.",
       "echo Login finished. Close this window and return to AnytimeVibe."
     ]);
@@ -7303,23 +7253,30 @@ function getEngineMaintenance(): EngineMaintenance {
       let rawOutputTail = "";
       let lastReportedAt = 0;
       for (const step of steps) {
-        await execFileWithTreeKill(step.command, step.args, {
-          timeoutMs: 5 * 60_000,
-          env,
-          cwd: step.cwd || os.homedir(),
-          maxBuffer: 2 * 1024 * 1024,
-          onOutput: (chunk) => {
-            // Keep raw chunks together so a credential split across chunks still
-            // retains its prefix when redacted. Only the sanitized tail is shown.
-            rawOutputTail = `${rawOutputTail}${chunk}`.slice(-64_000);
-            const outputTail = sanitizeEngineMaintenanceDetail(rawOutputTail).slice(-700);
-            const now = Date.now();
-            if (!outputTail || now - lastReportedAt < 900) return;
-            lastReportedAt = now;
-            updateState({ detail: `${engine} CLI 升级中… ${outputTail.slice(-260)}` });
-            onOutput(outputTail);
-          }
-        });
+        const runStep = async () => {
+          await execFileWithTreeKill(step.command, step.args, {
+            timeoutMs: 5 * 60_000,
+            env,
+            cwd: step.cwd || os.homedir(),
+            maxBuffer: 2 * 1024 * 1024,
+            onOutput: (chunk) => {
+              // Keep raw chunks together so a credential split across chunks still
+              // retains its prefix when redacted. Only the sanitized tail is shown.
+              rawOutputTail = `${rawOutputTail}${chunk}`.slice(-64_000);
+              const outputTail = sanitizeEngineMaintenanceDetail(rawOutputTail).slice(-700);
+              const now = Date.now();
+              if (!outputTail || now - lastReportedAt < 900) return;
+              lastReportedAt = now;
+              updateState({ detail: `${engine} CLI 升级中… ${outputTail.slice(-260)}` });
+              onOutput(outputTail);
+            }
+          });
+        };
+        if (engine === "codex" && process.platform === "win32" && target.installation.kind === "npm") {
+          await withCodexWindowsNpmShimRepair(target.installation.prefix, runStep);
+        } else {
+          await runStep();
+        }
       }
     },
     reload: async (engine) => {

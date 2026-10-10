@@ -11,6 +11,16 @@ afterEach(async () => {
 });
 
 describe("coding CLI upgrade commands", () => {
+  it("installs Codex's native platform dependency and command shims even when npmrc disables them", () => {
+    expect(buildEngineUpgradeSteps({
+      engine: "codex", platform: "win32", binary: "C:\\npm\\codex.cmd", version: "0.162.1",
+      installation: { kind: "npm", command: "C:\\Node\\npm.cmd", prefix: "C:\\npm" }
+    })).toEqual([{
+      command: "C:\\Node\\npm.cmd",
+      args: ["install", "-g", "--registry=https://registry.npmjs.org/", "--prefix=C:\\npm", "--include=optional", "--bin-links=true", "@openai/codex@0.162.1"]
+    }]);
+  });
+
   it("uses the official Pi package in the existing npm prefix", () => {
     expect(buildEngineUpgradeSteps({
       engine: "pi", platform: "win32", binary: "C:\\Tools\\npm\\pi.cmd",

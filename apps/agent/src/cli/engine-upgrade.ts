@@ -54,7 +54,11 @@ export function buildEngineUpgradeSteps(target: EngineUpgradeTarget): EngineUpgr
     : [];
   const steps: EngineUpgradeStep[] = [{
     command: installation.command,
-    args: ["install", "-g", "--registry=https://registry.npmjs.org/", ...prefixArgs, ...(engine === "pi" ? ["--ignore-scripts"] : []), packageSpec]
+    args: [
+      "install", "-g", "--registry=https://registry.npmjs.org/", ...prefixArgs,
+      ...(engine === "codex" && target.platform === "win32" ? ["--include=optional", "--bin-links=true"] : []),
+      ...(engine === "pi" ? ["--ignore-scripts"] : []), packageSpec
+    ]
   }];
   if (engine === "claude" && installation.repairScript && installation.nodeCommand) {
     steps.push({
