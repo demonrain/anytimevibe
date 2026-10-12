@@ -10,6 +10,7 @@ import { registerAdminRoutes, resolveRegistrationPolicy } from "./admin.js";
 import { loadConfig } from "./config.js";
 import { createDatabase, ensureSchema, type Database } from "./db.js";
 import { hashPassword, hashToken, openSecret, randomToken, safeEqual, sealSecret, verifyPassword } from "./security.js";
+import { registerAgentUpdateConfigRoute, registerUpdateRelayRoutes } from "./update-relay.js";
 
 const SESSION_COOKIE = "av_session";
 const SESSION_DAYS = 30;
@@ -279,7 +280,28 @@ async function main(): Promise<void> {
     };
   });
 
-  app.get("/api/agent/config", async () => ({ updateFeedUrl: config.UPDATE_FEED_URL ?? null }));
+  registerAgentUpdateConfigRoute(app, {
+    publicOrigin: config.PUBLIC_ORIGIN,
+    ...(config.UPDATE_TRANSFER_URL ? { transferUrl: config.UPDATE_TRANSFER_URL } : {}),
+    ...(config.UPDATE_FEED_URL ? { feedUrl: config.UPDATE_FEED_URL } : {}),
+    ...(config.UPDATE_PROXY_URL ? { proxyUrl: config.UPDATE_PROXY_URL } : {}),
+    ...(config.UPDATE_PROXY_TOKEN_SECRET ? { proxyTokenSecret: config.UPDATE_PROXY_TOKEN_SECRET } : {})
+  }, async (token) => {
+    const rows = await sql<Array<{ id: string }>>`
+      SELECT hosts.id FROM hosts JOIN users ON users.id = hosts.user_id
+      WHERE hosts.agent_token_hash = ${hashToken(token)} AND hosts.revoked_at IS NULL AND users.disabled_at IS NULL
+      LIMIT 1
+    `;
+    return rows[0]?.id ?? null;
+  });
+
+  registerUpdateRelayRoutes(app, {
+    publicOrigin: config.PUBLIC_ORIGIN,
+    ...(config.UPDATE_TRANSFER_URL ? { transferUrl: config.UPDATE_TRANSFER_URL } : {}),
+    ...(config.UPDATE_FEED_URL ? { feedUrl: config.UPDATE_FEED_URL } : {}),
+    ...(config.UPDATE_CACHE_DIR ? { cacheDir: config.UPDATE_CACHE_DIR } : {}),
+    ...(config.NPM_REGISTRY_ORIGIN ? { npmRegistryOrigin: config.NPM_REGISTRY_ORIGIN } : {})
+  });
 
   app.post("/api/setup", { config: { rateLimit: { max: isProd ? 5 : 50, timeWindow: "15 minutes" } } }, async (request, reply) => {
     const body = setupBody.parse(request.body);

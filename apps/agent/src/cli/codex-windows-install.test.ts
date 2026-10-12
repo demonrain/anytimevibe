@@ -8,6 +8,8 @@ import { CODEX_COMPAT_LABEL, CODEX_INSTALL_PACKAGE, isCodexCompatibleVersion } f
 import { normalizeWindowsCommandPath } from "../windows-command";
 import { execFileWithTreeKill } from "./exec-file-tree-kill";
 import { buildEngineUpgradeSteps } from "./engine-upgrade";
+import { createEngineUpdateOutputRedactor } from "./update-network";
+import { sanitizeEngineMaintenanceDetail } from "./engine-maintenance";
 
 // Exercise the installation and discovery functions without launching Electron.
 const source = createSourceFile("main.ts", readFileSync(path.resolve("apps/agent/src/main.ts"), "utf8"), ScriptTarget.Latest, true);
@@ -241,6 +243,11 @@ describe("Windows Codex upgrades", () => {
       }),
       buildEngineUpgradeSteps,
       collectLocalProxyEnv: async () => ({}), mergeProxyIntoEnv: () => ({}),
+      refreshAgentUpdateNetwork: async () => {},
+      buildEngineMaintenanceNetworkEnv: (env: NodeJS.ProcessEnv) => env,
+      createEngineUpdateOutputRedactor,
+      sanitizeEngineMaintenanceDetail,
+      redactEngineUpdateOutput: (text: string) => text,
       execFileWithTreeKill: async (npm: string, args: string[]) => { await f.context.runWindowsCommand(npm, args); }
     });
     const factory = productionFunction("getEngineMaintenance").runInNewContext(context) as () => {

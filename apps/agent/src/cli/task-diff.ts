@@ -11,6 +11,32 @@ const engineDiffChunks = new Map<string, string[]>();
 const gitDiffBaselines = new Map<string, string>();
 const fileBaselines = new Map<string, Map<string, string | null>>();
 
+/** Read the branch associated with a task directory, if it is inside a Git worktree. */
+export async function readGitBranch(cwd: string | undefined | null): Promise<string | undefined> {
+  const root = String(cwd ?? "").trim();
+  if (!root) return undefined;
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", root, "symbolic-ref", "--quiet", "--short", "HEAD"], {
+      windowsHide: true,
+      timeout: 5_000,
+      maxBuffer: 32_000
+    });
+    return stdout.trim() || undefined;
+  } catch {
+    try {
+      const { stdout: sha } = await execFileAsync("git", ["-C", root, "rev-parse", "--short", "HEAD"], {
+        windowsHide: true,
+        timeout: 5_000,
+        maxBuffer: 32_000
+      });
+      const shortSha = sha.trim();
+      return shortSha ? `detached @ ${shortSha}` : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
 export function clearEngineDiffChunks(threadId: string): void {
   engineDiffChunks.delete(threadId);
 }

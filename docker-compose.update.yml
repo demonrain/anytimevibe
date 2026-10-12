@@ -1,0 +1,45 @@
+services:
+  update-transfer:
+    image: anytimevibe-relay:updates
+    container_name: anytimevibe-update-transfer
+    command: ["node", "apps/relay/dist/update-transfer.js"]
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 8788
+      HOST: 0.0.0.0
+      PUBLIC_ORIGIN: https://${UPDATE_DOMAIN:-updates.demonrain.top}
+      UPDATE_TRANSFER_URL: https://${UPDATE_DOMAIN:-updates.demonrain.top}
+      UPDATE_FEED_URL: ${UPDATE_FEED_URL:-https://github.com/demonrain/anytimevibe/releases/latest/download}
+      NPM_REGISTRY_ORIGIN: ${NPM_REGISTRY_ORIGIN:-https://registry.npmjs.org}
+      UPDATE_CACHE_DIR: /app/apps/relay/data/update-cache
+    volumes:
+      - update-cache:/app/apps/relay/data/update-cache
+    networks:
+      - traefik-net
+
+  # Enable only after a valid certificate/key and shared secret have been provisioned.
+  update-proxy:
+    profiles: ["native-proxy"]
+    build:
+      context: .
+      dockerfile: apps/relay/Dockerfile
+    command: ["node", "apps/relay/dist/update-proxy-server.js"]
+    restart: unless-stopped
+    environment:
+      UPDATE_PROXY_BIND: 0.0.0.0
+      UPDATE_PROXY_PORT: 9443
+      UPDATE_PROXY_TOKEN_SECRET: ${UPDATE_PROXY_TOKEN_SECRET:-}
+      UPDATE_PROXY_TLS_CERT: /certs/fullchain.pem
+      UPDATE_PROXY_TLS_KEY: /certs/privkey.pem
+    ports:
+      - "9443:9443"
+    volumes:
+      - ${UPDATE_PROXY_CERT_DIR:-./update-proxy-certs}:/certs:ro
+
+volumes:
+  update-cache:
+
+networks:
+  traefik-net:
+    external: true

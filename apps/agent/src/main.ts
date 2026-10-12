@@ -80,7 +80,7 @@ import { isCodexModelsManagerNoise } from "./cli/log-noise";
 import { importLocalCliSessions, sanitizeTranscriptMessages } from "./cli/import-sessions";
 import { discoverEngineCapabilities, clearCodexDebugModelsCache, type EngineCapability } from "./cli/model-catalog";
 import { startEngineConfigWatch } from "./cli/engine-config-watch";
-import { appendEngineDiffChunk, buildTurnDiff, captureTurnDiffBaseline, clearEngineDiffChunks, extractFileChangeDiff } from "./cli/task-diff";
+import { appendEngineDiffChunk, buildTurnDiff, captureTurnDiffBaseline, clearEngineDiffChunks, extractFileChangeDiff, readGitBranch } from "./cli/task-diff";
 import { TaskStore } from "./cli/task-store";
 import { CodexThreadRegistry } from "./cli/codex-threads";
 import { normalizeCliEngine, isHeadlessCliEngine, type BackendStreamEvent } from "./cli/types";
@@ -90,6 +90,11 @@ import { assertCodexLocalGatewayReady, readCodexCredentialFingerprint, repairCod
 import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt, filterMacLoginPathSegment, safePathExists } from "./cli/macos-fs";
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyClearShellLines, applyProcessProxyEnv, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
+import { summarizeTaskTitle } from "./cli/task-title";
+import { resolveUpdateFeedUrl } from "./cli/update-feed";
+import { listTaskDirectories, resolveTaskDirectory, taskDirectoryRoots } from "./cli/task-directory";
+import { fetchAgentUpdateConfig, type AgentUpdateConfig } from "./cli/update-config";
+import { buildEngineMaintenanceNetworkEnv, configureEngineUpdateNetwork, createEngineUpdateOutputRedactor, npmUpdateRegistryCandidates, redactEngineUpdateOutput } from "./cli/update-network";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_RELAY_URL = "https://vibe.demonrain.top";
@@ -130,6 +135,8 @@ type AgentConfig = {
   pairing?: StoredPairing;
   workspaces: Workspace[];
   workspaceBookmarks?: Record<string, string>;
+  /** OS folder consent for per-task directories; independent of the legacy workspace list. */
+  directoryBookmarks?: Record<string, string>;
   sequence: number;
   processedCommandIds?: Record<string, number>;
   /** Undelivered push hints, flushed to the relay on reconnect. */
@@ -172,6 +179,7 @@ type AgentTask = {
   status: string;
   updatedAt: number;
   engine?: CliEngine;
+  gitBranch?: string;
 };
 
 type ActivityState = {
@@ -1259,13 +1267,15 @@ function touchAgentTask(threadId: string, patch: Partial<AgentTask> = {}): void 
   const existing = publicState.tasks.find((item) => item.threadId === threadId);
   const stored = taskStore.get(threadId);
   const engine = patch.engine || existing?.engine || stored?.engine;
+  const gitBranch = "gitBranch" in patch ? patch.gitBranch : (stored?.gitBranch || existing?.gitBranch);
   const task: AgentTask = {
     threadId,
     title: patch.title || existing?.title || stored?.title || "远程任务",
     cwd: preferTaskCwd(patch.cwd, existing?.cwd, stored?.cwd),
     status: patch.status || existing?.status || stored?.status || "active",
     updatedAt: now,
-    ...(engine ? { engine } : {})
+    ...(engine ? { engine } : {}),
+    ...(gitBranch ? { gitBranch } : {})
   };
   updateState({
     tasks: [task, ...publicState.tasks.filter((item) => item.threadId !== threadId)]
@@ -1482,7 +1492,6 @@ function rebuildTray(): void {
     { label: `状态：${publicState.status}`, enabled: false },
     { label: `名称：${resolvedDisplayName()}`, enabled: false },
     { label: "打开控制面板", click: () => showWindow() },
-    { label: "添加工作区", click: () => addWorkspace() },
     { label: "重新连接", click: () => connect().catch(handleError) },
     { type: "separator" },
     { label: "退出", click: () => app.quit() }
@@ -1724,11 +1733,11 @@ function rendererHtml(): string {
   .update-progress{flex:1 1 100%;height:6px;border-radius:999px;background:rgba(23,33,27,.1);overflow:hidden;margin-top:2px}
   .update-progress>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#2d7653,#3bab70);transition:width .2s ease}
   .pair{font:900 28px/1 monospace;letter-spacing:.18em;text-align:center;color:#e25832;margin:8px 0 4px;padding-left:.18em}
-  .workspaces{display:grid;gap:5px;margin-top:7px}
-  .workspace{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px;background:#eee6d8;border-radius:8px;min-width:0}
-  .workspace div{flex:1 1 auto;min-width:0;overflow:hidden}
-  .workspace strong,.workspace small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .workspace small{color:#747a73;margin-top:1px;font-size:10px}
+  .task-rows{display:grid;gap:5px;margin-top:7px}
+  .task-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px;background:#eee6d8;border-radius:8px;min-width:0}
+  .task-row div{flex:1 1 auto;min-width:0;overflow:hidden}
+  .task-row strong,.task-row small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .task-row small{color:#747a73;margin-top:1px;font-size:10px}
   .task-main{display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 auto}
   .engine-badge{width:18px;height:18px;border-radius:5px;object-fit:cover;flex:0 0 auto;background:#fff;box-shadow:0 0 0 1px rgba(23,33,27,.08)}
   .engine-filter{display:flex;align-items:center;gap:6px;margin-top:7px;flex-wrap:wrap}
@@ -1774,7 +1783,6 @@ function rendererHtml(): string {
     <button type="button" role="tab" data-tab="guide" class="active" id="tabGuide">指引</button>
     <button type="button" role="tab" data-tab="env" id="tabEnv">环境</button>
     <button type="button" role="tab" data-tab="pair" id="tabPair">配对</button>
-    <button type="button" role="tab" data-tab="ws" id="tabWs">工作区</button>
     <button type="button" role="tab" data-tab="tasks" id="tabTasks">任务</button>
   </nav>
   <div class="scroll">
@@ -1790,9 +1798,6 @@ function rendererHtml(): string {
   </div>
   <div class="tab-panel" data-panel="pair" id="panelPair">
     <section class="card"><h2 id="pairTitle">中继与配对</h2><p class="hint" id="pairHint">保存中继地址后生成配对码，在 Web 端输入即可绑定本机。</p><div class="stack"><div class="label" id="relayLabel">中继服务器</div><div class="row"><input id="relay" placeholder="https://vibe.demonrain.top"><button id="saveRelay" class="secondary">保存</button></div><div class="row"><button id="startPair">生成配对码</button></div><div id="pairBox"></div><div class="label" id="nameLabel">客户端名称</div><div class="row"><input id="displayName" placeholder="例如：公司电脑" maxlength="64"><button id="saveName" class="secondary">保存名称</button></div></div></section>
-  </div>
-  <div class="tab-panel" data-panel="ws" id="panelWs">
-    <section class="card grow"><div class="status"><h2 id="wsTitle">允许的工作区</h2><button id="addWorkspace" class="secondary">添加目录</button></div><p class="hint" id="wsHint">只有白名单目录可被远程任务读写。至少添加一个项目路径。</p><div id="workspaces" class="workspaces"></div></section>
   </div>
   <div class="tab-panel" data-panel="tasks" id="panelTasks">
     <section class="card" id="activityBox" style="display:none"></section>
@@ -1839,17 +1844,18 @@ function rendererHtml(): string {
     return 'codex';
   }
   var I18N={
-    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',starRepo:'Star 项目',feedback:'反馈问题',logs:'日志',logTitle:'运行日志',logRefresh:'刷新',logCopy:'复制',logClear:'清空',logOpenFile:'打开文件',logClose:'关闭',logEmpty:'暂无日志',logFooter:'最近运行记录 · 便于排查连接与任务问题',logCopied:'已复制到剪贴板',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',updateCli:'升级',installCli:'一键安装',installCompat:'安装兼容版',expand:'展开',collapse:'收起',open:'接力',tabGuide:'指引',tabEnv:'环境',tabPair:'配对',tabWs:'工作区',tabTasks:'任务',guideTitle:'快速上手',guideTip:'按下面步骤完成后，即可在网页端远程下发任务到本机编码引擎。',envTitle:'本机环境',envHint:'先安装 Node（Codex 需要）与至少一个编码引擎 CLI，再去做配对。重新检测会同时查询各 CLI 是否有新版本。',pairTitle:'中继与配对',pairHint:'保存中继地址后生成配对码，在 Web 端输入即可绑定本机。',relayLabel:'中继服务器',nameLabel:'客户端名称',wsTitle:'允许的工作区',wsHint:'只有白名单目录可被远程任务读写。至少添加一个项目路径。',stepEnv:'安装前置环境',stepEnvDesc:'安装 Node.js（Codex 需要）以及 Codex / Claude / Grok / Cursor / Antigravity 中至少一个 CLI 并登录。',stepRelay:'配置中继服务器',stepRelayDesc:'确认中继地址正确并保存（默认体验站可用）。',stepPair:'生成配对码并绑定',stepPairDesc:'点击生成配对码，在网页「添加主机」中输入。码约 10 分钟有效。',stepWs:'添加工作区目录',stepWsDesc:'允许至少一个本机项目目录，远程任务才能在该路径执行。',stepReady:'开始使用',stepReadyDesc:'网页端在线后即可新建任务。本页「任务」可接力到本机终端。',goEnv:'去环境',goPair:'去配对',goWs:'去工作区',goTasks:'看任务',done:'完成',todo:'待办',onlineReady:'已在线，可在网页下发任务。'},
-    en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',starRepo:'Star',feedback:'Feedback',logs:'Logs',logTitle:'Runtime logs',logRefresh:'Refresh',logCopy:'Copy',logClear:'Clear',logOpenFile:'Open file',logClose:'Close',logEmpty:'No logs yet',logFooter:'Recent runtime events for troubleshooting',logCopied:'Copied to clipboard',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',updateCli:'Update',installCli:'Install',installCompat:'Install compatible',expand:'Expand',collapse:'Collapse',open:'Open',tabGuide:'Guide',tabEnv:'Setup',tabPair:'Pair',tabWs:'Folders',tabTasks:'Tasks',guideTitle:'Get started',guideTip:'Finish the steps below so the web app can send coding tasks to this machine.',envTitle:'Local environment',envHint:'Install Node (for Codex) and at least one coding CLI, then pair. Recheck also queries whether each CLI has a newer release.',pairTitle:'Relay & pairing',pairHint:'Save the relay URL, generate a code, and enter it on the web.',relayLabel:'Relay server',nameLabel:'Client name',wsTitle:'Allowed workspaces',wsHint:'Only allowlisted folders can be used by remote tasks. Add at least one project path.',stepEnv:'Install prerequisites',stepEnvDesc:'Install Node.js (needed for Codex) and at least one of Codex / Claude / Grok / Cursor / Antigravity CLI, then sign in.',stepRelay:'Configure relay',stepRelayDesc:'Confirm and save the relay URL (public demo works by default).',stepPair:'Pair with the web app',stepPairDesc:'Generate a pairing code and enter it under Add host on the web. Codes expire in ~10 minutes.',stepWs:'Allow a workspace folder',stepWsDesc:'Add at least one local project directory for remote tasks to run in.',stepReady:'You are ready',stepReadyDesc:'When online, create tasks from the web. Use Tasks here to hand off to a local terminal.',goEnv:'Setup',goPair:'Pair',goWs:'Folders',goTasks:'Tasks',done:'Done',todo:'Todo',onlineReady:'Online — send tasks from the web.'}
+    'zh-CN':{brand:'随码',tag:'随时续上你的代码 · '+platformLabel,authorStrong:'随码 AnytimeVibe',authorLine:'作者 · demonrain · 开源项目',starRepo:'Star 项目',feedback:'反馈问题',logs:'日志',logTitle:'运行日志',logRefresh:'刷新',logCopy:'复制',logClear:'清空',logOpenFile:'打开文件',logEmpty:'暂无日志',logFooter:'最近运行记录 · 便于排查连接与任务问题',logCopied:'已复制到剪贴板',search:'搜索任务标题 / 路径 / 状态',relay:'任务接力',noTask:'暂无可接力任务',noMatch:'没有匹配的任务',latest:'已是最新',checking:'检查中',available:'发现新版本',downloading:'下载中',ready:'更新就绪',error:'更新失败',checkUpdate:'检查更新',installUpdate:'重启并更新',updateCli:'升级',installCli:'一键安装',installCompat:'安装兼容版',expand:'展开',collapse:'收起',open:'接力',tabGuide:'指引',tabEnv:'环境',tabPair:'配对',tabTasks:'任务',guideTitle:'快速上手',guideTip:'按下面步骤完成后，即可在网页端远程下发任务到本机编码引擎。',envTitle:'本机环境',envHint:'先安装 Node（Codex 需要）与至少一个编码引擎 CLI，再去做配对。重新检测会同时查询各 CLI 是否有新版本。',pairTitle:'中继与配对',pairHint:'保存中继地址后生成配对码，在 Web 端输入即可绑定本机。',relayLabel:'中继服务器',nameLabel:'客户端名称',stepEnv:'安装前置环境',stepEnvDesc:'安装 Node.js（Codex 需要）以及 Codex / Claude / Grok / Cursor / Antigravity 中至少一个 CLI 并登录。',stepRelay:'配置中继服务器',stepRelayDesc:'确认中继地址正确并保存（默认体验站可用）。',stepPair:'生成配对码并绑定',stepPairDesc:'点击生成配对码，在网页「添加主机」中输入。码约 10 分钟有效。',stepReady:'开始使用',stepReadyDesc:'网页端在线后即可新建任务。本页「任务」可接力到本机终端。',goEnv:'去环境',goPair:'去配对',goTasks:'看任务',done:'完成',todo:'待办',onlineReady:'已在线，可在网页下发任务。'},
+    en:{brand:'AnytimeVibe',tag:'Pick up your code · '+platformLabel,authorStrong:'AnytimeVibe',authorLine:'Author · demonrain · open source',starRepo:'Star',feedback:'Feedback',logs:'Logs',logTitle:'Runtime logs',logRefresh:'Refresh',logCopy:'Copy',logClear:'Clear',logOpenFile:'Open file',logClose:'Close',logEmpty:'No logs yet',logFooter:'Recent runtime events for troubleshooting',logCopied:'Copied to clipboard',search:'Search title / path / status',relay:'Task handoff',noTask:'No tasks yet',noMatch:'No matches',latest:'Up to date',checking:'Checking',available:'Update available',downloading:'Downloading',ready:'Ready to install',error:'Update failed',checkUpdate:'Check update',installUpdate:'Restart & install',updateCli:'Update',installCli:'Install',installCompat:'Install compatible',expand:'Expand',collapse:'Collapse',open:'Open',tabGuide:'Guide',tabEnv:'Setup',tabPair:'Pair',tabTasks:'Tasks',guideTitle:'Get started',guideTip:'Finish the steps below so the web app can send coding tasks to this machine.',envTitle:'Local environment',envHint:'Install Node (for Codex) and at least one coding CLI, then pair. Recheck also queries whether each CLI has a newer release.',pairTitle:'Relay & pairing',pairHint:'Save the relay URL, generate a code, and enter it on the web.',relayLabel:'Relay server',nameLabel:'Client name',stepEnv:'Install prerequisites',stepEnvDesc:'Install Node.js (needed for Codex) and at least one of Codex / Claude / Grok / Cursor / Antigravity CLI, then sign in.',stepRelay:'Configure relay',stepRelayDesc:'Confirm and save the relay URL (public demo works by default).',stepPair:'Pair with the web app',stepPairDesc:'Generate a pairing code and enter it under Add host on the web. Codes expire in ~10 minutes.',stepReady:'You are ready',stepReadyDesc:'When online, create tasks from the web. Use Tasks here to hand off to a local terminal.',goEnv:'Setup',goPair:'Pair',goTasks:'Tasks',done:'Done',todo:'Todo',onlineReady:'Online — send tasks from the web.'}
   };
   // Keep the setup checklist aligned with all supported coding engines.
+  I18N['zh-CN'].logClose='关闭';
   I18N['zh-CN'].stepEnvDesc=I18N['zh-CN'].stepEnvDesc.replace('Antigravity','Antigravity / Pi');
   I18N.en.stepEnvDesc=I18N.en.stepEnvDesc.replace('Antigravity CLI','Antigravity / Pi CLI');
   var locale=(function(){try{return localStorage.getItem('anytimevibe-locale')==='en'?'en':'zh-CN';}catch(e){return 'zh-CN';}})();
   function t(key){return (I18N[locale]&&I18N[locale][key])||I18N.en[key]||key}
   var activeTab=(function(){try{return localStorage.getItem('anytimevibe-tab')||'guide';}catch(e){return 'guide';}})();
   function setActiveTab(name){
-    activeTab=name||'guide';
+    activeTab=(name==='ws'?'guide':(name||'guide'));
     try{localStorage.setItem('anytimevibe-tab',activeTab);}catch(e){}
     document.querySelectorAll('.nav-tabs [data-tab]').forEach(function(btn){
       btn.classList.toggle('active',btn.getAttribute('data-tab')===activeTab);
@@ -1877,7 +1883,6 @@ function rendererHtml(): string {
     if(el=document.querySelector('#tabGuide')) el.textContent=t('tabGuide');
     if(el=document.querySelector('#tabEnv')) el.textContent=t('tabEnv');
     if(el=document.querySelector('#tabPair')) el.textContent=t('tabPair');
-    if(el=document.querySelector('#tabWs')) el.textContent=t('tabWs');
     if(el=document.querySelector('#tabTasks')) el.textContent=t('tabTasks');
     if(el=document.querySelector('#detailOpenLogs')) el.textContent=locale==='en'?'Open logs':'查看日志';
     if(el=document.querySelector('#detailDismiss')) el.textContent=locale==='en'?'Dismiss':'收起';
@@ -1889,8 +1894,6 @@ function rendererHtml(): string {
     if(el=document.querySelector('#pairHint')) el.textContent=t('pairHint');
     if(el=document.querySelector('#relayLabel')) el.textContent=t('relayLabel');
     if(el=document.querySelector('#nameLabel')) el.textContent=t('nameLabel');
-    if(el=document.querySelector('#wsTitle')) el.textContent=t('wsTitle');
-    if(el=document.querySelector('#wsHint')) el.textContent=t('wsHint');
     if(el=document.querySelector('#langZh')) el.classList.toggle('active',locale==='zh-CN');
     if(el=document.querySelector('#langEn')) el.classList.toggle('active',locale==='en');
   }
@@ -1904,7 +1907,6 @@ function rendererHtml(): string {
   var displayName=document.querySelector('#displayName');
   var pairBox=document.querySelector('#pairBox');
   var startPair=document.querySelector('#startPair');
-  var workspaces=document.querySelector('#workspaces');
   var meta=document.querySelector('#meta');
   var environment=document.querySelector('#environment');
   var updateBox=document.querySelector('#updateBox');
@@ -1946,13 +1948,12 @@ function rendererHtml(): string {
     var hasRelay=!!(state.relayUrl&&String(state.relayUrl).trim());
     var paired=!!state.hostId||state.status==='online'||state.status==='connecting';
     var online=state.status==='online';
-    var hasWs=!!(state.workspaces&&state.workspaces.length);
+    // Task directories are selected per task in the web app.
     var steps=[
       {id:'env',done:anyEngine,title:t('stepEnv'),desc:t('stepEnvDesc'),action:'env',actionLabel:t('goEnv')},
       {id:'relay',done:hasRelay,title:t('stepRelay'),desc:t('stepRelayDesc'),action:'pair',actionLabel:t('goPair')},
       {id:'pair',done:paired,title:t('stepPair'),desc:t('stepPairDesc'),action:'pair',actionLabel:t('goPair')},
-      {id:'ws',done:hasWs,title:t('stepWs'),desc:t('stepWsDesc'),action:'ws',actionLabel:t('goWs')},
-      {id:'ready',done:online&&hasWs&&anyEngine,title:t('stepReady'),desc:online?t('onlineReady'):t('stepReadyDesc'),action:'tasks',actionLabel:t('goTasks')}
+      {id:'ready',done:online&&anyEngine,title:t('stepReady'),desc:online?t('onlineReady'):t('stepReadyDesc'),action:'tasks',actionLabel:t('goTasks')}
     ];
     var currentIdx=steps.findIndex(function(s){return !s.done;});
     if(currentIdx<0) currentIdx=steps.length-1;
@@ -1974,7 +1975,7 @@ function rendererHtml(): string {
         var stored=localStorage.getItem('anytimevibe-tab');
         if(!stored){
           var first=steps.find(function(s){return !s.done;});
-          if(first&&first.action) setActiveTab(first.action==='env'||first.action==='pair'||first.action==='ws'||first.action==='tasks'?first.action:'guide');
+          if(first&&first.action) setActiveTab(first.action==='env'||first.action==='pair'||first.action==='tasks'?first.action:'guide');
           else setActiveTab('guide');
         }
       }catch(e){}
@@ -2071,12 +2072,6 @@ function rendererHtml(): string {
       var anyEngineReady=env.codexCompatible||engines.some(function(item){return item.ready;});
       if(startPair) startPair.disabled=!anyEngineReady||!state.relayUrl;
       if(pairBox) pairBox.innerHTML=state.pairingCode?'<div class="pair">'+escapeHtml(state.pairingCode)+'</div><p class="detail">'+(locale==='en'?'Enter this code on the web. Expires in ~10 minutes.':'在 Web 端输入配对码，约 10 分钟后失效。')+'</p>':'';
-      if(workspaces){
-        workspaces.innerHTML=(state.workspaces&&state.workspaces.length)?state.workspaces.map(function(w){return '<div class="workspace"><div><strong>'+escapeHtml(w.name)+'</strong><small>'+escapeHtml(w.path)+'</small></div><button class="ghost" data-id="'+escapeHtml(w.id)+'">'+(locale==='en'?'Remove':'移除')+'</button></div>';}).join(''):'<div class="empty">'+(locale==='en'?'No folders allowed yet':'尚未允许任何目录')+'</div>';
-        workspaces.querySelectorAll('button[data-id]').forEach(function(button){
-          button.addEventListener('click',function(){ if(api) api.removeWorkspace(button.getAttribute('data-id')); });
-        });
-      }
       renderUpdate(state.update||{status:'idle'});
       lastActivities=state.activities&&state.activities.length?state.activities:(state.activity?[state.activity]:[]);
       selectedActivityId=state.selectedActivityThreadId||(lastActivities[0]&&lastActivities[0].threadId)||null;
@@ -2173,10 +2168,10 @@ function rendererHtml(): string {
     taskBox.innerHTML='<div class="status"><h2>'+escapeHtml(t('relay'))+'</h2><button id="toggleTasks" class="secondary">'+(tasksOpen?t('collapse'):t('expand'))+' · '+filtered.length+(q||engineFilter?'/'+lastTasks.length:'')+'</button></div>'
       +(tasksOpen?filterBar:'')
       +(tasksOpen?'<div class="stack" style="margin-top:7px"><input id="taskSearch" placeholder="'+escapeHtml(t('search'))+'" value="'+escapeHtml(taskQuery)+'"></div>':'')
-      +(tasksOpen?(filtered.length?'<div class="workspaces" style="margin-top:7px">'+filtered.map(function(task){
+      +(tasksOpen?(filtered.length?'<div class="task-rows" style="margin-top:7px">'+filtered.map(function(task){
           var engine=detectEngine(task);
           var when=formatActivityTime(task.updatedAt);
-          return '<div class="workspace"><div class="task-main">'+engineLogo(engine)+'<div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+' · '+escapeHtml(task.status)+(when?' · '+when:'')+'</small></div></div><button data-relay="'+escapeHtml(task.threadId)+'">'+escapeHtml(t('open'))+'</button></div>';
+          return '<div class="task-row"><div class="task-main">'+engineLogo(engine)+'<div><strong>'+escapeHtml(task.title)+'</strong><small>'+escapeHtml(task.cwd)+(task.gitBranch?' · '+escapeHtml(task.gitBranch):'')+' · '+escapeHtml(task.status)+(when?' · '+when:'')+'</small></div></div><button data-relay="'+escapeHtml(task.threadId)+'">'+escapeHtml(t('open'))+'</button></div>';
         }).join('')+'</div>':'<div class="empty">'+(q||engineFilter?t('noMatch'):t('noTask'))+'</div>'):'');
     var toggle=document.querySelector('#toggleTasks');
     if(toggle) toggle.addEventListener('click',function(){
@@ -2268,7 +2263,6 @@ function rendererHtml(): string {
     if((el=document.querySelector('#saveRelay'))&&api) el.addEventListener('click',function(){api.setRelayUrl(relay.value);});
     if((el=document.querySelector('#saveName'))&&api) el.addEventListener('click',function(){api.setDisplayName(displayName.value);});
     if(startPair&&api) startPair.addEventListener('click',function(){api.startPairing();});
-    if((el=document.querySelector('#addWorkspace'))&&api) el.addEventListener('click',function(){api.addWorkspace();});
     if((el=document.querySelector('#recheck'))&&api) el.addEventListener('click',function(){
       el.disabled=true;
       detailDismissedText='';
@@ -2379,6 +2373,7 @@ async function loadConfig(): Promise<void> {
   }
   config.workspaces ??= [];
   config.workspaceBookmarks ??= {};
+  config.directoryBookmarks ??= {};
   config.sequence ??= 0;
   config.processedCommandIds ??= {};
   const commandCutoff = Date.now() - 24 * 60 * 60 * 1000;
@@ -2397,6 +2392,7 @@ async function loadConfig(): Promise<void> {
   } else {
     config.pendingPushHints = [];
   }
+  configureEngineUpdateNetwork({ relayUrl: config.relayUrl });
   if (dirty) await saveConfig();
   publicState = {
     ...publicState,
@@ -2417,8 +2413,12 @@ function activateMacWorkspaceBookmarks(): void {
     try { stop(); } catch { /* ignore */ }
   }
   const bookmarks = config.workspaceBookmarks || {};
-  for (const workspace of config.workspaces || []) {
-    const bookmark = bookmarks[workspace.id];
+  const folders = [
+    ...(config.workspaces || []).map((workspace) => ({ path: workspace.path, bookmark: bookmarks[workspace.id] })),
+    ...Object.entries(config.directoryBookmarks || {}).map(([folderPath, bookmark]) => ({ path: folderPath, bookmark }))
+  ];
+  for (const workspace of folders) {
+    const bookmark = workspace.bookmark;
     if (!bookmark) continue;
     try {
       const stop = app.startAccessingSecurityScopedResource(bookmark) as (() => void) | undefined;
@@ -2431,6 +2431,17 @@ function activateMacWorkspaceBookmarks(): void {
   }
 }
 
+async function rememberMacDirectoryAccess(selected: string, bookmark?: string): Promise<void> {
+  if (process.platform !== "darwin") return;
+  if (bookmark) {
+    const stop = app.startAccessingSecurityScopedResource(bookmark) as (() => void) | undefined;
+    if (typeof stop === "function") macBookmarkStoppers.push(stop);
+    config.directoryBookmarks = { ...(config.directoryBookmarks || {}), [selected]: bookmark };
+  }
+  grantMacFsAccessRoot(selected);
+  if (bookmark) await saveConfig();
+}
+
 async function ensureMacFolderAccess(targetPath: string, reason: string): Promise<string> {
   const resolved = path.resolve(targetPath);
   if (process.platform !== "darwin" || !isMacTccProtectedPath(resolved)) return resolved;
@@ -2439,7 +2450,7 @@ async function ensureMacFolderAccess(targetPath: string, reason: string): Promis
     return resolved;
   }
   const result = await dialog.showOpenDialog({
-    title: "\u6388\u6743\u8bbf\u95ee\u5de5\u4f5c\u533a",
+    title: "\u6388\u6743\u8bbf\u95ee\u4efb\u52a1\u76ee\u5f55",
     message: reason || "\u9700\u8981\u6388\u6743\u8bbf\u95ee\u8be5\u6587\u4ef6\u5939\u540e\u624d\u80fd\u7ee7\u7eed",
     defaultPath: resolved,
     properties: ["openDirectory", "createDirectory"],
@@ -2450,17 +2461,12 @@ async function ensureMacFolderAccess(targetPath: string, reason: string): Promis
   }
   const selected = path.resolve(result.filePaths[0]);
   const bookmark = Array.isArray(result.bookmarks) ? result.bookmarks[0] : undefined;
-  const matched = config.workspaces.find((item) => path.resolve(item.path).toLowerCase() === selected.toLowerCase());
-  if (matched && bookmark) {
-    config.workspaceBookmarks = { ...(config.workspaceBookmarks || {}), [matched.id]: bookmark };
-    await saveConfig();
-    try {
-      const stop = app.startAccessingSecurityScopedResource(bookmark) as (() => void) | undefined;
-      if (typeof stop === "function") macBookmarkStoppers.push(stop);
-    } catch { /* ignore */ }
+  const relative = path.relative(selected, resolved);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("请选择任务目录或它的上级文件夹进行授权");
   }
-  grantMacFsAccessRoot(selected);
-  return selected;
+  await rememberMacDirectoryAccess(selected, bookmark);
+  return resolved;
 }
 
 // ---------------------------------------------------------------------------
@@ -4952,15 +4958,6 @@ async function handleRelayMessage(raw: string): Promise<void> {
   await handleCommand(command);
 }
 
-function isAllowedWorkspace(requestedPath: string): boolean {
-  const requested = path.resolve(requestedPath).toLowerCase();
-  return config.workspaces.some((workspace) => {
-    const root = path.resolve(workspace.path).toLowerCase();
-    const relative = path.relative(root, requested);
-    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-  });
-}
-
 /** Always persist/publish absolute task working directories (subdir under a workspace stays the full path). */
 function resolveAbsoluteCwd(cwd: string | undefined | null, fallback = ""): string {
   const raw = String(cwd ?? "").trim();
@@ -4972,15 +4969,33 @@ function resolveAbsoluteCwd(cwd: string | undefined | null, fallback = ""): stri
   }
 }
 
-/** Prefer the more specific absolute path when merging snapshot vs local store. */
+/** Resolve symlinks for task display/execution while retaining a usable path if it disappeared. */
+async function normalizeTaskCwd(cwd: string | undefined | null, fallback = ""): Promise<string> {
+  const absolute = resolveAbsoluteCwd(cwd, fallback);
+  if (!absolute) return "";
+  if (!canProbePathWithoutPrompt(absolute, workspaceAllowRoots())) return absolute;
+  return fs.realpath(absolute).catch(() => absolute);
+}
+
+const gitBranchCache = new Map<string, { value: string | undefined; checkedAt: number }>();
+async function taskGitBranch(cwd: string): Promise<string | undefined> {
+  const absolute = resolveAbsoluteCwd(cwd);
+  if (!absolute || !canProbePathWithoutPrompt(absolute, workspaceAllowRoots())) return undefined;
+  const key = process.platform === "win32" ? absolute.toLowerCase() : absolute;
+  const cached = gitBranchCache.get(key);
+  if (cached && Date.now() - cached.checkedAt < 15_000) return cached.value;
+  const value = await readGitBranch(cwd);
+  gitBranchCache.set(key, { value, checkedAt: Date.now() });
+  return value;
+}
+
+/** Callers pass the current/native cwd first; other paths only fill a missing value. */
 function preferTaskCwd(...candidates: Array<string | undefined | null>): string {
-  const resolved = candidates
-    .map((item) => resolveAbsoluteCwd(item))
-    .filter(Boolean);
-  if (!resolved.length) return "";
-  // Longer path wins when one is a parent of another (workspace root vs task subdir).
-  resolved.sort((left, right) => right.length - left.length);
-  return resolved[0]!;
+  for (const candidate of candidates) {
+    const absolute = resolveAbsoluteCwd(candidate);
+    if (absolute) return absolute;
+  }
+  return "";
 }
 
 /** Remove credentials and query secrets before an endpoint is sent to the Web UI. */
@@ -5359,9 +5374,15 @@ async function publishStoredTaskSnapshot(
     await hideCodexSubagentTask(task.providerSessionId || threadId);
     return;
   }
-  const cwd = resolveAbsoluteCwd(task.cwd);
+  const cwd = await normalizeTaskCwd(task.cwd);
   if (cwd && task.cwd !== cwd) {
     task.cwd = cwd;
+    await taskStore.upsert(task);
+  }
+  const gitBranch = cwd ? await taskGitBranch(cwd) : undefined;
+  if (task.gitBranch !== gitBranch) {
+    if (gitBranch) task.gitBranch = gitBranch;
+    else delete task.gitBranch;
     await taskStore.upsert(task);
   }
   const messages = sanitizeTranscriptMessages(task.messages);
@@ -5383,7 +5404,8 @@ async function publishStoredTaskSnapshot(
     cwd,
     status: publishStatus,
     updatedAt: task.updatedAt,
-    engine: task.engine
+    engine: task.engine,
+    ...(gitBranch ? { gitBranch } : {})
   };
   updateState({
     tasks: [agentTask, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)]
@@ -5398,6 +5420,7 @@ async function publishStoredTaskSnapshot(
     title: task.title,
     cwd,
     status: publishStatus,
+    gitBranch: gitBranch ?? null,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     cliEngine: task.engine,
@@ -5437,14 +5460,15 @@ async function runHeadlessTaskTurn(options: {
   const turnId = crypto.randomUUID();
   const now = Date.now() / 1000;
   let stored = taskStore.get(options.threadId);
-  const absoluteCwd = resolveAbsoluteCwd(options.cwd);
+  const absoluteCwd = await normalizeTaskCwd(options.cwd);
+  const taskTitle = options.title?.trim() || summarizeTaskTitle(options.prompt);
   if (options.isNew || !stored) {
     stored = {
       threadId: options.threadId,
       engine: options.engine,
       providerSessionId: "",
       cwd: absoluteCwd,
-      title: options.title || options.prompt.slice(0, 80),
+      title: taskTitle,
       status: "active",
       createdAt: now,
       updatedAt: now,
@@ -5454,9 +5478,14 @@ async function runHeadlessTaskTurn(options: {
       ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
       ...(options.thinking !== undefined ? { thinking: options.thinking } : {})
     };
+    const gitBranch = absoluteCwd ? await taskGitBranch(absoluteCwd) : undefined;
+    if (gitBranch) stored.gitBranch = gitBranch;
   } else if (absoluteCwd) {
     // Keep the real absolute working dir (subdir under a workspace root stays full path).
     stored.cwd = preferTaskCwd(absoluteCwd, stored.cwd);
+    const gitBranch = await taskGitBranch(stored.cwd);
+    if (gitBranch) stored.gitBranch = gitBranch;
+    else delete stored.gitBranch;
   }
   if (options.model) {
     if (options.engine === "cursor") {
@@ -5797,8 +5826,43 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
     }
     return;
   }
+  if (command.type === "host.directory.pick") {
+    try {
+      await pickTaskDirectory(command.commandId, command.path);
+    } catch (error) {
+      await publish({
+        type: "host.directory.selected",
+        eventId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(),
+        commandId: command.commandId,
+        canceled: true,
+        error: error instanceof Error ? error.message : String(error)
+      }, false).catch(() => undefined);
+    }
+    return;
+  }
+  if (command.type === "host.directory.list") {
+    try {
+      const listing = command.path
+        ? await listTaskDirectories(command.path, { canRead: (cwd) => canProbePathWithoutPrompt(cwd, workspaceAllowRoots()) })
+        : await taskDirectoryRoots(taskStore.list(50).map((task) => task.cwd));
+      await publish({
+        ...listing, type: "host.directory.listed", commandId: command.commandId,
+        eventId: crypto.randomUUID(), occurredAt: new Date().toISOString()
+      }, false);
+    } catch (error) {
+      await publish({
+        type: "host.directory.listed", commandId: command.commandId,
+        eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(),
+        directories: [], ...(command.path ? { path: command.path } : {}),
+        error: (error instanceof Error ? error.message : String(error)).slice(0, 1000)
+      }, false).catch(() => undefined);
+    }
+    return;
+  }
   // host.refresh: status + re-import local Claude/Grok/Cursor sessions for web list.
   if (command.type === "host.refresh") {
+    gitBranchCache.clear();
     // Always re-push agentVersion first so web update banners clear quickly after client upgrade.
     publishAgentMeta({ agentVersion: agentAppVersion() });
     await publishHostStatus({ refresh: !engineMaintenanceInstance?.busy });
@@ -5957,8 +6021,8 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
   let localThreadId = "threadId" in command ? command.threadId : undefined;
   try {
     if (command.type === "task.create") {
-      if (!isAllowedWorkspace(command.cwd)) throw new Error("工作目录不在代理白名单中");
-      const accessCwd = await ensureMacFolderAccess(command.cwd, "远程任务需要访问该工作区文件夹");
+      const accessCwd = await resolveTaskDirectory(command.cwd,
+        (cwd) => ensureMacFolderAccess(cwd, "远程任务需要访问该任务目录"));
       const mode = command.permissionMode ?? "ask-for-approval";
       if (!command.cliEngine) throw new Error("请在网页端选择编码引擎后再下发任务");
       const engine = normalizeCliEngine(command.cliEngine);
@@ -5982,7 +6046,9 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
       }
       // Pre-trust project root so Codex app-server does not hang on the interactive
       // "Do you trust the contents of this directory?" prompt (no TTY in remote mode).
-      const absoluteCwd = resolveAbsoluteCwd(accessCwd);
+      const absoluteCwd = await normalizeTaskCwd(accessCwd);
+      if (!absoluteCwd) throw new Error("Task working directory is invalid");
+      const taskTitle = command.title?.trim() || summarizeTaskTitle(command.prompt);
       await ensureCodexTrustedAndReady(absoluteCwd);
       const startParams: Record<string, unknown> = {
         ...threadStartParams(absoluteCwd, mode),
@@ -6001,26 +6067,28 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
       }
       const thread = started.thread;
       localThreadId = thread.id;
-      if (command.title) await codex!.request("thread/name/set", { threadId: thread.id, name: command.title });
-      const threadCwd = preferTaskCwd(thread?.cwd, absoluteCwd);
+      await codex!.request("thread/name/set", { threadId: thread.id, name: taskTitle });
+      const threadCwd = await normalizeTaskCwd(preferTaskCwd(thread?.cwd, absoluteCwd), absoluteCwd);
+      const gitBranch = await taskGitBranch(threadCwd);
       await taskStore.upsert({
         threadId: thread.id,
         engine: "codex",
         providerSessionId: thread.id,
         cwd: threadCwd,
-        title: command.title || command.prompt.slice(0, 80),
+        title: taskTitle,
         status: "active",
         createdAt: Date.now() / 1000,
         updatedAt: Date.now() / 1000,
         messages: [],
         permissionMode: mode,
+        ...(gitBranch ? { gitBranch } : {}),
         ...(command.model ? { model: command.model } : {}),
         ...(command.reasoningEffort ? { reasoningEffort: command.reasoningEffort } : {}),
         ...(command.fast !== undefined ? { fast: command.fast } : {})
       });
       await appendStoredUserPrompt(thread.id, command.prompt);
       await publishThread(thread.id);
-      startLocalActivity(thread.id, command.prompt, command.title || command.prompt.slice(0, 80), "codex");
+      startLocalActivity(thread.id, command.prompt, taskTitle, "codex");
       const appliedPolicy = started?.approvalPolicy ?? started?.approval_policy;
       const appliedSandbox = started?.sandbox ?? started?.sandboxPolicy;
       logInfo(
@@ -6335,6 +6403,7 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
         platform: `${process.platform} ${os.release()}`,
         codexVersion,
         workspaces: config.workspaces,
+        directoryBrowsing: true,
         cliEngine: taskStore.getDefaultEngine(),
         availableEngines: publicState.availableEngines,
         engineCapabilities: publicState.engineCapabilities,
@@ -7046,11 +7115,36 @@ function publishAgentMeta(fields: {
   }
 }
 
+let updateNetworkConfigCache: { relayUrl: string; checkedAt: number; value: AgentUpdateConfig } | undefined;
+
+async function refreshAgentUpdateNetwork(force = false): Promise<AgentUpdateConfig> {
+  const relayUrl = config.relayUrl;
+  if (!force && updateNetworkConfigCache?.relayUrl === relayUrl && Date.now() - updateNetworkConfigCache.checkedAt < 60_000) {
+    return updateNetworkConfigCache.value;
+  }
+  // Reset transport fields before contacting the relay. If a deployment was
+  // downgraded or temporarily returns the legacy shape, stale proxy/registry
+  // values must not affect this check or subsequent engine probes.
+  configureEngineUpdateNetwork({ relayUrl, engineUpdateBaseUrl: null, npmRegistryUrl: null, engineUpdateProxyUrl: null });
+  let token: string | undefined;
+  try {
+    if (config.encryptedAgentToken) token = decryptSecret(config.encryptedAgentToken);
+  } catch { /* Anonymous config is sufficient for public artifact checks. */ }
+  const value = await fetchAgentUpdateConfig(relayUrl, token);
+  // Ignore a response from a relay that was replaced while the request was in flight.
+  if (config.relayUrl !== relayUrl) throw new Error("中继地址已变化，请重试检查更新");
+  configureEngineUpdateNetwork({ relayUrl, engineUpdateBaseUrl: value.engineUpdateBaseUrl ?? null,
+    npmRegistryUrl: value.npmRegistryUrl ?? null, engineUpdateProxyUrl: value.engineUpdateProxyUrl ?? null });
+  updateNetworkConfigCache = { relayUrl, checkedAt: Date.now(), value };
+  return value;
+}
+
 async function refreshAvailableEngines(options: {
   checkUpdates?: boolean;
   engine?: CliEngine;
   forceModels?: boolean;
 } = {}): Promise<void> {
+  if (options.checkUpdates) await refreshAgentUpdateNetwork().catch(() => undefined);
   const codexReady = Boolean(publicState.environment.codexCompatible || codex);
   const [detectedEngines, refreshedCapabilities] = await Promise.all([
     detectAvailableEngines({
@@ -7071,7 +7165,7 @@ async function refreshAvailableEngines(options: {
       ...refreshedCapabilities
     ]
     : refreshedCapabilities.length ? refreshedCapabilities : publicState.engineCapabilities;
-  // Latest-version probes use the system proxy. Skip on routine host.status publishes;
+  // Latest-version probes use the configured update transport. Skip on routine host.status publishes;
   // recheck / update flows pass checkUpdates to refresh the outdated badges.
   const availableEngines = options.checkUpdates
     ? await enrichEnginesWithLatestVersions(detectedEngines, { force: true }).catch(() => detectedEngines)
@@ -7121,6 +7215,7 @@ async function publishHostStatus(options: { refresh?: boolean } = {}): Promise<v
     type: "host.status", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), online: true,
     name: resolvedDisplayName(), platform: `${process.platform} ${os.release()}`, codexVersion,
     workspaces: config.workspaces,
+    directoryBrowsing: true,
     cliEngine: taskStore.getDefaultEngine(),
     availableEngines: publicState.availableEngines,
     engineCapabilities: publicState.engineCapabilities,
@@ -7209,6 +7304,9 @@ async function resolveEngineUpgradeTarget(engine: CliEngine, version: string | u
       }
       installation = {
         kind: "npm", command: npm!, prefix,
+        ...(npmUpdateRegistryCandidates()[0]
+          ? { registry: npmUpdateRegistryCandidates()[0] }
+          : {}),
         ...(repairScript && nodeCommand ? { repairScript, nodeCommand } : {})
       };
     } else if (engine === "claude" || engine === "cursor" || engine === "grok" || engine === "antigravity") {
@@ -7246,36 +7344,67 @@ function getEngineMaintenance(): EngineMaintenance {
       codexLoadedCredentialFingerprint = null;
     },
     upgrade: async (engine, version, onOutput) => {
+      await refreshAgentUpdateNetwork().catch(() => undefined);
       const target = await resolveEngineUpgradeTarget(engine, version);
       const steps = buildEngineUpgradeSteps(target);
       const proxy = await collectLocalProxyEnv();
-      const env = mergeProxyIntoEnv({ ...process.env }, proxy);
-      let rawOutputTail = "";
+      const env = buildEngineMaintenanceNetworkEnv(mergeProxyIntoEnv({ ...process.env }, proxy));
+      let redactedOutputTail = "";
       let lastReportedAt = 0;
+      let lastReportedOutput = "";
+      const reportOutput = (force = false) => {
+        const outputTail = sanitizeEngineMaintenanceDetail(redactedOutputTail).slice(-700);
+        const now = Date.now();
+        if (!outputTail || outputTail === lastReportedOutput || (!force && now - lastReportedAt < 900)) return;
+        lastReportedAt = now;
+        lastReportedOutput = outputTail;
+        updateState({ detail: `${engine} CLI 升级中… ${outputTail.slice(-260)}` });
+        onOutput(outputTail);
+      };
       for (const step of steps) {
-        const runStep = async () => {
-          await execFileWithTreeKill(step.command, step.args, {
-            timeoutMs: 5 * 60_000,
-            env,
-            cwd: step.cwd || os.homedir(),
-            maxBuffer: 2 * 1024 * 1024,
-            onOutput: (chunk) => {
-              // Keep raw chunks together so a credential split across chunks still
-              // retains its prefix when redacted. Only the sanitized tail is shown.
-              rawOutputTail = `${rawOutputTail}${chunk}`.slice(-64_000);
-              const outputTail = sanitizeEngineMaintenanceDetail(rawOutputTail).slice(-700);
-              const now = Date.now();
-              if (!outputTail || now - lastReportedAt < 900) return;
-              lastReportedAt = now;
-              updateState({ detail: `${engine} CLI 升级中… ${outputTail.slice(-260)}` });
-              onOutput(outputTail);
-            }
+        const runStep = async (stepToRun = step) => {
+          const redactor = createEngineUpdateOutputRedactor((chunk) => {
+            redactedOutputTail = `${redactedOutputTail}${chunk}`.slice(-64_000);
+            reportOutput();
           });
+          try {
+            await execFileWithTreeKill(stepToRun.command, stepToRun.args, {
+              timeoutMs: 5 * 60_000,
+              env,
+              cwd: stepToRun.cwd || os.homedir(),
+              maxBuffer: 2 * 1024 * 1024,
+              onOutput: redactor.write
+            });
+          } finally {
+            // Flush only assembled output, including failures without a trailing newline.
+            redactor.flush();
+            reportOutput(true);
+          }
         };
-        if (engine === "codex" && process.platform === "win32" && target.installation.kind === "npm") {
-          await withCodexWindowsNpmShimRepair(target.installation.prefix, runStep);
-        } else {
-          await runStep();
+        const runWithPlatformRepair = async (stepToRun = step) => {
+          if (engine === "codex" && process.platform === "win32" && target.installation.kind === "npm") {
+            await withCodexWindowsNpmShimRepair(target.installation.prefix, () => runStep(stepToRun));
+            return;
+          }
+          await runStep(stepToRun);
+        };
+        try {
+          await runWithPlatformRepair();
+        } catch (firstError) {
+          // Mainland networks may reset registry.npmjs.org while the mirror remains reachable.
+          // Retry only npm install steps; self-updaters and repair scripts must surface their error.
+          const registryArg = step.args.find((arg) => arg.startsWith("--registry="));
+          const mirror = "https://registry.npmmirror.com";
+          const retryArgs = registryArg && !new RegExp(mirror.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(registryArg)
+            ? step.args.map((arg) => arg.startsWith("--registry=") ? `--registry=${mirror}/` : arg)
+            : null;
+          if (!retryArgs) throw new Error(redactEngineUpdateOutput(firstError instanceof Error ? firstError.message : String(firstError)));
+          updateState({ detail: `${engine} CLI 正在切换 npm 镜像重试…` });
+          try {
+            await runWithPlatformRepair({ ...step, args: retryArgs });
+          } catch (retryError) {
+            throw new Error(redactEngineUpdateOutput(retryError instanceof Error ? retryError.message : String(retryError)));
+          }
         }
       }
     },
@@ -7352,10 +7481,16 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
   const snapshot = threadToSnapshot(result.thread);
   const stored = taskStore.get(threadId);
   const messages = mergeSnapshotUserPrompts(snapshot.messages, stored?.messages || []);
-  const cwd = preferTaskCwd(snapshot.cwd, stored?.cwd);
+  const cwd = await normalizeTaskCwd(preferTaskCwd(snapshot.cwd, stored?.cwd));
+  const gitBranch = cwd ? await taskGitBranch(cwd) : undefined;
   if (stored && cwd && stored.cwd !== cwd) {
     stored.cwd = cwd;
     stored.updatedAt = Date.now() / 1000;
+    await taskStore.upsert(stored);
+  }
+  if (stored && stored.gitBranch !== gitBranch) {
+    if (gitBranch) stored.gitBranch = gitBranch;
+    else delete stored.gitBranch;
     await taskStore.upsert(stored);
   }
   const updatedAt = options.touch
@@ -7372,7 +7507,8 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     cwd,
     status: publishStatus,
     updatedAt,
-    engine: "codex"
+    engine: "codex",
+    ...(gitBranch ? { gitBranch } : {})
   };
   updateState({
     tasks: [task, ...publicState.tasks.filter((item) => item.threadId !== task.threadId)]
@@ -7393,6 +7529,7 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     hasOlderMessages: windowed.hasOlderMessages,
     ...(windowed.oldestMessageId ? { oldestMessageId: windowed.oldestMessageId } : {}),
     cwd,
+    gitBranch: gitBranch ?? null,
     updatedAt,
     cliEngine: "codex",
     ...(stored?.model ? { model: stored.model } : {}),
@@ -7473,6 +7610,7 @@ async function reconcileOrphanedActiveTasks(): Promise<number> {
 
 /** Load 接力 task list from local Codex (thread/list) — independent of web sync. */
 async function refreshLocalTasks(limit = 50): Promise<void> {
+  gitBranchCache.clear();
   try {
     await reconcileOrphanedActiveTasks();
   } catch {
@@ -7492,22 +7630,32 @@ async function refreshLocalTasks(limit = 50): Promise<void> {
     if (!codex) await ensureCodex();
     await cleanupCodexSubagentTasks();
     const threads = await listCodexThreadsForSync({ limit: listLimit });
-    codexTasks = threads.map((thread) => ({
-      threadId: String(thread.id),
-      title: String(thread.name || thread.preview || "未命名任务"),
-      cwd: resolveAbsoluteCwd(String(thread.cwd || "")),
-      status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
-      updatedAt: normalizeUnixSeconds(thread.updatedAt),
-      engine: "codex" as const
+    codexTasks = await Promise.all(threads.map(async (thread) => {
+      const cwd = await normalizeTaskCwd(String(thread.cwd || ""));
+      const gitBranch = cwd ? await taskGitBranch(cwd) : undefined;
+      return {
+        threadId: String(thread.id),
+        title: String(thread.name || thread.preview || "未命名任务"),
+        cwd,
+        status: typeof thread.status === "string" ? thread.status : JSON.stringify(thread.status ?? "unknown"),
+        updatedAt: normalizeUnixSeconds(thread.updatedAt),
+        engine: "codex" as const,
+        ...(gitBranch ? { gitBranch } : {})
+      };
     }));
   } catch {
     // Codex optional when listing Claude/Grok tasks.
   }
-  const storedTasks: AgentTask[] = taskStore.list(1_000)
+  const storedTasks: AgentTask[] = await Promise.all(taskStore.list(1_000)
     .filter((task) => task.engine !== "codex" || !codexThreads.isSubagent(task.providerSessionId || task.threadId))
-    .slice(0, listLimit).map((task) => ({
-      threadId: task.threadId, title: task.title, cwd: resolveAbsoluteCwd(task.cwd),
-      status: task.status, updatedAt: task.updatedAt, engine: task.engine
+    .slice(0, listLimit).map(async (task) => {
+      const cwd = await normalizeTaskCwd(task.cwd);
+      const gitBranch = cwd ? await taskGitBranch(cwd) : undefined;
+      return {
+        threadId: task.threadId, title: task.title, cwd,
+        status: task.status, updatedAt: task.updatedAt, engine: task.engine,
+        ...(gitBranch ? { gitBranch } : {})
+      };
     }));
   const byId = new Map<string, AgentTask>();
   // Prefer the record with the newer last-activity time when the same id appears twice.
@@ -8205,6 +8353,40 @@ async function addWorkspace(): Promise<PublicState> {
   return publicState;
 }
 
+/** Let the paired desktop choose an arbitrary task directory without manual path entry. */
+async function pickTaskDirectory(commandId: string, requestedPath?: string): Promise<void> {
+  const result = await dialog.showOpenDialog({
+    title: "选择任务目录",
+    ...(requestedPath ? { defaultPath: requestedPath } : {}),
+    properties: ["openDirectory", "createDirectory"],
+    ...(process.platform === "darwin" ? { securityScopedBookmarks: true } : {})
+  });
+  const selected = result.filePaths[0];
+  if (result.canceled || !selected) {
+    await publish({
+      type: "host.directory.selected",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      commandId,
+      canceled: true
+    }, false);
+    return;
+  }
+  const bookmark = Array.isArray(result.bookmarks) ? result.bookmarks[0] : undefined;
+  const resolved = await resolveTaskDirectory(selected, async (absolute) => {
+    await rememberMacDirectoryAccess(absolute, bookmark);
+    return absolute;
+  });
+  grantMacFsAccessRoot(resolved);
+  await publish({
+    type: "host.directory.selected",
+    eventId: crypto.randomUUID(),
+    occurredAt: new Date().toISOString(),
+    commandId,
+    path: resolved
+  }, false);
+}
+
 function handleError(error: unknown): void {
   const detail = error instanceof Error ? error.message : String(error);
   // Intentional app-server recycle must not flash as a user-facing failure.
@@ -8672,16 +8854,17 @@ async function checkForAgentUpdate(): Promise<void> {
     if (!config.relayUrl || installingUpdate) return;
     registerUpdateListeners();
     const localVersion = agentAppVersion();
-    const runCheck = async (mode: "auto" | "direct") => {
+    const runCheck = async (mode: "auto" | "direct", viaRelay = true) => {
       await applyLocalProxyToElectronSessions(mode);
-      const response = await fetch(`${config.relayUrl}/api/agent/config`);
-      if (!response.ok) throw new Error(`无法读取更新配置：HTTP ${response.status}`);
-      const remoteConfig = await response.json() as { updateFeedUrl: string | null };
+      const remoteConfig = await refreshAgentUpdateNetwork(true);
       if (!remoteConfig.updateFeedUrl) {
         updateState({ update: { status: "idle", message: `服务端未配置更新源（本地 v${localVersion}）` } });
         return null;
       }
-      autoUpdater.setFeedURL({ provider: "generic", url: remoteConfig.updateFeedUrl });
+      const feedUrl = viaRelay
+        ? resolveUpdateFeedUrl(remoteConfig.updateFeedUrl, config.relayUrl, typeof remoteConfig.engineUpdateBaseUrl === "string" && remoteConfig.engineUpdateBaseUrl.length > 0)
+        : remoteConfig.updateFeedUrl;
+      autoUpdater.setFeedURL({ provider: "generic", url: feedUrl });
       autoUpdater.requestHeaders = { "Cache-Control": "no-cache", Pragma: "no-cache" };
       autoUpdater.autoDownload = false;
       autoUpdater.autoInstallOnAppQuit = true;
@@ -8691,10 +8874,10 @@ async function checkForAgentUpdate(): Promise<void> {
     updateState({ update: { status: "checking", message: `正在检查更新…（当前 v${localVersion}）` } });
     let result;
     try {
-      result = await runCheck("auto");
+      result = await runCheck("auto", true);
     } catch (error) {
-      logWarn("更新检查走代理失败，改为直连重试", error instanceof Error ? error.message : String(error));
-      result = await runCheck("direct");
+      logWarn("更新连接失败，改为直连中转重试", redactEngineUpdateOutput(error instanceof Error ? error.message : String(error)));
+      result = await runCheck("direct", true);
     }
     if (!result?.updateInfo) return;
 
@@ -8815,6 +8998,7 @@ function registerIpc(): void {
     const normalized = relayUrl.trim().replace(/\/$/, "");
     if (!/^https?:\/\//.test(normalized)) throw new Error("中继地址必须以 http:// 或 https:// 开头");
     config.relayUrl = normalized;
+    configureEngineUpdateNetwork({ relayUrl: normalized });
     await saveConfig();
     const paired = Boolean(config.hostId && config.encryptedAgentToken && config.encryptedSyncKey);
     updateState({ relayUrl: normalized, status: paired ? "offline" : "waiting_pairing", detail: paired ? "中继地址已更新，请重新连接。" : "中继地址已保存，正在等待配对连接。" });
@@ -9155,6 +9339,9 @@ app.whenReady().then(async () => {
 app.on("window-all-closed", () => undefined);
 app.on("before-quit", () => {
   quitting = true;
+  for (const stop of macBookmarkStoppers.splice(0)) {
+    try { stop(); } catch { /* ignore */ }
+  }
   stopEngineConfigWatch?.();
   stopEngineConfigWatch = null;
   if (installingUpdate) {

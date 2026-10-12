@@ -4,7 +4,7 @@ import path from "node:path";
 
 export type EngineUpgradeInstallation =
   | { kind: "self" }
-  | { kind: "npm"; command: string; prefix: string; repairScript?: string; nodeCommand?: string }
+  | { kind: "npm"; command: string; prefix: string; repairScript?: string; nodeCommand?: string; registry?: string }
   | { kind: "brew"; command: string };
 export type EngineUpgradeTarget = {
   engine: CliEngine;
@@ -55,7 +55,7 @@ export function buildEngineUpgradeSteps(target: EngineUpgradeTarget): EngineUpgr
   const steps: EngineUpgradeStep[] = [{
     command: installation.command,
     args: [
-      "install", "-g", "--registry=https://registry.npmjs.org/", ...prefixArgs,
+      "install", "-g", `--registry=${(installation.registry || "https://registry.npmjs.org").replace(/\/+$/, "")}/`, ...prefixArgs,
       ...(engine === "codex" && target.platform === "win32" ? ["--include=optional", "--bin-links=true"] : []),
       ...(engine === "pi" ? ["--ignore-scripts"] : []), packageSpec
     ]

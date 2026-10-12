@@ -19,6 +19,15 @@ const configSchema = z.object({
   // Leave empty to show「敬请期待」on the web UI when no macOS package is published.
   MAC_CLIENT_URL: urlWithDefault("https://github.com/demonrain/anytimevibe/releases/latest/download/AnytimeVibe-Agent.dmg"),
   UPDATE_FEED_URL: optionalUrl,
+  /** Public HTTPS origin for the standalone update transfer service. Defaults to PUBLIC_ORIGIN. */
+  UPDATE_TRANSFER_URL: optionalUrl,
+  /** Optional npm registry origin used only by the update metadata/artifact relay. */
+  NPM_REGISTRY_ORIGIN: optionalUrl,
+  /** Persistent cache volume for verified update metadata and package artifacts. */
+  UPDATE_CACHE_DIR: z.preprocess((value) => value === "" ? undefined : value, z.string().min(1).optional()),
+  /** Credential-free HTTPS CONNECT proxy URL; credentials are minted only for paired hosts. */
+  UPDATE_PROXY_URL: optionalUrl,
+  UPDATE_PROXY_TOKEN_SECRET: z.preprocess((value) => value === "" ? undefined : value, z.string().min(32).optional()),
   /** Optional pinned latest client semver (e.g. 0.4.31). When set, health skips GitHub lookup. */
   LATEST_CLIENT_VERSION: z.preprocess(
     (value) => (value === "" || value == null ? undefined : value),

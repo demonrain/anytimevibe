@@ -1,6 +1,6 @@
 # 服务端更新源配置说明
 
-随码桌面客户端（Windows / macOS）通过中继服务读取自动更新配置，再从更新源下载安装包。管理员只需在服务端配置 `UPDATE_FEED_URL`，客户端即可自动检查、下载并提示安装。
+随码桌面客户端（Windows / macOS）通过中继服务读取自动更新配置，再从更新源下载安装包。管理员只需在服务端配置 `UPDATE_FEED_URL`；生产环境建议同时配置独立的 `UPDATE_TRANSFER_URL`，让大文件、Cursor/Antigravity 版本探针以及 npm 引擎包从可控的传输域名进入大陆网络。
 
 > 安装后程序显示名为「随码」；发布产物文件名仍为 `AnytimeVibe-Agent-Setup.exe` 等工程标识，以保证更新源与历史链接兼容。
 
@@ -21,7 +21,19 @@ electron-updater 访问 updateFeedUrl
   └── macOS:   latest-mac.yml + 安装包 + blockmap
 ```
 
-- 中继**不托管**安装包本身，只告诉客户端更新源 URL。
+可选的传输服务还提供：
+
+```text
+GET /api/agent/engine/cursor/install?win32=true
+GET /api/agent/engine/antigravity/releases/latest
+GET /api/agent/npm/@scope/package
+GET /api/agent/npm/@scope/package/-/package-version.tgz
+```
+
+- 配置了 `UPDATE_TRANSFER_URL` 时，relay 会把 `updateFeedUrl`、`engineUpdateBaseUrl` 和 `npmRegistryUrl` 下发给新客户端；旧客户端仍读取 `updateFeedUrl`。
+- 传输服务会转发 `Range`、`If-Range`、`If-None-Match`、`HEAD` 和源站的 ETag/`Cache-Control`。大文件按流转发，不受固定 30 秒总时长限制；桌面端断开会取消源站请求。
+- npm 元数据中的 `dist.tarball` 会改写为 relay 地址；只允许官方引擎包及其声明的依赖，落盘前按 npm `integrity`/`shasum` 校验。响应头 `X-AnytimeVibe-Cache` 只会报告 `HIT`、`MISS` 或 `BYPASS`，不会把源站缓存策略伪装成命中。
+- 未配置传输服务时，relay 仍兼容旧的单一 `UPDATE_FEED_URL` 路由；但不应把裸 IP HTTP 地址当生产更新源。
 - 更新源必须是 electron-updater 的 **generic** 发布目录（含 YAML 元数据）。
 - 若未配置 `UPDATE_FEED_URL`，客户端显示「服务端未配置更新源」，不影响配对与任务。
 
@@ -36,11 +48,19 @@ MAC_CLIENT_URL=https://github.com/demonrain/anytimevibe/releases/latest/download
 
 # Agent 自动更新源（目录 URL，不要指向具体 .exe）
 UPDATE_FEED_URL=https://github.com/demonrain/anytimevibe/releases/latest/download
+
+# 可选：独立 HTTPS 传输域名（建议与业务 relay 分离）
+UPDATE_TRANSFER_URL=https://updates.example.com
+NPM_REGISTRY_ORIGIN=https://registry.npmjs.org
+UPDATE_CACHE_DIR=/app/apps/relay/data/update-cache
 ```
 
 | 变量 | 必填 | 说明 |
 |------|------|------|
 | `UPDATE_FEED_URL` | 否 | 更新元数据与安装包所在目录的 HTTPS URL |
+| `UPDATE_TRANSFER_URL` | 否 | 中继/独立传输服务的 HTTPS 根地址；用于固定更新、引擎探针和 npm 包地址。HTTP 仅允许 loopback 测试 |
+| `NPM_REGISTRY_ORIGIN` | 否 | 传输服务读取 npm 元数据/压缩包的官方 registry 根地址；不接受带凭据的 URL |
+| `UPDATE_CACHE_DIR` | 否 | 已校验元数据和包文件的持久目录；容器部署应挂载卷 |
 | `WINDOWS_CLIENT_URL` | 否 | Web 端 Windows 下载链接 |
 | `MAC_CLIENT_URL` | 否 | Web 端 macOS 下载链接；留空则显示「敬请期待」 |
 
@@ -51,6 +71,16 @@ docker compose up -d --force-recreate relay
 # 或
 docker compose restart relay
 ```
+
+独立传输服务使用 `docker-compose.update.yml`，接入已有的 Traefik 和外部 Docker 网络 `traefik-net`。先为更新域名配置 DNS 和 HTTPS，再构建并启动：
+
+```bash
+docker build -t anytimevibe-relay:updates -f apps/relay/Dockerfile .
+docker compose -f docker-compose.update.yml up -d update-transfer
+install -m 0644 traefik-anytimevibe-updates.yml /home/docker/traefik/config/dynamic/anytimevibe-updates.yml
+```
+
+示例使用 `updates.demonrain.top`，自建时同步修改 `UPDATE_DOMAIN` 和 `traefik-anytimevibe-updates.yml` 中的域名及证书设置。它只暴露更新 API，不连接 Postgres，也不承载任务、模型或登录流量。完整配置和验证见 [UPDATE_RELAY.md](UPDATE_RELAY.md)。
 
 ## 3. 更新源目录结构
 
@@ -68,7 +98,7 @@ docker compose restart relay
 `latest.yml` 示例：
 
 ```yaml
-version: 0.5.22
+version: 0.5.23
 files:
   - url: AnytimeVibe-Agent-Setup.exe
     sha512: <base64-sha512>
@@ -148,7 +178,28 @@ https://vibe.example.com {
 UPDATE_FEED_URL=https://vibe.example.com/updates
 ```
 
-## 5. 发布新版本流程
+## 5. 原生 CLI 维护代理（可选）
+
+部分官方 CLI 的 `update` 命令不是 npm 包安装。可为这些维护子进程配置一个单独的、带 HTTPS 的 CONNECT 代理：
+
+```dotenv
+UPDATE_PROXY_URL=https://proxy.example.com:9443
+UPDATE_PROXY_TOKEN_SECRET=<至少 32 个字符的随机值>
+```
+
+只有已配对且未撤销的 Agent 在请求 `/api/agent/config` 时得到一个 15 分钟有效的带签名代理 URL；匿名请求得到 `engineUpdateProxyUrl: null`。首次安装前尚未配对的主机可以使用公共 npm 中转，但不能取得原生维护代理凭据。客户端仅把 `HTTP_PROXY`/`HTTPS_PROXY` 等变量注入引擎维护子进程，并将 relay/transfer 域名放入 `NO_PROXY`，不会改变任务/模型流量。代理仅接受 `CONNECT host:443`，并限制为厂商域名，拒绝内网、环回、文档和保留地址。
+
+生成证书后启用可选服务：
+
+```bash
+docker compose -f docker-compose.update.yml --profile native-proxy up -d --build update-proxy
+```
+
+至少提供 `UPDATE_PROXY_CERT_DIR/fullchain.pem`、`privkey.pem`，并让 `UPDATE_PROXY_URL` 使用相同的公网 HTTPS 主机名。证书续期后重启 `update-proxy` 加载新证书。不要把 `UPDATE_PROXY_TOKEN_SECRET` 写入镜像或提交到仓库。
+
+边界：Cursor 当前官方脚本把下载地址硬编码在 `downloads.cursor.com`，没有可验证的镜像变量；Windows PowerShell 的部分官方安装脚本也可能忽略 `HTTP(S)_PROXY`。因此该代理只保证“厂商程序遵守代理环境变量”的维护路径，不能声称所有厂商自更新都已强制中转。Cursor/Antigravity 的版本检查本身会走 `/api/agent/engine/*`；安装脚本是否走代理取决于脚本实现。
+
+## 6. 发布新版本流程
 
 1. 提升 `apps/agent/package.json` 的 `version`。
 2. 构建：
@@ -165,7 +216,7 @@ pnpm --filter @anytimevibe/agent package:mac
 4. 确认 `UPDATE_FEED_URL` 下元数据中的 `version` 高于已安装客户端。
 5. 在已安装的 Agent 中点击「检查更新」，或等待 6 小时自动检查。
 
-## 6. 客户端行为说明
+## 7. 客户端行为说明
 
 | 场景 | 行为 |
 |------|------|
@@ -178,7 +229,7 @@ pnpm --filter @anytimevibe/agent package:mac
 
 默认中继地址为 `https://vibe.demonrain.top`（可在控制面板修改）。更新检查始终使用**当前已保存的中继地址**上的 `/api/agent/config`。
 
-## 7. 验证清单
+## 8. 验证清单
 
 ```bash
 # 1. 中继是否返回更新源
@@ -191,6 +242,12 @@ curl -sS  "$UPDATE_FEED_URL/latest.yml" | head
 
 # 3. 安装包是否可下载
 curl -sSI "$UPDATE_FEED_URL/AnytimeVibe-Agent-Setup.exe"
+
+# 新传输服务（期望是 HTTPS）
+curl -sS https://updates.example.com/api/health
+curl -sSI https://updates.example.com/api/agent/update/latest.yml
+curl -sSI -H 'Range: bytes=0-15' https://updates.example.com/api/agent/update/AnytimeVibe-Agent-Setup.exe
+curl -sS https://updates.example.com/api/agent/npm/@openai/codex | head
 ```
 
 在客户端：
@@ -199,7 +256,7 @@ curl -sSI "$UPDATE_FEED_URL/AnytimeVibe-Agent-Setup.exe"
 2. 点击「检查更新」。
 3. 观察状态：检查中 → 发现新版本 / 当前已是最新 / 错误信息。
 
-## 8. 常见问题
+## 9. 常见问题
 
 **Q: 点击检查更新提示网络错误？**  
 A: 检查中继是否可达、`UPDATE_FEED_URL` 是否 HTTPS 且匿名可访问；GitHub 私有仓库需改为公开或改用自建 CDN。
@@ -213,9 +270,11 @@ A: Windows SmartScreen / 未签名；macOS 未签名公证。生产环境应配�
 **Q: `WINDOWS_CLIENT_URL` 和 `UPDATE_FEED_URL` 有何区别？**  
 A: 前者是 Web 页给用户点的「首次下载」链接；后者是已安装 Agent 自动更新的目录地址。两者可以指向同一 Release 体系，但路径语义不同（文件 vs 目录）。
 
-## 9. 安全建议
+## 10. 安全建议
 
 - 仅使用 HTTPS 更新源，防止安装包被中间人替换。
 - 生产环境为 Windows / macOS 构建配置代码签名。
 - 不要把更新源目录配置成可列目录且混放无关敏感文件。
+- `X-AnytimeVibe-Cache: HIT` 表示本机已通过完整性校验的缓存文件；`MISS` 表示本次下载并校验后落盘；`BYPASS` 表示直接流式代理，不能据此声称已缓存。
+- npm 包必须保留官方 `integrity` 或 `shasum`；缺失摘要或摘要不匹配时中继拒绝服务并删除临时文件。
 - 版本号只升不降；回滚应发布更高版本号的回退包，或手动重装旧包。

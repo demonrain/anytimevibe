@@ -36,9 +36,9 @@
 
 | 步骤 | 做什么 |
 | --- | --- |
-| 1 | [下载 Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest) 并安装，添加白名单工作区 |
+| 1 | [下载 Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest) 并安装，完成编码引擎的安装与登录 |
 | 2 | 打开 [体验站](https://vibe.demonrain.top/) 或自建 Web PWA，登录并输入客户端配对码 |
-| 3 | 新建任务时选择 **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity / Pi**，在手机上查看进度、继续对话与审批 |
+| 3 | 在网页点选电脑上的任务目录，选择 **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity / Pi**，在手机上查看进度、继续对话与审批 |
 
 自建中继见下方 [Docker 部署](#docker-部署)。本地开发见 [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md)。
 
@@ -71,20 +71,20 @@
 
 ## 核心工作流
 
-1. 在手机或桌面浏览器登录 Web PWA，选择已配对的电脑和白名单工作区。
-2. 新建任务时选择 Codex、Claude Code、Grok Build、Cursor Agent、Google Antigravity 或 Pi，并使用该引擎对应的权限模式。
+1. 在手机或桌面浏览器登录 Web PWA，选择已配对的电脑，在「新任务」中浏览并点选任务目录。
+2. 选择 Codex、Claude Code、Grok Build、Cursor Agent、Google Antigravity 或 Pi 及对应权限模式。标题可留空，由任务描述自动提取。
 3. Windows / macOS Agent 在本机启动选定 CLI，实时同步阶段日志、回复和任务状态。
 4. 需要完整终端体验时，点击「电脑接力」，Agent 使用对应引擎的原生会话 ID 恢复任务。
 
 ## 能做什么（摘要）
 
-- 多用户隔离、多主机配对、工作区白名单。
+- 多用户隔离、多主机配对、网页点选远程电脑的任务目录。
 - 六引擎创建任务、流式输出、权限映射、原生会话接力。
-- 任务列表按最后活动时间排序；可按引擎筛选。
+- 任务列表按最后活动时间排序；可按引擎筛选，显示实际目录和当前 Git 分支。
 - Web Push 审批 / 完成通知；多浏览器授权同一主机密钥。
 - 客户端环境检测、引擎安装指引、自动更新。
 
-当前边界：各 CLI 能力存在差异，产品会映射为统一任务体验；不提供任意终端、远程桌面或文件浏览器。Agent 需在用户已登录的桌面会话中运行，且至少一种引擎已安装并登录。
+当前边界：各 CLI 能力存在差异，产品会映射为统一任务体验；目录浏览仅用于选择任务位置，不提供任意终端、远程桌面或文件内容浏览。Agent 需在用户已登录的桌面会话中运行，且至少一种引擎已安装并登录。macOS 受系统保护的目录首次访问时仍需在电脑上授权；旧客户端保留原目录下拉选择，升级后可直接浏览目录。
 
 ## 支持的编码引擎
 
@@ -93,7 +93,7 @@
 | Codex | `codex app-server --stdio` | Read Only、Ask for approval、Approve for me、Full Access | 读取 Codex thread，并通过 `codex resume` 接力 |
 | Claude Code | `claude -p --output-format stream-json` | 只读工具、接受文件编辑、跳过权限确认 | 导入 `~/.claude/projects` 会话，并通过 `claude --resume` 接力 |
 | Grok Build | `grok -p --output-format streaming-json` | 只读工具、接受文件编辑、全自动批准 | 导入 Grok sessions，并通过 `grok --resume` 接力 |
-| Cursor Agent | `agent -p --output-format stream-json --stream-partial-output` | 仅提议、允许改文件、全自动写盘 | 通过 `--workspace` 绑定工作区，并通过 `agent --resume` 接力 |
+| Cursor Agent | `agent -p --output-format stream-json --stream-partial-output` | 仅提议、允许改文件、全自动写盘 | 通过 `--workspace` 绑定任务目录，并通过 `agent --resume` 接力 |
 | Antigravity | `agy -p --output-format stream-json` | 沙箱 (`--sandbox`)、计划模式 (`--mode plan`)、接受编辑 (`--mode accept-edits`)、跳过权限确认 (`--dangerously-skip-permissions`) | 导入 `~/.gemini/antigravity-cli/brain` 会话记录，并通过 `agy --conversation <id>` 接力 |
 | Pi | `pi --mode rpc --approve` | 只读工具、审批或完全访问映射为 Pi 工具集 | 导入 `~/.pi/agent/sessions`，通过 `--session <id>` 恢复，并支持原生 CLI 接力 |
 
@@ -112,7 +112,7 @@ flowchart LR
     Router <-->|stream-json| Cursor[Cursor Agent]
     Router <-->|stream-json| Antigravity[Google Antigravity]
     Router <-->|JSONL RPC| Pi[Pi Coding Agent]
-    Codex --> Workspace[白名单工作区]
+    Codex --> Workspace[用户选择的任务目录]
     Claude --> Workspace
     Grok --> Workspace
     Cursor --> Workspace
@@ -139,7 +139,7 @@ flowchart LR
 - Web 与 Agent 之间传输加密事件信封；主机同步密钥由浏览器和 Agent 管理。
 - 浏览器密钥保存在 IndexedDB `CryptoKey` 中，新浏览器通过 Agent 授权现有主机密钥。
 - Agent 使用 Electron `safeStorage` 保护本机令牌、私钥和同步密钥。
-- 远程任务只能访问 Agent 明确配置的工作区，不能通过随码获得任意终端。
+- Agent 验证用户所选任务目录存在且为真实目录；执行权限由任务模式和引擎能力决定，macOS 同时受系统目录授权约束。
 - 服务端使用 Argon2id 保存密码，HTTP API 和 WebSocket 都有速率限制和消息大小限制。
 
 ## 快速开始

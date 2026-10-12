@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.5.22";
+export const PRODUCT_VERSION = "0.5.23";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -355,6 +355,17 @@ export const engineQuotaSchema = z.object({
 });
 export type EngineQuota = z.infer<typeof engineQuotaSchema>;
 
+/** Directory navigation on the paired computer; paths stay inside the encrypted channel. */
+export const taskDirectoryListingSchema = z.object({
+  path: z.string().min(1).max(8192).optional(),
+  parentPath: z.string().min(1).max(8192).optional(),
+  directories: z.array(z.object({ name: z.string().min(1), path: z.string().min(1).max(8192) })).max(500),
+  requiresAuthorization: z.boolean().optional(),
+  truncated: z.boolean().optional(),
+  error: z.string().max(1000).optional()
+});
+export type TaskDirectoryListing = z.infer<typeof taskDirectoryListingSchema>;
+
 export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
     type: z.literal("task.create"),
@@ -454,6 +465,15 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
     type: z.literal("host.refresh")
   }),
+  /** Open the desktop agent's native directory picker for a new task. */
+  commandBase.extend({
+    type: z.literal("host.directory.pick"),
+    path: z.string().trim().min(1).max(8192).optional()
+  }),
+  commandBase.extend({
+    type: z.literal("host.directory.list"),
+    path: z.string().trim().min(1).max(8192).optional()
+  }),
   /**
    * Ask the agent to query local CLI account / subscription remaining usage.
    * Optional engine filter; omit to refresh all detected engines.
@@ -495,6 +515,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     platform: z.string(),
     codexVersion: z.string(),
     workspaces: z.array(workspaceSchema),
+    /** New tasks browse arbitrary local folders; no workspace allowlist setup is needed. */
+    directoryBrowsing: z.boolean().optional(),
     detail: z.string().optional(),
     /** Preferred coding CLI on this host. */
     cliEngine: cliEngineSchema.optional(),
@@ -516,6 +538,18 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     detail: z.string().trim().max(ENGINE_QUOTA_DETAIL_MAX).optional()
   }),
   eventBase.extend({
+    ...taskDirectoryListingSchema.shape,
+    type: z.literal("host.directory.listed"),
+    commandId: z.string().uuid()
+  }),
+  eventBase.extend({
+    type: z.literal("host.directory.selected"),
+    commandId: z.string().uuid(),
+    path: z.string().min(1).optional(),
+    canceled: z.boolean().optional(),
+    error: z.string().max(1000).optional()
+  }),
+  eventBase.extend({
     type: z.literal("sync.completed"),
     threadCount: z.number().int().nonnegative(),
     /** True when only a recent window was loaded (not a full history dump). */
@@ -533,6 +567,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     threadId: z.string(),
     title: z.string(),
     cwd: z.string(),
+    /** null explicitly clears a branch after moving out of a Git repository. */
+    gitBranch: z.string().min(1).nullable().optional(),
     status: z.string(),
     activeTurnId: z.string().optional(),
     /** Last time the agent observed progress for the active turn. */

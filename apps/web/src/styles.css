@@ -545,6 +545,16 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
   font-size: 9px;
   flex: 0 0 auto;
 }
+.task-foot .task-branch {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 42%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #4b765d;
+  font-size: 9px;
+}
 .empty-state { text-align: center; padding: 70px 25px; color: #6f756e; }.empty-state > span { font: 800 36px monospace; color: var(--rust); }.empty-state h3 { color: var(--ink); }
 .conversation-column { min-width: 0; min-height: 0; height: 100%; max-height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; background: rgba(255,255,255,.25); }
 .conversation-head {
@@ -560,6 +570,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .conversation-head > div:first-of-type { min-width: 0; overflow: hidden; flex: 1 1 auto; }
 .conversation-head h2 { margin: 0 0 3px; font: 700 16px/1.25 "Rockwell", "Noto Serif SC", serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-head code { display: block; color: #747b73; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.conversation-head .thread-branch { display: block; color: #4b765d; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
 .tabs { display: flex; background: rgba(23,33,27,.08); border-radius: 9px; padding: 2px; flex: 0 0 auto; margin-top: 2px; }
 .tabs button { border: 0; background: transparent; padding: 6px 10px; border-radius: 7px; font-size: 11px; cursor: pointer; }
 .tabs button.active { background: var(--cream); box-shadow: 0 2px 8px rgba(0,0,0,.08); }
@@ -1150,6 +1161,28 @@ input:focus, textarea:focus, select:focus { border-color: var(--moss); box-shado
 .computer-icon { font-size: 58px; color: var(--moss); }
 .pair-preview h3 { margin: 0; }
 .task-prompt { min-height: 150px; max-height: min(36vh, 260px); resize: vertical; }
+.directory-picker-field { display: grid; gap: 8px; }
+.directory-picker-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.directory-picker-head strong { font-size: 12px; }
+.directory-picker-head button { flex: 0 0 auto; }
+.directory-picker-value { display: block; min-height: 38px; padding: 10px 11px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.48); color: #4f5d53; overflow-wrap: anywhere; }
+.directory-browser { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.5); min-width: 0; }
+.directory-browser-nav { display: flex; gap: 7px; flex-wrap: wrap; }
+.directory-browser-nav button { min-height: 38px; }
+.directory-browser-path { display: block; padding: 8px 0; color: var(--moss); font-size: 12px; overflow-wrap: anywhere; }
+.directory-browser-list { display: grid; gap: 3px; max-height: 240px; overflow-y: auto; overscroll-behavior: contain; }
+.directory-browser-item { display: flex; align-items: center; gap: 10px; text-align: left; width: 100%; min-height: 44px; border: 0; border-radius: 8px; padding: 9px 10px; background: transparent; color: var(--ink); cursor: pointer; }
+.directory-browser-item:hover { background: rgba(23,33,27,.06); }
+.directory-browser-item:disabled { opacity: .5; cursor: default; }
+.directory-browser-icon { color: var(--moss); font-size: 24px; flex: 0 0 auto; }
+.directory-browser-name { display: grid; gap: 3px; flex: 1; min-width: 0; }
+.directory-browser-name strong { font-size: 13px; overflow-wrap: anywhere; }
+.directory-browser-name code { color: #737970; font-size: 11px; overflow-wrap: anywhere; }
+.directory-browser p { margin: 0; font-size: 12px; line-height: 1.6; }
+.directory-browser-error { color: #9b341e; display: grid; gap: 8px; }
+.directory-browser-grant { display: grid; gap: 8px; }
+.directory-browser-empty { color: #737970; padding: 12px 4px; }
+.modal .directory-browser .directory-browser-select { position: static; min-height: 42px; padding: 10px 14px; }
 .modal .primary {
   position: sticky;
   bottom: 0;

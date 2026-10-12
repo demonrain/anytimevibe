@@ -31,9 +31,16 @@ services:
       WINDOWS_CLIENT_URL: ${WINDOWS_CLIENT_URL:-}
       MAC_CLIENT_URL: ${MAC_CLIENT_URL:-}
       UPDATE_FEED_URL: ${UPDATE_FEED_URL:-}
+      UPDATE_TRANSFER_URL: ${UPDATE_TRANSFER_URL:-}
+      NPM_REGISTRY_ORIGIN: ${NPM_REGISTRY_ORIGIN:-}
+      UPDATE_CACHE_DIR: ${UPDATE_CACHE_DIR:-/app/apps/relay/data/update-cache}
+      UPDATE_PROXY_URL: ${UPDATE_PROXY_URL:-}
+      UPDATE_PROXY_TOKEN_SECRET: ${UPDATE_PROXY_TOKEN_SECRET:-}
       VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
       VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY}
       VAPID_SUBJECT: ${VAPID_SUBJECT}
+    volumes:
+      - relay-update-cache:/app/apps/relay/data/update-cache
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,3 +71,4 @@ volumes:
   postgres-data:
   caddy-data:
   caddy-config:
+  relay-update-cache:

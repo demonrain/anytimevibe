@@ -119,8 +119,10 @@ pnpm dev:agent:local
    - 设置令牌：`.env.local` 里的 `SETUP_TOKEN`（默认示例为 `local-dev-setup-token-change-me`）  
    - 自定用户名 / 密码（密码 ≥ 6 位）
 3. 登录后 → **添加电脑** → 在 Agent 窗口点 **生成配对码** → Web 输入配对码
-4. Agent 中 **添加白名单工作区**
-5. Web **新建任务** 选择该工作区，验证发送 / 流式回复 / 简洁模式等
+4. Web **新建任务** → **选择目录**，从电脑目录列表点选项目；无需在 Agent 添加工作区
+5. 选择编码引擎与任务权限，填写描述并开始任务；验证流式回复、实际路径和 Git 分支，标题留空时自动生成
+
+macOS 首次浏览系统保护目录时需在电脑弹窗中授权；此后可在网页直接选择。旧客户端仍显示原目录下拉，需升级客户端才能使用目录浏览。
 
 ### Agent 中继地址
 
@@ -185,7 +187,7 @@ pnpm dev:agent:local
 | Docker 一直 Starting the Docker Engine | 见上文 WSL 修复，或直接放弃 Docker 用 `dev:pg` |
 | Web 登录后 WS 断 | 确认 Vite 代理、`PUBLIC_ORIGIN` 端口 4173 |
 | Agent 连不上 | 中继是否 `http://127.0.0.1:8787`（不要 https） |
-| 工作区为空 | Agent 已加白名单且在线；Web 新建任务会 `host.refresh` |
+| 无法浏览任务目录 | 确认 Agent 在线且支持目录浏览；旧客户端需升级，macOS 保护目录需在电脑授权 |
 | 与正式版互相干扰 | 只用 `dev:agent:local`，关掉安装版随码 |
 | 想清空本地库 | `pnpm dev:db:reset` 后重新 setup / 初始化管理员 |
 

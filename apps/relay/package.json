@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsup src/index.ts --format esm --platform node --sourcemap --clean",
+    "build": "tsup src/index.ts src/update-transfer.ts src/update-proxy-server.ts --format esm --platform node --sourcemap --clean",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "start:update-transfer": "node dist/update-transfer.js",
+    "start:update-proxy": "node dist/update-proxy-server.js"
   },
   "dependencies": {
     "@anytimevibe/protocol": "workspace:*",

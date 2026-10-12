@@ -66,6 +66,8 @@ function fixture() {
     DEFAULT_SYNC_LIMIT: 10, ensureCodex: async () => {},
     reconcileOrphanedActiveTasks: async () => {}, importLocalCliSessions: async () => ({}), pruneImportedCliSessions: async () => {},
     workspaceAllowRoots: () => [], resolveAbsoluteCwd: (cwd: string) => cwd,
+    normalizeTaskCwd: async (cwd: string) => cwd,
+    taskGitBranch: async () => undefined, gitBranchCache: new Map(),
     isThreadDeleted: () => false,
     isInProgressStoredStatus: (status: string) => status === "active",
     sanitizeTranscriptMessages: (messages: unknown[]) => messages, windowTranscriptMessages,

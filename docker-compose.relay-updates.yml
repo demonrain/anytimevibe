@@ -1,0 +1,12 @@
+services:
+  relay:
+    image: anytimevibe-relay:updates
+    environment:
+      UPDATE_TRANSFER_URL: ${UPDATE_TRANSFER_URL:?Set UPDATE_TRANSFER_URL to the public update domain}
+      NPM_REGISTRY_ORIGIN: ${NPM_REGISTRY_ORIGIN:-https://registry.npmjs.org}
+      UPDATE_CACHE_DIR: ${UPDATE_CACHE_DIR:-/app/apps/relay/data/update-cache}
+    volumes:
+      - relay-update-cache:/app/apps/relay/data/update-cache
+
+volumes:
+  relay-update-cache:

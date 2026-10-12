@@ -44,6 +44,7 @@ export type StoredTask = {
   engine: CliEngine;
   providerSessionId: string;
   cwd: string;
+  gitBranch?: string;
   title: string;
   status: string;
   createdAt: number;

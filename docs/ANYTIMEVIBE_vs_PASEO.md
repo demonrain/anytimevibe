@@ -29,7 +29,7 @@
 | CLI 自动化能力 | 有接力/本地流程，但不是平台主轴 | 强（daemon / agent / schedule / workspace 指令完整） |
 | 定时任务/计划任务 | 当前不是核心能力 | 强（schedule / loop 等） |
 | SDK 生态 | 当前偏产品内聚 | 强（`@getpaseo/client` 面向集成） |
-| 工作区隔离策略 | 白名单 + 单任务绑定 | worktree/workspace 编排能力更重 |
+| 任务目录与权限 | 网页点选目录 + 单任务权限模式 | worktree/workspace 编排能力更重 |
 
 ## 4. 随码（AnytimeVibe）的优势
 

@@ -55,6 +55,7 @@ import {
 } from "@anytimevibe/protocol";
 import { api, websocketUrl } from "./api";
 import { useI18n } from "./i18n/I18nProvider";
+import { TaskDirectoryPicker } from "./TaskDirectoryPicker";
 import {
   normalizePermissionMode,
   normalizeReplyDetail,
@@ -165,6 +166,7 @@ type Task = {
   threadId: string;
   title: string;
   cwd: string;
+  gitBranch?: string;
   status: string;
   updatedAt: number;
   activeTurnId?: string;
@@ -634,6 +636,14 @@ type HostRuntime = {
   engineQuotas?: EngineQuota[];
   quotaDetail?: string;
   quotaLoading?: boolean;
+  directoryPick?: {
+    commandId: string;
+    path?: string;
+    canceled?: boolean;
+    error?: string;
+  };
+  directoryBrowsing?: boolean;
+  directoryListing?: Extract<AgentEvent, { type: "host.directory.listed" }>;
 };
 
 type EngineMaintenanceRequest = {
@@ -2051,6 +2061,7 @@ export function reduceEvent(
     if (incomingAt && currentAt > incomingAt) return next;
     next.online = event.online;
     next.workspaces = event.workspaces;
+    next.directoryBrowsing = event.directoryBrowsing === true;
     next.hostStatusAt = event.occurredAt;
     if (event.availableEngines) next.availableEngines = event.availableEngines;
     if (event.engineCapabilities) next.engineCapabilities = event.engineCapabilities;
@@ -2078,6 +2089,19 @@ export function reduceEvent(
     if (event.detail) next.quotaDetail = event.detail;
     else delete next.quotaDetail;
     next.quotaLoading = false;
+    return next;
+  }
+  if (event.type === "host.directory.selected") {
+    next.directoryPick = {
+      commandId: event.commandId,
+      ...(event.path ? { path: event.path } : {}),
+      ...(event.canceled !== undefined ? { canceled: event.canceled } : {}),
+      ...(event.error ? { error: event.error } : {})
+    };
+    return next;
+  }
+  if (event.type === "host.directory.listed") {
+    next.directoryListing = event;
     return next;
   }
   if (event.type === "thread.deleted") {
@@ -2204,26 +2228,15 @@ export function reduceEvent(
         ? mergeRecentWindowSnapshot(incomingMessages, existing?.messages, hasOlderMessages)
         : (existing?.messages ?? [])
     );
-    // Prefer the more specific absolute cwd (task subdir over bare workspace root when both known).
-    const nextCwd = (() => {
-      const incoming = String(event.cwd || "").trim();
-      const prev = String(existing?.cwd || "").trim();
-      if (incoming && prev) {
-        const a = incoming.replace(/[\\/]+$/, "").toLowerCase();
-        const b = prev.replace(/[\\/]+$/, "").toLowerCase();
-        if (a === b) return incoming.length >= prev.length ? incoming : prev;
-        if (a.startsWith(b + "\\") || a.startsWith(b + "/") || b.startsWith(a + "\\") || b.startsWith(a + "/")) {
-          return incoming.length >= prev.length ? incoming : prev;
-        }
-        // Unrelated paths: prefer the longer absolute path (usually the real project dir).
-        return incoming.length >= prev.length ? incoming : prev;
-      }
-      return incoming || prev || "";
-    })();
+    // The agent reports the native cwd; path length cannot identify the real directory.
+    const nextCwd = String(event.cwd || "").trim() || existing?.cwd || "";
     next.tasks[event.threadId] = {
       threadId: event.threadId,
       title: event.title || existing?.title || "未命名任务",
       cwd: nextCwd,
+      ...(event.gitBranch
+        ? { gitBranch: event.gitBranch }
+        : (event.gitBranch === undefined && existing?.gitBranch ? { gitBranch: existing.gitBranch } : {})),
       status,
       updatedAt: updatedAt || Date.now() / 1000,
       // Prefer snapshot-persisted diff (survives reconnect); keep existing if absent.
@@ -3528,13 +3541,17 @@ export function App() {
       onRefreshAll={() => sendEngineMaintenance("refresh")}
     />}
     {composerOpen && activeHost && <NewTaskDialog
+      key={activeHost.id}
       host={activeHost}
-      workspaces={activeRuntime.workspaces}
       online={activeRuntime.online}
       availableEngines={activeRuntime.availableEngines ?? []}
       engineCapabilities={activeRuntime.engineCapabilities ?? []}
       onClose={() => setComposerOpen(false)}
-      onRefreshWorkspaces={() => sendCommand(activeHost.id, { type: "host.refresh", commandId: randomUuid() })}
+      directoryBrowsing={activeRuntime.directoryBrowsing === true}
+      workspaces={activeRuntime.workspaces}
+      onDirectoryCommand={(command) => sendCommand(activeHost.id, command)}
+      directoryListing={activeRuntime.directoryListing}
+      directorySelection={activeRuntime.directoryPick}
       onCreate={async (cwd, prompt, title, engine, mode, model, reasoningEffort, thinking, fast) => {
         setPermissionMode(mode);
         localStorage.setItem("permission-mode", mode);
@@ -3834,6 +3851,7 @@ function TaskListRow({
         <p title={preview}>{preview}</p>
         <div className="task-foot">
           <code className="task-cwd" title={formatTaskCwd(task.cwd)} dir="ltr">{formatTaskCwd(task.cwd)}</code>
+          {task.gitBranch && <small className="task-branch" title={task.gitBranch}>⎇ {task.gitBranch}</small>}
           {task.approvals.length > 0 && <b>{task.approvals.length}</b>}
         </div>
       </div>
@@ -4728,6 +4746,7 @@ function TaskConversation({
           <span>{task.title}</span>
         </h2>
         <code title={task.cwd}>{task.cwd}</code>
+        {task.gitBranch && <small className="thread-branch" title={task.gitBranch}>⎇ {task.gitBranch}</small>}
         <div
           className="thread-meta-chips"
           title={contextUsageTitleCombined(sessionView, turnView, gaugeView, legacyTokenView)}
@@ -5179,19 +5198,22 @@ function PairingDialog({ onClose, onPaired }: { onClose(): void; onPaired(): voi
   </section></div>;
 }
 
-function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapabilities, onClose, onRefreshWorkspaces, onCreate }: {
+function NewTaskDialog({ host, online, availableEngines, engineCapabilities, onClose, directoryBrowsing, workspaces, onDirectoryCommand, directoryListing, directorySelection, onCreate }: {
   host: Host;
-  workspaces: Workspace[];
   online: boolean | null;
   availableEngines: CliEngineInfo[];
   engineCapabilities: EngineCapability[];
   onClose(): void;
-  onRefreshWorkspaces(): Promise<void>;
+  directoryBrowsing: boolean;
+  workspaces: Workspace[];
+  onDirectoryCommand(command: ClientCommand): Promise<void>;
+  directoryListing?: HostRuntime["directoryListing"];
+  directorySelection?: HostRuntime["directoryPick"];
   onCreate(cwd: string, prompt: string, title: string, engine: CliEngine, permissionMode: PermissionMode, model?: string, reasoningEffort?: ReasoningEffort, thinking?: boolean, fast?: boolean): Promise<void>;
 }) {
   const { locale } = useI18n();
   const ready = readyEngines(availableEngines);
-  const [cwd, setCwd] = useState(workspaces[0]?.path ?? "");
+  const [cwd, setCwd] = useState("");
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [engine, setEngine] = useState<CliEngine | "">(ready[0]?.engine ?? "");
@@ -5231,14 +5253,7 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
     return /composer/i.test(cap?.currentModel || modelOptions[0]?.id || "");
   });
   const [loading, setLoading] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
-
-  // When host.status arrives after open, pick the first allowlisted path.
-  useEffect(() => {
-    if (!workspaces.length) return;
-    setCwd((current) => (current && workspaces.some((item) => item.path === current) ? current : workspaces[0]!.path));
-  }, [workspaces]);
 
   useEffect(() => {
     if (!ready.length) {
@@ -5288,25 +5303,12 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model, engineId, engineCapabilities]);
 
-  // Pull latest whitelist from the agent once when the dialog opens (avoid dep on unstable callback identity).
-  const refreshRef = useRef(onRefreshWorkspaces);
-  refreshRef.current = onRefreshWorkspaces;
-  useEffect(() => {
-    if (online !== true) return;
-    let cancelled = false;
-    setRefreshing(true);
-    refreshRef.current()
-      .catch((refreshError) => {
-        if (!cancelled) setError(refreshError instanceof Error ? refreshError.message : "无法刷新工作区列表");
-      })
-      .finally(() => {
-        if (!cancelled) setRefreshing(false);
-      });
-    return () => { cancelled = true; };
-  }, [host.id, online]);
-
   return <div className="modal-backdrop"><form className="modal wide" onSubmit={async (event) => {
     event.preventDefault();
+    if (!cwd) {
+      setError(locale === "en" ? "Choose a task directory first" : "请先选择任务目录");
+      return;
+    }
     if (!engine) {
       setError("请选择编码引擎");
       return;
@@ -5337,6 +5339,10 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
     <button type="button" className="modal-close" onClick={onClose}>×</button>
     <p className="eyebrow">NEW REMOTE TASK</p>
     <h2>向 {host.name} 下发任务</h2>
+    <TaskDirectoryPicker value={cwd} onChange={(nextCwd) => { setCwd(nextCwd); setError(""); }}
+      online={online} supported={directoryBrowsing} workspaces={workspaces}
+      {...(directoryListing ? { listing: directoryListing } : {})}
+      {...(directorySelection ? { selection: directorySelection } : {})} onCommand={onDirectoryCommand} />
     <div className="engine-picker">
       <span className="engine-picker-label">编码引擎</span>
       <div className="engine-picker-grid" role="radiogroup" aria-label="编码引擎">
@@ -5416,17 +5422,11 @@ function NewTaskDialog({ host, workspaces, online, availableEngines, engineCapab
         {permissionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
       </select>
     </label>
-    <label>工作区
-      <select value={cwd} onChange={(event) => setCwd(event.target.value)} required disabled={!workspaces.length}>
-        {!workspaces.length && <option value="" disabled>{refreshing ? "正在从电脑端读取白名单…" : online === true ? "电脑端尚未添加白名单目录" : "主机离线，无法读取白名单"}</option>}
-        {workspaces.map((workspace) => <option key={workspace.id} value={workspace.path}>{workspace.name} · {workspace.path}</option>)}
-      </select>
-    </label>
-    {online === true && <p className="admin-hint" style={{ marginTop: -6 }}>{refreshing ? "正在同步工作区…" : workspaces.length ? `已加载 ${workspaces.length} 个白名单目录` : "若刚添加目录，请确认电脑端客户端在线后重试。"}</p>}
-    <label>任务标题<input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="可选，默认使用第一条指令" /></label>
+    <label>{locale === "en" ? "Task title (optional)" : "任务标题（可选）"}<input value={title} maxLength={160} onChange={(event) => setTitle(event.target.value)}
+      placeholder={locale === "en" ? "Leave blank to summarize the task description" : "留空则根据任务描述生成标题"} /></label>
     <label>任务指令<textarea className="task-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="描述目标、约束和验收方式…" required /></label>
     {error && <p className="form-error">{error}</p>}
-    <button className="primary" disabled={loading || !cwd || !prompt.trim() || !engine}>{loading ? "正在发送…" : "开始任务"}</button>
+    <button className="primary" disabled={loading || online !== true || !cwd || !prompt.trim() || !engine}>{loading ? "正在发送…" : "开始任务"}</button>
   </form></div>;
 }
 

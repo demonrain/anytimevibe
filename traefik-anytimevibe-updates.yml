@@ -1,0 +1,19 @@
+http:
+  routers:
+    anytimevibe-updates:
+      rule: "Host(`updates.demonrain.top`)"
+      entryPoints:
+        - websecure
+      service: anytimevibe-update-transfer
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: "demonrain.top"
+            sans:
+              - "*.demonrain.top"
+
+  services:
+    anytimevibe-update-transfer:
+      loadBalancer:
+        servers:
+          - url: "http://anytimevibe-update-transfer:8788"

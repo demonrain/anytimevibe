@@ -153,6 +153,39 @@ describe("protocol crypto", () => {
     expect(heartbeat.type).toBe("thread.heartbeat");
   });
 
+  it("accepts native directory picker commands and results", () => {
+    const command = clientCommandSchema.parse({
+      type: "host.directory.pick",
+      commandId: crypto.randomUUID()
+    });
+    expect(command.type).toBe("host.directory.pick");
+    const event = agentEventSchema.parse({
+      type: "host.directory.selected",
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      commandId: command.commandId,
+      path: "C:/work/project"
+    });
+    expect(event.type).toBe("host.directory.selected");
+    if (event.type !== "host.directory.selected") throw new Error("Unexpected event type");
+    expect(event.path).toBe("C:/work/project");
+  });
+
+  it("round-trips directory browsing and the host capability", () => {
+    const commandId = crypto.randomUUID();
+    expect(clientCommandSchema.parse({ type: "host.directory.list", commandId, path: "C:/work/project" }))
+      .toEqual({ type: "host.directory.list", commandId, path: "C:/work/project" });
+    const event = {
+      type: "host.directory.listed", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), commandId,
+      path: "C:/work/project", parentPath: "C:/work", directories: [{ name: "src", path: "C:/work/project/src" }]
+    };
+    expect(agentEventSchema.parse(event)).toEqual(event);
+    expect(agentEventSchema.parse({
+      type: "host.status", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(),
+      online: true, name: "Desktop", platform: "win32", codexVersion: "unknown", workspaces: [], directoryBrowsing: true
+    })).toMatchObject({ directoryBrowsing: true });
+  });
+
   it("accepts a Codex steering command with the active turn id", () => {
     const command = {
       type: "turn.steer" as const,

@@ -9,12 +9,10 @@
 
 **Run Codex, Claude Code, Grok Build, Cursor Agent, Google Antigravity, or Pi on your own machine—and keep the task moving from your phone. Not a remote desktop. Not a cloud that holds your source or API keys.**
 
-## 35-second overview (six-engine edition)
-
-> This updated cut includes Google Antigravity and Pi end to end: dispatch from your phone, run on the paired computer, and hand off to the native `agy` or Pi RPC session alongside Codex, Claude Code, Grok Build, and Cursor Agent.
+## 35-second overview
 
 <p align="center">
-  <img src="docs/media/anytimevibe-promo.gif" alt="AnytimeVibe 35-second six-engine product preview" width="100%" />
+  <img src="docs/media/anytimevibe-promo.gif" alt="AnytimeVibe 35-second product preview" width="100%" />
 </p>
 
 <p align="center">
@@ -38,9 +36,9 @@
 
 | Step | Action |
 | --- | --- |
-| 1 | [Download the Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest), install it, and add allow-listed workspaces |
+| 1 | [Download the Windows / macOS Agent](https://github.com/demonrain/anytimevibe/releases/latest), install it, and install and sign in to a coding engine |
 | 2 | Open the [demo site](https://vibe.demonrain.top/) or your self-hosted Web PWA, sign in, and enter the pairing code from the agent |
-| 3 | Create a task with **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity / Pi**, then follow progress, continue the chat, and approve from your phone |
+| 3 | Browse and select a folder on the paired computer, create a task with **Codex / Claude Code / Grok Build / Cursor Agent / Google Antigravity / Pi**, then follow progress and approve from your phone |
 
 Self-host the relay via [Docker deployment](#docker-deployment). Local development: [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md).
 
@@ -69,20 +67,20 @@ AnytimeVibe does **not** replace SSH or RDP. Use “Handoff to computer” when 
 
 ## Core workflow
 
-1. Sign in to the Web PWA and choose a paired computer plus an allow-listed workspace.
-2. Create a task with Codex, Claude Code, Grok Build, Cursor Agent, Google Antigravity, or Pi and a matching permission mode.
+1. Sign in to the Web PWA, choose a paired computer, and browse its folders in “New task” to select a task directory.
+2. Choose Codex, Claude Code, Grok Build, Cursor Agent, Google Antigravity, or Pi and a matching permission mode. Leave the title blank to derive it from the task description.
 3. The Agent starts the selected local CLI and streams stages, replies, and status.
 4. For a full terminal, hand off to the provider-native session on the computer.
 
 ## Features (summary)
 
-- Multi-user isolation, multi-host pairing, workspace allow-lists.
+- Multi-user isolation, multi-host pairing, and a web picker for folders on the paired computer.
 - Six engines, streaming output, permission mapping, native session handoff.
-- Task list ordered by last activity; filter by engine.
+- Task list ordered by last activity; filter by engine and view the actual directory and current Git branch.
 - Web Push for approvals/completion; multi-browser host-key authorization.
 - Client environment detection, install helpers, auto-update.
 
-Boundary: CLI capabilities differ and are mapped into one UX. No arbitrary terminal, remote desktop, or file browser. The Agent must run in a logged-in desktop session with at least one engine installed and signed in.
+Boundary: CLI capabilities differ and are mapped into one UX. Folder browsing selects the task location; it does not expose a terminal, remote desktop, or file contents. The Agent must run in a logged-in desktop session with at least one engine installed and signed in. Protected macOS folders require approval on the computer on first access. Older clients keep their directory dropdown until upgraded.
 
 ## Supported Coding Engines
 
@@ -110,7 +108,7 @@ flowchart LR
     Router <-->|stream-json| Cursor[Cursor Agent]
     Router <-->|stream-json| Antigravity[Google Antigravity]
     Router <-->|JSONL RPC| Pi[Pi Coding Agent]
-    Codex --> Workspace[Allow-listed workspace]
+    Codex --> Workspace[User-selected task directory]
     Claude --> Workspace
     Grok --> Workspace
     Cursor --> Workspace
@@ -137,7 +135,7 @@ flowchart LR
 - Web and Agent messages are encrypted event envelopes; host sync keys are managed by the browser and Agent.
 - Browser keys are stored as IndexedDB `CryptoKey` values. A new browser receives an authorization package from the Agent.
 - The Agent uses Electron `safeStorage` to protect local tokens, private keys, and sync keys.
-- Remote tasks can only access workspaces explicitly configured by the Agent.
+- The Agent validates that each selected task directory exists and resolves its actual path. Task modes and engine capabilities control execution permissions; macOS folder grants still apply.
 - Passwords use Argon2id, and both HTTP APIs and WebSockets enforce rate and payload limits.
 
 ## Quick Start

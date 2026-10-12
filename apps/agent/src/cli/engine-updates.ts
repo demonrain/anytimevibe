@@ -1,6 +1,6 @@
 import type { CliEngine, CliEngineInfo } from "@anytimevibe/protocol";
-import { collectLocalProxyEnv, mergeProxyIntoEnv } from "../local-proxy";
 import { compareVersions, isUpdateAvailable, normalizeVersionLabel } from "./version-compare";
+import { engineUpdateNetworkRevision, npmUpdateRegistryCandidates, resolveEngineUpdateUrl } from "./update-network";
 
 const LATEST_PROBE_TIMEOUT_MS = 15_000;
 const LATEST_CACHE_TTL_MS = 30 * 60_000;
@@ -12,79 +12,37 @@ const NPM_PACKAGES: Partial<Record<CliEngine, { packageName: string; prereleaseT
   pi: { packageName: "@earendil-works/pi-coding-agent" }
 };
 
-const latestCache = new Map<CliEngine, { value: string | undefined; checkedAt: number }>();
+const latestCache = new Map<string, { value: string | undefined; checkedAt: number }>();
+
+/** npm is intermittently unreachable from mainland networks; keep a deterministic mirror fallback. */
+export function npmRegistryCandidates(): string[] {
+  return npmUpdateRegistryCandidates();
+}
 
 export function clearEngineLatestCache(): void {
   latestCache.clear();
 }
 
-async function withProxyFetchEnv<T>(run: () => Promise<T>): Promise<T> {
-  const proxy = await collectLocalProxyEnv();
-  const previous: Record<string, string | undefined> = {};
-  const merged = mergeProxyIntoEnv({ ...process.env }, proxy);
-  const keys = [
-    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
-    "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY"
-  ] as const;
-  for (const key of keys) {
-    previous[key] = process.env[key];
-    const value = merged[key];
-    if (typeof value === "string" && value) process.env[key] = value;
-  }
-  if (!process.env.NODE_USE_ENV_PROXY) process.env.NODE_USE_ENV_PROXY = "1";
-  try {
-    return await run();
-  } finally {
-    for (const key of keys) {
-      const value = previous[key];
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
-}
-
 async function fetchJson(url: string): Promise<unknown | null> {
-  return withProxyFetchEnv(async () => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), LATEST_PROBE_TIMEOUT_MS);
-    try {
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          Accept: "application/json",
-          "User-Agent": "AnytimeVibe-Agent"
-        }
-      });
-      if (!response.ok) return null;
-      return await response.json();
-    } catch {
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LATEST_PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { signal: controller.signal, headers: { Accept: "application/json", "User-Agent": "AnytimeVibe-Agent" } });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch { return null; }
+  finally { clearTimeout(timer); }
 }
 
 async function fetchText(url: string): Promise<string | null> {
-  return withProxyFetchEnv(async () => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), LATEST_PROBE_TIMEOUT_MS);
-    try {
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          Accept: "text/plain,*/*",
-          "User-Agent": "AnytimeVibe-Agent"
-        }
-      });
-      if (!response.ok) return null;
-      return await response.text();
-    } catch {
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LATEST_PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { signal: controller.signal, headers: { Accept: "text/plain,*/*", "User-Agent": "AnytimeVibe-Agent" } });
+    if (!response.ok) return null;
+    return await response.text();
+  } catch { return null; }
+  finally { clearTimeout(timer); }
 }
 
 function pickNpmLatest(
@@ -115,17 +73,22 @@ async function fetchNpmLatest(
   prereleaseTags: string[],
   localVersion: string | undefined
 ): Promise<string | undefined> {
-  // registry.npmjs.org expects the literal scoped path (@scope/name), not URI-encoded.
-  const body = await fetchJson(`https://registry.npmjs.org/${packageName}`) as {
-    "dist-tags"?: Record<string, unknown>;
-  } | null;
-  const tags = body?.["dist-tags"];
-  if (!tags || typeof tags !== "object") return undefined;
-  return pickNpmLatest(tags as Record<string, unknown>, prereleaseTags, localVersion);
+  // Keep the literal scoped path (@scope/name), not URI-encoded.
+  for (const registry of npmRegistryCandidates()) {
+    const body = await fetchJson(`${registry}/${packageName}`) as {
+      "dist-tags"?: Record<string, unknown>;
+    } | null;
+    const tags = body?.["dist-tags"];
+    if (!tags || typeof tags !== "object") continue;
+    const latest = pickNpmLatest(tags as Record<string, unknown>, prereleaseTags, localVersion);
+    if (latest) return latest;
+  }
+  return undefined;
 }
 
 async function fetchGithubLatestTag(repo: string): Promise<string | undefined> {
-  const json = await fetchJson(`https://api.github.com/repos/${repo}/releases/latest`) as {
+  const officialUrl = `https://api.github.com/repos/${repo}/releases/latest`;
+  const json = await fetchJson(resolveEngineUpdateUrl("antigravity-latest", officialUrl)) as {
     tag_name?: string;
     name?: string;
   } | null;
@@ -148,7 +111,7 @@ async function fetchCursorLatestVersion(): Promise<string | undefined> {
     ? ["https://cursor.com/install?win32=true", "https://cursor.com/install"]
     : ["https://cursor.com/install", "https://cursor.com/install?win32=true"];
   for (const url of urls) {
-    const text = await fetchText(url);
+    const text = await fetchText(resolveEngineUpdateUrl("cursor-installer", url));
     if (!text) continue;
     const match = text.match(/downloads\.cursor\.com\/lab\/(\d{4}\.\d{2}\.\d{2}-[0-9a-f]+)/i)
       || text.match(/versions\/(\d{4}\.\d{2}\.\d{2}-[0-9a-f]+)/i)
@@ -162,7 +125,8 @@ async function fetchLatestForEngine(
   engine: CliEngine,
   localVersion: string | undefined
 ): Promise<string | undefined> {
-  const cached = latestCache.get(engine);
+  const cacheKey = `${engineUpdateNetworkRevision()}|${npmRegistryCandidates().join(",")}|${engine}|${localVersion || ""}`;
+  const cached = latestCache.get(cacheKey);
   if (cached && Date.now() - cached.checkedAt < LATEST_CACHE_TTL_MS) {
     return cached.value;
   }
@@ -177,7 +141,7 @@ async function fetchLatestForEngine(
     value = await fetchGithubLatestTag("google-antigravity/antigravity-cli");
   }
 
-  latestCache.set(engine, { value, checkedAt: Date.now() });
+  latestCache.set(cacheKey, { value, checkedAt: Date.now() });
   return value;
 }
 
