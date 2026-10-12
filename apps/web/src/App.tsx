@@ -39,6 +39,7 @@ import {
   type CliEngine,
   type CliEngineInfo,
   type ClientCommand,
+  type ClientUpdateState,
   type ContextUsage,
   type EncryptedEnvelope,
   type EngineCapability,
@@ -56,6 +57,16 @@ import {
 import { api, websocketUrl } from "./api";
 import { useI18n } from "./i18n/I18nProvider";
 import { TaskDirectoryPicker } from "./TaskDirectoryPicker";
+import {
+  ClientUpdatePanel,
+  clientUpdateActions,
+  clientUpdateCommandCanSend,
+  clientUpdateIsActive,
+  clientUpdateStatusLabel,
+  reconcileClientUpdateRequest,
+  type ClientUpdateAction,
+  type ClientUpdateRequest
+} from "./ClientUpdatePanel";
 import {
   normalizePermissionMode,
   normalizeReplyDetail,
@@ -630,6 +641,10 @@ type HostRuntime = {
   engineManagement?: EngineManagement;
   hostStatusAt?: string;
   engineCommandErrors?: Record<string, string>;
+  clientUpdate?: ClientUpdateState;
+  clientUpdateEventAt?: string;
+  clientUpdateCommandErrors?: Record<string, string>;
+  clientUpdateOfflineAt?: number;
   /** Desktop agent version reported by host.status.agentVersion / relay.host_meta */
   agentVersion?: string;
   /** Last subscription / plan quota sample from host.quota.refresh */
@@ -742,6 +757,13 @@ function findLastSystemErrorText(messages: Array<{ role: string; text: string }>
 
 function emptyRuntime(online: boolean | null = null): HostRuntime {
   return { online, workspaces: [], tasks: {}, availableEngines: [] };
+}
+
+export function applyHostConnection(runtime: HostRuntime, online: boolean, now = Date.now()): HostRuntime {
+  const next = { ...runtime, online };
+  if (online) delete next.clientUpdateOfflineAt;
+  else next.clientUpdateOfflineAt = runtime.clientUpdateOfflineAt ?? now;
+  return next;
 }
 
 /** Track `(max-width: 700px)` for mobile conversation chrome. */
@@ -2048,17 +2070,30 @@ function pruneStaleQueueAgainstMessages(
   return next;
 }
 
+function clientUpdateSnapshotIsFresh(runtime: HostRuntime, update: ClientUpdateState, occurredAt: string): boolean {
+  const currentAt = Date.parse(runtime.clientUpdate?.updatedAt || "") || 0;
+  const incomingAt = Date.parse(update.updatedAt) || 0;
+  const currentEventAt = Date.parse(runtime.clientUpdateEventAt || "") || 0;
+  const incomingEventAt = Date.parse(occurredAt) || 0;
+  return incomingAt >= currentAt && incomingEventAt >= currentEventAt;
+}
+
 export function reduceEvent(
   runtime: HostRuntime,
   event: AgentEvent,
-  maintenanceCommandIds?: ReadonlySet<string>
+  maintenanceCommandIds?: ReadonlySet<string>,
+  clientUpdateCommandIds?: ReadonlySet<string>
 ): HostRuntime {
   if (event.type === "turn.delta" && !event.delta) return runtime;
   const next = cloneRuntime(runtime);
   if (event.type === "host.status") {
     const currentAt = Date.parse(next.hostStatusAt || "") || 0;
     const incomingAt = Date.parse(event.occurredAt) || 0;
-    if (incomingAt && currentAt > incomingAt) return next;
+    const clientUpdateAt = Math.max(
+      Date.parse(next.clientUpdateEventAt || "") || 0,
+      Date.parse(next.clientUpdate?.updatedAt || "") || 0
+    );
+    if (incomingAt && Math.max(currentAt, clientUpdateAt) > incomingAt) return next;
     next.online = event.online;
     next.workspaces = event.workspaces;
     next.directoryBrowsing = event.directoryBrowsing === true;
@@ -2067,10 +2102,27 @@ export function reduceEvent(
     if (event.engineCapabilities) next.engineCapabilities = event.engineCapabilities;
     if (event.engineManagement) next.engineManagement = event.engineManagement;
     else delete next.engineManagement;
-    if (event.agentVersion) next.agentVersion = event.agentVersion;
+    const freshClientUpdate = event.clientUpdate && clientUpdateSnapshotIsFresh(next, event.clientUpdate, event.occurredAt);
+    if (freshClientUpdate && event.clientUpdate) {
+      next.clientUpdate = event.clientUpdate;
+      next.clientUpdateEventAt = event.occurredAt;
+    } else if (event.online && !event.clientUpdate && incomingAt > clientUpdateAt) {
+      delete next.clientUpdate;
+      next.clientUpdateEventAt = event.occurredAt;
+    }
+    if (event.agentVersion && (!event.clientUpdate || freshClientUpdate)) next.agentVersion = event.agentVersion;
+    if (event.online) delete next.clientUpdateOfflineAt;
+    else next.clientUpdateOfflineAt ??= Date.now();
     if (event.engineQuotas?.length) {
       next.engineQuotas = event.engineQuotas;
       next.quotaLoading = false;
+    }
+    return next;
+  }
+  if (event.type === "host.client.update.status") {
+    if (clientUpdateSnapshotIsFresh(next, event.update, event.occurredAt)) {
+      next.clientUpdate = event.update;
+      next.clientUpdateEventAt = event.occurredAt;
     }
     return next;
   }
@@ -2081,6 +2133,13 @@ export function reduceEvent(
       next.engineCommandErrors = { ...(next.engineCommandErrors ?? {}), [event.commandId]: event.message };
       const errors = Object.entries(next.engineCommandErrors);
       if (errors.length > 20) next.engineCommandErrors = Object.fromEntries(errors.slice(-20));
+    }
+    const isClientUpdateError = event.commandId === next.clientUpdate?.commandId
+      || clientUpdateCommandIds?.has(event.commandId) === true;
+    if (isClientUpdateError) {
+      next.clientUpdateCommandErrors = { ...(next.clientUpdateCommandErrors ?? {}), [event.commandId]: event.message };
+      const errors = Object.entries(next.clientUpdateCommandErrors);
+      if (errors.length > 20) next.clientUpdateCommandErrors = Object.fromEntries(errors.slice(-20));
     }
     return next;
   }
@@ -2570,11 +2629,15 @@ export function App() {
   const [draggingHostId, setDraggingHostId] = useState<string | null>(null);
   const [dropTargetHostId, setDropTargetHostId] = useState<string | null>(null);
   const [runtime, setRuntime] = useState<Record<string, HostRuntime>>({});
+  const runtimeRef = useRef(runtime);
+  runtimeRef.current = runtime;
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [mobilePane, setMobilePane] = useState<"hosts" | "tasks" | "conversation">("hosts");
   const socketRef = useRef<WebSocket | null>(null);
+  const relayHostOnlineRef = useRef(new Map<string, boolean>());
   const maintenanceCommandIdsRef = useRef(new Map<string, Set<string>>());
+  const clientUpdateCommandIdsRef = useRef(new Map<string, Set<string>>());
   const reconnectTimerRef = useRef<number | null>(null);
   const hostOfflineTimersRef = useRef(new Map<string, number>());
   const [error, setError] = useState("");
@@ -2582,6 +2645,11 @@ export function App() {
   const [composerOpen, setComposerOpen] = useState(false);
   const [engineManagementOpen, setEngineManagementOpen] = useState(false);
   const [engineMaintenanceRequests, setEngineMaintenanceRequests] = useState<Record<string, EngineMaintenanceRequest>>({});
+  const [clientUpdateOpen, setClientUpdateOpen] = useState(false);
+  const [clientUpdateRequests, setClientUpdateRequests] = useState<Record<string, ClientUpdateRequest>>({});
+  const clientUpdateRequestsRef = useRef(clientUpdateRequests);
+  clientUpdateRequestsRef.current = clientUpdateRequests;
+  const [clientUpdateTick, setClientUpdateTick] = useState(Date.now);
   const [accountOpen, setAccountOpen] = useState(false);
   const [pushStatus, setPushStatus] = useState<"idle" | "syncing" | "enabled">("idle");
   const [syncStatus, setSyncStatus] = useState<Record<string, string>>({});
@@ -2606,6 +2674,33 @@ export function App() {
   } | null>(null);
   /** In-page only: refresh shows the tip again if the client is still outdated. */
   const [clientUpdateDismissed, setClientUpdateDismissed] = useState(false);
+
+  const clientUpdateNeedsClock = Object.values(clientUpdateRequests).some((request) => request.state === "sending" || request.state === "waiting")
+    || Object.values(runtime).some((hostRuntime) => {
+      const offlineAt = hostRuntime.clientUpdateOfflineAt ?? (Date.parse(hostRuntime.clientUpdate?.updatedAt || "") || Date.now());
+      return hostRuntime.online !== true && clientUpdateIsActive(hostRuntime.clientUpdate) && Date.now() - offlineAt < 5 * 60_000;
+    });
+  useEffect(() => {
+    if (!clientUpdateNeedsClock) return;
+    setClientUpdateTick(Date.now());
+    const timer = window.setInterval(() => setClientUpdateTick(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [clientUpdateNeedsClock]);
+  useEffect(() => {
+    setClientUpdateRequests((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const [hostId, request] of Object.entries(current)) {
+        const hostRuntime = runtime[hostId];
+        const reconciled = reconcileClientUpdateRequest(request, hostRuntime?.clientUpdate,
+          hostRuntime?.clientUpdateCommandErrors?.[request.commandId], Date.now());
+        if (reconciled === request) continue;
+        next[hostId] = reconciled;
+        changed = true;
+      }
+      return changed ? next : current;
+    });
+  }, [runtime, clientUpdateRequests, clientUpdateTick]);
 
   useEffect(() => {
     setEngineMaintenanceRequests((current) => {
@@ -2757,14 +2852,19 @@ export function App() {
           };
         }));
       }
-      setRuntime((current) => ({
-        ...current,
-        [envelope.hostId]: reduceEvent(
+      setRuntime((current) => {
+        let hostRuntime = reduceEvent(
           current[envelope.hostId] ?? emptyRuntime(),
           event,
-          maintenanceCommandIdsRef.current.get(envelope.hostId)
-        )
-      }));
+          maintenanceCommandIdsRef.current.get(envelope.hostId),
+          clientUpdateCommandIdsRef.current.get(envelope.hostId)
+        );
+        // Decryption can finish after a disconnect; an old snapshot must not revive presence.
+        if (socketRef.current?.readyState !== WebSocket.OPEN || relayHostOnlineRef.current.get(envelope.hostId) === false) {
+          hostRuntime = applyHostConnection(hostRuntime, false);
+        }
+        return { ...current, [envelope.hostId]: hostRuntime };
+      });
       // Auto-open the task just created via the new-task dialog.
       if ("threadId" in event && typeof event.threadId === "string") {
         maybeSelectNewTask(envelope.hostId, event.threadId);
@@ -2774,21 +2874,19 @@ export function App() {
   });
 
   const updateHostStatus = useEffectEvent((hostId: string, online: boolean) => {
+    relayHostOnlineRef.current.set(hostId, online);
     const pendingTimer = hostOfflineTimersRef.current.get(hostId);
     if (pendingTimer) window.clearTimeout(pendingTimer);
     hostOfflineTimersRef.current.delete(hostId);
     if (online) {
-      setRuntime((current) => ({
-        ...current,
-        [hostId]: { ...(current[hostId] ?? emptyRuntime()), online: true }
-      }));
+      setRuntime((current) => ({ ...current, [hostId]: applyHostConnection(current[hostId] ?? emptyRuntime(), true) }));
       return;
     }
     const timer = window.setTimeout(() => {
       hostOfflineTimersRef.current.delete(hostId);
       setRuntime((current) => ({
         ...current,
-        [hostId]: { ...(current[hostId] ?? emptyRuntime()), online: false }
+        [hostId]: applyHostConnection(current[hostId] ?? emptyRuntime(), false)
       }));
     }, 1500);
     hostOfflineTimersRef.current.set(hostId, timer);
@@ -3001,6 +3099,8 @@ export function App() {
       connection.onclose = () => {
         if (socketRef.current !== connection || stopped) return;
         socketRef.current = null;
+        for (const hostId of relayHostOnlineRef.current.keys()) relayHostOnlineRef.current.set(hostId, false);
+        setRuntime((current) => Object.fromEntries(Object.entries(current).map(([hostId, hostRuntime]) => [hostId, applyHostConnection(hostRuntime, false)])));
         autoSyncedHostsRef.current.clear();
         reconnectTimerRef.current = window.setTimeout(connect, 1800);
       };
@@ -3020,9 +3120,13 @@ export function App() {
 
   async function sendCommand(hostId: string, command: ClientCommand) {
     const parsed = clientCommandSchema.parse(command);
+    const isClientUpdateCommand = parsed.type === "host.client.update";
+    if (isClientUpdateCommand && (runtimeRef.current[hostId]?.online !== true || relayHostOnlineRef.current.get(hostId) === false)) {
+      throw new Error(locale === "en" ? "The client is offline. Reconnect before sending an update request." : "客户端当前离线，请重新连接后再发送更新请求。");
+    }
     const key = await ensureHostKey(hostId);
     const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("实时连接尚未建立，请稍后重试。");
+    if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error(isClientUpdateCommand && locale === "en" ? "The live connection is not ready. Please reconnect and try again." : "实时连接尚未建立，请稍后重试。");
     const sequence = Number(localStorage.getItem(`command:${hostId}`) ?? 0) + 1;
     localStorage.setItem(`command:${hostId}`, String(sequence));
     const isMaintenanceCommand = parsed.type === "host.engine.update" || parsed.type === "host.engine.refresh";
@@ -3033,11 +3137,54 @@ export function App() {
       while (commandIds.size > 20) commandIds.delete(commandIds.values().next().value as string);
       maintenanceCommandIdsRef.current.set(hostId, commandIds);
     }
+    if (isClientUpdateCommand) {
+      const commandIds = clientUpdateCommandIdsRef.current.get(hostId) ?? new Set<string>();
+      commandIds.add(parsed.commandId);
+      while (commandIds.size > 20) commandIds.delete(commandIds.values().next().value as string);
+      clientUpdateCommandIdsRef.current.set(hostId, commandIds);
+    }
     try {
-      socket.send(JSON.stringify(await createEnvelope(hostId, sequence, key, parsed)));
+      const envelope = await createEnvelope(hostId, sequence, key, parsed);
+      if (isClientUpdateCommand && (!clientUpdateCommandCanSend(parsed.commandId,
+        clientUpdateRequestsRef.current[hostId], runtimeRef.current[hostId]?.online === true && relayHostOnlineRef.current.get(hostId) !== false, Date.now())
+        || runtimeRef.current[hostId]?.clientUpdate?.supported !== true)) {
+        throw new Error(locale === "en" ? "The update request was not sent because the client disconnected, the request expired, or a newer request replaced it. Check the client status and try again." : "客户端已断线、更新请求已超时或已被新的请求替代，因此未发送。请检查客户端状态后重试。");
+      }
+      if (socketRef.current !== socket || socket.readyState !== WebSocket.OPEN) {
+        throw new Error(locale === "en" ? "The connection changed before the command could be sent. Please retry." : "发送命令前连接已变化，请重新连接后重试。");
+      }
+      socket.send(JSON.stringify(envelope));
     } catch (sendError) {
       if (isMaintenanceCommand) maintenanceCommandIdsRef.current.get(hostId)?.delete(parsed.commandId);
+      if (isClientUpdateCommand) clientUpdateCommandIdsRef.current.get(hostId)?.delete(parsed.commandId);
       throw sendError;
+    }
+  }
+
+  async function sendClientUpdate(action: ClientUpdateAction): Promise<void> {
+    if (!selectedHostId) return;
+    const hostId = selectedHostId;
+    const hostRuntime = runtimeRef.current[hostId];
+    const previousRequest = clientUpdateRequestsRef.current[hostId];
+    if (!clientUpdateActions(hostRuntime?.clientUpdate, hostRuntime?.online === true && relayHostOnlineRef.current.get(hostId) !== false, previousRequest, Date.now())[action]) return;
+    const commandId = randomUuid();
+    const request: ClientUpdateRequest = { commandId, action, state: "sending", sentAt: Date.now() };
+    clientUpdateRequestsRef.current = { ...clientUpdateRequestsRef.current, [hostId]: request };
+    setClientUpdateRequests((current) => ({ ...current, [hostId]: request }));
+    try {
+      await sendCommand(hostId, { type: "host.client.update", commandId, action });
+      setClientUpdateRequests((current) => {
+        const pending = current[hostId];
+        if (pending?.commandId !== commandId || pending.state !== "sending") return current;
+        return { ...current, [hostId]: { ...pending, state: "waiting" } };
+      });
+    } catch (sendError) {
+      setClientUpdateRequests((current) => {
+        const pending = current[hostId];
+        if (pending?.commandId !== commandId || (pending.state !== "sending" && pending.state !== "waiting")) return current;
+        return { ...current, [hostId]: { ...pending, state: "failed",
+          error: sendError instanceof Error ? sendError.message : String(sendError) } };
+      });
     }
   }
 
@@ -3294,19 +3441,24 @@ export function App() {
     <header className="topbar">
       <div className="brand"><span className="brand-mark" aria-hidden="true"><img src="/icon.svg" alt="" /></span><div><strong>{t("brand")}</strong><small>{t("brandTag")}</small></div></div>
       <div className="top-actions">
-        <span
+        <button
+          type="button"
           className={`version-chip${versionWarn ? " warn" : ""}`}
-          title={versionTitle}
+          title={`${versionTitle}${activeHost ? ` · ${clientUpdateStatusLabel(activeRuntime.clientUpdate, locale, clientVersion)}` : ""}`}
+          aria-label={activeHost ? (locale === "en" ? `Client updates for ${activeHost.name}` : `${activeHost.name} 的客户端升级`) : (locale === "en" ? "Select a computer to manage client updates" : "选择电脑后管理客户端更新")}
+          aria-expanded={clientUpdateOpen && Boolean(activeHost)}
+          disabled={!activeHost}
+          onClick={() => setClientUpdateOpen(true)}
         >
-          <span className="version-chip-line">Web v{PRODUCT_VERSION}</span>
+          <span className="version-chip-line">Web v{PRODUCT_VERSION}{activeHost && <span className="version-chip-action"> · {locale === "en" ? "Updates" : "客户端升级"}</span>}</span>
           <span className="version-chip-line">
             {activeHost
-              ? `${locale === "en" ? "Client" : "客户端"} ${clientVersion ? `v${clientVersion}` : (locale === "en" ? "unknown" : "未知")}${clientOutdated ? (locale === "en" ? " · update" : " · 需更新") : clientVersionUnknown ? (locale === "en" ? " · ?" : " · 未知") : ""}`
+              ? `${locale === "en" ? "Client" : "客户端"} ${clientVersion ? `v${clientVersion}` : (locale === "en" ? "unknown" : "未知")}${activeRuntime.clientUpdate?.status === "downloading" && activeRuntime.clientUpdate.progress != null ? ` · ${Math.round(activeRuntime.clientUpdate.progress)}%` : ""}`
               : latestClientVersion
                 ? `${locale === "en" ? "Client" : "客户端"} ${locale === "en" ? "latest" : "最新"} v${latestClientVersion}`
                 : `${locale === "en" ? "Client" : "客户端"} —`}
           </span>
-        </span>
+        </button>
         <ClientDownloads downloads={health.clientDownloads} />
         <div className="lang-switch" role="group" aria-label={t("lang")}>
           <button type="button" className={locale === "zh-CN" ? "active" : ""} onClick={() => setLocale("zh-CN")}>中文</button>
@@ -3522,6 +3674,21 @@ export function App() {
     </main>
 
     {pairingOpen && <PairingDialog onClose={() => setPairingOpen(false)} onPaired={async () => { setPairingOpen(false); await loadHosts(); }} />}
+    {clientUpdateOpen && activeHost && <ClientUpdatePanel
+      key={activeHost.id}
+      hostName={activeHost.name}
+      locale={locale}
+      online={activeRuntime.online === true}
+      update={activeRuntime.clientUpdate}
+      agentVersion={clientVersion}
+      latestVersion={latestClientVersion}
+      downloads={health.clientDownloads}
+      request={clientUpdateRequests[activeHost.id]}
+      offlineAt={activeRuntime.clientUpdateOfflineAt}
+      now={Date.now()}
+      onClose={() => setClientUpdateOpen(false)}
+      onAction={sendClientUpdate}
+    />}
     {engineManagementOpen && activeHost && <EngineManagementDialog
       host={activeHost}
       online={activeRuntime.online === true}

@@ -1,6 +1,5 @@
 import {
   app,
-  autoUpdater as electronNativeUpdater,
   BrowserWindow,
   dialog,
   ipcMain,
@@ -12,7 +11,7 @@ import {
   Tray
 } from "electron";
 import { execFile, spawn } from "node:child_process";
-import { promises as fs, readFileSync, writeFileSync } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -37,6 +36,7 @@ import {
   type CliEngine,
   type CliEngineInfo,
   type ClientCommand,
+  type ClientUpdateState,
   type EngineOperation,
   type EncryptedEnvelope,
   type PermissionMode,
@@ -95,6 +95,8 @@ import { resolveUpdateFeedUrl } from "./cli/update-feed";
 import { listTaskDirectories, resolveTaskDirectory, taskDirectoryRoots } from "./cli/task-directory";
 import { fetchAgentUpdateConfig, type AgentUpdateConfig } from "./cli/update-config";
 import { buildEngineMaintenanceNetworkEnv, configureEngineUpdateNetwork, createEngineUpdateOutputRedactor, npmUpdateRegistryCandidates, redactEngineUpdateOutput } from "./cli/update-network";
+import { ClientUpdateController, type ClientUpdateIntent } from "./client-update";
+import { prepareSilentClientUpdate } from "./client-update-installer";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_RELAY_URL = "https://vibe.demonrain.top";
@@ -141,6 +143,7 @@ type AgentConfig = {
   processedCommandIds?: Record<string, number>;
   /** Undelivered push hints, flushed to the relay on reconnect. */
   pendingPushHints?: PendingPushHint[];
+  clientUpdateIntent?: ClientUpdateIntent;
 };
 
 type PublicState = {
@@ -162,6 +165,7 @@ type PublicState = {
   /** False until first local engine/env probe finishes ? UI shows a loading mask. */
   environmentReady: boolean;
   update: UpdateState;
+  clientUpdate?: ClientUpdateState;
   /** Running desktop build (prefer Electron app.getVersion when packaged). */
   agentVersion: string;
   tasks: AgentTask[];
@@ -215,6 +219,9 @@ let configPath = "";
 let codexCommand = "codex.cmd";
 let codexVersion = "unknown";
 let engineMaintenanceInstance: EngineMaintenance | null = null;
+let clientUpdateController: ClientUpdateController | null = null;
+let clientOperations = 0;
+let hideWindowForUpdateRestart = process.argv.includes("--client-update-restart");
 const initialEnvironment: EnvironmentState = { platform: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "other", nodeInstalled: false, codexInstalled: false, codexCompatible: false };
 let publicState: PublicState = {
   relayUrl: DEFAULT_RELAY_URL,
@@ -327,7 +334,7 @@ let codex: CodexAdapter | null = null;
 let codexLoadedCredentialFingerprint: string | null = null;
 let syncKey: CryptoKey | null = null;
 let quitting = false;
-/** True while quitAndInstall is in progress — suppress all UI/side-effect callbacks. */
+/** True after the independent installer acknowledges readiness and we start quitting. */
 let installingUpdate = false;
 /** Bumped on every intentional connect(); stale socket handlers ignore events. */
 let connectGeneration = 0;
@@ -1114,6 +1121,7 @@ function scheduleDrainTurnQueue(threadId: string): void {
 }
 
 async function drainTurnQueue(threadId: string): Promise<void> {
+  if (clientUpdateController?.applying) return;
   if (isThreadTurnBusy(threadId) || pendingCodexSteeringByThread.has(threadId)) return;
   const engine = resolveActivityEngine(threadId) || "codex";
   if (engineMaintenanceInstance?.isUpdating(engine)) return;
@@ -1413,9 +1421,19 @@ function decryptSecret(value: string): string {
   return safeStorage.decryptString(Buffer.from(value, "base64"));
 }
 
-async function saveConfig(): Promise<void> {
-  await fs.mkdir(path.dirname(configPath), { recursive: true });
-  await fs.writeFile(configPath, JSON.stringify(config, null, 2), "utf8");
+let configWriteQueue: Promise<void> = Promise.resolve();
+function saveConfig(): Promise<void> {
+  const destination = configPath;
+  const snapshot = JSON.stringify(config, null, 2);
+  // An interrupted upgrade must never leave a truncated pairing/configuration file.
+  const write = configWriteQueue.then(async () => {
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    const temporary = `${destination}.tmp`;
+    await fs.writeFile(temporary, snapshot, "utf8");
+    await fs.rename(temporary, destination);
+  });
+  configWriteQueue = write.catch(() => undefined);
+  return write;
 }
 
 function isWindowAlive(): boolean {
@@ -1456,6 +1474,9 @@ function updateState(patch: Partial<PublicState>): void {
     agentVersion: nextPatch.agentVersion ?? agentAppVersion(),
     workspaces: config?.workspaces ?? publicState.workspaces
   };
+  if (patch.update && clientUpdateController) {
+    void clientUpdateController.observe(patch.update).catch((error) => logWarn("更新状态同步失败", String(error)));
+  }
   // During quit/update the BrowserWindow/Tray may already be destroyed; never touch them.
   if (quitting || installingUpdate) return;
   if (!isWindowAlive()) {
@@ -1548,6 +1569,7 @@ function createWindow(): void {
     hasShadow: false,
     backgroundColor: "#00000000",
     title: "随码",
+    show: !hideWindowForUpdateRestart,
     autoHideMenuBar: true,
     icon,
     webPreferences: {
@@ -2017,7 +2039,7 @@ function rendererHtml(): string {
       if(!state.environmentReady){
         if(environment) environment.innerHTML='<div class="check"><b>\u672c\u673a\u73af\u5883</b><span>\u6b63\u5728\u68c0\u6d4b\u672c\u673a\u7f16\u7801\u73af\u5883\uff0c\u8bf7\u7a0d\u5019\u2026</span></div>';
         renderGuide(state);
-        renderUpdate(state.update||{status:'idle'});
+        renderUpdate(state.clientUpdate||state.update||{status:'idle'});
         return;
       }
       var nodeAction=!env.nodeInstalled?'<button data-install="node" class="secondary">'+escapeHtml(t('installCli'))+'</button>':'';
@@ -2072,7 +2094,7 @@ function rendererHtml(): string {
       var anyEngineReady=env.codexCompatible||engines.some(function(item){return item.ready;});
       if(startPair) startPair.disabled=!anyEngineReady||!state.relayUrl;
       if(pairBox) pairBox.innerHTML=state.pairingCode?'<div class="pair">'+escapeHtml(state.pairingCode)+'</div><p class="detail">'+(locale==='en'?'Enter this code on the web. Expires in ~10 minutes.':'在 Web 端输入配对码，约 10 分钟后失效。')+'</p>':'';
-      renderUpdate(state.update||{status:'idle'});
+      renderUpdate(state.clientUpdate||state.update||{status:'idle'});
       lastActivities=state.activities&&state.activities.length?state.activities:(state.activity?[state.activity]:[]);
       selectedActivityId=state.selectedActivityThreadId||(lastActivities[0]&&lastActivities[0].threadId)||null;
       renderActivity(lastActivities, selectedActivityId);
@@ -2092,7 +2114,7 @@ function rendererHtml(): string {
   function renderUpdate(update){
     if(!updateBox) return;
     update=update||{status:'idle'};
-    var labels={idle:t('latest'),checking:t('checking'),available:t('available'),downloading:t('downloading'),ready:t('ready'),error:t('error')};
+    var labels={idle:t('latest'),checking:t('checking'),available:t('available'),downloading:t('downloading'),ready:t('ready'),error:t('error'),waiting:locale==='en'?'Waiting for tasks':'等待任务结束',installing:locale==='en'?'Installing':'正在静默升级',completed:locale==='en'?'Updated':'升级完成'};
     var tone=update.status==='idle'?'ok':update.status==='error'?'err':(update.status==='available'||update.status==='downloading'||update.status==='ready')?'warn':'';
     // Prefer message (includes download percent) over bare version — version alone hid progress.
     var text=update.message
@@ -2101,12 +2123,12 @@ function rendererHtml(): string {
       || '';
     var pct=update.status==='downloading'&&update.progress!==undefined?Math.max(0,Math.min(100,Number(update.progress)||0)):null;
     var bar=pct!==null?'<div class="update-progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><i style="width:'+pct+'%"></i></div>':'';
-    var busy=update.status==='checking'||update.status==='downloading';
-    updateBox.innerHTML='<div class="check '+tone+'"><b>'+(labels[update.status]||update.status)+'</b><span>'+escapeHtml(text)+'</span></div><button id="checkUpdate" class="secondary"'+(busy?' disabled':'')+'>'+escapeHtml(t('checkUpdate'))+'</button>'+(update.status==='ready'?'<button id="installUpdate">'+escapeHtml(t('installUpdate'))+'</button>':'')+bar;
+    var busy=update.status==='checking'||update.status==='downloading'||update.status==='waiting'||update.status==='installing';
+    updateBox.innerHTML='<div class="check '+tone+'"><b>'+(labels[update.status]||update.status)+'</b><span>'+escapeHtml(text)+'</span></div><button id="checkUpdate" class="secondary"'+(busy?' disabled':'')+'>'+escapeHtml(t('checkUpdate'))+'</button>'+(update.status==='ready'&&!update.installWhenIdle?'<button id="installUpdate">'+escapeHtml(t('installUpdate'))+'</button>':'')+bar;
     var checkBtn=document.querySelector('#checkUpdate');
     var installBtn=document.querySelector('#installUpdate');
-    if(checkBtn&&api) checkBtn.addEventListener('click',function(){api.checkUpdate();});
-    if(installBtn&&api) installBtn.addEventListener('click',function(){api.installUpdate();});
+    if(checkBtn&&api) checkBtn.addEventListener('click',function(){api.checkUpdate().catch(shortAlert);});
+    if(installBtn&&api) installBtn.addEventListener('click',function(){api.installUpdate().catch(shortAlert);});
   }
   function renderActivity(activities, selectedId){
     if(!activityBox) return;
@@ -3132,13 +3154,73 @@ async function runWindowsCommand(
   }
 }
 
+/** Keep remote client installation blocked until an external command really finishes. */
+function trackExternalClientOperation(completionPath: string, release: () => void): () => void {
+  let finished = false;
+  let polling = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    clearInterval(timer);
+    release();
+    void fs.unlink(completionPath).catch(() => undefined);
+  };
+  const timer = setInterval(() => {
+    if (finished || polling) return;
+    polling = true;
+    void fs.readFile(completionPath, "utf8").then((value) => {
+      if (value.trim() === "complete") finish();
+    }).catch(() => undefined).finally(() => { polling = false; });
+  }, 1000);
+  timer.unref();
+  return finish;
+}
+
+/** Wait-on-return WScript owns the console; the receipt precedes its final pause. */
+async function launchWindowsVisibleScript(script: string, extension: "cmd" | "ps1"): Promise<void> {
+  const release = reserveClientOperation();
+  let finish = release;
+  try {
+    const directory = await fs.mkdtemp(path.join(app.getPath("temp"), "anytimevibe-console-"));
+    finish = trackExternalClientOperation(path.join(directory, "complete"), release);
+    await fs.writeFile(path.join(directory, `payload.${extension}`), script, "utf8");
+    // Relative paths avoid CALL's second expansion of percent signs in user directories.
+    const runner = [
+      "@echo off", "setlocal DisableDelayedExpansion", "pushd .",
+      extension === "cmd" ? "call payload.cmd" : "powershell.exe -NoLogo -ExecutionPolicy Bypass -File .\\payload.ps1",
+      "popd", ">complete echo complete", "echo.", "pause", "endlocal", ""
+    ].join("\r\n");
+    await fs.writeFile(path.join(directory, "runner.cmd"), runner, "utf8");
+    const vbsPath = path.join(directory, "launcher.vbs");
+    const vbs = [
+      'Set launcher = CreateObject("WScript.Shell")',
+      `launcher.CurrentDirectory = "${directory.replace(/"/g, '""')}"`,
+      'launcher.Run "cmd /d /c runner.cmd", 1, True'
+    ].join("\r\n");
+    await fs.writeFile(vbsPath, vbs, "utf8");
+    const wscript = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
+    const child = spawn(wscript, [vbsPath], { stdio: "ignore", windowsHide: true, cwd: directory });
+    await new Promise<void>((resolve, reject) => {
+      child.once("error", (error) => { finish(); reject(new Error(`无法打开控制台：${error.message}`)); });
+      child.once("spawn", () => resolve());
+      child.once("close", () => {
+        // A killed launcher does not prove its installer children have stopped.
+        void fs.readFile(path.join(directory, "complete"), "utf8").then((value) => {
+          if (value.trim() === "complete") finish();
+        }).catch(() => logWarn("外部终端操作未确认结束", "客户端保持在线；客户端升级将继续等待，以免中断仍在运行的安装或接力命令。"));
+      });
+    });
+    child.unref();
+  } catch (error) {
+    finish();
+    throw error;
+  }
+}
+
 /** Visible console from Electron GUI on Windows (WScript is more reliable than cmd start). */
 async function openWindowsVisibleConsole(lines: string[]): Promise<void> {
   if (process.platform !== "win32") throw new Error("openWindowsVisibleConsole is Windows-only");
-  const stamp = Date.now();
-  const scriptPath = path.join(app.getPath("temp"), `anytimevibe-console-${stamp}.cmd`);
-  const vbsPath = path.join(app.getPath("temp"), `anytimevibe-console-${stamp}.vbs`);
-  const script = [
+  return launchWindowsVisibleScript([
     "@echo off",
     "setlocal EnableExtensions",
     "chcp 65001 >nul",
@@ -3148,27 +3230,9 @@ async function openWindowsVisibleConsole(lines: string[]): Promise<void> {
     "set \"PATH=%SYSPATH%;%USERPATH%;%ProgramFiles%\\nodejs;%APPDATA%\\npm;%PATH%\"",
     ...lines,
     "echo.",
-    "pause",
     "endlocal",
     ""
-  ].join("\r\n");
-  await fs.writeFile(scriptPath, script, "utf8");
-  const quoted = scriptPath.replace(/"/g, '""');
-  const vbs = `CreateObject("WScript.Shell").Run "cmd /k ""${quoted}""", 1, False`;
-  await fs.writeFile(vbsPath, vbs, "utf8");
-  const wscript = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
-  const child = spawn(wscript, [vbsPath], {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-    cwd: os.homedir()
-  });
-  await new Promise<void>((resolve, reject) => {
-    child.once("error", (error) => reject(new Error(`无法打开控制台：${error.message}`)));
-    child.once("spawn", () => resolve());
-    setTimeout(() => resolve(), 800);
-  });
-  child.unref();
+  ].join("\r\n"), "cmd");
 }
 
 /**
@@ -3397,17 +3461,37 @@ async function proxyShellLines(platform: "win32" | "darwin" | "powershell"): Pro
 
 /** Launch a `.command` file in Terminal via `open` — avoids AppleScript / System Events automation prompts. */
 async function launchMacTerminalScriptFile(scriptPath: string): Promise<void> {
-  const child = spawn("/usr/bin/open", ["-a", "Terminal", scriptPath], {
-    detached: true,
-    stdio: "ignore",
-    env: process.env
-  });
-  await new Promise<void>((resolve, reject) => {
-    child.once("error", (error) => reject(new Error(`无法打开 Terminal：${error.message}`)));
-    child.once("spawn", () => resolve());
-    setTimeout(() => resolve(), 800);
-  });
-  child.unref();
+  const release = reserveClientOperation();
+  let finish = release;
+  try {
+    const directory = await fs.mkdtemp(path.join(app.getPath("temp"), "anytimevibe-terminal-"));
+    const completionPath = path.join(directory, "complete");
+    finish = trackExternalClientOperation(completionPath, release);
+    const runnerPath = path.join(directory, "runner.command");
+    await fs.writeFile(runnerPath, [
+      "#!/bin/bash",
+      // A separate bash keeps payload EXIT/early-return behavior from skipping the receipt.
+      // Ignore hangups so closing Terminal cannot report completion while children still run.
+      "trap '' HUP",
+      `/bin/bash ${shellQuote(scriptPath)}`,
+      `printf 'complete\\n' > ${shellQuote(completionPath)}`,
+      ""
+    ].join("\n"), "utf8");
+    await fs.chmod(runnerPath, 0o755);
+    const child = spawn("/usr/bin/open", ["-a", "Terminal", runnerPath], {
+      detached: true, stdio: "ignore", env: process.env
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("error", (error) => { finish(); reject(new Error(`无法打开 Terminal：${error.message}`)); });
+      child.once("spawn", () => resolve());
+      // open exits as soon as Terminal launches, while the actual shell keeps running.
+      child.once("close", (code) => { if (code !== 0) finish(); });
+    });
+    child.unref();
+  } catch (error) {
+    finish();
+    throw error;
+  }
 }
 
 /** macOS Terminal: run a multi-line bash script (proxy + PATH already injected). */
@@ -3439,9 +3523,6 @@ async function openMacTerminalScript(scriptBody: string): Promise<void> {
 /** Windows: visible PowerShell window (never WSL/bash — those install Linux binaries). */
 async function openWindowsPowerShellScript(scriptBody: string): Promise<void> {
   if (process.platform !== "win32") throw new Error("openWindowsPowerShellScript is Windows-only");
-  const stamp = Date.now();
-  const ps1Path = path.join(app.getPath("temp"), `anytimevibe-ps-${stamp}.ps1`);
-  const vbsPath = path.join(app.getPath("temp"), `anytimevibe-ps-${stamp}.vbs`);
   const proxyLines = await proxyShellLines("powershell");
   const full = [
     "$ErrorActionPreference = 'Continue'",
@@ -3450,27 +3531,9 @@ async function openWindowsPowerShellScript(scriptBody: string): Promise<void> {
     "$ProgressPreference = 'SilentlyContinue'",
     ...proxyLines,
     scriptBody,
-    "Write-Host ''",
-    "Write-Host 'Press Enter to close...'",
-    "[void](Read-Host)"
+    "Write-Host ''"
   ].join("\r\n");
-  await fs.writeFile(ps1Path, `\uFEFF${full}`, "utf8");
-  const quoted = ps1Path.replace(/"/g, '""');
-  const vbs = `CreateObject("WScript.Shell").Run "powershell.exe -NoLogo -ExecutionPolicy Bypass -File ""${quoted}""", 1, False`;
-  await fs.writeFile(vbsPath, vbs, "utf8");
-  const wscript = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
-  const child = spawn(wscript, [vbsPath], {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-    cwd: os.homedir()
-  });
-  await new Promise<void>((resolve, reject) => {
-    child.once("error", (error) => reject(new Error(`无法打开 PowerShell：${error.message}`)));
-    child.once("spawn", () => resolve());
-    setTimeout(() => resolve(), 800);
-  });
-  child.unref();
+  return launchWindowsVisibleScript(`\uFEFF${full}`, "ps1");
 }
 
 /**
@@ -4520,6 +4583,10 @@ function scheduleReconnect(detail: string): void {
 }
 
 async function ensureCodex(options: { maintenance?: boolean } = {}): Promise<void> {
+  return withClientOperation(() => ensureCodexImpl(options));
+}
+
+async function ensureCodexImpl(options: { maintenance?: boolean } = {}): Promise<void> {
   const release = options.maintenance ? undefined : getEngineMaintenance().reserveRun("codex");
   try {
     await startCodexAppServer();
@@ -4850,7 +4917,7 @@ function startEngineCredentialAndCatalogWatch(): void {
       scheduleCodexCredentialReload(`切号/凭证变更:${reason}`);
     },
     onCapabilitySourcesChanged: (reason) => {
-      if (engineMaintenanceInstance?.busy) return;
+      if (engineMaintenanceInstance?.busy || clientUpdateController?.applying) return;
       if (capabilityRefreshInFlight) return;
       capabilityRefreshInFlight = true;
       clearCodexDebugModelsCache();
@@ -5701,23 +5768,44 @@ async function handleCommand(command: ClientCommand): Promise<void> {
     await publishCommandStatus(command, "duplicate", "命令已处理，忽略重复投递");
     return;
   }
-  config.processedCommandIds = { ...(config.processedCommandIds ?? {}), [command.commandId]: now };
-  const entries = Object.entries(config.processedCommandIds);
-  if (entries.length > 2000) {
-    config.processedCommandIds = Object.fromEntries(entries.sort((a, b) => a[1] - b[1]).slice(-2000));
-  }
-  await saveConfig().catch(() => undefined);
-  await publishCommandStatus(command, "accepted");
+  // Reserve at receipt, before configuration I/O can yield to the update timer.
+  // Commands rejected during installation are not recorded as already processed.
+  let releaseClient: (() => void) | undefined;
+  let releaseEngine: (() => void) | undefined;
   try {
-    await handleCommandImpl(command);
-    if (queuedCommandIds.delete(command.commandId)) {
-      await publishCommandStatus(command, "queued");
-      return;
-    }
-    await publishCommandStatus(command, "completed");
+    releaseClient = reserveClientOperation(["host.client.update", "host.refresh", "host.directory.list"].includes(command.type));
+    const engine = commandEngine(command);
+    if (engine) releaseEngine = getEngineMaintenance().reserveRun(engine);
   } catch (error) {
-    await publishCommandStatus(command, "failed", error instanceof Error ? error.message : String(error));
+    releaseClient?.();
+    await publish({ type: "error", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(),
+      commandId: command.commandId, message: error instanceof Error ? error.message : String(error),
+      ...("threadId" in command ? { threadId: command.threadId } : {})
+    }, true).catch(() => undefined);
     throw error;
+  }
+  try {
+    config.processedCommandIds = { ...(config.processedCommandIds ?? {}), [command.commandId]: now };
+    const entries = Object.entries(config.processedCommandIds);
+    if (entries.length > 2000) {
+      config.processedCommandIds = Object.fromEntries(entries.sort((a, b) => a[1] - b[1]).slice(-2000));
+    }
+    await saveConfig().catch(() => undefined);
+    await publishCommandStatus(command, "accepted");
+    try {
+      await handleCommandImpl(command);
+      if (queuedCommandIds.delete(command.commandId)) {
+        await publishCommandStatus(command, "queued");
+        return;
+      }
+      await publishCommandStatus(command, "completed");
+    } catch (error) {
+      await publishCommandStatus(command, "failed", error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  } finally {
+    releaseEngine?.();
+    releaseClient?.();
   }
 }
 
@@ -5786,7 +5874,11 @@ function commandEngine(command: ClientCommand): CliEngine | undefined {
 async function handleCommandImpl(command: ClientCommand): Promise<void> {
   const engine = commandEngine(command);
   let release: (() => void) | undefined;
+  const reservesClient = !["host.client.update", "host.refresh", "host.directory.list"].includes(command.type);
   try {
+    if (reservesClient && clientUpdateController?.applying) {
+      throw new Error("客户端正在准备安装更新，请等待更新完成后再操作。");
+    }
     if (engine) release = getEngineMaintenance().reserveRun(engine);
   } catch (error) {
     await publish({
@@ -5799,14 +5891,28 @@ async function handleCommandImpl(command: ClientCommand): Promise<void> {
     }, true).catch(() => undefined);
     throw error;
   }
+  if (reservesClient) clientOperations++;
   try {
     await handleCommandBody(command);
   } finally {
     release?.();
+    if (reservesClient) clientOperations--;
   }
 }
 
 async function handleCommandBody(command: ClientCommand): Promise<void> {
+  if (command.type === "host.client.update") {
+    try {
+      if (!clientUpdateController) throw new Error("客户端更新控制器尚未就绪。");
+      await clientUpdateController.execute(command);
+    } catch (error) {
+      await publish({ type: "error", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(),
+        commandId: command.commandId, message: error instanceof Error ? error.message : String(error)
+      }, true).catch(() => undefined);
+      throw error;
+    }
+    return;
+  }
   if (command.type === "host.engine.update" || command.type === "host.engine.refresh") {
     try {
       await getEngineMaintenance().execute(command);
@@ -5862,6 +5968,10 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
   }
   // host.refresh: status + re-import local Claude/Grok/Cursor sessions for web list.
   if (command.type === "host.refresh") {
+    if (clientUpdateController?.applying) {
+      await publishHostStatus({ refresh: false });
+      return;
+    }
     gitBranchCache.clear();
     // Always re-push agentVersion first so web update banners clear quickly after client upgrade.
     publishAgentMeta({ agentVersion: agentAppVersion() });
@@ -6413,6 +6523,7 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
           ...(engineMaintenanceInstance?.operation ? { operation: engineMaintenanceInstance.operation } : {})
         },
         agentVersion: agentAppVersion(),
+        ...(clientUpdateController ? { clientUpdate: clientUpdateController.state } : {}),
         ...(lastEngineQuotas.length ? { engineQuotas: lastEngineQuotas } : {})
       }, true).catch(() => undefined);
       publishAgentMeta({ agentVersion: agentAppVersion() });
@@ -7206,7 +7317,7 @@ async function refreshEngineQuotas(filter?: CliEngine): Promise<EngineQuota[]> {
 
 async function publishHostStatus(options: { refresh?: boolean } = {}): Promise<void> {
   // Keep encrypted host.status for workspaces/online UX; version/name also go via agent.meta for DB.
-  if (options.refresh !== false && !engineMaintenanceInstance?.busy) {
+  if (options.refresh !== false && !engineMaintenanceInstance?.busy && !clientUpdateController?.applying) {
     await refreshAvailableEngines().catch(() => undefined);
   }
   // Always stamp the running build version so web banners update without waiting for a full re-pair.
@@ -7225,6 +7336,7 @@ async function publishHostStatus(options: { refresh?: boolean } = {}): Promise<v
       ...(engineMaintenanceInstance?.operation ? { operation: engineMaintenanceInstance.operation } : {})
     },
     agentVersion: agentAppVersion(),
+    ...(clientUpdateController ? { clientUpdate: clientUpdateController.state } : {}),
     ...(lastEngineQuotas.length ? { engineQuotas: lastEngineQuotas } : {})
   }, true);
 }
@@ -7610,6 +7722,10 @@ async function reconcileOrphanedActiveTasks(): Promise<number> {
 
 /** Load 接力 task list from local Codex (thread/list) — independent of web sync. */
 async function refreshLocalTasks(limit = 50): Promise<void> {
+  return withClientOperation(() => refreshLocalTasksImpl(limit));
+}
+
+async function refreshLocalTasksImpl(limit = 50): Promise<void> {
   gitBranchCache.clear();
   try {
     await reconcileOrphanedActiveTasks();
@@ -8415,17 +8531,130 @@ let updateListenersRegistered = false;
 let pendingDownloadedUpdateFile: string | null = null;
 /** Version string of the package currently sitting in the updater pending cache. */
 let pendingDownloadedVersion: string | null = null;
-/** Native Squirrel.Mac finished staging the update (macOS only). */
-let macNativeUpdateReady = false;
 /** Avoid overlapping check+download sequences from UI spam / interval. */
 let updateCheckInFlight: Promise<void> | null = null;
+
+function reserveClientOperation(allowDuringUpdate = false): () => void {
+  if (!allowDuringUpdate && clientUpdateController?.applying) throw new Error("客户端正在准备安装更新，请等待更新完成后再操作。");
+  clientOperations++;
+  let released = false;
+  return () => { if (!released) { released = true; clientOperations--; } };
+}
+
+async function withClientOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const release = reserveClientOperation();
+  try { return await operation(); }
+  finally { release(); }
+}
+
+async function initializeClientUpdate(): Promise<void> {
+  const userDataPath = app.getPath("userData");
+  const intent = config.clientUpdateIntent;
+  if (intent?.phase === "installing" && process.argv.includes("--updated")) hideWindowForUpdateRestart = true;
+  let recoveryFailure: string | undefined;
+  let installerResultConfirmed = false;
+  try {
+    const result = JSON.parse(await fs.readFile(path.join(userDataPath, "client-update-result.json"), "utf8"));
+    if (intent?.phase === "installing" && result.operationId === intent.commandId && typeof result.success === "boolean") {
+      installerResultConfirmed = true;
+      if (!result.success) recoveryFailure = String(result.message || "静默安装未完成，已尝试重新启动客户端。").slice(0, 1000);
+    }
+  } catch { /* no prior installer result */ }
+  clientUpdateController = new ClientUpdateController({
+    supported: app.isPackaged && (process.platform === "win32" || process.platform === "darwin"),
+    currentVersion: agentAppVersion(), intent,
+    awaitingInstallerResult: intent?.phase === "installing" && !installerResultConfirmed,
+    ...(recoveryFailure ? { recoveryFailure } : {}),
+    busy: () => clientOperations > 0 || Boolean(engineMaintenanceInstance?.busy)
+      || codexMessageChains.size > 0 || Boolean(codexReloadInFlight) || capabilityRefreshInFlight
+      || (engineMaintenanceInstance?.busyEngines() ?? busyCodingEngines()).length > 0,
+    persist: async (next) => {
+      const previous = config.clientUpdateIntent;
+      if (next) config.clientUpdateIntent = next;
+      else delete config.clientUpdateIntent;
+      try { await saveConfig(); }
+      catch (error) {
+        if (previous) config.clientUpdateIntent = previous;
+        else delete config.clientUpdateIntent;
+        throw error;
+      }
+    },
+    check: checkForAgentUpdate,
+    prepare: async (installIntent) => {
+      const update = clientUpdateController!.state;
+      if (!pendingDownloadedUpdateFile || !pendingDownloadedVersion || !update.version
+        || pendingDownloadedVersion !== update.version || !update.commandId) {
+        throw new Error("未找到匹配版本的已下载更新包，请重新检查更新。");
+      }
+      if (process.platform !== "win32" && process.platform !== "darwin") throw new Error("当前平台不支持静默升级。");
+      return prepareSilentClientUpdate({
+        platform: process.platform,
+        installerPath: pendingDownloadedUpdateFile,
+        appPath: process.platform === "darwin" ? getDarwinAppBundlePath() : path.dirname(process.execPath),
+        executablePath: process.execPath, userDataPath, currentPid: process.pid,
+        currentVersion: agentAppVersion(), targetVersion: update.version, operationId: installIntent.commandId
+      });
+    },
+    quit: () => {
+      // The helper has acknowledged readiness; only now release the relay and current process.
+      prepareForUpdateQuit();
+      app.quit();
+      setTimeout(() => app.exit(0), 5000).unref();
+    },
+    notify: async (update) => {
+      updateState({ clientUpdate: update });
+      if (!clientUpdateController?.applying) scheduleDrainAllTurnQueues();
+      await publish({ type: "host.client.update.status", eventId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(), update }, true);
+    }
+  });
+  updateState({ clientUpdate: clientUpdateController.state });
+  // Clear a previous installing intent before connecting; keep its visible outcome in memory.
+  await clientUpdateController.tick();
+  const recoveryStartedAt = Date.now();
+  let polling = false;
+  setInterval(() => {
+    if (quitting || polling) return;
+    polling = true;
+    void (async () => {
+      if (intent?.phase === "installing" && clientUpdateController?.state.status === "installing") {
+        let confirmed = false;
+        try {
+          const result = JSON.parse(await fs.readFile(path.join(userDataPath, "client-update-result.json"), "utf8"));
+          if (result.operationId === intent.commandId && typeof result.success === "boolean") {
+            await clientUpdateController.confirmRestart({ success: result.success, message: String(result.message || "").slice(0, 1000) });
+            confirmed = true;
+          }
+        } catch { /* helper has not published its result yet */ }
+        if (!confirmed && Date.now() - recoveryStartedAt > 120_000) {
+          await clientUpdateController.confirmRestart({ success: false, message: "客户端已重新启动，但未收到安装辅助进程的最终确认。请检查更新结果后再重试。" });
+        }
+      }
+      await clientUpdateController?.tick();
+      if (!clientUpdateController?.applying) scheduleDrainAllTurnQueues();
+    })().catch((error) => logWarn("客户端升级检查失败", String(error))).finally(() => { polling = false; });
+  }, 2000).unref();
+}
+
+let clientHealthWriteInFlight = false;
+async function writeClientUpdateHealth(): Promise<void> {
+  if (quitting || clientHealthWriteInFlight || !app.isPackaged) return;
+  clientHealthWriteInFlight = true;
+  const destination = path.join(app.getPath("userData"), "client-update-health.json");
+  const temporary = `${destination}.${process.pid}.tmp`;
+  try {
+    await fs.writeFile(temporary, JSON.stringify({ version: agentAppVersion(), pid: process.pid, updatedAt: Date.now() }), "utf8");
+    await fs.rename(temporary, destination);
+  } catch (error) {
+    logWarn("升级启动心跳写入失败", error instanceof Error ? error.message : String(error));
+  } finally { clientHealthWriteInFlight = false; }
+}
 
 /** Drop a stale pending installer so a newer feed version can download cleanly. */
 async function clearPendingUpdaterCache(reason: string): Promise<void> {
   logInfo("清除本地更新缓存", reason);
   pendingDownloadedUpdateFile = null;
   pendingDownloadedVersion = null;
-  macNativeUpdateReady = false;
   try {
     const helper = (autoUpdater as unknown as {
       downloadedUpdateHelper?: { clear?: () => Promise<void> };
@@ -8467,84 +8696,12 @@ function getDarwinAppBundlePath(): string {
   return path.resolve(process.execPath, "..", "..", "..");
 }
 
-/**
- * macOS electron-updater relies on Squirrel.Mac, which often fails for unsigned builds.
- * Spawn a detached installer that replaces the .app after we quit, then relaunches.
- */
-function launchMacZipReplaceInstaller(zipPath: string): void {
-  const appBundle = getDarwinAppBundlePath();
-  const script = `#!/bin/bash
-set -euo pipefail
-ZIP=${JSON.stringify(zipPath)}
-APP_BUNDLE=${JSON.stringify(appBundle)}
-LOG="$HOME/Library/Logs/AnytimeVibe-update.log"
-exec >>"$LOG" 2>&1
-echo "[$(date -Iseconds)] start update zip=$ZIP app=$APP_BUNDLE"
-
-# Wait until this app process tree is gone (up to ~45s).
-for i in $(seq 1 90); do
-  if ! pgrep -f "$APP_BUNDLE/Contents/MacOS/" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 0.5
-done
-sleep 1
-
-if [ ! -f "$ZIP" ]; then
-  echo "zip missing: $ZIP"
-  exit 1
-fi
-
-TMP=$(mktemp -d /tmp/anytimevibe-update.XXXXXX)
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
-
-# Unzip (ditto handles zip + resource forks on macOS)
-ditto -x -k "$ZIP" "$TMP"
-NEW_APP=$(find "$TMP" -name "*.app" -type d -maxdepth 4 | head -n 1 || true)
-if [ -z "\${NEW_APP}" ] || [ ! -d "\${NEW_APP}" ]; then
-  echo "no .app found inside zip"
-  find "$TMP" -maxdepth 3 -print
-  exit 1
-fi
-
-PARENT=$(dirname "$APP_BUNDLE")
-if [ ! -w "$PARENT" ]; then
-  echo "parent not writable: $PARENT"
-  exit 1
-fi
-
-BACKUP="\${APP_BUNDLE}.bak-update"
-rm -rf "$BACKUP"
-if [ -d "$APP_BUNDLE" ]; then
-  mv "$APP_BUNDLE" "$BACKUP"
-fi
-# ditto preserves attributes better than cp -R
-ditto "\${NEW_APP}" "$APP_BUNDLE"
-rm -rf "$BACKUP"
-xattr -dr com.apple.quarantine "$APP_BUNDLE" 2>/dev/null || true
-
-echo "update applied, launching"
-open "$APP_BUNDLE" || open -a "$APP_BUNDLE" || true
-echo "[$(date -Iseconds)] done"
-`;
-  const scriptPath = path.join(os.tmpdir(), `anytimevibe-update-${Date.now()}.sh`);
-  writeFileSync(scriptPath, script, { encoding: "utf8", mode: 0o755 });
-  const child = spawn("/bin/bash", [scriptPath], {
-    detached: true,
-    stdio: "ignore",
-    env: process.env
-  });
-  child.unref();
-  console.log(`[update] mac zip installer launched: ${scriptPath} → ${appBundle}`);
-}
-
 function registerUpdateListeners(): void {
   if (updateListenersRegistered) return;
   updateListenersRegistered = true;
   // Manual download from checkForAgentUpdate — avoids racing autoDownload + downloadUpdate().
   autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.autoRunAppAfterInstall = true;
   autoUpdater.allowDowngrade = false;
   autoUpdater.on("checking-for-update", () => {
@@ -8601,7 +8758,6 @@ function registerUpdateListeners(): void {
       : null;
     if (downloadedFile) pendingDownloadedUpdateFile = downloadedFile;
     pendingDownloadedVersion = String(info.version || pendingDownloadedVersion || "");
-    macNativeUpdateReady = false;
 
     if (process.platform === "darwin" && isRunningFromDmgOrReadOnlyVolume()) {
       updateState({
@@ -8611,7 +8767,6 @@ function registerUpdateListeners(): void {
           message: "当前从 DMG 直接运行，无法就地更新。请将「随码」拖入「应用程序」后再检查更新。"
         }
       });
-      showWindow();
       return;
     }
 
@@ -8624,7 +8779,6 @@ function registerUpdateListeners(): void {
           : "更新已在后台下载完成"
       }
     });
-    showWindow();
   });
   autoUpdater.on("error", (error) => {
     // Do not clear flags mid-install; that re-enables tray-hide and races with quit.
@@ -8632,41 +8786,12 @@ function registerUpdateListeners(): void {
       console.error("update install error:", error);
       return;
     }
+    // A failed proxy attempt may still succeed through the direct transfer retry.
+    // The check's final catch reports failure only after those alternatives finish.
+    if (updateCheckInFlight) return;
     if (quitting) quitting = false;
     updateState({ update: { status: "error", message: error.message } });
   });
-  // Required so window close handlers do not cancel quitAndInstall by hide-to-tray.
-  // electron-updater emits this event; typings may lag behind runtime.
-  (autoUpdater as NodeJS.EventEmitter).on("before-quit-for-update", () => {
-    quitting = true;
-    installingUpdate = true;
-    prepareForUpdateQuit();
-  });
-
-  // Track native Squirrel.Mac readiness / errors (electron-updater stages zip then feeds Squirrel).
-  if (process.platform === "darwin") {
-    try {
-      electronNativeUpdater.on("update-downloaded", () => {
-        macNativeUpdateReady = true;
-        console.log("[update] native Squirrel.Mac update-downloaded");
-      });
-      electronNativeUpdater.on("error", (error) => {
-        console.error("[update] native Squirrel.Mac error:", error);
-        // Keep status ready if we already have a zip — shell fallback can still install.
-        if (!installingUpdate && publicState.update.status === "ready" && pendingDownloadedUpdateFile) {
-          updateState({
-            update: {
-              ...publicState.update,
-              status: "ready",
-              message: "系统自动更新组件不可用，将在重启时用安装包替换应用（无需签名）。"
-            }
-          });
-        }
-      });
-    } catch (error) {
-      console.error("[update] failed to bind native autoUpdater", error);
-    }
-  }
 }
 
 /** Tear down sockets/codex/UI before the updater replaces the app bundle. */
@@ -8716,85 +8841,10 @@ function prepareForUpdateQuit(): void {
   windowRef = null;
 }
 
-function installDownloadedUpdate(): void {
-  if (installingUpdate) return;
-  if (publicState.update.status !== "ready") {
-    updateState({ update: { status: "error", message: "更新包尚未下载完成，请先等待下载或点击检查更新。" } });
-    return;
-  }
-
-  if (process.platform === "darwin" && isRunningFromDmgOrReadOnlyVolume()) {
-    updateState({
-      update: {
-        status: "error",
-        message: "当前从 DMG 直接运行，无法更新。请先将「随码」拖到「应用程序」文件夹，再打开并检查更新。"
-      }
-    });
-    return;
-  }
-
-  // macOS: always arm zip-replace installer first. Squirrel.Mac often no-ops on unsigned apps;
-  // the previous app.exit() fallback killed the process before any install could run.
-  if (process.platform === "darwin") {
-    const zipPath = pendingDownloadedUpdateFile;
-    if (!zipPath) {
-      updateState({
-        update: {
-          status: "error",
-          message: "未找到已下载的更新包路径，请重新点击「检查更新」后再试。"
-        }
-      });
-      return;
-    }
-    try {
-      launchMacZipReplaceInstaller(zipPath);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      updateState({ update: { status: "error", message: `无法启动 macOS 安装脚本：${message}` } });
-      return;
-    }
-    prepareForUpdateQuit();
-    setTimeout(() => {
-      try {
-        // Best-effort native path when the app is signed / Squirrel staged successfully.
-        autoUpdater.autoRunAppAfterInstall = true;
-        if (macNativeUpdateReady) {
-          autoUpdater.quitAndInstall(false, true);
-        }
-      } catch (error) {
-        console.error("[update] mac quitAndInstall error", error);
-      }
-      // Graceful quit only — never app.exit() on mac; that aborts the detached installer mid-flight.
-      setTimeout(() => {
-        try { app.quit(); } catch { /* ignore */ }
-        setTimeout(() => {
-          // Last resort exit after installer has had time to start waiting on pgrep.
-          try { app.exit(0); } catch { /* ignore */ }
-        }, 4000);
-      }, 800);
-    }, 200);
-    return;
-  }
-
-  // Windows NSIS: standard electron-updater path.
-  prepareForUpdateQuit();
-  setTimeout(() => {
-    try {
-      autoUpdater.quitAndInstall(false, true);
-      setTimeout(() => {
-        if (!installingUpdate) return;
-        try { app.quit(); } catch { /* ignore */ }
-        setTimeout(() => {
-          if (installingUpdate) app.exit(0);
-        }, 1500);
-      }, 2000);
-    } catch (error) {
-      installingUpdate = false;
-      quitting = false;
-      const message = error instanceof Error ? error.message : String(error);
-      updateState({ update: { status: "error", message: `无法启动安装：${message}` } });
-    }
-  }, 150);
+async function installDownloadedUpdate(): Promise<void> {
+  if (!clientUpdateController) throw new Error("客户端更新控制器尚未就绪。");
+  await clientUpdateController.execute({ commandId: crypto.randomUUID(), action: "upgrade" });
+  await clientUpdateController.tick();
 }
 
 function toElectronProxyRules(proxyUrl: string): string {
@@ -8845,7 +8895,9 @@ async function applyLocalProxyToElectronSessions(mode: "auto" | "direct" = "auto
 }
 
 async function checkForAgentUpdate(): Promise<void> {
+  if (clientUpdateController?.applying) return;
   if (updateCheckInFlight) return updateCheckInFlight;
+  if (publicState.update.status === "downloading") return;
   updateCheckInFlight = (async () => {
     if (!app.isPackaged) {
       updateState({ update: { status: "idle", message: "开发模式不检查更新" } });
@@ -8867,7 +8919,7 @@ async function checkForAgentUpdate(): Promise<void> {
       autoUpdater.setFeedURL({ provider: "generic", url: feedUrl });
       autoUpdater.requestHeaders = { "Cache-Control": "no-cache", Pragma: "no-cache" };
       autoUpdater.autoDownload = false;
-      autoUpdater.autoInstallOnAppQuit = true;
+      autoUpdater.autoInstallOnAppQuit = false;
       return autoUpdater.checkForUpdates();
     };
 
@@ -8940,7 +8992,10 @@ async function checkForAgentUpdate(): Promise<void> {
       if (installingUpdate) return;
       updateState({ update: { status: "error", message: error.message || "Update download failed" } });
     });
-  })().finally(() => {
+  })().catch((error) => {
+    updateState({ update: { status: "error", message: error instanceof Error ? error.message : String(error) } });
+    throw error;
+  }).finally(() => {
     updateCheckInFlight = null;
   });
   return updateCheckInFlight;
@@ -9057,11 +9112,12 @@ function registerIpc(): void {
     logInfo("已打开日志文件", agentLogFilePath);
     return { path: agentLogFilePath };
   });
-  ipcMain.handle("agent:check-environment", async () => recheckLocalEnvironment());
+  ipcMain.handle("agent:check-environment", async () => withClientOperation(recheckLocalEnvironment));
   ipcMain.handle("agent:install-environment", async (_event, target: "node" | "codex" | "claude" | "grok" | "cursor" | "antigravity" | "pi") => {
     if (target !== "node" && target !== "codex" && target !== "claude" && target !== "grok" && target !== "cursor" && target !== "antigravity" && target !== "pi") {
       throw new Error("未知的安装目标");
     }
+    const release = reserveClientOperation();
     try {
       await installEnvironment(target);
       // Re-detect after install window is launched (user may finish later; still refresh now for partial hits).
@@ -9079,6 +9135,8 @@ function registerIpc(): void {
     } catch (error) {
       handleError(error);
       throw error;
+    } finally {
+      release();
     }
     return publicState;
   });
@@ -9086,6 +9144,7 @@ function registerIpc(): void {
     if (target !== "codex" && target !== "claude" && target !== "grok" && target !== "cursor" && target !== "antigravity" && target !== "pi") {
       throw new Error("未知的升级目标");
     }
+    const release = reserveClientOperation();
     try {
       await getEngineMaintenance().execute({
         type: "host.engine.update",
@@ -9097,12 +9156,17 @@ function registerIpc(): void {
     } catch (error) {
       handleError(error);
       throw error;
+    } finally {
+      release();
     }
   });
-  ipcMain.handle("agent:check-update", async () => { await checkForAgentUpdate(); return publicState; });
-  ipcMain.handle("agent:install-update", () => {
+  ipcMain.handle("agent:check-update", async () => {
+    if (clientUpdateController) await clientUpdateController.execute({ commandId: crypto.randomUUID(), action: "check" });
+    return publicState;
+  });
+  ipcMain.handle("agent:install-update", async () => {
     try {
-      installDownloadedUpdate();
+      await installDownloadedUpdate();
     } catch (error) {
       installingUpdate = false;
       quitting = false;
@@ -9112,12 +9176,15 @@ function registerIpc(): void {
     return publicState;
   });
   ipcMain.handle("agent:relay-task", async (_event, threadId: string) => {
+    const release = reserveClientOperation();
     try {
       await relayTaskToCli(threadId);
       updateState({ detail: `已打开任务接力终端：${threadId.slice(0, 8)}…` });
     } catch (error) {
       handleError(error);
       throw error;
+    } finally {
+      release();
     }
     // After handoff, re-import CLI sessions a bit later so local work can appear on web sync.
     setTimeout(() => {
@@ -9131,14 +9198,17 @@ function registerIpc(): void {
     return publicState;
   });
   ipcMain.handle("agent:refresh-tasks", async () => {
-    await refreshLocalTasks();
-    // Also push multi-CLI tasks to the web when the agent window refreshes.
+    const release = reserveClientOperation();
     try {
-      await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
-    } catch {
-      // ignore
-    }
-    return publicState;
+      await refreshLocalTasks();
+      // Also push multi-CLI tasks to the web when the agent window refreshes.
+      try {
+        await publishRecentMultiCliSnapshots(DEFAULT_SYNC_LIMIT);
+      } catch {
+        // ignore
+      }
+      return publicState;
+    } finally { release(); }
   });
   ipcMain.handle("agent:select-activity", async (_event, threadId: string) => {
     const id = String(threadId || "");
@@ -9147,7 +9217,7 @@ function registerIpc(): void {
     return publicState;
   });
   ipcMain.handle("agent:refresh-engines", async () => {
-    await refreshAvailableEngines();
+    await withClientOperation(() => refreshAvailableEngines());
     return publicState;
   });
   ipcMain.handle("agent:window-minimize", () => {
@@ -9230,6 +9300,7 @@ app.whenReady().then(async () => {
   await loadDeletedThreads(app.getPath("userData"));
   await initAgentLogFile(app.getPath("userData"));
   updateState({ cliEngine: taskStore.getDefaultEngine(), agentVersion: agentAppVersion() });
+  await initializeClientUpdate();
   registerIpc();
   if (process.platform === "darwin") {
     Menu.setApplicationMenu(Menu.buildFromTemplate([{ role: "appMenu" }]));
@@ -9244,6 +9315,7 @@ app.whenReady().then(async () => {
     if (process.platform === "win32") showWindow();
   });
   createWindow();
+  if (hideWindowForUpdateRestart && process.platform === "darwin") app.dock?.hide();
   setInterval(() => void publishActiveTurnHeartbeats(), 15_000).unref();
   startEngineCredentialAndCatalogWatch();
   // Defer update check so first paint / IPC is never delayed by network download.
@@ -9273,6 +9345,8 @@ app.whenReady().then(async () => {
   // Connect immediately when paired — never wait on Codex/env probes (those can hang PATH shells).
   // Any supported coding engine is enough; missing Codex must not prevent relay.
   if (config.hostId) void connect().catch(handleError);
+  await writeClientUpdateHealth();
+  setInterval(() => void writeClientUpdateHealth(), 5000).unref();
   // Background env detect (Codex optional; failures must not block relay).
   void (async () => {
     // Version probes (especially hidden `claude --version`) can hang past their own

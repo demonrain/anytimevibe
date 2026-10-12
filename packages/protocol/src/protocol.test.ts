@@ -20,6 +20,23 @@ import {
   windowTranscriptMessages
 } from "./index";
 
+describe("remote client updates", () => {
+  it("accepts only built-in update actions", () => {
+    for (const action of ["check", "upgrade", "cancel"]) {
+      expect(clientCommandSchema.safeParse({ type: "host.client.update", commandId: crypto.randomUUID(), action }).success).toBe(true);
+    }
+    expect(clientCommandSchema.safeParse({ type: "host.client.update", commandId: crypto.randomUUID(), action: "run" }).success).toBe(false);
+    expect(clientCommandSchema.safeParse({ type: "host.client.update", commandId: crypto.randomUUID(), action: "upgrade", url: "https://untrusted.example/installer.exe" }).success).toBe(false);
+  });
+
+  it("transfers bounded download progress and restart state", () => {
+    const base = { eventId: crypto.randomUUID(), occurredAt: new Date().toISOString() };
+    const update = { supported: true, currentVersion: "0.5.23", version: "0.5.24", status: "waiting", installWhenIdle: true, updatedAt: base.occurredAt };
+    expect(agentEventSchema.safeParse({ ...base, type: "host.client.update.status", update }).success).toBe(true);
+    expect(agentEventSchema.safeParse({ ...base, type: "host.client.update.status", update: { ...update, progress: 150 } }).success).toBe(false);
+  });
+});
+
 describe("protocol crypto", () => {
   it("round-trips encrypted envelopes", async () => {
     const key = await importAesKey(randomKeyBytes());

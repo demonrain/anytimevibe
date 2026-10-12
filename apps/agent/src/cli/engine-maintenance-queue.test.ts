@@ -42,7 +42,9 @@ function fixture(blockAt: "persist" | "publish") {
     syncModels: async () => {},
     notify: async () => {}
   });
+  const clientUpdateController = { applying: false };
   const drain = drainScript.runInNewContext({
+    clientUpdateController,
     isThreadTurnBusy: () => false,
     pendingCodexSteeringByThread: new Map(),
     resolveActivityEngine: () => "pi",
@@ -60,10 +62,19 @@ function fixture(blockAt: "persist" | "publish") {
     },
     publishCommandStatus: async () => {}
   }) as (threadId: string) => Promise<void>;
-  return { gate, threadId, queues, started, maintenance, drain };
+  return { gate, threadId, queues, started, maintenance, drain, clientUpdateController };
 }
 
 describe("queue drain maintenance protection", () => {
+  it("preserves queued requests while the desktop client prepares an update", async () => {
+    const f = fixture("persist");
+    f.clientUpdateController.applying = true;
+    await f.drain(f.threadId);
+    expect(f.queues.size).toBe(1);
+    expect(f.started).toEqual([]);
+    expect(f.maintenance.busyEngines()).toEqual(["pi"]);
+  });
+
   it.each(["persist", "publish"] as const)("rejects an upgrade while a dequeued request awaits %s", async (blockAt) => {
     const f = fixture(blockAt);
     const draining = f.drain(f.threadId);

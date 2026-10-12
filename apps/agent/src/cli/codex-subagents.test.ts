@@ -13,7 +13,7 @@ const source = createSourceFile("main.ts", readFileSync(path.resolve("apps/agent
 const names = [
   "handleCodexMessage", "handleCodexMessageBody", "touchAgentTask", "extractCodexThreadList", "extractCodexNextCursor",
   "threadMatchesQuery", "listCodexThreadsForSync", "mapPool", "hideCodexSubagentTask", "cleanupCodexSubagentTasks",
-  "refreshLocalTasks", "publishThread", "publishStoredTaskSnapshot", "hasActiveCodexTurn", "hasRunningCodexTurn", "busyCodingEngines", "resolveRelayTask", "recoverAfterCodexAppServerExit"
+  "refreshLocalTasks", "refreshLocalTasksImpl", "reserveClientOperation", "withClientOperation", "publishThread", "publishStoredTaskSnapshot", "hasActiveCodexTurn", "hasRunningCodexTurn", "busyCodingEngines", "resolveRelayTask", "recoverAfterCodexAppServerExit"
 ];
 const declarations = source.statements.filter((node) => isFunctionDeclaration(node) && names.includes(node.name?.text || ""));
 const script = new Script(`${transpileModule(declarations.map((node) => node.getText(source)).join("\n"), {
@@ -32,6 +32,8 @@ function fixture() {
     ...adapter,
     crypto: globalThis.crypto,
     publicState, taskStore: new TaskStore(),
+    clientUpdateController: null,
+    clientOperations: 0,
     activeTurnByThread: new Map([["parent", "parent-turn"]]),
     lastProgressAtByThread: new Map(), turnUsageByThread: new Map(), pendingUsageByThread: new Map(),
     usageFlushTimers: new Map(), turnStartingByThread: new Set(), pendingCodexSteeringByThread: new Map(),

@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.5.23";
+export const PRODUCT_VERSION = "0.5.24";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -211,6 +211,20 @@ export const engineManagementSchema = z.object({
   operation: engineOperationSchema.optional()
 });
 export type EngineManagement = z.infer<typeof engineManagementSchema>;
+
+/** Desktop application updates travel over the paired, encrypted host channel. */
+export const clientUpdateStateSchema = z.object({
+  supported: z.boolean(),
+  status: z.enum(["idle", "checking", "available", "downloading", "ready", "waiting", "installing", "completed", "error"]),
+  currentVersion: z.string().min(1).max(80),
+  version: z.string().min(1).max(80).optional(),
+  progress: z.number().min(0).max(100).optional(),
+  commandId: z.string().uuid().optional(),
+  installWhenIdle: z.boolean().optional(),
+  message: z.string().max(1000).optional(),
+  updatedAt: z.string().datetime()
+});
+export type ClientUpdateState = z.infer<typeof clientUpdateStateSchema>;
 
 export const contextUsageSchema = z.object({
   inputTokens: z.number().nonnegative().optional(),
@@ -465,6 +479,11 @@ export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
     type: z.literal("host.refresh")
   }),
+  /** Only built-in actions: a browser cannot supply an installer URL, path, or command. */
+  commandBase.extend({
+    type: z.literal("host.client.update"),
+    action: z.enum(["check", "upgrade", "cancel"])
+  }).strict(),
   /** Open the desktop agent's native directory picker for a new task. */
   commandBase.extend({
     type: z.literal("host.directory.pick"),
@@ -528,8 +547,13 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     engineManagement: engineManagementSchema.optional(),
     /** Desktop agent app version (AnytimeVibe client). */
     agentVersion: z.string().optional(),
+    clientUpdate: clientUpdateStateSchema.optional(),
     /** Latest subscription / plan quotas from local CLIs (if available). */
     engineQuotas: z.array(engineQuotaSchema).optional()
+  }),
+  eventBase.extend({
+    type: z.literal("host.client.update.status"),
+    update: clientUpdateStateSchema
   }),
   eventBase.extend({
     type: z.literal("host.quota"),

@@ -10,7 +10,7 @@ import { EngineMaintenance } from "./engine-maintenance";
 const mainSource = createSourceFile(
   "main.ts", readFileSync(path.resolve("apps/agent/src/main.ts"), "utf8"), ScriptTarget.Latest, true
 );
-const names = ["ensureCodex", "startCodexAppServer", "reloadCodexAppServer", "performCodexAppServerReload", "reconcileCodexCredentialsIfStale", "queueCodexCredentialReload"];
+const names = ["ensureCodex", "ensureCodexImpl", "reserveClientOperation", "withClientOperation", "startCodexAppServer", "reloadCodexAppServer", "performCodexAppServerReload", "reconcileCodexCredentialsIfStale", "queueCodexCredentialReload"];
 const declarations = names.map((name) => {
   const declaration = mainSource.statements.find((node) =>
     isFunctionDeclaration(node) && node.name?.text === name
@@ -47,6 +47,8 @@ function fixture() {
   });
   const context = {
     codex: null,
+    clientUpdateController: { applying: false },
+    clientOperations: 0,
     codexVersion: "1.0.0",
     codexMessageGeneration: 0,
     codexCommand: "codex",
@@ -82,6 +84,14 @@ function fixture() {
 }
 
 describe("Codex lifecycle maintenance protection", () => {
+  it("keeps background bootstrap from starting while the desktop client is updating", async () => {
+    const f = fixture();
+    f.context.clientUpdateController.applying = true;
+    await expect(f.lifecycle.ensureCodex()).rejects.toThrow(/安装更新/);
+    expect(f.effects).toEqual([]);
+    expect(f.context.clientOperations).toBe(0);
+  });
+
   it.each(["ensure", "reload"] as const)("blocks a background %s while CLI files are being upgraded", async (action) => {
     const f = fixture();
     const updating = f.update();
