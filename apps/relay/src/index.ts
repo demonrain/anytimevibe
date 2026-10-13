@@ -10,6 +10,7 @@ import { registerAdminRoutes, resolveRegistrationPolicy } from "./admin.js";
 import { loadConfig } from "./config.js";
 import { createDatabase, ensureSchema, type Database } from "./db.js";
 import { hashPassword, hashToken, openSecret, randomToken, safeEqual, sealSecret, verifyPassword } from "./security.js";
+import { selectSyncEventPage } from "./sync-events.js";
 import { registerAgentUpdateConfigRoute, registerUpdateRelayRoutes } from "./update-relay.js";
 
 const SESSION_COOKIE = "av_session";
@@ -643,26 +644,34 @@ async function main(): Promise<void> {
     const user = await requireUser(sql, request, reply);
     if (!user) return;
     const { hostId } = request.params as { hostId: string };
-    const query = request.query as { after?: string; limit?: string };
+    const query = request.query as { after?: string; limit?: string; tail?: string };
     const afterValue = Number(query.after ?? 0);
     const after = Number.isFinite(afterValue) ? Math.max(0, Math.floor(afterValue)) : 0;
     const limitValue = Number(query.limit ?? 500);
     const limit = Number.isFinite(limitValue) ? Math.min(1000, Math.max(1, Math.floor(limitValue))) : 500;
+    const tail = query.tail === "1" || query.tail === "true";
     const owns = await sql`SELECT id FROM hosts WHERE id = ${hostId} AND user_id = ${user.id} AND revoked_at IS NULL`;
     if (!owns.length) return reply.code(404).send({ error: "host_not_found" });
-    const rows = await sql<Array<{ sequence: number; envelope: EncryptedEnvelope }>>`
-      SELECT sequence, envelope
-      FROM sync_events
-      WHERE host_id = ${hostId} AND sequence > ${after}
-      ORDER BY sequence ASC
-      LIMIT ${limit + 1}
-    `;
-    const hasMore = rows.length > limit;
-    const page = hasMore ? rows.slice(0, limit) : rows;
+    const rows = tail
+      ? await sql<Array<{ sequence: number; envelope: EncryptedEnvelope }>>`
+          SELECT sequence, envelope
+          FROM sync_events
+          WHERE host_id = ${hostId}
+          ORDER BY sequence DESC
+          LIMIT ${limit}
+        `
+      : await sql<Array<{ sequence: number; envelope: EncryptedEnvelope }>>`
+          SELECT sequence, envelope
+          FROM sync_events
+          WHERE host_id = ${hostId} AND sequence > ${after}
+          ORDER BY sequence ASC
+          LIMIT ${limit + 1}
+        `;
+    const selected = selectSyncEventPage(rows, limit, tail);
     return {
-      events: page.map((row) => row.envelope),
-      nextSequence: page.at(-1)?.sequence ?? after,
-      hasMore
+      events: selected.page.map((row) => row.envelope),
+      nextSequence: selected.page.at(-1)?.sequence ?? after,
+      hasMore: selected.hasMore
     };
   });
 

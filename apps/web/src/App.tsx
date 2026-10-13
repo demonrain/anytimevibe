@@ -57,6 +57,7 @@ import {
 import { api, websocketUrl } from "./api";
 import { useI18n } from "./i18n/I18nProvider";
 import { TaskDirectoryPicker } from "./TaskDirectoryPicker";
+import { buildSyncReplayUrl, startLiveSync } from "./sync-replay";
 import {
   ClientUpdateNotice,
   clientUpdateAvailable,
@@ -2940,14 +2941,16 @@ export function App() {
             initialAfter,
             Number(localStorage.getItem(`sync:${hostId}`) ?? 0) || 0
           );
+          let bootstrap = after === 0;
           for (let page = 0; page < 100; page += 1) {
             const sync = await api<{ events: EncryptedEnvelope[]; nextSequence: number; hasMore?: boolean }>(
-              `/api/sync/${hostId}?after=${after}&limit=500`
+              buildSyncReplayUrl(hostId, after, bootstrap)
             );
             for (const envelope of sync.events) {
               const parsed = parseEncryptedEnvelope(envelope);
               if (parsed) await applyEnvelope(parsed);
             }
+            bootstrap = false;
             const next = Number(sync.nextSequence);
             if (!sync.hasMore || !Number.isFinite(next) || next <= after) break;
             after = next;
@@ -3251,13 +3254,10 @@ export function App() {
       };
       connection.onerror = () => connection.close();
     };
-    // Catch up from the durable event log before opening the live stream. This
-    // removes the initial replay/live race; subsequent events use the queue above.
-    void loadHosts()
-      .catch((loadError) => setError(loadError.message))
-      .finally(() => {
-        if (!stopped) connect();
-      });
+    // Establish live delivery immediately. Durable replay runs in the background
+    // behind the per-host barrier, so a new device can send/receive a sync request
+    // without waiting for the host's complete event history to be decrypted.
+    startLiveSync(connect, loadHosts, (loadError) => setError(loadError instanceof Error ? loadError.message : String(loadError)));
     return () => {
       stopped = true;
       if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
