@@ -158,6 +158,20 @@ describe("Codex subagent task visibility", () => {
     expect(f.context.taskStore.get("child")).toBeDefined();
   });
 
+  it("persists a Codex task loaded from native history before a fail-fast turn", async () => {
+    const f = fixture();
+    expect(f.context.taskStore.get("parent")).toBeUndefined();
+
+    await f.publishThread("parent");
+
+    expect(f.context.taskStore.get("parent")).toMatchObject({
+      threadId: "parent",
+      engine: "codex",
+      providerSessionId: "parent",
+      title: "主任务"
+    });
+  });
+
   it("fills the recent task window across pages occupied by subagents", async () => {
     const f = fixture();
     const cursors: unknown[] = [];

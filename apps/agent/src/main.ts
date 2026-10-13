@@ -50,7 +50,8 @@ import {
   normalizeContextUsage,
   normalizeSessionContextUsage,
   normalizeTurnContextUsage,
-  resolveContextUsageTotals
+  resolveContextUsageTotals,
+  SerialPromiseQueue
 } from "@anytimevibe/protocol";
 import {
   CodexAdapter,
@@ -242,6 +243,9 @@ let publicState: PublicState = {
   activities: []
 };
 const taskStore = new TaskStore();
+// All encrypted events share one sequence space. Serialize envelope creation
+// and socket writes so concurrent CLI callbacks cannot reorder snapshots/errors.
+const publishQueue = new SerialPromiseQueue();
 
 /** Prefer packaged Electron version so UI / updater / host.status never drift from protocol constant. */
 function agentAppVersion(): string {
@@ -6043,18 +6047,23 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
     if (isThreadDeleted(threadId)) return;
     let messages: Array<{ id: string; role: "user" | "assistant" | "system"; text: string }> = [];
     const stored = taskStore.get(threadId);
-    if (stored) {
-      messages = sanitizeTranscriptMessages(stored.messages);
-    } else {
-      // Codex-only threads may live outside the multi-CLI store.
+    if (stored?.engine === "codex" || !stored) {
+      // Codex's native transcript is authoritative for history pagination. The
+      // local store intentionally keeps only a bounded recovery copy, so using
+      // it after the first snapshot would make older assistant turns stale.
       try {
         await ensureCodex();
-        const result = await codex!.request("thread/read", { threadId, includeTurns: true });
+        const nativeThreadId = stored?.providerSessionId || threadId;
+        const result = await codex!.request("thread/read", { threadId: nativeThreadId, includeTurns: true });
         const snapshot = threadToSnapshot(result.thread);
-        messages = sanitizeTranscriptMessages(snapshot.messages);
+        messages = sanitizeTranscriptMessages(
+          mergeSnapshotUserPrompts(snapshot.messages, stored?.messages || [])
+        );
       } catch {
-        messages = [];
+        messages = stored ? sanitizeTranscriptMessages(stored.messages) : [];
       }
+    } else {
+      messages = sanitizeTranscriptMessages(stored.messages);
     }
     const page = pageTranscriptMessagesBefore(
       messages,
@@ -7613,6 +7622,23 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
   const publishStatus = liveTurnId && !isInProgressStoredStatus(snapshot.status)
     ? "active"
     : snapshot.status;
+  // A Codex thread can come from native history without an AnytimeVibe record.
+  // Materialize it before the next command arrives so fail-fast turns still have
+  // somewhere durable to append the user's prompt and error message.
+  if (!stored) {
+    await taskStore.upsert({
+      threadId,
+      engine: "codex",
+      providerSessionId: threadId,
+      cwd,
+      title: snapshot.title,
+      status: publishStatus,
+      createdAt: normalizeUnixSeconds(snapshot.createdAt, updatedAt),
+      updatedAt,
+      messages: messages.map((message) => ({ id: message.id, role: message.role, text: message.text })),
+      ...(gitBranch ? { gitBranch } : {})
+    });
+  }
   const task: AgentTask = {
     threadId: snapshot.threadId,
     title: snapshot.title,
@@ -8372,28 +8398,30 @@ async function relayTaskToCli(threadId: string): Promise<void> {
 }
 
 async function publish(event: AgentEvent, persist: boolean, hint?: "approval" | "completed"): Promise<void> {
-  // A queued delta/snapshot may predate discovery of a child. Block stale product
-  // events here as well; actionable requests must still be delivered if unowned.
-  if ("threadId" in event && event.threadId && codexThreads.isSubagent(event.threadId)
-    && event.type !== "thread.deleted" && event.type !== "approval.requested" && event.type !== "request.resolved") return;
-  agentEventSchema.parse(event);
-  if (!socket || socket.readyState !== WebSocket.OPEN || !config.hostId || !syncKey) {
-    // Socket down (sleep / network flap / closed laptop). The encrypted event is lost,
-    // but a completion/approval push must NOT be: persist the hint and flush on reconnect
-    // so the phone still gets notified once the agent comes back online.
-    if (hint) await enqueuePushHint(hint, event.occurredAt);
-    return;
-  }
-  config.sequence += 1;
-  await saveConfig();
-  const envelope = await createEnvelope(config.hostId, config.sequence, syncKey, event, { persist, ...(hint ? { hint } : {}) });
-  try {
-    socket.send(JSON.stringify(envelope));
-  } catch (error) {
-    // send() can still throw if the socket died between the readyState check and here.
-    if (hint) await enqueuePushHint(hint, event.occurredAt);
-    throw error;
-  }
+  return publishQueue.run(async () => {
+    // A queued delta/snapshot may predate discovery of a child. Block stale product
+    // events here as well; actionable requests must still be delivered if unowned.
+    if ("threadId" in event && event.threadId && codexThreads.isSubagent(event.threadId)
+      && event.type !== "thread.deleted" && event.type !== "approval.requested" && event.type !== "request.resolved") return;
+    agentEventSchema.parse(event);
+    if (!socket || socket.readyState !== WebSocket.OPEN || !config.hostId || !syncKey) {
+      // Socket down (sleep / network flap / closed laptop). The encrypted event is lost,
+      // but a completion/approval push must NOT be: persist the hint and flush on reconnect
+      // so the phone still gets notified once the agent comes back online.
+      if (hint) await enqueuePushHint(hint, event.occurredAt);
+      return;
+    }
+    config.sequence += 1;
+    await saveConfig();
+    const envelope = await createEnvelope(config.hostId, config.sequence, syncKey, event, { persist, ...(hint ? { hint } : {}) });
+    try {
+      socket.send(JSON.stringify(envelope));
+    } catch (error) {
+      // send() can still throw if the socket died between the readyState check and here.
+      if (hint) await enqueuePushHint(hint, event.occurredAt);
+      throw error;
+    }
+  });
 }
 
 /** Cap the queue so a long offline stretch cannot grow the config file unbounded. */

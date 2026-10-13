@@ -98,7 +98,7 @@ install -m 0644 traefik-anytimevibe-updates.yml /home/docker/traefik/config/dyna
 `latest.yml` 示例：
 
 ```yaml
-version: 0.5.24
+version: 0.5.25
 files:
   - url: AnytimeVibe-Agent-Setup.exe
     sha512: <base64-sha512>

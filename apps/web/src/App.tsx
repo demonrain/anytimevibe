@@ -34,6 +34,7 @@ import {
   pairingClaimResponseSchema,
   randomUuid,
   resolveContextUsageTotals,
+  SerialPromiseQueue,
   TRANSCRIPT_HISTORY_PAGE_SIZE,
   type AgentEvent,
   type CliEngine,
@@ -2661,6 +2662,12 @@ export function App() {
   const [engineFilter, setEngineFilter] = useState<CliEngine | null>(null);
   const taskSearchTimerRef = useRef<number | null>(null);
   const autoSyncedHostsRef = useRef(new Set<string>());
+  const knownHostIdsRef = useRef<string[]>([]);
+  const replayingHostIdsRef = useRef(new Set<string>());
+  const replayRequiredHostIdsRef = useRef(new Set<string>());
+  const replayRetryTimersRef = useRef(new Map<string, number>());
+  const replayPromisesRef = useRef(new Map<string, Promise<void>>());
+  const bufferedEnvelopesRef = useRef(new Map<string, EncryptedEnvelope[]>());
   const [keyAuthorizationStatus, setKeyAuthorizationStatus] = useState<Record<string, "missing" | "authorizing">>({});
   /** In-flight key authorization; shared so concurrent callers can await the same run. */
   const keyAuthorizationPromisesRef = useRef(new Map<string, Promise<void>>());
@@ -2804,7 +2811,14 @@ export function App() {
     return () => { active = false; };
   }, [user, health?.vapidPublicKey]);
 
-  const handleEnvelope = useEffectEvent(async (envelope: EncryptedEnvelope) => {
+  const applyEnvelope = useEffectEvent(async (envelope: EncryptedEnvelope) => {
+    // A live envelope may also be returned by durable replay. Persisted
+    // sequences are the relay's cursor; ignore a replay duplicate before it
+    // can append a delta or roll a snapshot back.
+    if (envelope.persist) {
+      const lastApplied = Number(localStorage.getItem(`sync:${envelope.hostId}`) ?? 0);
+      if (Number.isFinite(lastApplied) && envelope.sequence <= lastApplied) return;
+    }
     const key = await getHostKey(envelope.hostId);
     if (!key) return;
     const decrypted = await openEnvelope<unknown>(key, envelope);
@@ -2871,6 +2885,132 @@ export function App() {
       }
     }
     if (envelope.persist) localStorage.setItem(`sync:${envelope.hostId}`, String(envelope.sequence));
+  });
+
+  // Replay and live WebSocket delivery share the same state store. Serialize
+  // both paths per host so an older snapshot cannot finish decrypting after a
+  // newer error/completion event and roll the conversation back.
+  const envelopeQueuesRef = useRef(new Map<string, SerialPromiseQueue>());
+  const handleEnvelope = useEffectEvent((envelope: EncryptedEnvelope) => {
+    if (replayingHostIdsRef.current.has(envelope.hostId) || replayRequiredHostIdsRef.current.has(envelope.hostId)) {
+      const buffered = bufferedEnvelopesRef.current.get(envelope.hostId) ?? [];
+      buffered.push(envelope);
+      bufferedEnvelopesRef.current.set(envelope.hostId, buffered);
+      return Promise.resolve();
+    }
+    let queue = envelopeQueuesRef.current.get(envelope.hostId);
+    if (!queue) {
+      queue = new SerialPromiseQueue();
+      envelopeQueuesRef.current.set(envelope.hostId, queue);
+    }
+    return queue.run(() => applyEnvelope(envelope));
+  });
+
+  // Keep durable replay behind the same host queue as live envelopes. This is
+  // important when key authorization or a manual refresh runs while the live
+  // socket is already open: replaying an older snapshot must finish first.
+  const replayHostEvents = useEffectEvent((hostId: string, initialAfter: number): Promise<void> => {
+    const existing = replayPromisesRef.current.get(hostId);
+    if (existing) return existing;
+
+    let queue = envelopeQueuesRef.current.get(hostId);
+    if (!queue) {
+      queue = new SerialPromiseQueue();
+      envelopeQueuesRef.current.set(hostId, queue);
+    }
+
+    // Mark the host before the first await. Messages arriving while the HTTP
+    // replay is in flight are held until the durable cursor has caught up.
+    replayingHostIdsRef.current.add(hostId);
+    const promise = (async () => {
+      let canDecrypt = false;
+      let replayFailed = false;
+      try {
+        // A host without a browser key cannot be decrypted yet. Its durable
+        // events will be replayed again after authorization completes.
+        if (!await getHostKey(hostId)) return;
+        canDecrypt = true;
+        await queue.run(async () => {
+          let after = Math.max(
+            initialAfter,
+            Number(localStorage.getItem(`sync:${hostId}`) ?? 0) || 0
+          );
+          for (let page = 0; page < 100; page += 1) {
+            const sync = await api<{ events: EncryptedEnvelope[]; nextSequence: number; hasMore?: boolean }>(
+              `/api/sync/${hostId}?after=${after}&limit=500`
+            );
+            for (const envelope of sync.events) {
+              const parsed = parseEncryptedEnvelope(envelope);
+              if (parsed) await applyEnvelope(parsed);
+            }
+            const next = Number(sync.nextSequence);
+            if (!sync.hasMore || !Number.isFinite(next) || next <= after) break;
+            after = next;
+          }
+        });
+
+        // The relay preserves host sequence order, but the browser may receive
+        // live frames while replay is awaiting the database. Flush those frames
+        // in sequence order after replay; applyEnvelope de-duplicates frames
+        // already included in the durable pages.
+        for (;;) {
+          const buffered = bufferedEnvelopesRef.current.get(hostId) ?? [];
+          bufferedEnvelopesRef.current.delete(hostId);
+          if (!buffered.length) break;
+          buffered.sort((left, right) => left.sequence - right.sequence);
+          await queue.run(async () => {
+            for (const envelope of buffered) await applyEnvelope(envelope);
+          });
+        }
+        replayRequiredHostIdsRef.current.delete(hostId);
+        const retryTimer = replayRetryTimersRef.current.get(hostId);
+        if (retryTimer !== undefined) {
+          window.clearTimeout(retryTimer);
+          replayRetryTimersRef.current.delete(hostId);
+        }
+      } catch (replayError) {
+        replayFailed = true;
+        replayRequiredHostIdsRef.current.add(hostId);
+        // A transient replay failure must not strand frames received during
+        // the barrier. Apply only the non-persisted live tail now; persisted
+        // frames remain buffered until the durable gap can be replayed.
+        if (canDecrypt) {
+          const buffered = bufferedEnvelopesRef.current.get(hostId) ?? [];
+          bufferedEnvelopesRef.current.delete(hostId);
+          const transient = buffered.filter((envelope) => !envelope.persist);
+          const durable = buffered.filter((envelope) => envelope.persist);
+          if (durable.length) bufferedEnvelopesRef.current.set(hostId, durable);
+          transient.sort((left, right) => left.sequence - right.sequence);
+          if (transient.length) {
+            await queue.run(async () => {
+              for (const envelope of transient) await applyEnvelope(envelope);
+            }).catch(() => undefined);
+          }
+        }
+        if (!replayRetryTimersRef.current.has(hostId)) {
+          const retryTimer = window.setTimeout(() => {
+            replayRetryTimersRef.current.delete(hostId);
+            const after = Number(localStorage.getItem(`sync:${hostId}`) ?? 0);
+            void replayHostEvents(hostId, after).catch((retryError) => setError(retryError.message));
+          }, 2000);
+          replayRetryTimersRef.current.set(hostId, retryTimer);
+        }
+        throw replayError;
+      } finally {
+        replayingHostIdsRef.current.delete(hostId);
+        // Frames received before key authorization cannot be decrypted and are
+        // superseded by the next durable replay after the key is available.
+        if (!canDecrypt) {
+          replayRequiredHostIdsRef.current.delete(hostId);
+          bufferedEnvelopesRef.current.delete(hostId);
+        } else if (!replayFailed) {
+          bufferedEnvelopesRef.current.delete(hostId);
+        }
+        replayPromisesRef.current.delete(hostId);
+      }
+    })();
+    replayPromisesRef.current.set(hostId, promise);
+    return promise;
   });
 
   const updateHostStatus = useEffectEvent((hostId: string, online: boolean) => {
@@ -2979,6 +3119,7 @@ export function App() {
 
   const loadHosts = useEffectEvent(async () => {
     const response = await api<{ hosts: Host[] }>("/api/hosts");
+    knownHostIdsRef.current = response.hosts.map((host) => host.id);
     const mergedOrder = mergeHostOrder(loadHostOrder(), response.hosts.map((host) => host.id));
     saveHostOrder(mergedOrder);
     setHostOrder(mergedOrder);
@@ -2999,10 +3140,13 @@ export function App() {
     });
     setSelectedHostId((current) => current ?? mergedOrder[0] ?? response.hosts[0]?.id ?? null);
     for (const host of response.hosts) {
+      const after = Number(localStorage.getItem(`sync:${host.id}`) ?? 0);
+      const replay = replayHostEvents(host.id, after);
       const key = await getHostKey(host.id);
       if (!key) {
         setKeyAuthorizationStatus((current) => ({ ...current, [host.id]: current[host.id] ?? "missing" }));
         if (host.online) void authorizeExistingHost(host.id).catch((authorizationError) => setError(authorizationError.message));
+        void replay.catch((replayError) => setError(replayError.message));
         continue;
       }
       setKeyAuthorizationStatus((current) => {
@@ -3011,30 +3155,26 @@ export function App() {
         delete next[host.id];
         return next;
       });
-      let after = Number(localStorage.getItem(`sync:${host.id}`) ?? 0);
-      for (let page = 0; page < 100; page += 1) {
-        const sync = await api<{ events: EncryptedEnvelope[]; nextSequence: number; hasMore?: boolean }>(
-          `/api/sync/${host.id}?after=${after}&limit=500`
-        );
-        for (const envelope of sync.events) {
-          const parsed = parseEncryptedEnvelope(envelope);
-          if (parsed) await handleEnvelope(parsed);
-        }
-        const next = Number(sync.nextSequence);
-        if (!sync.hasMore || !Number.isFinite(next) || next <= after) break;
-        after = next;
-      }
+      await replay;
     }
   });
 
   useEffect(() => {
     if (!user) return;
-    loadHosts().catch((loadError) => setError(loadError.message));
     let stopped = false;
     const connect = () => {
       if (stopped) return;
       const connection = new WebSocket(websocketUrl("/ws/client"));
       socketRef.current = connection;
+      connection.onopen = () => {
+        // Every reconnect has a small gap between the last HTTP replay and
+        // WebSocket registration. Replay again from the durable cursor; the
+        // per-host barrier buffers live frames during that catch-up window.
+        for (const hostId of knownHostIdsRef.current) {
+          const after = Number(localStorage.getItem(`sync:${hostId}`) ?? 0);
+          void replayHostEvents(hostId, after).catch((syncError) => setError(syncError.message));
+        }
+      };
       connection.onmessage = (message) => {
         try {
           const parsed = JSON.parse(String(message.data)) as Record<string, unknown>;
@@ -3106,12 +3246,23 @@ export function App() {
       };
       connection.onerror = () => connection.close();
     };
-    connect();
+    // Catch up from the durable event log before opening the live stream. This
+    // removes the initial replay/live race; subsequent events use the queue above.
+    void loadHosts()
+      .catch((loadError) => setError(loadError.message))
+      .finally(() => {
+        if (!stopped) connect();
+      });
     return () => {
       stopped = true;
       if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
       for (const timer of hostOfflineTimersRef.current.values()) window.clearTimeout(timer);
       hostOfflineTimersRef.current.clear();
+      for (const timer of replayRetryTimersRef.current.values()) window.clearTimeout(timer);
+      replayRetryTimersRef.current.clear();
+      replayRequiredHostIdsRef.current.clear();
+      replayingHostIdsRef.current.clear();
+      bufferedEnvelopesRef.current.clear();
       const connection = socketRef.current;
       socketRef.current = null;
       connection?.close();

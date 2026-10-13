@@ -5,7 +5,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { randomInt, randomUUID } from "node:crypto";
 import webPush from "web-push";
 import { z } from "zod";
-import { encryptedEnvelopeSchema, type EncryptedEnvelope } from "@anytimevibe/protocol";
+import { encryptedEnvelopeSchema, SerialPromiseQueue, type EncryptedEnvelope } from "@anytimevibe/protocol";
 import { registerAdminRoutes, resolveRegistrationPolicy } from "./admin.js";
 import { loadConfig } from "./config.js";
 import { createDatabase, ensureSchema, type Database } from "./db.js";
@@ -153,6 +153,10 @@ async function main(): Promise<void> {
   }
 
   const app = Fastify({ logger: { level: config.NODE_ENV === "production" ? "info" : "debug" } });
+  // One queue spans reconnects for the same host. A per-socket queue would let
+  // an in-flight frame from the old connection race a newer frame after a
+  // reconnect, advancing the browser cursor past the old snapshot.
+  const agentMessageQueues = new Map<string, SerialPromiseQueue>();
   await app.register(cookie, { secret: config.COOKIE_SECRET });
   const isProd = config.NODE_ENV === "production";
   await app.register(rateLimit, {
@@ -756,11 +760,25 @@ async function main(): Promise<void> {
       platform: host.platform
     }));
 
-    agentSocket.on("message", async (data) => {
-      try {
-        if (!allowSocketMessage(agentSocket)) return;
+    // ws does not await an async listener. Serialize one agent's envelopes so
+    // database latency cannot reorder snapshots, errors, and completions.
+    let agentMessageQueue = agentMessageQueues.get(host.id);
+    if (!agentMessageQueue) {
+      agentMessageQueue = new SerialPromiseQueue();
+      agentMessageQueues.set(host.id, agentMessageQueue);
+    }
+    agentSocket.on("message", (data) => {
+      // Accept frames only while this socket is the host's current connection.
+      // Once accepted, an encrypted event must finish processing even if the
+      // socket disconnects while an earlier queued event is awaiting the DB.
+      if (agentSockets.get(host.id) !== agentSocket || !allowSocketMessage(agentSocket)) return;
+      void agentMessageQueue.run(async () => {
+        try {
         const parsed = JSON.parse(data.toString()) as Record<string, unknown>;
         if (parsed.type === "agent.key_authorization") {
+          // Control messages from a replaced socket must not overwrite state
+          // established by the current connection.
+          if (agentSockets.get(host.id) !== agentSocket) return;
           const pairingId = z.string().uuid().parse(parsed.pairingId);
           const wrappedSyncKey = authorizePairingBody.shape.wrappedSyncKey.parse(parsed.wrappedSyncKey);
           await sql`
@@ -772,6 +790,7 @@ async function main(): Promise<void> {
         }
         // Unencrypted agent metadata: keep admin/web host rows in sync with live client.
         if (parsed.type === "agent.meta") {
+          if (agentSockets.get(host.id) !== agentSocket) return;
           const meta = z.object({
             name: z.string().trim().min(1).max(64).optional(),
             codexVersion: z.string().trim().min(1).max(80).optional(),
@@ -822,6 +841,7 @@ async function main(): Promise<void> {
         }
         // Offline catch-up: agent reconnects and asks relay to fire Web Push without a full envelope.
         if (parsed.type === "agent.push_hint") {
+          if (agentSockets.get(host.id) !== agentSocket) return;
           const hint = z.enum(["approval", "completed"]).parse(parsed.hint);
           await sendPush(host.userId, hint);
           return;
@@ -837,9 +857,10 @@ async function main(): Promise<void> {
         }
         broadcastToUser(host.userId, JSON.stringify(envelope));
         if (envelope.hint) await sendPush(host.userId, envelope.hint);
-      } catch (error) {
-        app.log.warn({ error, hostId: host.id }, "invalid agent websocket message");
-      }
+        } catch (error) {
+          app.log.warn({ error, hostId: host.id }, "invalid agent websocket message");
+        }
+      });
     });
 
     const disconnected = () => {
