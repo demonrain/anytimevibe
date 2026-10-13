@@ -63,6 +63,7 @@ describe("desktop update transport", () => {
       feedUrl: "https://github.com/demonrain/anytimevibe/releases/latest/download"
     })).toEqual({
       updateFeedUrl: "https://updates.example.com/edge/api/agent/update/",
+      updateDirectUrl: "https://github.com/demonrain/anytimevibe/releases/latest/download",
       engineUpdateBaseUrl: "https://updates.example.com/edge/api/agent/engine/",
       npmRegistryUrl: "https://updates.example.com/edge/api/agent/npm/"
     });

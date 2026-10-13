@@ -45,11 +45,13 @@ function trustedUrl(value: string): URL {
 }
 
 export function agentUpdateConfiguration(options: Pick<UpdateRelayOptions, "publicOrigin" | "transferUrl" | "feedUrl">): {
-  updateFeedUrl: string | null; engineUpdateBaseUrl: string; npmRegistryUrl: string;
+  updateFeedUrl: string | null; updateDirectUrl: string | null; engineUpdateBaseUrl: string; npmRegistryUrl: string;
 } {
   const origin = trustedUrl(options.transferUrl || options.publicOrigin).toString().replace(/\/+$/, "");
+  const direct = options.feedUrl ? trustedUrl(options.feedUrl).toString().replace(/\/+$/, "") : null;
   return {
     updateFeedUrl: options.feedUrl ? `${origin}${PREFIX}/update/` : null,
+    updateDirectUrl: direct,
     engineUpdateBaseUrl: `${origin}${PREFIX}/engine/`,
     npmRegistryUrl: `${origin}${PREFIX}/npm/`
   };

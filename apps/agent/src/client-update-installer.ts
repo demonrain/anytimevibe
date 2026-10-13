@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
-import { constants, promises as fs } from "node:fs";
+import { constants as nodeConstants, promises as nodeFs } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
@@ -18,6 +19,17 @@ export interface SilentClientUpdateOptions {
 }
 
 const execFileAsync = promisify(execFile);
+
+// Electron patches node:fs to understand virtual paths inside app.asar. The
+// installed application backup must copy the physical app.asar archive itself,
+// so use Electron's original-fs when it is available. Plain Node test/build
+// processes do not expose that module and safely fall back to node:fs.
+const originalFs = (() => {
+  try { return createRequire(__filename)("original-fs") as typeof import("node:fs"); }
+  catch { return undefined; }
+})();
+const fs = originalFs?.promises ?? nodeFs;
+const constants = originalFs?.constants ?? nodeConstants;
 
 function inside(parent: string, child: string): boolean {
   const relative = path.relative(parent, child);

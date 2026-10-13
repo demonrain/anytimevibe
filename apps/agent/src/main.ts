@@ -92,7 +92,7 @@ import { grantMacFsAccessRoot, isMacTccProtectedPath, canProbePathWithoutPrompt,
 import { collectLocalProxyEnv, mergeProxyIntoEnv, proxyClearShellLines, applyProcessProxyEnv, LOCAL_PROXY_BYPASS_RULES } from "./local-proxy";
 import { normalizeWindowsCommandPath, windowsCmdArguments } from "./windows-command";
 import { summarizeTaskTitle } from "./cli/task-title";
-import { resolveUpdateFeedUrl } from "./cli/update-feed";
+import { resolveUpdateSources } from "./cli/update-feed";
 import { listTaskDirectories, resolveTaskDirectory, taskDirectoryRoots } from "./cli/task-directory";
 import { fetchAgentUpdateConfig, type AgentUpdateConfig } from "./cli/update-config";
 import { buildEngineMaintenanceNetworkEnv, configureEngineUpdateNetwork, createEngineUpdateOutputRedactor, npmUpdateRegistryCandidates, redactEngineUpdateOutput } from "./cli/update-network";
@@ -8904,7 +8904,11 @@ async function applyLocalProxyToElectronSessions(mode: "auto" | "direct" = "auto
   const localProxy = await collectLocalProxyEnv();
   const proxyUrl = localProxy.HTTPS_PROXY || localProxy.HTTP_PROXY || localProxy.ALL_PROXY
     || localProxy.https_proxy || localProxy.http_proxy || localProxy.all_proxy;
-  if (!proxyUrl) return;
+  if (!proxyUrl) {
+    // Reset a session left in direct/relay mode by a previous source attempt.
+    await Promise.all(targets.map((target) => target.setProxy({ mode: "direct" })));
+    return;
+  }
   const bypass = [
     ...LOCAL_PROXY_BYPASS_RULES,
     localProxy.NO_PROXY,
@@ -8937,24 +8941,30 @@ async function checkForAgentUpdate(): Promise<void> {
     const runCheck = async (mode: "auto" | "direct", viaRelay = true) => {
       await applyLocalProxyToElectronSessions(mode);
       const remoteConfig = await refreshAgentUpdateNetwork(true);
-      if (!remoteConfig.updateFeedUrl) {
+      if (!remoteConfig.updateFeedUrl && !remoteConfig.updateDirectUrl) {
         updateState({ update: { status: "idle", message: `服务端未配置更新源（本地 v${localVersion}）` } });
         return null;
       }
-      const feedUrl = viaRelay
-        ? resolveUpdateFeedUrl(remoteConfig.updateFeedUrl, config.relayUrl, typeof remoteConfig.engineUpdateBaseUrl === "string" && remoteConfig.engineUpdateBaseUrl.length > 0)
-        : remoteConfig.updateFeedUrl;
+      const sources = resolveUpdateSources(remoteConfig, config.relayUrl,
+        typeof remoteConfig.engineUpdateBaseUrl === "string" && remoteConfig.engineUpdateBaseUrl.length > 0);
+      const source = viaRelay ? sources[sources.length - 1] : sources[0];
+      const feedUrl = source?.url || "";
+      if (!feedUrl) return null;
       autoUpdater.setFeedURL({ provider: "generic", url: feedUrl });
       autoUpdater.requestHeaders = { "Cache-Control": "no-cache", Pragma: "no-cache" };
       autoUpdater.autoDownload = false;
       autoUpdater.autoInstallOnAppQuit = false;
+      // The custom silent installer replaces the complete installation tree.
+      // Differential downloads can inspect a stale/missing local package and
+      // surface ENOENT for resources\\app.asar, so always fetch the full package.
+      autoUpdater.disableDifferentialDownload = true;
       return autoUpdater.checkForUpdates();
     };
 
     updateState({ update: { status: "checking", message: `正在检查更新…（当前 v${localVersion}）` } });
     let result;
     try {
-      result = await runCheck("auto", true);
+      result = await runCheck("auto", false);
     } catch (error) {
       logWarn("更新连接失败，改为直连中转重试", redactEngineUpdateOutput(error instanceof Error ? error.message : String(error)));
       result = await runCheck("direct", true);
@@ -9013,13 +9023,32 @@ async function checkForAgentUpdate(): Promise<void> {
         message: `Downloading v${remoteVersion} (current v${localVersion})?`
       }
     });
-    void autoUpdater.downloadUpdate().then(() => {
-      autoUpdater.disableDifferentialDownload = false;
-    }).catch((error: Error) => {
-      autoUpdater.disableDifferentialDownload = false;
+    const rememberDownloadedFile = (files: unknown, version: string): void => {
+      const downloadedFile = Array.isArray(files) && typeof files[0] === "string" ? files[0] : null;
+      if (!downloadedFile) throw new Error("Updater completed without returning the downloaded installer path");
+      pendingDownloadedUpdateFile = downloadedFile;
+      pendingDownloadedVersion = version;
+    };
+    try {
+      rememberDownloadedFile(await autoUpdater.downloadUpdate(), remoteVersion);
+      updateState({ update: {
+        status: "ready", version: remoteVersion, progress: 100,
+        message: `Update downloaded (v${remoteVersion}, current v${localVersion})`
+      } });
+    } catch (error) {
       if (installingUpdate) return;
-      updateState({ update: { status: "error", message: error.message || "Update download failed" } });
-    });
+      logWarn("GitHub update download failed; trying the server relay", redactEngineUpdateOutput(error instanceof Error ? error.message : String(error)));
+      await clearPendingUpdaterCache("primary update source download failed");
+      const fallback = await runCheck("direct", true);
+      if (!fallback?.updateInfo || !fallback.isUpdateAvailable) throw error;
+      const fallbackVersion = String(fallback.updateInfo.version || remoteVersion).trim();
+      autoUpdater.disableDifferentialDownload = true;
+      rememberDownloadedFile(await autoUpdater.downloadUpdate(), fallbackVersion);
+      updateState({ update: {
+        status: "ready", version: fallbackVersion, progress: 100,
+        message: `Update downloaded from the server relay (v${fallbackVersion}, current v${localVersion})`
+      } });
+    }
   })().catch((error) => {
     updateState({ update: { status: "error", message: error instanceof Error ? error.message : String(error) } });
     throw error;

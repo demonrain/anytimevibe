@@ -2,6 +2,8 @@ import { z } from "zod";
 
 const updateConfigSchema = z.object({
   updateFeedUrl: z.string().nullable(),
+  /** Original public release feed. New clients try this before updateFeedUrl. */
+  updateDirectUrl: z.string().nullable().optional(),
   engineUpdateBaseUrl: z.string().nullable().optional(),
   npmRegistryUrl: z.string().nullable().optional(),
   engineUpdateProxyUrl: z.string().nullable().optional()

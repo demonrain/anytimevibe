@@ -9,10 +9,13 @@ describe("agent update configuration", () => {
       if (url !== "https://vibe.example/api/agent/config" || (options.headers as Record<string, string>).Authorization !== "Bearer agent-token") {
         return new Response("not authorized", { status: 401 });
       }
-      return Response.json({ updateFeedUrl: "https://updates.example/api/agent/update/", npmRegistryUrl: "https://updates.example/api/agent/npm" });
+      return Response.json({ updateFeedUrl: "https://updates.example/api/agent/update/", updateDirectUrl: "https://github.com/demonrain/anytimevibe/releases/latest/download", npmRegistryUrl: "https://updates.example/api/agent/npm" });
     });
     await expect(fetchAgentUpdateConfig("https://vibe.example/", "agent-token"))
-      .resolves.toMatchObject({ npmRegistryUrl: "https://updates.example/api/agent/npm" });
+      .resolves.toMatchObject({
+        updateDirectUrl: "https://github.com/demonrain/anytimevibe/releases/latest/download",
+        npmRegistryUrl: "https://updates.example/api/agent/npm"
+      });
   });
 
   it("supports an old relay config without new transport fields", async () => {
