@@ -11,8 +11,12 @@ export function codexSubagentInfo(thread: NativeThread): { parentThreadId?: stri
   const spawn = subagent && typeof subagent === "object" ? subagent.thread_spawn ?? subagent.threadSpawn : undefined;
   const parent = threadId(thread.parentThreadId) || threadId(thread.parent_thread_id)
     || threadId(spawn?.parent_thread_id) || threadId(spawn?.parentThreadId);
-  const marked = source && typeof source === "object"
-    && (Object.hasOwn(source, "subAgent") || Object.hasOwn(source, "subagent"));
+  const marker = source && typeof source === "object"
+    ? (source.subAgent ?? source.subagent)
+    : undefined;
+  // Some Codex versions include `subAgent: null/false` on ordinary root
+  // threads. Property presence alone is not proof that a session is a child.
+  const marked = Boolean(marker) || (typeof marker === "object" && marker !== null);
   if (!parent && !marked) return undefined;
   return parent && parent !== threadId(thread.id) ? { parentThreadId: parent } : {};
 }

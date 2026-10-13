@@ -83,6 +83,7 @@ import { discoverEngineCapabilities, clearCodexDebugModelsCache, type EngineCapa
 import { startEngineConfigWatch } from "./cli/engine-config-watch";
 import { appendEngineDiffChunk, buildTurnDiff, captureTurnDiffBaseline, clearEngineDiffChunks, extractFileChangeDiff, readGitBranch } from "./cli/task-diff";
 import { TaskStore } from "./cli/task-store";
+import type { StoredTask } from "./cli/types";
 import { CodexThreadRegistry } from "./cli/codex-threads";
 import { normalizeCliEngine, isHeadlessCliEngine, type BackendStreamEvent } from "./cli/types";
 import { handoffPermissionArgs, normalizePermissionMode } from "./cli/permission-args";
@@ -7700,23 +7701,51 @@ async function reconcileOrphanedActiveTasks(): Promise<number> {
       if (isThreadTurnBusy(task.threadId)) continue;
       if (isHeadlessThreadActive(task.threadId)) continue;
     } else if (task.engine === "codex") {
+      const nativeThreadId = task.providerSessionId || task.threadId;
+      // A live in-process turn is authoritative even when thread/read briefly
+      // reports an older status during reconnect or app-server reload.
+      if (activeTurnByThread.has(task.threadId)
+        || turnStartingByThread.has(task.threadId)
+        || activeNativeCodexTurns.has(nativeThreadId)) continue;
       // Codex app-server may lose a notification during reconnect. Read its durable
       // thread state before deciding that the task is orphaned.
       if (!codex) continue;
       try {
-        const result = await codex.request("thread/read", { threadId: task.threadId, includeTurns: true });
+        const result = await codex.request("thread/read", { threadId: nativeThreadId, includeTurns: true });
         const snapshot = threadToSnapshot(result.thread);
         if (snapshot.activeTurnId || isInProgressStoredStatus(snapshot.status)) continue;
+
+        // `idle`/`unknown` without a terminal turn is ambiguous: the app-server
+        // can return that shape while a turn is still running elsewhere. Keep the
+        // durable task active instead of inventing an `interrupted` result. When
+        // thread-level status is vague, use the most recent explicit turn status.
+        const turns = Array.isArray(result.thread?.turns) ? result.thread.turns : [];
+        const latestTurn = [...turns].reverse().find((turn: Record<string, any>) => String(turn?.status || "").trim());
+        const nativeStatus = String(snapshot.status || "");
+        const terminalStatus = isTerminalTurnStatus(nativeStatus)
+          ? nativeStatus
+          : String(latestTurn?.status || "");
+        if (!isTerminalTurnStatus(terminalStatus)) continue;
+
+        task.status = terminalStatus;
       } catch {
         // If the app-server is unavailable, leave the task untouched for the next pass.
         continue;
       }
     }
 
-    const hasAssistant = task.messages.some(
-      (message) => message.role === "assistant" && String(message.text || "").trim()
-    );
-    const nextStatus = hasAssistant ? "completed" : "interrupted";
+    if (task.engine === "codex") {
+      // Codex status was resolved from its native terminal turn above. Do not
+      // fall through to the old assistant-text heuristic: a completed turn may
+      // legitimately have no assistant text (for example, a tool-only turn).
+      if (!isTerminalTurnStatus(task.status)) continue;
+    } else {
+      const hasAssistant = task.messages.some(
+        (message) => message.role === "assistant" && String(message.text || "").trim()
+      );
+      task.status = hasAssistant ? "completed" : "interrupted";
+    }
+    const nextStatus = task.status;
     const turnId = activeTurnByThread.get(task.threadId) || crypto.randomUUID();
     activeTurnByThread.delete(task.threadId);
     turnStartingByThread.delete(task.threadId);
@@ -7788,9 +7817,38 @@ async function refreshLocalTasksImpl(limit = 50): Promise<void> {
   } catch {
     // Codex optional when listing Claude/Grok tasks.
   }
-  const storedTasks: AgentTask[] = await Promise.all(taskStore.list(1_000)
-    .filter((task) => task.engine !== "codex" || !codexThreads.isSubagent(task.providerSessionId || task.threadId))
-    .slice(0, listLimit).map(async (task) => {
+  const allStoredTasks = taskStore.list(1_000)
+    .filter((task) => task.engine !== "codex" || !codexThreads.isSubagent(task.providerSessionId || task.threadId));
+  const activeStoredTasks = allStoredTasks.filter((task) =>
+    isInProgressStoredStatus(task.status)
+    || turnStartingByThread.has(task.threadId)
+    || activeTurnByThread.has(task.threadId)
+    || (task.engine === "codex" && activeNativeCodexTurns.has(task.providerSessionId || task.threadId))
+  );
+  const storedCandidates = new Map<string, StoredTask>();
+  for (const task of [...activeStoredTasks, ...allStoredTasks.slice(0, listLimit)]) {
+    if (!storedCandidates.has(task.threadId)) storedCandidates.set(task.threadId, task);
+  }
+  // A task can be in memory before its first durable upsert completes. Keep it
+  // visible while that short write race settles, provided it is still active.
+  for (const task of publicState.tasks) {
+    if (!isInProgressStoredStatus(task.status) && !activeTurnByThread.has(task.threadId) && !turnStartingByThread.has(task.threadId)) continue;
+    if (task.engine === "codex" && codexThreads.isSubagent(task.threadId)) continue;
+    if (!storedCandidates.has(task.threadId)) {
+      storedCandidates.set(task.threadId, {
+        threadId: task.threadId,
+        engine: task.engine || "codex",
+        providerSessionId: task.threadId,
+        cwd: task.cwd,
+        title: task.title,
+        status: task.status,
+        createdAt: task.updatedAt,
+        updatedAt: task.updatedAt,
+        messages: []
+      });
+    }
+  }
+  const storedTasks: AgentTask[] = await Promise.all([...storedCandidates.values()].map(async (task) => {
       const cwd = await normalizeTaskCwd(task.cwd);
       const gitBranch = cwd ? await taskGitBranch(cwd) : undefined;
       return {
@@ -7811,7 +7869,22 @@ async function refreshLocalTasksImpl(limit = 50): Promise<void> {
       byId.set(task.threadId, normalized);
     }
   }
-  const tasks = [...byId.values()].sort((left, right) => right.updatedAt - left.updatedAt).slice(0, listLimit);
+  const sortedTasks = [...byId.values()].sort((left, right) => right.updatedAt - left.updatedAt);
+  const activeIds = new Set<string>([
+    ...activeStoredTasks.map((task) => task.threadId),
+    ...publicState.tasks
+      .filter((task) => isInProgressStoredStatus(task.status)
+        || activeTurnByThread.has(task.threadId)
+        || turnStartingByThread.has(task.threadId))
+      .map((task) => task.threadId)
+  ]);
+  // The recent window is only a cap for idle history. A running task must stay
+  // visible even when older history fills the requested page.
+  const activeTasks = sortedTasks.filter((task) => activeIds.has(task.threadId));
+  const recentTasks = sortedTasks
+    .filter((task) => !activeIds.has(task.threadId))
+    .slice(0, Math.max(0, listLimit - activeTasks.length));
+  const tasks = [...activeTasks, ...recentTasks].sort((left, right) => right.updatedAt - left.updatedAt);
   updateState({ tasks });
 }
 

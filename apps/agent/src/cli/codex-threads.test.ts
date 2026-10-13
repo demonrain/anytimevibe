@@ -17,6 +17,8 @@ describe("native Codex thread identity", () => {
     { id: "normal", source: "cli", name: null, preview: "" },
     { id: "normal", source: "vscode", parentThreadId: null, forkedFromId: "root" },
     { id: "normal", source: "unknown" },
+    { id: "normal", source: { subAgent: null } },
+    { id: "normal", source: { subagent: false } },
     { id: "normal", source: { custom: "subagent" }, agentNickname: "someone" }
   ])("keeps user sessions with metadata %j", (thread) => {
     expect(codexSubagentInfo(thread)).toBeUndefined();

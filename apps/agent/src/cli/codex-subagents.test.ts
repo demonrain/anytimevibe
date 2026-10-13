@@ -13,12 +13,12 @@ const source = createSourceFile("main.ts", readFileSync(path.resolve("apps/agent
 const names = [
   "handleCodexMessage", "handleCodexMessageBody", "touchAgentTask", "extractCodexThreadList", "extractCodexNextCursor",
   "threadMatchesQuery", "listCodexThreadsForSync", "mapPool", "hideCodexSubagentTask", "cleanupCodexSubagentTasks",
-  "refreshLocalTasks", "refreshLocalTasksImpl", "reserveClientOperation", "withClientOperation", "publishThread", "publishStoredTaskSnapshot", "hasActiveCodexTurn", "hasRunningCodexTurn", "busyCodingEngines", "resolveRelayTask", "recoverAfterCodexAppServerExit"
+  "refreshLocalTasks", "refreshLocalTasksImpl", "reconcileOrphanedActiveTasks", "reserveClientOperation", "withClientOperation", "publishThread", "publishStoredTaskSnapshot", "hasActiveCodexTurn", "hasRunningCodexTurn", "busyCodingEngines", "resolveRelayTask", "recoverAfterCodexAppServerExit"
 ];
 const declarations = source.statements.filter((node) => isFunctionDeclaration(node) && names.includes(node.name?.text || ""));
 const script = new Script(`${transpileModule(declarations.map((node) => node.getText(source)).join("\n"), {
   compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.CommonJS }
-}).outputText}\n({ handleCodexMessage, listCodexThreadsForSync, refreshLocalTasks, publishThread, publishStoredTaskSnapshot, hasActiveCodexTurn, hasRunningCodexTurn, busyCodingEngines, resolveRelayTask, recoverAfterCodexAppServerExit });`);
+}).outputText}\n({ handleCodexMessage, listCodexThreadsForSync, refreshLocalTasks, publishThread, publishStoredTaskSnapshot, hasActiveCodexTurn, hasRunningCodexTurn, busyCodingEngines, resolveRelayTask, recoverAfterCodexAppServerExit, reconcileOrphanedActiveTasks });`);
 
 function fixture() {
   const events: Array<Record<string, any>> = [];
@@ -74,6 +74,10 @@ function fixture() {
     isInProgressStoredStatus: (status: string) => status === "active",
     sanitizeTranscriptMessages: (messages: unknown[]) => messages, windowTranscriptMessages,
     queuedTurnsForThread: () => [],
+    isHeadlessCliEngine: () => false,
+    isThreadTurnBusy: () => false,
+    threadHasPendingCursorApproval: () => false,
+    clearThreadCursorApprovals: () => {},
     codex: { request: async (method: string, params: Record<string, any>): Promise<any> => {
       if (method === "thread/read") return { thread: threads.get(params.threadId) };
       if (method === "thread/list") return { data: [...threads.values()].filter((thread) =>
@@ -92,6 +96,7 @@ function fixture() {
     busyCodingEngines(): string[];
     resolveRelayTask(threadId: string): Promise<unknown>;
     recoverAfterCodexAppServerExit(detail: string): Promise<void>;
+    reconcileOrphanedActiveTasks(): Promise<number>;
   };
   return { ...functions, context, events, deltas, threads, publicState };
 }
@@ -185,6 +190,41 @@ describe("Codex subagent task visibility", () => {
     const rows = await f.listCodexThreadsForSync({ limit: 2 });
     expect(rows.map((row) => row.id)).toEqual(["parent", "older"]);
     expect(cursors).toEqual([undefined, "next"]);
+  });
+
+  it("keeps active tasks outside the recent refresh window", async () => {
+    const f = fixture();
+    await f.context.taskStore.upsert({
+      threadId: "active-old", engine: "claude", providerSessionId: "active-old", cwd: "",
+      title: "仍在运行", status: "active", createdAt: 1, updatedAt: 1, messages: []
+    });
+    f.publicState.tasks.push({ threadId: "active-old", title: "仍在运行", cwd: "", status: "active", updatedAt: 1, engine: "claude" });
+    for (let index = 0; index < 12; index += 1) {
+      await f.context.taskStore.upsert({
+        threadId: `recent-${index}`, engine: "claude", providerSessionId: `recent-${index}`, cwd: "",
+        title: `最近任务 ${index}`, status: "completed", createdAt: 10 + index, updatedAt: 10 + index, messages: []
+      });
+    }
+
+    await f.refreshLocalTasks(10);
+
+    expect(f.publicState.tasks.some((task) => task.threadId === "active-old")).toBe(true);
+  });
+
+  it("does not convert an active Codex task to interrupted without a terminal native status", async () => {
+    const f = fixture();
+    await f.context.taskStore.upsert({
+      threadId: "parent", engine: "codex", providerSessionId: "parent", cwd: "",
+      title: "主任务", status: "active", createdAt: 1, updatedAt: 1, messages: []
+    });
+    f.context.activeTurnByThread.clear();
+    f.threads.set("parent", { ...f.threads.get("parent"), status: "idle", turns: [] });
+
+    const fixed = await f.reconcileOrphanedActiveTasks();
+
+    expect(fixed).toBe(0);
+    expect(f.context.taskStore.get("parent")?.status).toBe("active");
+    expect(f.events.filter((event) => event.type === "turn.completed")).toEqual([]);
   });
 
   it("still treats an invisible background child as busy for engine upgrade and reload", async () => {

@@ -1615,8 +1615,15 @@ export function listStaleNativeImportThreadIds(store: TaskStore, limit: number):
   }
   const stale: string[] = [];
   for (const list of byEngine.values()) {
-    list.sort((a, b) => b.updatedAt - a.updatedAt);
-    for (const extra of list.slice(cap)) stale.push(extra.threadId);
+    // A long-running imported CLI may not update its transcript timestamp while
+    // it is streaming. Never let the history window delete an active session;
+    // the live process/reconciliation path owns its eventual terminal status.
+    const idle = list.filter((task) => {
+      const status = String(task.status || "").toLowerCase().replace(/[\s_-]/g, "");
+      return !["active", "running", "processing", "inprogress"].includes(status);
+    });
+    idle.sort((a, b) => b.updatedAt - a.updatedAt);
+    for (const extra of idle.slice(cap)) stale.push(extra.threadId);
   }
   return stale;
 }
