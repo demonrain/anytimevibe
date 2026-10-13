@@ -639,7 +639,14 @@ button.version-chip:hover:not(:disabled) { border-color: var(--moss); background
 button.version-chip:focus-visible { outline: 2px solid var(--moss); outline-offset: 3px; }
 button.version-chip:disabled { cursor: default; }
 .version-chip-action { color: var(--moss); }
-/* Soft update notice — tip only; no download chrome (topbar already has downloads). */
+.version-chip.update-attention {
+  animation: version-chip-update-attention 1.15s ease-in-out infinite;
+}
+@keyframes version-chip-update-attention {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(166,59,40,0); }
+  50% { background: #fff; box-shadow: 0 0 0 4px rgba(166,59,40,.22); }
+}
+/* Soft update notice with a direct recovery installer link for affected clients. */
 .client-update-banner {
   position: fixed;
   top: var(--topbar-h);
@@ -673,6 +680,32 @@ button.version-chip:disabled { cursor: default; }
   line-height: 1.4;
   color: #8a4a38;
 }
+.client-update-banner-manual { align-items: center; }
+.client-update-banner-downloads {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.client-update-banner-downloads a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid rgba(166,59,40,.3);
+  border-radius: 6px;
+  background: rgba(255,255,255,.72);
+  color: #8f3022;
+  font-size: 11px;
+  font-weight: 800;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.client-update-banner-downloads a:hover { background: #fff; border-color: rgba(166,59,40,.6); }
+.client-update-banner-downloads a:focus-visible { outline: 2px solid var(--moss); outline-offset: 2px; }
+.client-update-banner-unavailable { flex: 0 0 auto; font-size: 11px; color: #8a4a38; }
 .client-update-banner-close {
   flex: 0 0 auto;
   width: 36px;
@@ -695,10 +728,20 @@ button.version-chip:disabled { cursor: default; }
 }
 @media (max-width: 700px) {
   .client-update-banner {
-    top: 58px;
+    top: calc(58px + env(safe-area-inset-top, 0px));
     padding: 8px 8px 8px 12px;
     gap: 6px;
   }
+  .client-update-banner-manual {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+  }
+  .client-update-banner-manual .client-update-banner-copy { grid-column: 1; grid-row: 1; }
+  .client-update-banner-downloads { grid-column: 1 / -1; grid-row: 2; }
+  .client-update-banner-unavailable { grid-column: 1 / -1; grid-row: 2; }
+  .client-update-banner-manual .client-update-banner-close { grid-column: 2; grid-row: 1; }
+  .client-update-banner-downloads a { min-height: 44px; }
   .client-update-banner-copy strong { font-size: 11px; }
   .client-update-banner-copy span { font-size: 10px; }
   .client-update-banner-close {
@@ -1182,6 +1225,7 @@ button.version-chip:disabled { cursor: default; }
   .client-update-actions > button, .client-update-actions > button.primary { flex-basis: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
+  .version-chip.update-attention { animation: none; }
   .client-update-progress > span { transition: none; }
   .client-update-progress.indeterminate > span { animation: none; }
 }

@@ -52,12 +52,17 @@ import {
   type ReasoningEffort,
   type RunInfo,
   type Workspace,
-  PRODUCT_VERSION,
-  compareSemver
+  PRODUCT_VERSION
 } from "@anytimevibe/protocol";
 import { api, websocketUrl } from "./api";
 import { useI18n } from "./i18n/I18nProvider";
 import { TaskDirectoryPicker } from "./TaskDirectoryPicker";
+import {
+  ClientUpdateNotice,
+  clientUpdateAvailable,
+  clientUpdateButtonClassName,
+  shouldRecommendManualClientInstall
+} from "./ClientUpdateNotice";
 import {
   ClientUpdatePanel,
   clientUpdateActions,
@@ -3560,18 +3565,21 @@ export function App() {
 
   const clientVersion = activeRuntime.agentVersion;
   const latestClientVersion = health.latestClientVersion?.replace(/^v/i, "") || null;
-  // Soft update only: compare connected client to latest published release (not web PRODUCT_VERSION).
+  // Compare the last reported host version to the latest desktop release, even while the host is offline.
   const clientOutdated = Boolean(
     activeHost
-    && activeRuntime.online === true
-    && clientVersion
-    && latestClientVersion
-    && compareSemver(clientVersion, latestClientVersion) < 0
+    && clientUpdateAvailable(clientVersion, latestClientVersion)
   );
   const clientVersionUnknown = Boolean(
     activeHost
     && activeRuntime.online === true
     && !clientVersion
+  );
+  const manualClientInstallRequired = Boolean(
+    activeHost
+    && clientVersion
+    && latestClientVersion
+    && shouldRecommendManualClientInstall(clientVersion, latestClientVersion)
   );
   const versionWarn = clientOutdated || clientVersionUnknown;
   const versionTitle = clientOutdated
@@ -3585,7 +3593,7 @@ export function App() {
       : (locale === "en"
         ? `Web v${PRODUCT_VERSION}${clientVersion ? ` · Client v${clientVersion}` : ""}${latestClientVersion ? ` · Latest client v${latestClientVersion}` : ""}`
         : `网页 v${PRODUCT_VERSION}${clientVersion ? ` · 客户端 v${clientVersion}` : ""}${latestClientVersion ? ` · 最新客户端 v${latestClientVersion}` : ""}`);
-  const showClientUpdateBanner = versionWarn && !clientUpdateDismissed;
+  const showClientUpdateBanner = (versionWarn || manualClientInstallRequired) && !clientUpdateDismissed;
 
   return <div className="app-shell">
     {error && <ErrorBanner message={error} clear={() => setError("")} />}
@@ -3594,9 +3602,18 @@ export function App() {
       <div className="top-actions">
         <button
           type="button"
-          className={`version-chip${versionWarn ? " warn" : ""}`}
+          className={clientUpdateButtonClassName(
+            versionWarn,
+            clientOutdated,
+            clientUpdateOpen,
+            clientUpdateIsActive(activeRuntime.clientUpdate)
+          )}
           title={`${versionTitle}${activeHost ? ` · ${clientUpdateStatusLabel(activeRuntime.clientUpdate, locale, clientVersion)}` : ""}`}
-          aria-label={activeHost ? (locale === "en" ? `Client updates for ${activeHost.name}` : `${activeHost.name} 的客户端升级`) : (locale === "en" ? "Select a computer to manage client updates" : "选择电脑后管理客户端更新")}
+          aria-label={activeHost
+            ? `${locale === "en" ? `Client updates for ${activeHost.name}` : `${activeHost.name} 的客户端升级`}${clientOutdated && latestClientVersion
+              ? (locale === "en" ? `, update available: v${latestClientVersion}` : `，有新版本 v${latestClientVersion}`)
+              : ""}`
+            : (locale === "en" ? "Select a computer to manage client updates" : "选择电脑后管理客户端更新")}
           aria-expanded={clientUpdateOpen && Boolean(activeHost)}
           disabled={!activeHost}
           onClick={() => setClientUpdateOpen(true)}
@@ -3636,14 +3653,25 @@ export function App() {
       </div>
     </header>
 
-    {showClientUpdateBanner && (
+    {showClientUpdateBanner && manualClientInstallRequired && activeHost && clientVersion && latestClientVersion && (
+      <ClientUpdateNotice
+        locale={locale}
+        clientVersion={clientVersion}
+        latestVersion={latestClientVersion}
+        platform={activeHost.platform}
+        downloads={health.clientDownloads}
+        onDismiss={() => setClientUpdateDismissed(true)}
+      />
+    )}
+
+    {showClientUpdateBanner && !manualClientInstallRequired && (
       <div className="client-update-banner" role="status">
         <div className="client-update-banner-copy">
           <strong>{locale === "en" ? "Client update available" : "客户端有新版本"}</strong>
           <span>
             {clientOutdated
               ? (locale === "en"
-                ? `Connected client v${clientVersion} is behind latest v${latestClientVersion}. Please update when convenient.`
+                  ? `Client v${clientVersion} is behind latest v${latestClientVersion}. Please update when convenient.`
                 : `当前客户端 v${clientVersion}，线上最新 v${latestClientVersion}，建议及时更新以确保功能正常。`)
               : (locale === "en"
                 ? `Latest client is v${latestClientVersion ?? "—"}. This host did not report a version.`
