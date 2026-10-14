@@ -1325,7 +1325,31 @@ export function resolveAgyConversationResumeId(
   return id;
 }
 
-/** Stream incremental tokens; if agy later sends a fuller snapshot, only emit the missing suffix. */
+/**
+ * Merge Antigravity's mixed stream shapes. `step_update` may carry either a
+ * token delta or the full text accumulated so far, while `result.response` is
+ * a terminal full snapshot.
+ */
+export function mergeAgyAssistantText(
+  previous: string,
+  incoming: string
+): { text: string; delta: string } {
+  const cleanPrevious = previous.replace(/\uFFFD+$/g, "");
+  const cleanIncoming = incoming.replace(/^\uFFFD+/, "");
+  if (!cleanIncoming) return { text: cleanPrevious || previous, delta: "" };
+  if (!cleanPrevious) return { text: cleanIncoming, delta: cleanIncoming };
+  if (cleanIncoming === cleanPrevious || cleanPrevious.startsWith(cleanIncoming)) {
+    return { text: cleanPrevious, delta: "" };
+  }
+  if (cleanIncoming.startsWith(cleanPrevious)) {
+    return {
+      text: cleanIncoming,
+      delta: cleanIncoming.slice(cleanPrevious.length)
+    };
+  }
+  return { text: cleanPrevious + cleanIncoming, delta: cleanIncoming };
+}
+
 function emitAgyAssistantText(
   state: ParseState,
   options: HeadlessRunOptions,
@@ -1333,26 +1357,10 @@ function emitAgyAssistantText(
   incoming: string
 ): void {
   if (!incoming) return;
-  if (incoming === state.text) return;
-  // Strip trailing replacement characters from accumulated text — they indicate
-  // a multi-byte UTF-8 sequence was split across chunks and will be completed
-  // by the next chunk.
-  const cleanPrevious = state.text.replace(/\uFFFD+$/g, "");
-  // Strip leading replacement characters from incoming — leftover partial bytes
-  // from the previous chunk's incomplete multi-byte sequence.
-  const cleanIncoming = incoming.replace(/^\uFFFD+/, "");
-  if (cleanPrevious && cleanIncoming.startsWith(cleanPrevious)) {
-    const extra = cleanIncoming.slice(cleanPrevious.length);
-    state.text = cleanIncoming;
-    state.sawAssistant = true;
-    if (extra) emitDelta(onEvent, options, "assistant", "assistant", extra);
-    return;
-  }
-  if (cleanPrevious && cleanPrevious.startsWith(cleanIncoming)) return;
-  state.text = cleanIncoming || incoming;
+  const merged = mergeAgyAssistantText(state.text, incoming);
+  state.text = merged.text;
   state.sawAssistant = true;
-  const delta = cleanIncoming || incoming;
-  if (delta) emitDelta(onEvent, options, "assistant", "assistant", delta);
+  if (merged.delta) emitDelta(onEvent, options, "assistant", "assistant", merged.delta);
 }
 
 function handleAntigravityLine(
