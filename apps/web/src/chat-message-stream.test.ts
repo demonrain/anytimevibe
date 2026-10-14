@@ -102,6 +102,36 @@ describe("assistant stream display", () => {
     expect(html).toContain('<pre class="md-code-block">');
     expect(html).toContain(text.includes("hello") ? "&lt;div&gt;hello&lt;/div&gt;" : "const answer = 42;");
   });
+
+  it("renders AGY break tags as line breaks instead of exposing the tag", () => {
+    const html = renderStream([{ id: "assistant:turn-1:agy", role: "assistant", text: "第一行<br>第二行" }]);
+
+    expect(html).not.toContain("&lt;br&gt;");
+    expect(html).toContain("第一行<br/>");
+    expect(html).toContain("第二行");
+  });
+
+  it("keeps literal break tags inside fenced code blocks", () => {
+    const html = renderStream([{
+      id: "assistant:turn-1:code",
+      role: "assistant",
+      text: "```html\n<div>第一行<br>第二行</div>\n```"
+    }]);
+
+    expect(html).toContain("&lt;div&gt;第一行&lt;br&gt;第二行&lt;/div&gt;");
+    expect(html).not.toContain("第一行<br/>");
+  });
+
+  it("renders Mermaid flowchart fences in a chart container with source fallback", () => {
+    const html = renderStream([{
+      id: "assistant:turn-1:mermaid",
+      role: "assistant",
+      text: "```mermaid\nflowchart LR\n  A[开始] --> B[完成]\n```"
+    }]);
+
+    expect(html).toContain('data-mermaid="true"');
+    expect(html).toContain("flowchart LR");
+  });
 });
 
 describe("empty stream events", () => {

@@ -13,6 +13,24 @@ const execFileAsync = promisify(execFile);
 
 type HistoryMessage = StoredTask["messages"][number];
 
+function isAnytimeVibeManagedTask(task: {
+  managedByAnytimeVibe?: boolean;
+  permissionMode?: StoredTask["permissionMode"];
+} | undefined): boolean {
+  // permissionMode is also present on product tasks saved before the explicit marker existed.
+  return task?.managedByAnytimeVibe === true || Boolean(task?.permissionMode);
+}
+
+export function productTaskOwnershipFields(
+  existing?: Pick<StoredTask, "managedByAnytimeVibe" | "permissionMode">
+): Partial<Pick<StoredTask, "managedByAnytimeVibe" | "permissionMode">> {
+  if (!isAnytimeVibeManagedTask(existing)) return {};
+  return {
+    managedByAnytimeVibe: true,
+    ...(existing?.permissionMode ? { permissionMode: existing.permissionMode } : {})
+  };
+}
+
 /** Keep enough early turns so long sessions remain scrollable after import/re-sync. */
 const TRANSCRIPT_MESSAGE_CAP = 2000;
 
@@ -143,7 +161,10 @@ export function isJunkCursorImportTask(task: {
   messages?: HistoryMessage[];
   providerSessionId?: string;
   threadId?: string;
+  managedByAnytimeVibe?: boolean;
+  permissionMode?: StoredTask["permissionMode"];
 }): boolean {
+  if (isAnytimeVibeManagedTask(task)) return false;
   // AnytimeVibe web-bound tasks own their transcript via headless streaming.
   const webBound = Boolean(
     task.providerSessionId
@@ -171,7 +192,10 @@ export function isJunkGrokImportTask(task: {
   cwd?: string;
   title?: string;
   messages?: HistoryMessage[];
+  managedByAnytimeVibe?: boolean;
+  permissionMode?: StoredTask["permissionMode"];
 }): boolean {
+  if (isAnytimeVibeManagedTask(task)) return false;
   if (isEphemeralImportCwd(task.cwd)) return true;
   const title = String(task.title || "").trim();
   if (isGrokSmokePrompt(title)) return true;
@@ -468,7 +492,7 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
     } catch {
       // meta/prompt-history only
     }
-    const isWebBound = Boolean(existing && existing.threadId !== hit.id);
+    const isWebBound = Boolean(existing && (existing.threadId !== hit.id || isAnytimeVibeManagedTask(existing)));
     // Cursor IDE Agent/Composer chats share ~/.cursor/chats — never create native sync rows.
     // Web-bound AnytimeVibe tasks may resume the same session id; keep updating those.
     if (!isWebBound && (imported.ideAgentTranscript || historyIsIde)) {
@@ -500,7 +524,8 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
       title,
       messages,
       threadId: existing?.threadId || hit.id,
-      providerSessionId: hit.id
+      providerSessionId: hit.id,
+      ...productTaskOwnershipFields(existing)
     };
     if (isCursorIdeAgentTranscriptImport({ title, messages })
       || isCursorIdeAgentTranscriptNoise(titleFromHistory)
@@ -520,6 +545,7 @@ async function importCursorSessions(store: TaskStore, limit: number): Promise<nu
       threadId,
       engine: "cursor",
       providerSessionId: hit.id,
+      ...productTaskOwnershipFields(existing),
       cwd,
       title,
       status: mergeImportStatus(existing),
@@ -559,6 +585,7 @@ async function removeOrphanNativeDuplicate(
   if (providerSessionId === keepThreadId) return;
   const orphan = store.get(providerSessionId);
   if (!orphan) return;
+  if (isAnytimeVibeManagedTask(orphan)) return;
   // Only drop pure native-keyed clones of the same session.
   if (orphan.threadId === providerSessionId && (orphan.providerSessionId === providerSessionId || !orphan.providerSessionId)) {
     await store.remove(providerSessionId);
@@ -893,7 +920,7 @@ async function importGrokSessions(store: TaskStore, limit: number): Promise<numb
       ? importedMessages
       : (existing?.messages || importedMessages);
     const title = existing?.title || meta.title || `Grok ${hit.id.slice(0, 8)}`;
-    if (isJunkGrokImportTask({ cwd, title, messages })) continue;
+    if (isJunkGrokImportTask({ cwd, title, messages, ...productTaskOwnershipFields(existing) })) continue;
 
     // Keep AnytimeVibe threadId (UUID) when this native session was already bound to a web task.
     const threadId = existing?.threadId || hit.id;
@@ -901,6 +928,7 @@ async function importGrokSessions(store: TaskStore, limit: number): Promise<numb
       threadId,
       engine: "grok",
       providerSessionId: hit.id,
+      ...productTaskOwnershipFields(existing),
       cwd: cwd ? path.resolve(cwd) : "",
       title,
       status: mergeImportStatus(existing),
@@ -1219,6 +1247,7 @@ async function importClaudeSessions(
       threadId,
       engine: "claude",
       providerSessionId: hit.id,
+      ...productTaskOwnershipFields(existing),
       cwd,
       title: existing?.title || titleFromUser || `Claude ${hit.id.slice(0, 8)}`,
       status: mergeImportStatus(existing),
@@ -1386,8 +1415,7 @@ export function listAgySubagentImportThreadIds(store: TaskStore, subagentIds: Se
       if (task.engine !== "antigravity") return false;
       const native = (task.providerSessionId || task.threadId || "").trim();
       if (!native || !subagentIds.has(native)) return false;
-      // Keep AnytimeVibe web-bound tasks even if the native id somehow collides.
-      if (task.providerSessionId && task.threadId !== task.providerSessionId) return false;
+      if (isAnytimeVibeManagedTask(task)) return false;
       return true;
     })
     .map((task) => task.threadId);
@@ -1524,6 +1552,7 @@ async function importAntigravitySessions(store: TaskStore, limit: number): Promi
       threadId,
       engine: "antigravity",
       providerSessionId: hit.id,
+      ...productTaskOwnershipFields(existing),
       cwd: hit.cwd || existing?.cwd || "",
       title: existing?.title || titleFromUser || hit.title,
       status: mergeImportStatus(existing),
@@ -1564,6 +1593,9 @@ export async function dedupeMultiCliTasks(store: TaskStore): Promise<number> {
   for (const group of groups.values()) {
     if (group.length < 2) continue;
     group.sort((a, b) => {
+      const aManaged = isAnytimeVibeManagedTask(a) ? 1 : 0;
+      const bManaged = isAnytimeVibeManagedTask(b) ? 1 : 0;
+      if (bManaged !== aManaged) return bManaged - aManaged;
       const aWeb = a.providerSessionId && a.providerSessionId !== a.threadId ? 1 : 0;
       const bWeb = b.providerSessionId && b.providerSessionId !== b.threadId ? 1 : 0;
       if (bWeb !== aWeb) return bWeb - aWeb;
@@ -1583,6 +1615,7 @@ export async function dedupeMultiCliTasks(store: TaskStore): Promise<number> {
       await store.upsert(keep);
     }
     for (const extra of group.slice(1)) {
+      if (isAnytimeVibeManagedTask(extra)) continue;
       if (extra.threadId === keep.threadId) continue;
       await store.remove(extra.threadId);
       removed += 1;
@@ -1609,6 +1642,7 @@ export function listStaleNativeImportThreadIds(store: TaskStore, limit: number):
   const byEngine = new Map<string, StoredTask[]>();
   for (const task of store.list(1000)) {
     if (!isNativeKeyedCliImport(task)) continue;
+    if (isAnytimeVibeManagedTask(task)) continue;
     const list = byEngine.get(task.engine) ?? [];
     list.push(task);
     byEngine.set(task.engine, list);

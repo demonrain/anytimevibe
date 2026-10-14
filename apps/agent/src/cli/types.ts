@@ -43,6 +43,8 @@ export type StoredTask = {
   threadId: string;
   engine: CliEngine;
   providerSessionId: string;
+  /** Distinguishes product tasks from native CLI imports during history cleanup. */
+  managedByAnytimeVibe?: boolean;
   cwd: string;
   gitBranch?: string;
   title: string;

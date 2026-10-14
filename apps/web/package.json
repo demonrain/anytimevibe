@@ -12,6 +12,7 @@
   "dependencies": {
     "@anytimevibe/protocol": "workspace:*",
     "@vitejs/plugin-react": "^4.5.2",
+    "mermaid": "^11.17.2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",

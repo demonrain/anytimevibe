@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  isValidElement,
   type MutableRefObject,
   type ReactNode,
   type RefObject,
@@ -57,6 +58,7 @@ import {
 import { api, websocketUrl } from "./api";
 import { useI18n } from "./i18n/I18nProvider";
 import { TaskDirectoryPicker } from "./TaskDirectoryPicker";
+import { MermaidDiagram, normalizeAssistantMarkdown } from "./markdown-display";
 import { buildSyncReplayUrl, startLiveSync } from "./sync-replay";
 import {
   ClientUpdateNotice,
@@ -1241,6 +1243,10 @@ function childrenToPlainText(children: ReactNode): string {
 
 /** Stable markdown config — recreating these every render forces ReactMarkdown to re-walk the tree. */
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
+function singleMarkdownChild(children: ReactNode): ReactNode {
+  return Array.isArray(children) && children.length === 1 ? children[0] : children;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- react-markdown Components typing is overly strict with exactOptionalPropertyTypes
 const MARKDOWN_COMPONENTS: any = {
   a: ({ href, children }: { href?: string; children?: ReactNode }) => {
@@ -1271,17 +1277,28 @@ const MARKDOWN_COMPONENTS: any = {
     );
   },
   // The Markdown pre node identifies a block even when its language tag is absent.
-  pre: ({ children }: { children?: ReactNode }) => <div className="md-pre"><pre className="md-code-block">{children}</pre></div>,
-  code: ({ className, children }: { className?: string; children?: ReactNode }) => (
-    <code className={className || "md-code-inline"}>{children}</code>
-  )
+  pre: ({ children }: { children?: ReactNode }) => {
+    const child = singleMarkdownChild(children);
+    if (isValidElement(child) && child.type === MermaidDiagram) return child;
+    return <div className="md-pre"><pre className="md-code-block">{children}</pre></div>;
+  },
+  code: ({ className, children }: { className?: string; children?: ReactNode }) => {
+    if (/\blanguage-mermaid\b/i.test(className || "")) {
+      const chart = childrenToPlainText(children).replace(/\r\n?/g, "\n").replace(/\n$/, "");
+      return <MermaidDiagram chart={chart} />;
+    }
+    return <code className={className || "md-code-inline"}>{children}</code>;
+  }
 };
 
 /** Assistant reply: header (engine label + view toggle) and markdown/source body. */
 const AssistantMessageCard = memo(function AssistantMessageCard({ label, text }: { label: string; text: string }) {
   const { locale } = useI18n();
   // Sanitize once per text change; memo keeps markdown parse off the composer keystroke path.
-  const clean = useMemo(() => sanitizeDisplayText(text), [text]);
+  const clean = useMemo(
+    () => normalizeAssistantMarkdown(sanitizeDisplayText(text)),
+    [text]
+  );
   const [mode, setMode] = useState<"preview" | "source">("preview");
   return (
     <>

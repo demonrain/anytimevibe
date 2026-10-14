@@ -585,6 +585,7 @@ const activeTurnByThread = new Map<string, string>();
 const codexThreads = new CodexThreadRegistry();
 /** Product-list cleanup only; never tombstone or delete a native subagent session. */
 const hiddenCodexSubagentIds = new Set<string>();
+const reportedCodexProductTaskConflicts = new Set<string>();
 /** Track native lifecycle immediately, even before a new thread's identity is read. */
 const activeNativeCodexTurns = new Map<string, string>();
 /** Codex callbacks are concurrent; preserve native event order within each thread. */
@@ -627,6 +628,8 @@ const pendingCodexSteeringByThread = new Map<string, PendingCodexSteering>();
 const queueSteeringInFlight = new Set<string>();
 /** Covers the gap between accepting turn.start and activeTurnByThread being set. */
 const turnStartingByThread = new Set<string>();
+/** Active interactive CLI handoff terminals keyed by product task. */
+const externalHandoffCountByThread = new Map<string, number>();
 let turnQueueFilePath = "";
 const WS_CONNECT_TIMEOUT_MS = 15_000;
 const PATH_REFRESH_TIMEOUT_MS = 8_000;
@@ -1073,6 +1076,7 @@ async function deleteLocalThread(threadId: string): Promise<void> {
 async function pruneJunkCliImports(junkIds: string[]): Promise<void> {
   for (const threadId of junkIds) {
     if (!threadId || isThreadDeleted(threadId)) continue;
+    if (isProtectedFromCliImportCleanup(threadId)) continue;
     try {
       await deleteLocalThread(threadId);
     } catch {
@@ -1088,6 +1092,7 @@ async function pruneJunkCliImports(junkIds: string[]): Promise<void> {
 async function evictStaleNativeCliImports(threadIds: string[]): Promise<void> {
   for (const threadId of threadIds) {
     if (!threadId || isThreadDeleted(threadId)) continue;
+    if (isProtectedFromCliImportCleanup(threadId)) continue;
     try {
       await taskStore.remove(threadId);
       updateState({
@@ -1235,10 +1240,42 @@ async function appendStoredUserPrompt(threadId: string, prompt: string): Promise
   const stored = taskStore.get(threadId);
   if (!stored) return;
   const already = stored.messages.some((message) => message.role === "user" && message.text.trim() === text);
-  if (already) return;
-  stored.messages.push({ id: crypto.randomUUID(), role: "user", text });
+  let changed = false;
+  if (!stored.managedByAnytimeVibe) {
+    stored.managedByAnytimeVibe = true;
+    changed = true;
+  }
+  if (!already) {
+    stored.messages.push({ id: crypto.randomUUID(), role: "user", text });
+    changed = true;
+  }
+  if (!changed) return;
   stored.updatedAt = Date.now() / 1000;
   await taskStore.upsert(stored);
+}
+
+function isAnytimeVibeManagedTask(task?: StoredTask): boolean {
+  // permissionMode identifies product tasks written by older client versions.
+  return task?.managedByAnytimeVibe === true || Boolean(task?.permissionMode);
+}
+
+function isProtectedFromCliImportCleanup(threadId: string): boolean {
+  const stored = taskStore.get(threadId)
+    || taskStore.findByProviderSession(threadId)
+    || taskStore.findByProviderSession(threadId, "codex");
+  const taskId = stored?.threadId || threadId;
+  return isAnytimeVibeManagedTask(stored)
+    || isInProgressStoredStatus(stored?.status)
+    || isThreadTurnBusy(taskId)
+    || externalHandoffCountByThread.has(taskId);
+}
+
+function isHiddenCodexSubagentTask(nativeThreadId: string, task?: StoredTask): boolean {
+  if (!codexThreads.isSubagent(nativeThreadId)) return false;
+  const productTask = task
+    || taskStore.get(nativeThreadId)
+    || taskStore.findByProviderSession(nativeThreadId, "codex");
+  return !isAnytimeVibeManagedTask(productTask);
 }
 
 function startLocalActivity(threadId: string, prompt: string, title = "远程任务", engine?: CliEngine): void {
@@ -1275,7 +1312,7 @@ function appendLocalActivityStage(threadId: string, text: string): void {
 }
 
 function touchAgentTask(threadId: string, patch: Partial<AgentTask> = {}): void {
-  if (codexThreads.isSubagent(threadId)) return;
+  if (isHiddenCodexSubagentTask(threadId)) return;
   const now = Date.now() / 1000;
   const existing = publicState.tasks.find((item) => item.threadId === threadId);
   const stored = taskStore.get(threadId);
@@ -3160,7 +3197,11 @@ async function runWindowsCommand(
 }
 
 /** Keep remote client installation blocked until an external command really finishes. */
-function trackExternalClientOperation(completionPath: string, release: () => void): () => void {
+function trackExternalClientOperation(
+  completionPath: string,
+  release: () => void,
+  onComplete?: () => void
+): () => void {
   let finished = false;
   let polling = false;
   const finish = () => {
@@ -3169,6 +3210,7 @@ function trackExternalClientOperation(completionPath: string, release: () => voi
     clearInterval(timer);
     release();
     void fs.unlink(completionPath).catch(() => undefined);
+    try { onComplete?.(); } catch (error) { logWarn("鎺ュ姏缁堢缁撴潫澶勭悊澶辫触", error); }
   };
   const timer = setInterval(() => {
     if (finished || polling) return;
@@ -3181,13 +3223,72 @@ function trackExternalClientOperation(completionPath: string, release: () => voi
   return finish;
 }
 
+async function beginExternalTaskHandoff(threadId: string): Promise<void> {
+  const count = retainExternalHandoff(threadId);
+  if (count > 1) return;
+  try {
+    const stored = taskStore.get(threadId);
+    if (stored) {
+      stored.status = "active";
+      stored.updatedAt = Date.now() / 1000;
+      await taskStore.upsert(stored);
+    }
+    touchAgentTask(threadId, { status: "active" });
+    await publishStoredTaskSnapshot(threadId).catch(() => undefined);
+    await publishHostStatus({ refresh: false }).catch(() => undefined);
+  } catch (error) {
+    releaseExternalHandoff(threadId);
+    throw error;
+  }
+}
+
+function retainExternalHandoff(threadId: string): number {
+  const count = (externalHandoffCountByThread.get(threadId) || 0) + 1;
+  externalHandoffCountByThread.set(threadId, count);
+  return count;
+}
+
+function releaseExternalHandoff(threadId: string): boolean {
+  const count = externalHandoffCountByThread.get(threadId) || 0;
+  if (count <= 0) return false;
+  if (count > 1) {
+    externalHandoffCountByThread.set(threadId, count - 1);
+    return false;
+  }
+  externalHandoffCountByThread.delete(threadId);
+  return true;
+}
+
+async function finishExternalTaskHandoff(threadId: string): Promise<void> {
+  if (!releaseExternalHandoff(threadId)) return;
+  const stored = taskStore.get(threadId);
+  if (stored) {
+    // The external TUI does not report whether the last request completed or the
+    // user simply closed it. Preserve an imported terminal status; otherwise mark
+    // the unobserved handoff as interrupted and leave the task easy to find.
+    if (isInProgressStoredStatus(stored.status)) stored.status = "interrupted";
+    stored.updatedAt = Date.now() / 1000;
+    await taskStore.upsert(stored);
+  }
+  touchAgentTask(threadId, {
+    status: stored?.status || "interrupted",
+    ...(stored?.engine ? { engine: stored.engine } : {})
+  });
+  await publishStoredTaskSnapshot(threadId).catch(() => undefined);
+  await publishHostStatus({ refresh: false }).catch(() => undefined);
+}
+
 /** Wait-on-return WScript owns the console; the receipt precedes its final pause. */
-async function launchWindowsVisibleScript(script: string, extension: "cmd" | "ps1"): Promise<void> {
+async function launchWindowsVisibleScript(
+  script: string,
+  extension: "cmd" | "ps1",
+  onComplete?: () => void
+): Promise<void> {
   const release = reserveClientOperation();
   let finish = release;
   try {
     const directory = await fs.mkdtemp(path.join(app.getPath("temp"), "anytimevibe-console-"));
-    finish = trackExternalClientOperation(path.join(directory, "complete"), release);
+    finish = trackExternalClientOperation(path.join(directory, "complete"), release, onComplete);
     await fs.writeFile(path.join(directory, `payload.${extension}`), script, "utf8");
     // Relative paths avoid CALL's second expansion of percent signs in user directories.
     const runner = [
@@ -3223,7 +3324,7 @@ async function launchWindowsVisibleScript(script: string, extension: "cmd" | "ps
 }
 
 /** Visible console from Electron GUI on Windows (WScript is more reliable than cmd start). */
-async function openWindowsVisibleConsole(lines: string[]): Promise<void> {
+async function openWindowsVisibleConsole(lines: string[], onComplete?: () => void): Promise<void> {
   if (process.platform !== "win32") throw new Error("openWindowsVisibleConsole is Windows-only");
   return launchWindowsVisibleScript([
     "@echo off",
@@ -3237,7 +3338,7 @@ async function openWindowsVisibleConsole(lines: string[]): Promise<void> {
     "echo.",
     "endlocal",
     ""
-  ].join("\r\n"), "cmd");
+  ].join("\r\n"), "cmd", onComplete);
 }
 
 /**
@@ -3465,13 +3566,13 @@ async function proxyShellLines(platform: "win32" | "darwin" | "powershell"): Pro
 }
 
 /** Launch a `.command` file in Terminal via `open` — avoids AppleScript / System Events automation prompts. */
-async function launchMacTerminalScriptFile(scriptPath: string): Promise<void> {
+async function launchMacTerminalScriptFile(scriptPath: string, onComplete?: () => void): Promise<void> {
   const release = reserveClientOperation();
   let finish = release;
   try {
     const directory = await fs.mkdtemp(path.join(app.getPath("temp"), "anytimevibe-terminal-"));
     const completionPath = path.join(directory, "complete");
-    finish = trackExternalClientOperation(completionPath, release);
+    finish = trackExternalClientOperation(completionPath, release, onComplete);
     const runnerPath = path.join(directory, "runner.command");
     await fs.writeFile(runnerPath, [
       "#!/bin/bash",
@@ -5442,7 +5543,7 @@ async function publishStoredTaskSnapshot(
   const task = taskStore.get(threadId);
   if (!task) return;
   if (task.providerSessionId && isThreadDeleted(task.providerSessionId)) return;
-  if (task.engine === "codex" && codexThreads.isSubagent(task.providerSessionId || threadId)) {
+  if (task.engine === "codex" && isHiddenCodexSubagentTask(task.providerSessionId || threadId, task)) {
     await hideCodexSubagentTask(task.providerSessionId || threadId);
     return;
   }
@@ -5467,9 +5568,11 @@ async function publishStoredTaskSnapshot(
   // turn. Usage heartbeats reuse this path and would otherwise flip the web UI to「已完成」
   // mid-stream (Codex follow-ups often leave taskStore.status as the prior completion).
   const liveTurnId = activeTurnByThread.get(task.threadId);
-  const publishStatus = liveTurnId && !isInProgressStoredStatus(task.status)
+  const publishStatus = externalHandoffCountByThread.has(task.threadId)
     ? "active"
-    : task.status;
+    : liveTurnId && !isInProgressStoredStatus(task.status)
+      ? "active"
+      : task.status;
   const agentTask: AgentTask = {
     threadId: task.threadId,
     title: task.title,
@@ -5539,6 +5642,7 @@ async function runHeadlessTaskTurn(options: {
       threadId: options.threadId,
       engine: options.engine,
       providerSessionId: "",
+      managedByAnytimeVibe: true,
       cwd: absoluteCwd,
       title: taskTitle,
       status: "active",
@@ -6194,6 +6298,7 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
         threadId: thread.id,
         engine: "codex",
         providerSessionId: thread.id,
+        managedByAnytimeVibe: true,
         cwd: threadCwd,
         title: taskTitle,
         status: "active",
@@ -6632,6 +6737,13 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
 
 async function hideCodexSubagentTask(threadId: string): Promise<void> {
   if (!codexThreads.isSubagent(threadId)) return;
+  if (!isHiddenCodexSubagentTask(threadId)) {
+    if (!reportedCodexProductTaskConflicts.has(threadId)) {
+      reportedCodexProductTaskConflicts.add(threadId);
+      logWarn("保留 AnytimeVibe 任务：Codex 子 Agent 元数据与产品任务冲突", threadId.slice(0, 8));
+    }
+    return;
+  }
   if (publicState.tasks.some((task) => task.threadId === threadId)
     || publicState.activities.some((activity) => activity.threadId === threadId)) {
     updateState({
@@ -6714,7 +6826,7 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
   const turnId = String(message.params?.turn?.id ?? message.params?.turnId ?? "");
   if (threadId && message.method === "turn/started") activeNativeCodexTurns.set(threadId, turnId);
   if (threadId && message.method === "turn/completed"
-    && (!turnId || activeNativeCodexTurns.get(threadId) === turnId)) activeNativeCodexTurns.delete(threadId);
+    && turnId && activeNativeCodexTurns.get(threadId) === turnId) activeNativeCodexTurns.delete(threadId);
   if (threadId && message.method === "thread/closed") activeNativeCodexTurns.delete(threadId);
   // Record identity as soon as a notification arrives, including while an older
   // turn notification is still awaiting thread/read.
@@ -6732,6 +6844,14 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
 
 async function handleCodexMessageBody(message: Record<string, any>, generation = codexMessageGeneration): Promise<void> {
   const nativeThreadId = codexMessageThreadId(message);
+  if (message.method === "turn/completed" && nativeThreadId) {
+    const completedTurnId = String(message.params?.turn?.id ?? message.params?.turnId ?? "");
+    const activeTurnId = activeTurnByThread.get(nativeThreadId) || activeNativeCodexTurns.get(nativeThreadId) || "";
+    if (activeTurnId && activeTurnId !== completedTurnId) {
+      logWarn("忽略旧 Codex turn 的完成通知，保留当前运行任务", nativeThreadId.slice(0, 8));
+      return;
+    }
+  }
   if (message.params?.thread) codexThreads.observeThread(message.params.thread);
   // Spawn notifications can prove the relation before the child's first delta arrives.
   const childIds = codexThreads.observeItem(message.params?.item ?? {}, nativeThreadId);
@@ -6743,7 +6863,7 @@ async function handleCodexMessageBody(message: Record<string, any>, generation =
       return result.thread;
     }).catch(() => undefined);
     if (generation !== codexMessageGeneration) return;
-    if (codexThreads.isSubagent(nativeThreadId)) {
+    if (isHiddenCodexSubagentTask(nativeThreadId)) {
       await hideCodexSubagentTask(nativeThreadId).catch(handleError);
       const rootThreadId = await codexThreads.ensureRootThreadId(nativeThreadId, async (threadId) => {
         if (!codex) return undefined;
@@ -6913,7 +7033,7 @@ async function handleCodexMessageBody(message: Record<string, any>, generation =
     await flushRemoteDeltas();
     const pendingUsage = pendingUsageByThread.get(threadId);
     const finalTurnUsage = turnUsageByThread.get(threadId) ?? turnContextUsage;
-    activeTurnByThread.delete(threadId);
+    if (!turnId || activeTurnByThread.get(threadId) === turnId) activeTurnByThread.delete(threadId);
     lastProgressAtByThread.delete(threadId);
     turnUsageByThread.delete(threadId);
     const usageTimer = usageFlushTimers.get(threadId);
@@ -7355,6 +7475,7 @@ function busyCodingEngines(): CliEngine[] {
   const threads = new Set<string>([
     ...activeTurnByThread.keys(),
     ...turnStartingByThread,
+    ...externalHandoffCountByThread.keys(),
     ...pendingCodexSteeringByThread.keys(),
     ...pendingCursorApprovalsByThread.keys(),
     ...turnQueueByThread.keys()
@@ -7565,7 +7686,7 @@ async function publishActiveTurnHeartbeats(): Promise<void> {
 
 async function publishThread(threadId: string, options: { touch?: boolean } = {}): Promise<void> {
   if (isThreadDeleted(threadId)) return;
-  if (codexThreads.isSubagent(threadId)) {
+  if (isHiddenCodexSubagentTask(threadId)) {
     await hideCodexSubagentTask(threadId);
     return;
   }
@@ -7596,7 +7717,8 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     await publishLocalFallback();
     return;
   }
-  if (codexThreads.observeThread(result.thread)) {
+  codexThreads.observeThread(result.thread);
+  if (isHiddenCodexSubagentTask(threadId)) {
     await hideCodexSubagentTask(threadId);
     return;
   }
@@ -7620,9 +7742,11 @@ async function publishThread(threadId: string, options: { touch?: boolean } = {}
     : normalizeUnixSeconds(snapshot.updatedAt);
   const liveTurnId = snapshot.activeTurnId || activeTurnByThread.get(threadId);
   // Prefer a live in-flight turn over a stale completed/idle snapshot status.
-  const publishStatus = liveTurnId && !isInProgressStoredStatus(snapshot.status)
+  const publishStatus = externalHandoffCountByThread.has(threadId)
     ? "active"
-    : snapshot.status;
+    : liveTurnId && !isInProgressStoredStatus(snapshot.status)
+      ? "active"
+      : snapshot.status;
   // A Codex thread can come from native history without an AnytimeVibe record.
   // Materialize it before the next command arrives so fail-fast turns still have
   // somewhere durable to append the user's prompt and error message.
@@ -7818,11 +7942,12 @@ async function refreshLocalTasksImpl(limit = 50): Promise<void> {
     // Codex optional when listing Claude/Grok tasks.
   }
   const allStoredTasks = taskStore.list(1_000)
-    .filter((task) => task.engine !== "codex" || !codexThreads.isSubagent(task.providerSessionId || task.threadId));
+    .filter((task) => task.engine !== "codex" || !isHiddenCodexSubagentTask(task.providerSessionId || task.threadId, task));
   const activeStoredTasks = allStoredTasks.filter((task) =>
     isInProgressStoredStatus(task.status)
     || turnStartingByThread.has(task.threadId)
     || activeTurnByThread.has(task.threadId)
+    || externalHandoffCountByThread.has(task.threadId)
     || (task.engine === "codex" && activeNativeCodexTurns.has(task.providerSessionId || task.threadId))
   );
   const storedCandidates = new Map<string, StoredTask>();
@@ -7832,8 +7957,11 @@ async function refreshLocalTasksImpl(limit = 50): Promise<void> {
   // A task can be in memory before its first durable upsert completes. Keep it
   // visible while that short write race settles, provided it is still active.
   for (const task of publicState.tasks) {
-    if (!isInProgressStoredStatus(task.status) && !activeTurnByThread.has(task.threadId) && !turnStartingByThread.has(task.threadId)) continue;
-    if (task.engine === "codex" && codexThreads.isSubagent(task.threadId)) continue;
+    if (!isInProgressStoredStatus(task.status)
+      && !activeTurnByThread.has(task.threadId)
+      && !turnStartingByThread.has(task.threadId)
+      && !externalHandoffCountByThread.has(task.threadId)) continue;
+    if (task.engine === "codex" && isHiddenCodexSubagentTask(task.threadId, taskStore.get(task.threadId))) continue;
     if (!storedCandidates.has(task.threadId)) {
       storedCandidates.set(task.threadId, {
         threadId: task.threadId,
@@ -7869,14 +7997,89 @@ async function refreshLocalTasksImpl(limit = 50): Promise<void> {
       byId.set(task.threadId, normalized);
     }
   }
+
+  // Metadata lookups above yield to CLI callbacks. A task can become active after
+  // `storedCandidates` was captured but before the replacement below. Re-read the
+  // live view at the commit point so that refresh cannot erase a running task.
+  const latestStoredTasks = taskStore.list(1_000)
+    .filter((task) => !isThreadDeleted(task.threadId))
+    .filter((task) => task.engine !== "codex" || !isHiddenCodexSubagentTask(task.providerSessionId || task.threadId, task));
+  const latestActiveStoredTasks = latestStoredTasks.filter((task) =>
+    isInProgressStoredStatus(task.status)
+    || turnStartingByThread.has(task.threadId)
+    || activeTurnByThread.has(task.threadId)
+    || externalHandoffCountByThread.has(task.threadId)
+    || (task.engine === "codex" && activeNativeCodexTurns.has(task.providerSessionId || task.threadId))
+  );
+  const latestLiveTasks = new Map<string, AgentTask>();
+  for (const task of latestActiveStoredTasks) {
+    const listed = publicState.tasks.find((item) => item.threadId === task.threadId);
+    const gitBranch = task.gitBranch || listed?.gitBranch;
+    const hasLiveExecution = turnStartingByThread.has(task.threadId)
+      || activeTurnByThread.has(task.threadId)
+      || externalHandoffCountByThread.has(task.threadId)
+      || (task.engine === "codex" && activeNativeCodexTurns.has(task.providerSessionId || task.threadId));
+    latestLiveTasks.set(task.threadId, {
+      threadId: task.threadId,
+      title: task.title || listed?.title || "鏈懡鍚嶄换鍔?",
+      // The stored task already contains the exact native cwd. Prefer the current
+      // public row when it has a more recent normalized value.
+      cwd: preferTaskCwd(listed?.cwd, task.cwd),
+      status: hasLiveExecution ? "active" : task.status,
+      updatedAt: Math.max(normalizeUnixSeconds(task.updatedAt), normalizeUnixSeconds(listed?.updatedAt)),
+      engine: task.engine,
+      ...(gitBranch ? { gitBranch } : {})
+    });
+  }
+  const latestLiveThreadIds = new Set<string>([
+    ...turnStartingByThread,
+    ...activeTurnByThread.keys(),
+    ...externalHandoffCountByThread.keys()
+  ]);
+  for (const nativeThreadId of activeNativeCodexTurns.keys()) {
+    if (isHiddenCodexSubagentTask(nativeThreadId)) continue;
+    const stored = taskStore.findByProviderSession(nativeThreadId, "codex");
+    const listed = publicState.tasks.find((item) => item.threadId === nativeThreadId);
+    if (stored) latestLiveThreadIds.add(stored.threadId);
+    else if (listed) latestLiveThreadIds.add(listed.threadId);
+  }
+  for (const threadId of latestLiveThreadIds) {
+    if (latestLiveTasks.has(threadId) || isThreadDeleted(threadId)) continue;
+    if (isHiddenCodexSubagentTask(threadId)) continue;
+    const stored = taskStore.get(threadId);
+    const listed = publicState.tasks.find((item) => item.threadId === threadId);
+    if (stored?.providerSessionId && isThreadDeleted(stored.providerSessionId)) continue;
+    const engine = stored?.engine || listed?.engine || "codex";
+    const gitBranch = stored?.gitBranch || listed?.gitBranch;
+    latestLiveTasks.set(threadId, {
+      threadId,
+      title: stored?.title || listed?.title || "姝ｅ湪杩愯鐨勪换鍔?",
+      cwd: preferTaskCwd(listed?.cwd, stored?.cwd),
+      status: "active",
+      updatedAt: Math.max(normalizeUnixSeconds(stored?.updatedAt), normalizeUnixSeconds(listed?.updatedAt)),
+      engine,
+      ...(gitBranch ? { gitBranch } : {})
+    });
+  }
+  for (const listed of publicState.tasks) {
+    if (isThreadDeleted(listed.threadId)) continue;
+    if (!isInProgressStoredStatus(listed.status)
+      && !activeTurnByThread.has(listed.threadId)
+      && !turnStartingByThread.has(listed.threadId)
+      && !externalHandoffCountByThread.has(listed.threadId)) continue;
+    if (listed.engine === "codex" && isHiddenCodexSubagentTask(listed.threadId)) continue;
+    if (!latestLiveTasks.has(listed.threadId)) latestLiveTasks.set(listed.threadId, { ...listed });
+  }
+  for (const liveTask of latestLiveTasks.values()) {
+    const existing = byId.get(liveTask.threadId);
+    if (!existing || liveTask.updatedAt >= existing.updatedAt || isInProgressStoredStatus(liveTask.status)) {
+      byId.set(liveTask.threadId, liveTask);
+    }
+  }
   const sortedTasks = [...byId.values()].sort((left, right) => right.updatedAt - left.updatedAt);
   const activeIds = new Set<string>([
-    ...activeStoredTasks.map((task) => task.threadId),
-    ...publicState.tasks
-      .filter((task) => isInProgressStoredStatus(task.status)
-        || activeTurnByThread.has(task.threadId)
-        || turnStartingByThread.has(task.threadId))
-      .map((task) => task.threadId)
+    ...latestActiveStoredTasks.map((task) => task.threadId),
+    ...latestLiveTasks.keys()
   ]);
   // The recent window is only a cap for idle history. A running task must stay
   // visible even when older history fills the requested page.
@@ -7960,7 +8163,8 @@ async function listCodexThreadsForSync(options: {
       const id = String(thread?.id || "").trim();
       if (!id || seen.has(id)) continue;
       seen.add(id);
-      if (codexThreads.observeThread(thread)) {
+      codexThreads.observeThread(thread);
+      if (isHiddenCodexSubagentTask(id)) {
         await hideCodexSubagentTask(id);
         continue;
       }
@@ -8084,7 +8288,7 @@ async function resolveRelayTask(threadId: string): Promise<AgentTask & { provide
       const result = await codex!.request("thread/read", { threadId: id, includeTurns: false });
       return result.thread;
     }).catch(() => undefined);
-    if (codexThreads.isSubagent(nativeId)) {
+    if (isHiddenCodexSubagentTask(nativeId, stored)) {
       await hideCodexSubagentTask(nativeId);
       throw new Error("该会话属于子 agent，请从原任务进行接力。");
     }
@@ -8106,7 +8310,8 @@ async function resolveRelayTask(threadId: string): Promise<AgentTask & { provide
     try {
       await ensureCodex();
       const result = await codex!.request("thread/read", { threadId, includeTurns: false });
-      if (codexThreads.observeThread(result.thread)) {
+      codexThreads.observeThread(result.thread);
+      if (isHiddenCodexSubagentTask(threadId)) {
         await hideCodexSubagentTask(threadId);
         throw new Error("该会话属于子 agent，请从原任务进行接力。");
       }
@@ -8126,7 +8331,7 @@ async function resolveRelayTask(threadId: string): Promise<AgentTask & { provide
       });
       return task;
     } catch {
-      if (codexThreads.isSubagent(threadId)) throw new Error("该会话属于子 agent，请从原任务进行接力。");
+      if (isHiddenCodexSubagentTask(threadId)) throw new Error("该会话属于子 agent，请从原任务进行接力。");
       if (cached) return cached;
       throw new Error("任务不存在或会话已失效");
     }
@@ -8137,7 +8342,8 @@ async function resolveRelayTask(threadId: string): Promise<AgentTask & { provide
 async function openExternalTerminal(
   cwd: string,
   commandLine: string,
-  proxyMode: "strip" | "inject" = "strip"
+  proxyMode: "strip" | "inject" = "strip",
+  onComplete?: () => void
 ): Promise<void> {
   // strip  = local gateway only (Codex → localhost:3310). Clash still hijacks loopback via HTTP_PROXY.
   // inject = cloud CLIs (Cursor/Claude/Grok). Egress IP decides Cursor model catalog
@@ -8160,7 +8366,7 @@ async function openExternalTerminal(
       "echo [AnytimeVibe] NODE_USE_ENV_PROXY=%NODE_USE_ENV_PROXY%",
       "echo.",
       commandLine
-    ]);
+    ], onComplete);
     return;
   }
   if (process.platform === "darwin") {
@@ -8188,7 +8394,7 @@ async function openExternalTerminal(
     } catch {
       // ignore
     }
-    await launchMacTerminalScriptFile(scriptPath);
+    await launchMacTerminalScriptFile(scriptPath, onComplete);
     return;
   }
   throw new Error("当前系统暂不支持启动接力终端。");
@@ -8282,6 +8488,29 @@ async function relayTaskToCli(threadId: string): Promise<void> {
   // Only resume with provider-native session ids (not our product thread UUID unless they match).
   const providerSessionId = (stored?.providerSessionId || "").trim();
   const permissionMode = normalizePermissionMode(stored?.permissionMode);
+  let handoffStarted = false;
+  let handoffFinished = false;
+  const onHandoffComplete = () => {
+    if (handoffFinished) return;
+    handoffFinished = true;
+    void finishExternalTaskHandoff(threadId).catch(handleError);
+  };
+  const openHandoffTerminal = async (
+    commandCwd: string,
+    commandLine: string,
+    proxyMode: "strip" | "inject" = "strip"
+  ): Promise<void> => {
+    if (!handoffStarted) {
+      await beginExternalTaskHandoff(threadId);
+      handoffStarted = true;
+    }
+    try {
+      await openExternalTerminal(commandCwd, commandLine, proxyMode, onHandoffComplete);
+    } catch (error) {
+      onHandoffComplete();
+      throw error;
+    }
+  };
 
   // Pre-accept directory trust prompts before opening an interactive handoff terminal.
   await ensureWorkspaceTrusted(engine, accessCwd);
@@ -8308,9 +8537,9 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     ];
     console.log(`[relay] claude permission=${permissionMode} args=${args.join(" ")}`);
     if (process.platform === "win32") {
-      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
+      await openHandoffTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
     } else {
-      await openExternalTerminal(
+      await openHandoffTerminal(
         accessCwd,
         [shellQuote(binary), ...args.map((part) => (part.startsWith("-") ? part : shellQuote(part)))].join(" "),
         "inject"
@@ -8331,9 +8560,9 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     ];
     console.log(`[relay] grok permission=${permissionMode}`);
     if (process.platform === "win32") {
-      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
+      await openHandoffTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
     } else {
-      await openExternalTerminal(
+      await openHandoffTerminal(
         accessCwd,
         [
           shellQuote(binary),
@@ -8364,9 +8593,9 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     ];
     console.log(`[relay] cursor permission=${permissionMode}`);
     if (process.platform === "win32") {
-      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
+      await openHandoffTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
     } else {
-      await openExternalTerminal(
+      await openHandoffTerminal(
         accessCwd,
         [
           shellQuote(binary),
@@ -8397,9 +8626,9 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     ];
     console.log(`[relay] pi permission=${permissionMode} session=${sessionId || "(new)"}`);
     if (process.platform === "win32") {
-      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
+      await openHandoffTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
     } else {
-      await openExternalTerminal(
+      await openHandoffTerminal(
         accessCwd,
         [shellQuote(binary), ...args.map((part) => (part.startsWith("-") ? part : shellQuote(part)))].join(" "),
         "inject"
@@ -8423,9 +8652,9 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     ];
     console.log(`[relay] antigravity permission=${permissionMode} conversation=${conversationId || "(new)"}`);
     if (process.platform === "win32") {
-      await openExternalTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
+      await openHandoffTerminal(accessCwd, formatWinCliCommand(binary, args), "inject");
     } else {
-      await openExternalTerminal(
+      await openHandoffTerminal(
         accessCwd,
         [shellQuote(binary), ...args.map((part) => (part.startsWith("-") ? part : shellQuote(part)))].join(" "),
         "inject"
@@ -8454,14 +8683,14 @@ async function relayTaskToCli(threadId: string): Promise<void> {
     } catch {
       // keep call codex.cmd
     }
-    await openExternalTerminal(accessCwd, commandLine);
+    await openHandoffTerminal(accessCwd, commandLine);
     return;
   }
   if (process.platform === "darwin") {
     const flagPart = permissionArgs
       .map((part) => (part.startsWith("-") ? part : shellQuote(part)))
       .join(" ");
-    await openExternalTerminal(
+    await openHandoffTerminal(
       accessCwd,
       `${shellQuote(binary)}${flagPart ? ` ${flagPart}` : ""} resume ${shellQuote(threadId)}`
     );
@@ -8474,7 +8703,7 @@ async function publish(event: AgentEvent, persist: boolean, hint?: "approval" | 
   return publishQueue.run(async () => {
     // A queued delta/snapshot may predate discovery of a child. Block stale product
     // events here as well; actionable requests must still be delivered if unowned.
-    if ("threadId" in event && event.threadId && codexThreads.isSubagent(event.threadId)
+    if ("threadId" in event && event.threadId && isHiddenCodexSubagentTask(event.threadId)
       && event.type !== "thread.deleted" && event.type !== "approval.requested" && event.type !== "request.resolved") return;
     agentEventSchema.parse(event);
     if (!socket || socket.readyState !== WebSocket.OPEN || !config.hostId || !syncKey) {
