@@ -13,12 +13,12 @@ const source = createSourceFile("main.ts", readFileSync(path.resolve("apps/agent
 const names = [
   "handleCodexMessage", "handleCodexMessageBody", "touchAgentTask", "extractCodexThreadList", "extractCodexNextCursor",
   "threadMatchesQuery", "listCodexThreadsForSync", "mapPool", "hideCodexSubagentTask", "cleanupCodexSubagentTasks", "pruneJunkCliImports", "evictStaleNativeCliImports", "isProtectedFromCliImportCleanup",
-  "refreshLocalTasks", "refreshLocalTasksImpl", "reconcileOrphanedActiveTasks", "isAnytimeVibeManagedTask", "isHiddenCodexSubagentTask", "retainExternalHandoff", "releaseExternalHandoff", "reserveClientOperation", "withClientOperation", "publishThread", "publishStoredTaskSnapshot", "hasActiveCodexTurn", "hasRunningCodexTurn", "busyCodingEngines", "resolveRelayTask", "recoverAfterCodexAppServerExit"
+  "refreshLocalTasks", "refreshLocalTasksImpl", "reconcileOrphanedActiveTasks", "reconcileStaleNativeCodexTurns", "isAnytimeVibeManagedTask", "isHiddenCodexSubagentTask", "retainExternalHandoff", "releaseExternalHandoff", "reserveClientOperation", "withClientOperation", "publishThread", "publishStoredTaskSnapshot", "hasActiveCodexTurn", "hasRunningCodexTurn", "busyCodingEngines", "resolveRelayTask", "recoverAfterCodexAppServerExit"
 ];
 const declarations = source.statements.filter((node) => isFunctionDeclaration(node) && names.includes(node.name?.text || ""));
 const script = new Script(`${transpileModule(declarations.map((node) => node.getText(source)).join("\n"), {
   compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.CommonJS }
-}).outputText}\n({ handleCodexMessage, listCodexThreadsForSync, refreshLocalTasks, publishThread, publishStoredTaskSnapshot, hideCodexSubagentTask, pruneJunkCliImports, evictStaleNativeCliImports, hasActiveCodexTurn, hasRunningCodexTurn, busyCodingEngines, resolveRelayTask, recoverAfterCodexAppServerExit, reconcileOrphanedActiveTasks, retainExternalHandoff, releaseExternalHandoff });`);
+}).outputText}\n({ handleCodexMessage, listCodexThreadsForSync, refreshLocalTasks, publishThread, publishStoredTaskSnapshot, hideCodexSubagentTask, pruneJunkCliImports, evictStaleNativeCliImports, hasActiveCodexTurn, hasRunningCodexTurn, busyCodingEngines, resolveRelayTask, recoverAfterCodexAppServerExit, reconcileOrphanedActiveTasks, reconcileStaleNativeCodexTurns, retainExternalHandoff, releaseExternalHandoff });`);
 
 function fixture() {
   const events: Array<Record<string, any>> = [];
@@ -32,6 +32,7 @@ function fixture() {
   const context = {
     ...adapter,
     crypto: globalThis.crypto,
+    setTimeout,
     publicState, taskStore: new TaskStore(),
     clientUpdateController: null,
     clientOperations: 0,
@@ -64,6 +65,8 @@ function fixture() {
     codexThreads: new CodexThreadRegistry(),
     pendingCodexRequestOwners: new Map(),
     activeNativeCodexTurns: new Map<string, string>(),
+    nativeTurnReconcileInFlight: null,
+    nativeTurnLastReconciledAt: 0,
     codexMessageChains: new Map<string, Promise<void>>(),
     codexMessageGeneration: 0,
     pendingCursorApprovalsByThread: new Map(), turnQueueByThread: new Map(),
@@ -88,6 +91,8 @@ function fixture() {
         params.sourceKinds?.length ? !!thread.parentThreadId : true), nextCursor: null };
       throw new Error(`Unexpected RPC ${method}`);
     } }
+    , threadToSnapshot: adapter.threadToSnapshot,
+    isTerminalTurnStatus: adapter.isTerminalTurnStatus
   };
   const functions = script.runInNewContext(context) as {
     handleCodexMessage(message: Record<string, any>): Promise<void>;
@@ -101,6 +106,7 @@ function fixture() {
     resolveRelayTask(threadId: string): Promise<unknown>;
     recoverAfterCodexAppServerExit(detail: string): Promise<void>;
     reconcileOrphanedActiveTasks(): Promise<number>;
+    reconcileStaleNativeCodexTurns(): Promise<number>;
     hideCodexSubagentTask(threadId: string): Promise<void>;
     pruneJunkCliImports(threadIds: string[]): Promise<void>;
     evictStaleNativeCliImports(threadIds: string[]): Promise<void>;
@@ -111,6 +117,66 @@ function fixture() {
 }
 
 describe("Codex subagent task visibility", () => {
+  it("does not keep the coding engine busy for an empty durable queue marker", () => {
+    const f = fixture();
+    f.context.activeTurnByThread.clear();
+    f.context.turnQueueByThread.set("empty-queue", []);
+
+    expect(f.busyCodingEngines()).toEqual([]);
+  });
+
+  it("clears native turns whose durable Codex snapshot is already terminal", async () => {
+    const f = fixture();
+    f.context.activeTurnByThread.clear();
+    f.context.activeNativeCodexTurns.set("child", "child-turn");
+    f.threads.set("child", {
+      ...f.threads.get("child"),
+      status: "idle",
+      turns: [{ id: "child-turn", status: "completed", completedAt: 2 }]
+    });
+    expect(adapter.threadToSnapshot(f.threads.get("child")!)).toMatchObject({ status: "idle" });
+    expect(adapter.isTerminalTurnStatus("completed")).toBe(true);
+
+    expect(await f.reconcileStaleNativeCodexTurns()).toBe(1);
+    expect([...f.context.activeNativeCodexTurns]).toEqual([]);
+    expect(f.busyCodingEngines()).toEqual([]);
+  });
+
+  it("clears a native turn when Codex omits the turn id on completion", async () => {
+    const f = fixture();
+    f.context.activeTurnByThread.clear();
+    f.threads.set("child", {
+      ...f.threads.get("child"),
+      status: "idle",
+      turns: [{ id: "child-turn", status: "completed", completedAt: 2 }]
+    });
+
+    await f.handleCodexMessage({ method: "turn/started", params: { threadId: "child", turn: { id: "child-turn" } } });
+    await f.handleCodexMessage({ method: "turn/completed", params: { threadId: "child", status: "completed" } });
+
+    expect([...f.context.activeNativeCodexTurns]).toEqual([]);
+    expect(f.busyCodingEngines()).toEqual([]);
+  });
+
+  it("does not clear a native turn for a stale idle hint while the native turn is active", async () => {
+    const f = fixture();
+    f.context.activeTurnByThread.clear();
+    f.threads.set("child", {
+      ...f.threads.get("child"),
+      status: "active",
+      turns: [{ id: "child-turn", status: "inProgress" }]
+    });
+
+    await f.handleCodexMessage({ method: "turn/started", params: { threadId: "child", turn: { id: "child-turn" } } });
+    await f.handleCodexMessage({
+      method: "thread/status/changed",
+      params: { threadId: "child", status: { type: "idle", activeFlags: [] } }
+    });
+
+    expect(f.context.activeNativeCodexTurns.get("child")).toBe("child-turn");
+    expect(f.busyCodingEngines()).toEqual(["codex"]);
+  });
+
   it("does not hide a task created by AnytimeVibe when Codex metadata marks its thread as a subagent", async () => {
     const f = fixture();
     f.context.codexThreads.observeThread({ id: "parent", source: { subAgent: "review" } });

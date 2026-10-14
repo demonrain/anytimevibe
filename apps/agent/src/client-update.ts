@@ -22,12 +22,40 @@ type Dependencies = {
   recoveryFailure?: string;
   awaitingInstallerResult?: boolean;
   busy(): boolean;
+  busyMessage?(): string | undefined;
   persist(intent: ClientUpdateIntent | undefined): Promise<void>;
   check(): Promise<void>;
   prepare(intent: ClientUpdateIntent): Promise<{ launch(): Promise<void>; dispose?(): Promise<void> }>;
   quit(): void;
   notify(state: ClientUpdateState): Promise<void>;
 };
+
+/**
+ * Only work that can be interrupted by replacing the client should defer a
+ * silent install. Codex event serialization, app-server reloads, and model
+ * catalog refreshes are internal housekeeping and are intentionally accepted
+ * as optional diagnostics rather than installation blockers.
+ */
+export type ClientUpdateBusySnapshot = {
+  clientOperations: number;
+  engineMaintenanceBusy: boolean;
+  busyEngines: readonly string[];
+  codexMessageChains?: number;
+  codexReloadInFlight?: boolean;
+  capabilityRefreshInFlight?: boolean;
+};
+
+export function clientUpdateBusyReasons(snapshot: ClientUpdateBusySnapshot): string[] {
+  const reasons: string[] = [];
+  if (snapshot.clientOperations > 0) reasons.push("client-operation");
+  if (snapshot.engineMaintenanceBusy) reasons.push("engine-maintenance");
+  if (snapshot.busyEngines.length > 0) reasons.push("coding-engine-work");
+  return reasons;
+}
+
+export function isClientUpdateBusy(snapshot: ClientUpdateBusySnapshot): boolean {
+  return clientUpdateBusyReasons(snapshot).length > 0;
+}
 
 /** Downloading is harmless while busy; installation needs an explicit durable intent and an idle host. */
 export class ClientUpdateController {
@@ -120,6 +148,10 @@ export class ClientUpdateController {
     try { await this.persist(undefined); }
     catch { message += "（无法保存升级状态，请检查客户端数据目录权限。）"; }
     await this.report({ status: "error", installWhenIdle: false, message: message.slice(0, 1000) });
+  }
+
+  private waitingMessage(fallback: string): string {
+    return this.dependencies.busyMessage?.() || fallback;
   }
 
   execute(command: Pick<Extract<ClientCommand, { type: "host.client.update" }>, "commandId" | "action">): Promise<void> {
@@ -216,6 +248,10 @@ export class ClientUpdateController {
     }
     if (this.applying || this.pendingCancellations || !this.intent || this.native.status !== "ready") return;
     if (this.dependencies.busy()) {
+      const detail = this.dependencies.busyMessage?.();
+      if (detail && (this.snapshot.status !== "waiting" || this.snapshot.message !== detail)) {
+        await this.report({ status: "waiting", message: detail });
+      }
       if (this.snapshot.status !== "waiting") await this.report({ status: "waiting", message: "更新包已下载，正在等待任务和编码引擎维护结束。" });
       return;
     }

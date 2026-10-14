@@ -1,15 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { ClientUpdateController, type ClientUpdateIntent, type NativeUpdateState } from "./client-update";
+import {
+  ClientUpdateController,
+  isClientUpdateBusy,
+  type ClientUpdateIntent,
+  type NativeUpdateState
+} from "./client-update";
 
 const id = "11111111-1111-4111-8111-111111111111";
-function fixture(options: { busy?: boolean; intent?: ClientUpdateIntent; version?: string; prepareFailure?: string } = {}) {
+function fixture(options: { busy?: boolean; busyMessage?: string; intent?: ClientUpdateIntent; version?: string; prepareFailure?: string } = {}) {
   let busy = options.busy ?? false;
+  let busyMessage = options.busyMessage;
   let intent = options.intent;
   let checks = 0;
   let launches = 0;
   const controller = new ClientUpdateController({
     supported: true, currentVersion: options.version || "0.5.23", intent,
     busy: () => busy,
+    busyMessage: () => busyMessage,
     persist: async (value) => { intent = value; },
     check: async () => { checks++; },
     prepare: async () => {
@@ -19,12 +26,24 @@ function fixture(options: { busy?: boolean; intent?: ClientUpdateIntent; version
     quit: () => {},
     notify: async () => {}
   });
-  return { controller, setBusy: (value: boolean) => { busy = value; }, saved: () => intent,
+  return { controller, setBusy: (value: boolean) => { busy = value; },
+    setBusyMessage: (value: string | undefined) => { busyMessage = value; }, saved: () => intent,
     checks: () => checks, launches: () => launches };
 }
 const ready: NativeUpdateState = { status: "ready", version: "0.5.24", progress: 100 };
 
 describe("remote client update control", () => {
+  it("does not block on internal Codex housekeeping when no user work is active", () => {
+    expect(isClientUpdateBusy({
+      clientOperations: 0,
+      engineMaintenanceBusy: false,
+      busyEngines: [],
+      codexMessageChains: 1,
+      codexReloadInFlight: true,
+      capabilityRefreshInFlight: true
+    })).toBe(false);
+  });
+
   it("downloads while busy and waits for all work before installing", async () => {
     const f = fixture({ busy: true });
     await f.controller.execute({ commandId: id, action: "upgrade" });
@@ -37,6 +56,19 @@ describe("remote client update control", () => {
     await f.controller.tick();
     expect(f.launches()).toBe(1);
     expect(f.saved()).toMatchObject({ commandId: id, phase: "installing", targetVersion: "0.5.24" });
+  });
+
+  it("reports the specific operation that is keeping a downloaded update waiting", async () => {
+    const f = fixture({ busy: true, busyMessage: "Waiting for local operation 1" });
+    await f.controller.execute({ commandId: id, action: "upgrade" });
+    await f.controller.observe(ready);
+    await f.controller.tick();
+
+    expect(f.controller.state).toMatchObject({ status: "waiting", message: "Waiting for local operation 1" });
+
+    f.setBusyMessage("Waiting for Codex task");
+    await f.controller.tick();
+    expect(f.controller.state.message).toBe("Waiting for Codex task");
   });
 
   it("does not install a background download without explicit intent", async () => {

@@ -97,7 +97,7 @@ import { resolveUpdateSources } from "./cli/update-feed";
 import { listTaskDirectories, resolveTaskDirectory, taskDirectoryRoots } from "./cli/task-directory";
 import { fetchAgentUpdateConfig, type AgentUpdateConfig } from "./cli/update-config";
 import { buildEngineMaintenanceNetworkEnv, configureEngineUpdateNetwork, createEngineUpdateOutputRedactor, npmUpdateRegistryCandidates, redactEngineUpdateOutput } from "./cli/update-network";
-import { ClientUpdateController, type ClientUpdateIntent } from "./client-update";
+import { ClientUpdateController, isClientUpdateBusy, type ClientUpdateIntent } from "./client-update";
 import { prepareSilentClientUpdate } from "./client-update-installer";
 
 const execFileAsync = promisify(execFile);
@@ -6844,12 +6844,49 @@ async function handleCodexMessage(message: Record<string, any>): Promise<void> {
 
 async function handleCodexMessageBody(message: Record<string, any>, generation = codexMessageGeneration): Promise<void> {
   const nativeThreadId = codexMessageThreadId(message);
+  if (message.method === "thread/status/changed" && nativeThreadId) {
+    const status = message.params?.status;
+    const statusName = String(typeof status === "string" ? status : status?.type ?? status?.status ?? "").toLowerCase();
+    if (/^(idle|completed|complete|done|closed)$/.test(statusName)) {
+      // Status notifications can be stale or arrive while a newer turn is starting.
+      // Let the durable thread snapshot, not this lightweight hint, clear a turn.
+      void reconcileStaleNativeCodexTurns().catch(handleError);
+    }
+  }
   if (message.method === "turn/completed" && nativeThreadId) {
     const completedTurnId = String(message.params?.turn?.id ?? message.params?.turnId ?? "");
     const activeTurnId = activeTurnByThread.get(nativeThreadId) || activeNativeCodexTurns.get(nativeThreadId) || "";
-    if (activeTurnId && activeTurnId !== completedTurnId) {
+    if (activeTurnId && completedTurnId && activeTurnId !== completedTurnId) {
       logWarn("忽略旧 Codex turn 的完成通知，保留当前运行任务", nativeThreadId.slice(0, 8));
       return;
+    }
+    if (activeTurnId && !completedTurnId) {
+      try {
+        if (!codex) return;
+        const result = await codex.request("thread/read", { threadId: nativeThreadId, includeTurns: true });
+        const snapshot = threadToSnapshot(result.thread);
+        const turns = Array.isArray(result.thread?.turns) ? result.thread.turns : [];
+        const latestTurn = [...turns].reverse().find((turn: Record<string, any>) => String(turn?.status || "").trim());
+        const nativeTerminal = !snapshot.activeTurnId && (
+          isTerminalTurnStatus(String(snapshot.status || ""))
+          || isTerminalTurnStatus(String(latestTurn?.status || ""))
+        );
+        if (!nativeTerminal) {
+          logWarn("忽略无法与当前回合关联的 Codex 完成通知", nativeThreadId.slice(0, 8));
+          return;
+        }
+        if ((activeTurnByThread.has(nativeThreadId)
+          && activeTurnByThread.get(nativeThreadId) !== activeTurnId)
+          || (activeNativeCodexTurns.has(nativeThreadId)
+            && activeNativeCodexTurns.get(nativeThreadId) !== activeTurnId)) return;
+        if (activeNativeCodexTurns.get(nativeThreadId) === activeTurnId) {
+          activeNativeCodexTurns.delete(nativeThreadId);
+        }
+      } catch {
+        // Missing turn ids are ambiguous; a failed native read must not end live work.
+        logWarn("忽略缺少 turn id 且无法复核的 Codex 完成通知", nativeThreadId.slice(0, 8));
+        return;
+      }
     }
   }
   if (message.params?.thread) codexThreads.observeThread(message.params.thread);
@@ -7475,14 +7512,83 @@ function busyCodingEngines(): CliEngine[] {
   const threads = new Set<string>([
     ...activeTurnByThread.keys(),
     ...turnStartingByThread,
-    ...externalHandoffCountByThread.keys(),
+    ...[...externalHandoffCountByThread]
+      .filter(([, count]) => count > 0)
+      .map(([threadId]) => threadId),
     ...pendingCodexSteeringByThread.keys(),
-    ...pendingCursorApprovalsByThread.keys(),
-    ...turnQueueByThread.keys()
+    ...[...pendingCursorApprovalsByThread]
+      .filter(([, requests]) => requests.size > 0)
+      .map(([threadId]) => threadId),
+    ...[...turnQueueByThread]
+      .filter(([, items]) => items.length > 0)
+      .map(([threadId]) => threadId)
   ]);
   const engines = [...threads].map((threadId) => resolveActivityEngine(threadId) || "codex");
-  if (activeNativeCodexTurns.size) engines.push("codex");
+  if ([...activeNativeCodexTurns.values()].some(Boolean)) engines.push("codex");
   return [...new Set(engines)];
+}
+
+let nativeTurnReconcileInFlight: Promise<number> | null = null;
+let nativeTurnLastReconciledAt = 0;
+
+/**
+ * A lost Codex terminal notification can leave the native turn map populated
+ * forever, especially for hidden sub-agent threads. Re-read the native thread
+ * before a deferred client install and clear only an explicitly terminal turn.
+ * Vague/unknown snapshots remain busy because they are not proof of completion.
+ */
+async function reconcileStaleNativeCodexTurns(): Promise<number> {
+  if (!codex || !activeNativeCodexTurns.size) return 0;
+  if (nativeTurnReconcileInFlight) return nativeTurnReconcileInFlight;
+  if (Date.now() - nativeTurnLastReconciledAt < 5_000) return 0;
+  nativeTurnLastReconciledAt = Date.now();
+  const adapter = codex;
+  const work = (async () => {
+    let cleared = 0;
+    for (const [nativeThreadId, turnId] of [...activeNativeCodexTurns]) {
+      if (codex !== adapter) break;
+      try {
+        const result = await Promise.race([
+          adapter.request("thread/read", { threadId: nativeThreadId, includeTurns: true }),
+          new Promise<undefined>((resolve) => {
+            const timer = setTimeout(() => resolve(undefined), 2_500);
+            timer.unref?.();
+          })
+        ]) as { thread?: Record<string, any> } | undefined;
+        if (!result?.thread || codex !== adapter) continue;
+        const snapshot = threadToSnapshot(result.thread);
+        if (snapshot.activeTurnId) {
+          if (activeNativeCodexTurns.get(nativeThreadId) === turnId
+            && snapshot.activeTurnId !== turnId) {
+            activeNativeCodexTurns.set(nativeThreadId, snapshot.activeTurnId);
+          }
+          continue;
+        }
+        const turns = Array.isArray(result.thread.turns) ? result.thread.turns : [];
+        const latestTurn = [...turns].reverse().find((item: Record<string, any>) => String(item?.status || "").trim());
+        const terminalStatus = isTerminalTurnStatus(String(snapshot.status || ""))
+          ? String(snapshot.status)
+          : String(latestTurn?.status || "");
+        if (!isTerminalTurnStatus(terminalStatus)) continue;
+        if (activeNativeCodexTurns.get(nativeThreadId) !== turnId) continue;
+        activeNativeCodexTurns.delete(nativeThreadId);
+        const stored = taskStore.findByProviderSession(nativeThreadId, "codex");
+        if (activeTurnByThread.get(nativeThreadId) === turnId) activeTurnByThread.delete(nativeThreadId);
+        if (stored && activeTurnByThread.get(stored.threadId) === turnId) {
+          activeTurnByThread.delete(stored.threadId);
+        }
+        cleared += 1;
+      } catch (error) {
+        // A failed or incomplete read is not evidence that the turn is done.
+        logWarn("Codex native turn 状态复核失败", error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (cleared > 0) logInfo("宸叉竻鐞嗘柇寮€鐨?Codex native turn", `count=${cleared}`);
+    return cleared;
+  })();
+  nativeTurnReconcileInFlight = work;
+  try { return await work; }
+  finally { if (nativeTurnReconcileInFlight === work) nativeTurnReconcileInFlight = null; }
 }
 
 async function npmExecutable(): Promise<string | null> {
@@ -8895,9 +9001,31 @@ async function initializeClientUpdate(): Promise<void> {
     currentVersion: agentAppVersion(), intent,
     awaitingInstallerResult: intent?.phase === "installing" && !installerResultConfirmed,
     ...(recoveryFailure ? { recoveryFailure } : {}),
-    busy: () => clientOperations > 0 || Boolean(engineMaintenanceInstance?.busy)
-      || codexMessageChains.size > 0 || Boolean(codexReloadInFlight) || capabilityRefreshInFlight
-      || (engineMaintenanceInstance?.busyEngines() ?? busyCodingEngines()).length > 0,
+    busy: () => isClientUpdateBusy({
+      clientOperations,
+      engineMaintenanceBusy: Boolean(engineMaintenanceInstance?.busy),
+      busyEngines: engineMaintenanceInstance?.busyEngines() ?? busyCodingEngines(),
+      // Keep these fields for diagnostics and backwards-compatible snapshots;
+      // they are internal housekeeping and must not block a client install.
+      codexMessageChains: codexMessageChains.size,
+      codexReloadInFlight: Boolean(codexReloadInFlight),
+      capabilityRefreshInFlight
+    }),
+    busyMessage: () => {
+      const engines = engineMaintenanceInstance?.busyEngines() ?? busyCodingEngines();
+      const reasons: string[] = [];
+      if (clientOperations > 0) reasons.push(`本机操作 ${clientOperations} 项`);
+      if (engineMaintenanceInstance?.busy) {
+        const operation = engineMaintenanceInstance.operation;
+        reasons.push(operation?.cliEngine
+          ? `${operation.cliEngine} 引擎维护${operation.phase === "failed" ? "收尾" : ""}`
+          : "编码引擎维护");
+      }
+      if (engines.length) reasons.push(`活跃引擎任务：${engines.join("、")}`);
+      return reasons.length
+        ? `更新包已下载，正在等待 ${reasons.join("；")} 结束后安装。`
+        : undefined;
+    },
     persist: async (next) => {
       const previous = config.clientUpdateIntent;
       if (next) config.clientUpdateIntent = next;
@@ -8959,6 +9087,10 @@ async function initializeClientUpdate(): Promise<void> {
         if (!confirmed && Date.now() - recoveryStartedAt > 120_000) {
           await clientUpdateController.confirmRestart({ success: false, message: "客户端已重新启动，但未收到安装辅助进程的最终确认。请检查更新结果后再重试。" });
         }
+      }
+      if (clientUpdateController?.state.installWhenIdle && activeNativeCodexTurns.size) {
+        const cleared = await reconcileStaleNativeCodexTurns();
+        if (cleared > 0) await reconcileOrphanedActiveTasks().catch(() => undefined);
       }
       await clientUpdateController?.tick();
       if (!clientUpdateController?.applying) scheduleDrainAllTurnQueues();
