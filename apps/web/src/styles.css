@@ -1022,14 +1022,8 @@ button.version-chip:disabled { cursor: default; }
   font-weight: inherit;
   text-decoration: none;
 }
-.message-markdown table {
-  border-collapse: collapse;
-  width: 100%;
-  margin: 0 0 .65em;
-  font-size: 12px;
-  display: block;
-  overflow-x: auto;
-}
+.message-markdown .md-table-wrap { max-width: 100%; margin: 0 0 .65em; overflow-x: auto; overscroll-behavior-inline: contain; }
+.message-markdown table { border-collapse: collapse; width: 100%; min-width: 520px; margin: 0; font-size: 12px; table-layout: auto; }
 .message-markdown th, .message-markdown td {
   border: 1px solid var(--line);
   padding: 6px 8px;

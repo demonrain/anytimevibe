@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { AgentEvent } from "@anytimevibe/protocol";
 import { ChatMessageStream, reduceEvent } from "./App";
 import { I18nProvider } from "./i18n/I18nProvider";
+import { normalizeAssistantMarkdown, normalizeMermaidChart } from "./markdown-display";
 
 type StreamProps = ComponentProps<typeof ChatMessageStream>;
 type Message = StreamProps["messages"][number];
@@ -47,6 +48,22 @@ function deltaEvent(delta: string, itemId = "native-message", threadId = "thread
 }
 
 describe("assistant stream display", () => {
+  it("keeps AGY line breaks inside GFM table cells", () => {
+    const normalized = normalizeAssistantMarkdown("| 路线 | 说明 |\n| --- | --- |\n| 南京<br>山谷庄园 | 慢度假 |");
+    expect(normalized).toContain("| 南京 · 山谷庄园 | 慢度假 |");
+    expect(normalized).not.toContain("南京  \n山谷庄园");
+    const html = renderStream([{ id: "assistant:turn-1:table", role: "assistant", text: normalized }]);
+    expect(html).toContain('class="md-table-wrap"');
+    expect(html).toContain("<td>南京 · 山谷庄园</td>");
+  });
+
+  it("normalizes AGY subgraph titles before Mermaid rendering", () => {
+    const normalized = normalizeMermaidChart("flowchart TD\nsubgraph 周六：直达山谷庄园·开启慢度假\nA --> B\nend\n----------------------");
+    expect(normalized).toContain('subgraph agy_subgraph_1["周六：直达山谷庄园·开启慢度假"]');
+    expect(normalized).toContain("A --> B");
+    expect(normalized).not.toMatch(/^-{3,}$/m);
+  });
+
   it.each(["concise", "detailed"] as const)("hides Codex whitespace placeholders in %s mode", (detail) => {
     const runtime = reduceEvent(runtimeFixture(), deltaEvent(" \n\t"));
     const html = renderStream(runtime.tasks["thread-1"]!.messages, detail);

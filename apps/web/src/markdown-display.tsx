@@ -48,7 +48,7 @@ export function normalizeAssistantMarkdown(text: string): string {
   const lines = normalized.split("\n");
   let fence: { marker: "`" | "~"; length: number } | undefined;
 
-  return lines.map((line) => {
+  return lines.map((line, index) => {
     const fenceMatch = /^ {0,3}(`{3,}|~{3,})/.exec(line);
     if (fence) {
       const closes = fenceMatch
@@ -62,8 +62,27 @@ export function normalizeAssistantMarkdown(text: string): string {
       return line;
     }
     if (/^(?: {4}|\t)/.test(line)) return line;
-    return replaceBreakTagsOutsideInlineCode(line);
+    // A hard line break inside a GFM table row starts a new row. AGY uses
+    // <br> for multi-line cells, so keep that content on the same row.
+    const nextLine = lines[index + 1] || "";
+    const tableRow = /^\s*\|/.test(line) && (/\|\s*$/.test(line) || /^\s*\|?\s*:?-{3,}/.test(nextLine));
+    return tableRow
+      ? line.replace(BREAK_TAG_PATTERN, " · ")
+      : replaceBreakTagsOutsideInlineCode(line);
   }).join("\n");
+}
+
+/** Make common AGY Mermaid decorations valid without changing node labels. */
+export function normalizeMermaidChart(chart: string): string {
+  let subgraphId = 0;
+  return chart.replace(/^(\s*)subgraph\s+(.+?)\s*$/gim, (full, indent: string, rawTitle: string) => {
+    const title = rawTitle.trim();
+    // Existing IDs and explicit [title] declarations are already valid.
+    if (/^[A-Za-z_][A-Za-z0-9_-]*(?:\s*\[.*\])?$/.test(title)) return full;
+    const safeTitle = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    subgraphId += 1;
+    return `${indent}subgraph agy_subgraph_${subgraphId}["${safeTitle}"]`;
+  }).replace(/^\s*-{3,}\s*$/gm, "");
 }
 
 function mermaidRenderId(id: string): string {
@@ -126,7 +145,7 @@ export function MermaidDiagram({ chart }: { chart: string }) {
           theme: "base",
           flowchart: { htmlLabels: false, curve: "basis" }
         });
-        return mermaid.render(renderId, chart);
+        return mermaid.render(renderId, normalizeMermaidChart(chart));
       })
       .then((result) => {
         if (!disposed) setSvg(result.svg);

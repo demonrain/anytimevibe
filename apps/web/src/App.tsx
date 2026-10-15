@@ -1282,6 +1282,9 @@ const MARKDOWN_COMPONENTS: any = {
     if (isValidElement(child) && child.type === MermaidDiagram) return child;
     return <div className="md-pre"><pre className="md-code-block">{children}</pre></div>;
   },
+  table: ({ children }: { children?: ReactNode }) => (
+    <div className="md-table-wrap"><table>{children}</table></div>
+  ),
   code: ({ className, children }: { className?: string; children?: ReactNode }) => {
     if (/\blanguage-mermaid\b/i.test(className || "")) {
       const chart = childrenToPlainText(children).replace(/\r\n?/g, "\n").replace(/\n$/, "");
