@@ -104,20 +104,20 @@ export function TaskDirectoryPicker({ value, onChange, online, supported, worksp
   return <section className="directory-picker-field" aria-label={en ? "Task directory" : "任务目录"}>
     <div className="directory-picker-head">
       <strong>{en ? "Task directory" : "任务目录"}</strong>
-      <button type="button" className="secondary" aria-expanded={open} disabled={online !== true} onClick={() => {
+      <button type="button" className="secondary directory-picker-toggle" aria-expanded={open} disabled={online !== true} onClick={() => {
         if (open) setOpen(false);
         else { setOpen(true); void request("list", value || undefined); }
       }}>{open ? (en ? "Collapse" : "收起") : (en ? "Choose directory" : "选择目录")}</button>
     </div>
     <code className="directory-picker-value" dir="ltr" title={value}>{value || (en ? "No directory selected" : "尚未选择目录")}</code>
     {open && <div className="directory-browser">
-      <div className="directory-browser-nav">
-        <button type="button" className="secondary" disabled={Boolean(pending) || online !== true} onClick={() => void request("list")}>
+      <div className="directory-browser-nav" role="toolbar" aria-label={en ? "Directory navigation" : "目录导航"}>
+        <button type="button" className="secondary directory-nav-button" disabled={Boolean(pending) || online !== true} onClick={() => void request("list")}>
           {en ? "Computer" : "电脑目录"}
         </button>
-        <button type="button" className="secondary" disabled={!current.parentPath || Boolean(pending) || online !== true}
+        <button type="button" className="secondary directory-nav-button" disabled={!current.parentPath || Boolean(pending) || online !== true}
           onClick={() => void request("list", current.parentPath)}>{en ? "Up" : "上一级"}</button>
-        <button type="button" className="secondary" disabled={Boolean(pending) || online !== true}
+        <button type="button" className="secondary directory-nav-button" disabled={Boolean(pending) || online !== true}
           onClick={() => void request("list", lastPath.current)}>{en ? "Refresh" : "刷新"}</button>
       </div>
       <code className="directory-browser-path" dir="ltr">{current.path || (en ? "Recent folders and drives" : "最近目录与磁盘")}</code>

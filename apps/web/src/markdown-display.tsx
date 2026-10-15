@@ -71,6 +71,41 @@ function mermaidRenderId(id: string): string {
   return `mermaid-${safe || "diagram"}`;
 }
 
+export function downloadMermaidImage(svgMarkup: string) {
+  const source = new Blob([svgMarkup], { type: "image/svg+xml;charset=utf-8" });
+  const sourceUrl = URL.createObjectURL(source);
+  const image = new Image();
+  image.onload = () => {
+    const canvas = document.createElement("canvas");
+    const scale = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+    canvas.width = Math.ceil(image.naturalWidth * scale);
+    canvas.height = Math.ceil(image.naturalHeight * scale);
+    const context = canvas.getContext("2d");
+    if (!context) { URL.revokeObjectURL(sourceUrl); return; }
+    context.fillStyle = "#fffdf8";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob((blob) => {
+      URL.revokeObjectURL(sourceUrl);
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `mermaid-${new Date().toISOString().slice(0, 10)}.png`;
+      link.click();
+      URL.revokeObjectURL(url);
+    }, "image/png");
+  };
+  image.onerror = () => {
+    const link = document.createElement("a");
+    link.href = sourceUrl;
+    link.download = `mermaid-${new Date().toISOString().slice(0, 10)}.svg`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(sourceUrl), 1000);
+  };
+  image.src = sourceUrl;
+}
+
 /** Render a Mermaid fence in the browser, keeping source visible while loading or on error. */
 export function MermaidDiagram({ chart }: { chart: string }) {
   const reactId = useId();
@@ -109,6 +144,7 @@ export function MermaidDiagram({ chart }: { chart: string }) {
 
   return (
     <figure className="md-mermaid" data-mermaid="true">
+      {svg && <div className="md-mermaid-toolbar"><span>Mermaid 图表</span><button type="button" className="md-mermaid-export" onClick={() => downloadMermaidImage(svg)} title="导出为图片">导出图片</button></div>}
       <div className="md-mermaid-canvas">
         {svg ? (
           <div className="md-mermaid-svg" dangerouslySetInnerHTML={{ __html: svg }} />

@@ -2666,6 +2666,7 @@ export function App() {
   const hostOfflineTimersRef = useRef(new Map<string, number>());
   const [error, setError] = useState("");
   const [pairingOpen, setPairingOpen] = useState(false);
+  const [renameHostTarget, setRenameHostTarget] = useState<Host | null>(null);
   const [composerOpen, setComposerOpen] = useState(false);
   const [engineManagementOpen, setEngineManagementOpen] = useState(false);
   const [engineMaintenanceRequests, setEngineMaintenanceRequests] = useState<Record<string, EngineMaintenanceRequest>>({});
@@ -3732,7 +3733,7 @@ export function App() {
               dragging={draggingHostId === host.id}
               dropTarget={dropTargetHostId === host.id && draggingHostId !== host.id}
               onSelect={() => { setSelectedHostId(host.id); setSelectedTaskId(null); setMobilePane("tasks"); }}
-              onRename={() => renameHost(host).catch((renameError) => setError(renameError.message))}
+              onRename={() => setRenameHostTarget(host)}
               onDelete={() => deleteHost(host).catch((deleteError) => setError(deleteError.message))}
               onMoveUp={() => shiftHost(host.id, -1)}
               onMoveDown={() => shiftHost(host.id, 1)}
@@ -3870,6 +3871,18 @@ export function App() {
     </main>
 
     {pairingOpen && <PairingDialog onClose={() => setPairingOpen(false)} onPaired={async () => { setPairingOpen(false); await loadHosts(); }} />}
+    {renameHostTarget && <RenameHostDialog host={renameHostTarget} onClose={() => setRenameHostTarget(null)} onSave={async (name) => {
+      try {
+        const nextName = name.trim();
+        if (!nextName || nextName === renameHostTarget.name) { setRenameHostTarget(null); return; }
+        if (nextName.length > 64) throw new Error("名称最多 64 个字符");
+        const response = await api<{ host: { id: string; name: string } }>(`/api/hosts/${renameHostTarget.id}`, {
+          method: "PATCH", body: JSON.stringify({ name: nextName })
+        });
+        setHosts((current) => current.map((item) => item.id === renameHostTarget.id ? { ...item, name: response.host.name } : item));
+        setRenameHostTarget(null);
+      } catch (renameError) { setError(renameError instanceof Error ? renameError.message : String(renameError)); }
+    }} />}
     {clientUpdateOpen && activeHost && <ClientUpdatePanel
       key={activeHost.id}
       hostName={activeHost.name}
@@ -5510,6 +5523,26 @@ function EngineManagementDialog({
         })}
       </div>
     </section>
+  </div>;
+}
+
+function RenameHostDialog({ host, onClose, onSave }: { host: Host; onClose(): void; onSave(name: string): Promise<void> | void }) {
+  const [name, setName] = useState(host.name);
+  const [saving, setSaving] = useState(false);
+  return <div className="modal-backdrop" role="presentation">
+    <form className="modal host-rename-modal" role="dialog" aria-modal="true" aria-labelledby="rename-host-title" onSubmit={async (event) => {
+      event.preventDefault();
+      if (!name.trim() || saving) return;
+      setSaving(true);
+      try { await onSave(name); } finally { setSaving(false); }
+    }}>
+      <button type="button" className="modal-close" onClick={onClose} aria-label="关闭">×</button>
+      <p className="eyebrow">REMOTE COMPUTER</p>
+      <h2 id="rename-host-title">重命名远程主机</h2>
+      <p className="modal-lead">给这台电脑设置一个容易识别的名称，方便在任务列表中快速找到它。</p>
+      <label className="host-rename-field"><span>主机名称</span><input autoFocus maxLength={64} value={name} onChange={(event) => setName(event.target.value)} /></label>
+      <div className="host-rename-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button type="submit" className="primary" disabled={!name.trim() || saving}>{saving ? "保存中…" : "保存名称"}</button></div>
+    </form>
   </div>;
 }
 
