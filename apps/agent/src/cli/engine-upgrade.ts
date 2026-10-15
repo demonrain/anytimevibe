@@ -99,27 +99,41 @@ async function packageOwnedByBinary(prefix: string, engine: CliEngine, binary: s
 
 /** Resolve Pi's official versioned managed layout, which provides `pi update`. */
 export async function resolvePiManagedInstallRoot(binary: string): Promise<string | null> {
-  const actual = await fs.realpath(binary).catch(() => binary);
-  const binDir = path.dirname(actual);
-  if (path.basename(actual).toLowerCase() !== "pi" || path.basename(binDir).toLowerCase() !== "bin") return null;
+  const validateRoot = async (installRoot: string): Promise<boolean> => {
+    try {
+      const marker = JSON.parse(await fs.readFile(path.join(installRoot, "managed-install.json"), "utf8")) as {
+        kind?: unknown;
+        schemaVersion?: unknown;
+        layout?: unknown;
+      };
+      if (marker.kind !== "pi-managed-install" || marker.schemaVersion !== 1 || marker.layout !== "releases-v1") return false;
 
-  const installRoot = path.resolve(path.dirname(binDir), "install");
-  try {
-    const marker = JSON.parse(await fs.readFile(path.join(installRoot, "managed-install.json"), "utf8")) as {
-      kind?: unknown;
-      schemaVersion?: unknown;
-      layout?: unknown;
-    };
-    if (marker.kind !== "pi-managed-install" || marker.schemaVersion !== 1 || marker.layout !== "releases-v1") return null;
+      const version = (await fs.readFile(path.join(installRoot, "current-version"), "utf8")).trim();
+      if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) return false;
+      await fs.access(path.join(installRoot, "releases", version, "node_modules", ".bin", "pi"));
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
-    const version = (await fs.readFile(path.join(installRoot, "current-version"), "utf8")).trim();
-    if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) return null;
-    const releaseBinary = path.join(installRoot, "releases", version, "node_modules", ".bin", "pi");
-    await fs.access(releaseBinary);
-    return installRoot;
-  } catch {
-    return null;
+  // The command found on PATH may be the installer's launcher, a symlink in
+  // ~/.local/bin, or npm's release .bin entrypoint. Search both the original
+  // path and its resolved target instead of requiring realpath() to end in
+  // bin/pi (which is not true for npm-generated shims).
+  const paths = [path.resolve(binary), await fs.realpath(binary).catch(() => path.resolve(binary))];
+  for (const candidate of [...new Set(paths)]) {
+    let cursor = path.dirname(candidate);
+    for (let depth = 0; depth < 12; depth += 1) {
+      for (const root of [cursor, path.join(cursor, "install")]) {
+        if (await validateRoot(root)) return root;
+      }
+      const parent = path.dirname(cursor);
+      if (parent === cursor) break;
+      cursor = parent;
+    }
   }
+  return null;
 }
 
 /** Identify the npm tree owning the binary; a standalone binary must return null. */

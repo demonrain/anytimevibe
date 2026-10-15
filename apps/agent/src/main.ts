@@ -7591,9 +7591,26 @@ async function reconcileStaleNativeCodexTurns(): Promise<number> {
   finally { if (nativeTurnReconcileInFlight === work) nativeTurnReconcileInFlight = null; }
 }
 
-async function npmExecutable(): Promise<string | null> {
+async function npmExecutable(hints: string[] = []): Promise<string | null> {
   if (process.platform === "win32") {
-    return (await resolveCommandPath("npm.cmd")) || (await resolveCommandPath("npm.exe"));
+    const resolved = (await resolveCommandPath("npm.cmd")) || (await resolveCommandPath("npm.exe"));
+    if (resolved) return resolved;
+    // Electron-launched clients may not inherit the shell's refreshed PATH.
+    // npm's Windows shims live beside the global package shim, so use the
+    // resolved engine path as a bounded fallback instead of guessing globally.
+    const node = await resolveCommandPath("node.exe");
+    for (const hint of [...hints, ...(node ? [node] : [])]) {
+      const dir = path.dirname(hint);
+      for (const candidate of [path.join(dir, "npm.cmd"), path.join(dir, "npm.exe")]) {
+        try {
+          const stat = await fs.stat(candidate);
+          if (stat.isFile()) return candidate;
+        } catch {
+          // Try the next sibling.
+        }
+      }
+    }
+    return null;
   }
   return (await resolveCommandPath("npm")) || null;
 }
@@ -7606,7 +7623,7 @@ async function resolveEngineUpgradeTarget(engine: CliEngine, version: string | u
     : await resolveEngineBinary(engine);
   if (!binary) throw new Error(`未找到 ${engine} CLI，无法升级。`);
 
-  const npm = await npmExecutable();
+  const npm = await npmExecutable([binary]);
   let defaultPrefix = "";
   if (npm) {
     try {
@@ -7629,13 +7646,18 @@ async function resolveEngineUpgradeTarget(engine: CliEngine, version: string | u
     if (!brew) throw new Error("检测到 Codex 由 Homebrew Cask 安装，但未找到 brew 命令。");
     installation = { kind: "brew", command: brew };
   } else {
-    const prefix = npm
-      ? await resolveNpmEnginePrefix(binary, engine, defaultPrefix)
-      : null;
     const piManagedInstallRoot = engine === "pi"
       ? await resolvePiManagedInstallRoot(binary)
       : null;
-    if (prefix) {
+    // Pi's managed releases also contain an npm package tree. Resolve the
+    // verified marker first so they use `pi update` instead of installing a
+    // second copy through npm.
+    const prefix = piManagedInstallRoot
+      ? null
+      : (npm ? await resolveNpmEnginePrefix(binary, engine, defaultPrefix) : null);
+    if (piManagedInstallRoot) {
+      installation = { kind: "pi-managed", installRoot: piManagedInstallRoot };
+    } else if (prefix) {
       const repairCandidates = [
         path.join(prefix, "node_modules", "@anthropic-ai", "claude-code", "install.cjs"),
         path.join(prefix, "lib", "node_modules", "@anthropic-ai", "claude-code", "install.cjs")
@@ -7661,8 +7683,6 @@ async function resolveEngineUpgradeTarget(engine: CliEngine, version: string | u
           : {}),
         ...(repairScript && nodeCommand ? { repairScript, nodeCommand } : {})
       };
-    } else if (piManagedInstallRoot) {
-      installation = { kind: "pi-managed", installRoot: piManagedInstallRoot };
     } else if (engine === "claude" || engine === "cursor" || engine === "grok" || engine === "antigravity") {
       installation = { kind: "self" };
     } else {

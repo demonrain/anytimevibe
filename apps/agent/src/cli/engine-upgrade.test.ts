@@ -31,6 +31,22 @@ describe("coding CLI upgrade commands", () => {
     }]);
   });
 
+  it("recognizes Pi's managed release binary even when the launcher resolves into .bin", async () => {
+    const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "av-pi-managed-release-"));
+    tempDirs.push(agentDir);
+    const installRoot = path.join(agentDir, "install");
+    const version = "1.0.2";
+    const binary = path.join(installRoot, "releases", version, "node_modules", ".bin", "pi");
+    await fs.mkdir(path.dirname(binary), { recursive: true });
+    await fs.writeFile(path.join(installRoot, "managed-install.json"), JSON.stringify({
+      kind: "pi-managed-install", schemaVersion: 1, layout: "releases-v1"
+    }));
+    await fs.writeFile(path.join(installRoot, "current-version"), `${version}\n`);
+    await fs.writeFile(binary, "#!/bin/sh\n");
+
+    expect(await resolvePiManagedInstallRoot(binary)).toBe(installRoot);
+  });
+
   it("uses Pi's native updater only for a verified official managed installation", async () => {
     const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "av-pi-managed-"));
     tempDirs.push(agentDir);
@@ -123,6 +139,18 @@ describe("coding CLI upgrade commands", () => {
     await fs.mkdir(path.dirname(custom));
     await fs.writeFile(custom, "standalone-native-binary");
     expect(await resolveNpmEnginePrefix(custom, "pi", prefix)).toBeNull();
+  });
+
+  it("recognizes Pi's npm package behind a Windows command shim", async () => {
+    const prefix = await fs.mkdtemp(path.join(os.tmpdir(), "av-pi-npm-shim-"));
+    tempDirs.push(prefix);
+    const packageDir = path.join(prefix, "node_modules", "@earendil-works", "pi-coding-agent");
+    await fs.mkdir(packageDir, { recursive: true });
+    await fs.writeFile(path.join(packageDir, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent" }));
+    const binary = path.join(prefix, "pi.cmd");
+    await fs.writeFile(binary, "@echo off\nnode \"%~dp0node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js\" %*\n");
+
+    expect(await resolveNpmEnginePrefix(binary, "pi", prefix)).toBe(prefix);
   });
 });
 
