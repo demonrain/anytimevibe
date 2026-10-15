@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { AgentEvent } from "@anytimevibe/protocol";
 import { ChatMessageStream, reduceEvent } from "./App";
 import { I18nProvider } from "./i18n/I18nProvider";
-import { normalizeAssistantMarkdown, normalizeMermaidChart } from "./markdown-display";
+import { normalizeAssistantMarkdown, normalizeMermaidChart, sanitizeMermaidSvg } from "./markdown-display";
 
 type StreamProps = ComponentProps<typeof ChatMessageStream>;
 type Message = StreamProps["messages"][number];
@@ -62,6 +62,16 @@ describe("assistant stream display", () => {
     expect(normalized).toContain('subgraph agy_subgraph_1["周六：直达山谷庄园·开启慢度假"]');
     expect(normalized).toContain("A --> B");
     expect(normalized).not.toMatch(/^-{3,}$/m);
+  });
+
+  it("sanitizes Mermaid SVGs before raster export", () => {
+    const sanitized = sanitizeMermaidSvg('<svg width="640" height="320" viewBox="0 0 640 320"><style>@import url("https://cdn.example.test/font.css"); .edge { fill: url(https://cdn.example.test/pattern); }</style><defs><marker id="arrow" /></defs><path class="edge" marker-end="url(#arrow)" href="https://cdn.example.test/remote" style="fill: url(data:image/png;base64,AAAA)" /><image href="https://cdn.example.test/image.png" /></svg>');
+
+    expect(sanitized).toContain('xmlns="http://www.w3.org/2000/svg"');
+    expect(sanitized).toContain('viewBox="0 0 640 320"');
+    expect(sanitized).toContain('marker-end="url(#arrow)"');
+    expect(sanitized).not.toContain("cdn.example.test");
+    expect(sanitized).not.toContain("<image");
   });
 
   it.each(["concise", "detailed"] as const)("hides Codex whitespace placeholders in %s mode", (detail) => {

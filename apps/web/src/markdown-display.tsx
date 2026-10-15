@@ -90,37 +90,112 @@ function mermaidRenderId(id: string): string {
   return `mermaid-${safe || "diagram"}`;
 }
 
+function sanitizeMermaidSvgText(svgMarkup: string): string {
+  return svgMarkup
+    .replace(/<image\b[^>]*\/>/gi, "")
+    .replace(/<image\b[^>]*>[\s\S]*?<\/image\s*>/gi, "")
+    .replace(/<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject\s*>/gi, "")
+    .replace(/@import\s+(?:url\([^)]*\)|[^;]+);?/gi, "")
+    .replace(/url\(\s*(['"]?)(?!#)[^)]+\1\s*\)/gi, "none")
+    .replace(/\s(?:href|xlink:href)=(['"])(?!#)[^'"\s]*\1/gi, "");
+}
+
+function setMermaidSvgDimensions(svg: SVGElement) {
+  const viewBox = svg.getAttribute("viewBox")?.trim().split(/[ ,]+/).map(Number);
+  if (viewBox?.length === 4 && viewBox.every(Number.isFinite)) {
+    if (!svg.getAttribute("width") && viewBox[2]! > 0) svg.setAttribute("width", `${Math.ceil(viewBox[2]!)}px`);
+    if (!svg.getAttribute("height") && viewBox[3]! > 0) svg.setAttribute("height", `${Math.ceil(viewBox[3]!)}px`);
+  }
+}
+
+/** Remove SVG resources that would taint a canvas and make its dimensions explicit. */
+export function sanitizeMermaidSvg(svgMarkup: string): string {
+  if (typeof DOMParser !== "undefined" && typeof XMLSerializer !== "undefined") {
+    const document = new DOMParser().parseFromString(svgMarkup, "image/svg+xml");
+    const svg = document.documentElement;
+    if (svg?.localName === "svg") {
+      document.querySelectorAll("image, foreignObject").forEach((node) => node.remove());
+      document.querySelectorAll("*").forEach((element) => {
+        for (const attribute of Array.from(element.attributes)) {
+          if ((attribute.localName === "href" || attribute.name === "href" || attribute.name === "xlink:href") && !attribute.value.trim().startsWith("#")) {
+            element.removeAttribute(attribute.name);
+          }
+          if (attribute.name === "style") element.setAttribute("style", sanitizeMermaidSvgText(attribute.value));
+        }
+      });
+      document.querySelectorAll("style").forEach((style) => {
+        style.textContent = sanitizeMermaidSvgText(style.textContent || "");
+      });
+      svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+      setMermaidSvgDimensions(svg as unknown as SVGElement);
+      return new XMLSerializer().serializeToString(svg);
+    }
+  }
+
+  let svg = sanitizeMermaidSvgText(svgMarkup);
+
+  const viewBox = /\bviewBox=(['"])([-+\d.eE]+)[ ,]+([-+\d.eE]+)[ ,]+([-+\d.eE]+)[ ,]+([-+\d.eE]+)\1/i.exec(svg);
+  const width = viewBox ? Math.ceil(Number(viewBox[4])) : 0;
+  const height = viewBox ? Math.ceil(Number(viewBox[5])) : 0;
+  if (!/\sxmlns=(['"])http:\/\/www\.w3\.org\/2000\/svg\1/i.test(svg)) {
+    svg = svg.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+  }
+  if (width > 0 && !/\swidth=(['"])[^'"]+\1/i.test(svg)) {
+    svg = svg.replace(/<svg\b/i, `<svg width="${width}px"`);
+  }
+  if (height > 0 && !/\sheight=(['"])[^'"]+\1/i.test(svg)) {
+    svg = svg.replace(/<svg\b/i, `<svg height="${height}px"`);
+  }
+  return svg;
+}
+
+function saveMermaidSvg(svg: string, date: string) {
+  const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `mermaid-${date}.svg`;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export function downloadMermaidImage(svgMarkup: string) {
-  const source = new Blob([svgMarkup], { type: "image/svg+xml;charset=utf-8" });
+  const svg = sanitizeMermaidSvg(svgMarkup);
+  const source = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
   const sourceUrl = URL.createObjectURL(source);
   const image = new Image();
+  const date = new Date().toISOString().slice(0, 10);
   image.onload = () => {
-    const canvas = document.createElement("canvas");
-    const scale = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
-    canvas.width = Math.ceil(image.naturalWidth * scale);
-    canvas.height = Math.ceil(image.naturalHeight * scale);
-    const context = canvas.getContext("2d");
-    if (!context) { URL.revokeObjectURL(sourceUrl); return; }
-    context.fillStyle = "#fffdf8";
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(image, 0, 0, canvas.width, canvas.height);
-    canvas.toBlob((blob) => {
+    try {
+      const canvas = document.createElement("canvas");
+      const scale = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+      canvas.width = Math.ceil(image.naturalWidth * scale);
+      canvas.height = Math.ceil(image.naturalHeight * scale);
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Canvas is unavailable");
+      context.fillStyle = "#fffdf8";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob) => {
+        URL.revokeObjectURL(sourceUrl);
+        if (!blob) {
+          saveMermaidSvg(svg, date);
+          return;
+        }
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `mermaid-${date}.png`;
+        link.click();
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }, "image/png");
+    } catch {
       URL.revokeObjectURL(sourceUrl);
-      if (!blob) return;
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `mermaid-${new Date().toISOString().slice(0, 10)}.png`;
-      link.click();
-      URL.revokeObjectURL(url);
-    }, "image/png");
+      saveMermaidSvg(svg, date);
+    }
   };
   image.onerror = () => {
-    const link = document.createElement("a");
-    link.href = sourceUrl;
-    link.download = `mermaid-${new Date().toISOString().slice(0, 10)}.svg`;
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(sourceUrl), 1000);
+    URL.revokeObjectURL(sourceUrl);
+    saveMermaidSvg(svg, date);
   };
   image.src = sourceUrl;
 }
@@ -143,6 +218,15 @@ export function MermaidDiagram({ chart }: { chart: string }) {
           startOnLoad: false,
           securityLevel: "strict",
           theme: "base",
+          themeVariables: {
+            background: "transparent",
+            primaryColor: "#fffdf8",
+            primaryBorderColor: "#89958b",
+            lineColor: "#68766d",
+            clusterBkg: "#f5f7f3",
+            clusterBorder: "#cbd4cc",
+            tertiaryColor: "transparent"
+          },
           flowchart: { htmlLabels: false, curve: "basis" }
         });
         return mermaid.render(renderId, normalizeMermaidChart(chart));
@@ -163,7 +247,7 @@ export function MermaidDiagram({ chart }: { chart: string }) {
 
   return (
     <figure className="md-mermaid" data-mermaid="true">
-      {svg && <div className="md-mermaid-toolbar"><span>Mermaid 图表</span><button type="button" className="md-mermaid-export" onClick={() => downloadMermaidImage(svg)} title="导出为图片">导出图片</button></div>}
+      {svg && <div className="md-mermaid-toolbar"><span>Mermaid 图表</span><button type="button" className="md-mermaid-export" onClick={() => downloadMermaidImage(svg)} title="导出 PNG 图片">导出 PNG</button></div>}
       <div className="md-mermaid-canvas">
         {svg ? (
           <div className="md-mermaid-svg" dangerouslySetInnerHTML={{ __html: svg }} />

@@ -1065,9 +1065,9 @@ button.version-chip:disabled { cursor: default; }
   max-width: 100%;
   margin: 0 0 .65em;
   overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(255,255,255,.72);
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
 }
 .message-markdown .md-mermaid-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--line); background: rgba(242,234,219,.62); color: #687168; font-size: 10px; font-weight: 850; letter-spacing: .04em; }
 .message-markdown .md-mermaid-export { border: 1px solid rgba(45,118,83,.28); border-radius: 8px; padding: 6px 9px; background: rgba(255,255,255,.75); color: var(--moss); font-size: 11px; font-weight: 850; cursor: pointer; }
@@ -1086,6 +1086,12 @@ button.version-chip:disabled { cursor: default; }
   display: block;
   max-width: none;
   height: auto;
+  background: transparent !important;
+}
+.message-markdown .md-mermaid-svg svg > rect:first-child,
+.message-markdown .md-mermaid-svg svg rect.background {
+  fill: transparent !important;
+  stroke: none !important;
 }
 .message-markdown .md-mermaid-source {
   margin: 0;
