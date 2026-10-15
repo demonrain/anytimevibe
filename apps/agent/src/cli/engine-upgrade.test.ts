@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildEngineUpgradeSteps, resolveNpmEnginePrefix } from "./engine-upgrade";
+import { buildEngineUpgradeSteps, resolveNpmEnginePrefix, resolvePiManagedInstallRoot } from "./engine-upgrade";
 import { execFileWithTreeKill } from "./exec-file-tree-kill";
 
 const tempDirs: string[] = [];
@@ -29,6 +29,43 @@ describe("coding CLI upgrade commands", () => {
       command: "C:\\Node\\npm.cmd",
       args: ["install", "-g", "--registry=https://registry.npmjs.org/", "--prefix=C:\\Tools\\npm", "--ignore-scripts", "@earendil-works/pi-coding-agent@0.62.0"]
     }]);
+  });
+
+  it("uses Pi's native updater only for a verified official managed installation", async () => {
+    const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "av-pi-managed-"));
+    tempDirs.push(agentDir);
+    const installRoot = path.join(agentDir, "install");
+    const version = "1.0.2";
+    const binary = path.join(agentDir, "bin", "pi");
+    const releaseBinary = path.join(installRoot, "releases", version, "node_modules", ".bin", "pi");
+    await fs.mkdir(path.dirname(binary), { recursive: true });
+    await fs.mkdir(path.dirname(releaseBinary), { recursive: true });
+    await fs.writeFile(binary, "#!/bin/sh\n");
+    await fs.writeFile(path.join(installRoot, "managed-install.json"), JSON.stringify({
+      kind: "pi-managed-install", schemaVersion: 1, layout: "releases-v1",
+      entrypoint: { type: "symlink", path: binary }
+    }));
+    await fs.writeFile(path.join(installRoot, "current-version"), `${version}\n`);
+    await fs.writeFile(releaseBinary, "#!/bin/sh\n");
+
+    expect(await resolvePiManagedInstallRoot(binary)).toBe(installRoot);
+    expect(buildEngineUpgradeSteps({
+      engine: "pi", platform: process.platform, binary, version,
+      installation: { kind: "pi-managed", installRoot }
+    })).toEqual([{ command: binary, args: ["update"] }]);
+  });
+
+  it("does not classify an unmarked Pi binary as an official managed installation", async () => {
+    const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "av-pi-unmarked-"));
+    tempDirs.push(agentDir);
+    const binary = path.join(agentDir, "bin", "pi");
+    await fs.mkdir(path.dirname(binary), { recursive: true });
+    await fs.writeFile(binary, "standalone pi binary");
+
+    expect(await resolvePiManagedInstallRoot(binary)).toBeNull();
+    expect(() => buildEngineUpgradeSteps({
+      engine: "pi", platform: process.platform, binary, installation: { kind: "self" }
+    })).toThrow(/升级命令|官方安装/);
   });
 
   it("uses the resolved Cursor binary rather than the colliding Grok agent on PATH", () => {

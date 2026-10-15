@@ -73,7 +73,7 @@ import { clearEngineBinaryCache, detectAvailableEngines, resolveCommandPath, res
 import { enrichEnginesWithLatestVersions, clearEngineLatestCache } from "./cli/engine-updates";
 import { isUpdateAvailable, normalizeVersionLabel } from "./cli/version-compare";
 import { EngineMaintenance, sanitizeEngineMaintenanceDetail } from "./cli/engine-maintenance";
-import { buildEngineUpgradeSteps, resolveNpmEnginePrefix } from "./cli/engine-upgrade";
+import { buildEngineUpgradeSteps, resolveNpmEnginePrefix, resolvePiManagedInstallRoot } from "./cli/engine-upgrade";
 import { execFileWithTreeKill } from "./cli/exec-file-tree-kill";
 import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn, normalizeSystemErrorText } from "./cli/headless-runner";
@@ -7632,6 +7632,9 @@ async function resolveEngineUpgradeTarget(engine: CliEngine, version: string | u
     const prefix = npm
       ? await resolveNpmEnginePrefix(binary, engine, defaultPrefix)
       : null;
+    const piManagedInstallRoot = engine === "pi"
+      ? await resolvePiManagedInstallRoot(binary)
+      : null;
     if (prefix) {
       const repairCandidates = [
         path.join(prefix, "node_modules", "@anthropic-ai", "claude-code", "install.cjs"),
@@ -7658,6 +7661,8 @@ async function resolveEngineUpgradeTarget(engine: CliEngine, version: string | u
           : {}),
         ...(repairScript && nodeCommand ? { repairScript, nodeCommand } : {})
       };
+    } else if (piManagedInstallRoot) {
+      installation = { kind: "pi-managed", installRoot: piManagedInstallRoot };
     } else if (engine === "claude" || engine === "cursor" || engine === "grok" || engine === "antigravity") {
       installation = { kind: "self" };
     } else {

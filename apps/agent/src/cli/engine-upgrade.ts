@@ -4,6 +4,7 @@ import path from "node:path";
 
 export type EngineUpgradeInstallation =
   | { kind: "self" }
+  | { kind: "pi-managed"; installRoot: string }
   | { kind: "npm"; command: string; prefix: string; repairScript?: string; nodeCommand?: string; registry?: string }
   | { kind: "brew"; command: string };
 export type EngineUpgradeTarget = {
@@ -38,6 +39,10 @@ function npmPackageSpec(engine: CliEngine, version: string | undefined): string 
 export function buildEngineUpgradeSteps(target: EngineUpgradeTarget): EngineUpgradeStep[] {
   const { engine, binary, installation } = target;
   if (!binary.trim()) throw new Error("缺少编码引擎 CLI 路径");
+  if (installation.kind === "pi-managed") {
+    if (engine !== "pi") throw new Error(`${engine} does not support the Pi managed updater`);
+    return [{ command: binary, args: ["update"] }];
+  }
   if (installation.kind === "self") {
     if (engine === "claude" || engine === "cursor" || engine === "grok" || engine === "antigravity") {
       return [{ command: binary, args: ["update"] }];
@@ -90,6 +95,31 @@ async function packageOwnedByBinary(prefix: string, engine: CliEngine, binary: s
     }
   }
   return false;
+}
+
+/** Resolve Pi's official versioned managed layout, which provides `pi update`. */
+export async function resolvePiManagedInstallRoot(binary: string): Promise<string | null> {
+  const actual = await fs.realpath(binary).catch(() => binary);
+  const binDir = path.dirname(actual);
+  if (path.basename(actual).toLowerCase() !== "pi" || path.basename(binDir).toLowerCase() !== "bin") return null;
+
+  const installRoot = path.resolve(path.dirname(binDir), "install");
+  try {
+    const marker = JSON.parse(await fs.readFile(path.join(installRoot, "managed-install.json"), "utf8")) as {
+      kind?: unknown;
+      schemaVersion?: unknown;
+      layout?: unknown;
+    };
+    if (marker.kind !== "pi-managed-install" || marker.schemaVersion !== 1 || marker.layout !== "releases-v1") return null;
+
+    const version = (await fs.readFile(path.join(installRoot, "current-version"), "utf8")).trim();
+    if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) return null;
+    const releaseBinary = path.join(installRoot, "releases", version, "node_modules", ".bin", "pi");
+    await fs.access(releaseBinary);
+    return installRoot;
+  } catch {
+    return null;
+  }
 }
 
 /** Identify the npm tree owning the binary; a standalone binary must return null. */
