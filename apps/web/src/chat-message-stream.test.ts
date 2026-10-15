@@ -65,11 +65,14 @@ describe("assistant stream display", () => {
   });
 
   it("sanitizes Mermaid SVGs before raster export", () => {
-    const sanitized = sanitizeMermaidSvg('<svg width="640" height="320" viewBox="0 0 640 320"><style>@import url("https://cdn.example.test/font.css"); .edge { fill: url(https://cdn.example.test/pattern); }</style><defs><marker id="arrow" /></defs><path class="edge" marker-end="url(#arrow)" href="https://cdn.example.test/remote" style="fill: url(data:image/png;base64,AAAA)" /><image href="https://cdn.example.test/image.png" /></svg>');
+    const sanitized = sanitizeMermaidSvg('<svg width="640" height="320" viewBox="0 0 640 320"><style>@import url("https://cdn.example.test/font.css"); .edge { fill: url(https://cdn.example.test/pattern); }</style><rect class="background" width="100%" height="100%" fill="#000" /><defs><marker id="arrow" /></defs><path class="edge" marker-end="url(#arrow)" href="https://cdn.example.test/remote" style="fill: url(data:image/png;base64,AAAA)" /><foreignObject><div>文字标签</div></foreignObject><image href="https://cdn.example.test/image.png" /></svg>');
 
     expect(sanitized).toContain('xmlns="http://www.w3.org/2000/svg"');
     expect(sanitized).toContain('viewBox="0 0 640 320"');
     expect(sanitized).toContain('marker-end="url(#arrow)"');
+    expect(sanitized).toContain("文字标签");
+    expect(sanitized).not.toContain('class="background"');
+    expect(sanitized).not.toContain('fill="#000"');
     expect(sanitized).not.toContain("cdn.example.test");
     expect(sanitized).not.toContain("<image");
   });

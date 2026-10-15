@@ -94,7 +94,6 @@ function sanitizeMermaidSvgText(svgMarkup: string): string {
   return svgMarkup
     .replace(/<image\b[^>]*\/>/gi, "")
     .replace(/<image\b[^>]*>[\s\S]*?<\/image\s*>/gi, "")
-    .replace(/<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject\s*>/gi, "")
     .replace(/@import\s+(?:url\([^)]*\)|[^;]+);?/gi, "")
     .replace(/url\(\s*(['"]?)(?!#)[^)]+\1\s*\)/gi, "none")
     .replace(/\s(?:href|xlink:href)=(['"])(?!#)[^'"\s]*\1/gi, "");
@@ -108,13 +107,25 @@ function setMermaidSvgDimensions(svg: SVGElement) {
   }
 }
 
+function removeMermaidRootBackground(svg: Element) {
+  svg.querySelectorAll(":scope > rect").forEach((rect) => {
+    const className = rect.getAttribute("class") || "";
+    const fill = (rect.getAttribute("fill") || "").toLowerCase();
+    const width = (rect.getAttribute("width") || "").toLowerCase();
+    const height = (rect.getAttribute("height") || "").toLowerCase();
+    if (className.split(/\s+/).includes("background") || (width === "100%" && height === "100%") || ["#000", "#000000", "black", "rgb(0,0,0)"] .includes(fill)) {
+      rect.remove();
+    }
+  });
+}
+
 /** Remove SVG resources that would taint a canvas and make its dimensions explicit. */
 export function sanitizeMermaidSvg(svgMarkup: string): string {
   if (typeof DOMParser !== "undefined" && typeof XMLSerializer !== "undefined") {
     const document = new DOMParser().parseFromString(svgMarkup, "image/svg+xml");
     const svg = document.documentElement;
     if (svg?.localName === "svg") {
-      document.querySelectorAll("image, foreignObject").forEach((node) => node.remove());
+      document.querySelectorAll("image").forEach((node) => node.remove());
       document.querySelectorAll("*").forEach((element) => {
         for (const attribute of Array.from(element.attributes)) {
           if ((attribute.localName === "href" || attribute.name === "href" || attribute.name === "xlink:href") && !attribute.value.trim().startsWith("#")) {
@@ -127,12 +138,16 @@ export function sanitizeMermaidSvg(svgMarkup: string): string {
         style.textContent = sanitizeMermaidSvgText(style.textContent || "");
       });
       svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+      svg.setAttribute("style", `${svg.getAttribute("style") || ""};background: transparent !important;`);
+      removeMermaidRootBackground(svg);
       setMermaidSvgDimensions(svg as unknown as SVGElement);
       return new XMLSerializer().serializeToString(svg);
     }
   }
 
   let svg = sanitizeMermaidSvgText(svgMarkup);
+
+  svg = svg.replace(/<rect\b[^>]*(?:class=["'][^"']*\bbackground\b[^"']*["'][^>]*|width=["']100%["'][^>]*height=["']100%["'][^>]*)\/?>(?:<\/rect>)?/gi, "");
 
   const viewBox = /\bviewBox=(['"])([-+\d.eE]+)[ ,]+([-+\d.eE]+)[ ,]+([-+\d.eE]+)[ ,]+([-+\d.eE]+)\1/i.exec(svg);
   const width = viewBox ? Math.ceil(Number(viewBox[4])) : 0;
@@ -172,8 +187,7 @@ export function downloadMermaidImage(svgMarkup: string) {
       canvas.height = Math.ceil(image.naturalHeight * scale);
       const context = canvas.getContext("2d");
       if (!context) throw new Error("Canvas is unavailable");
-      context.fillStyle = "#fffdf8";
-      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.clearRect(0, 0, canvas.width, canvas.height);
       context.drawImage(image, 0, 0, canvas.width, canvas.height);
       canvas.toBlob((blob) => {
         URL.revokeObjectURL(sourceUrl);
@@ -218,6 +232,7 @@ export function MermaidDiagram({ chart }: { chart: string }) {
           startOnLoad: false,
           securityLevel: "strict",
           theme: "base",
+          htmlLabels: false,
           themeVariables: {
             background: "transparent",
             primaryColor: "#fffdf8",
