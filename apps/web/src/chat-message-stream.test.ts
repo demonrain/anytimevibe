@@ -133,6 +133,17 @@ describe("assistant stream display", () => {
     expect(html).toContain(text.includes("hello") ? "&lt;div&gt;hello&lt;/div&gt;" : "const answer = 42;");
   });
 
+  it("adds a copy button to rendered code blocks", () => {
+    const html = renderStream([{
+      id: "assistant:turn-1:copy",
+      role: "assistant",
+      text: "```ts\nconst answer = 42;\n```"
+    }]);
+
+    expect(html).toContain('class="md-code-copy"');
+    expect(html).toContain('aria-label="复制代码"');
+  });
+
   it("renders AGY break tags as line breaks instead of exposing the tag", () => {
     const html = renderStream([{ id: "assistant:turn-1:agy", role: "assistant", text: "第一行<br>第二行" }]);
 

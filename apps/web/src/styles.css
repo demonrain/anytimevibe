@@ -1042,10 +1042,26 @@ button.version-chip:disabled { cursor: default; }
   border-radius: 5px;
   background: rgba(23,33,27,.07);
 }
-.message-markdown .md-pre { margin: 0 0 .65em; }
+.message-markdown .md-pre { position: relative; min-width: 0; margin: 0 0 .65em; }
+.message-markdown .md-code-copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  border: 1px solid rgba(232,238,232,.28);
+  border-radius: 7px;
+  padding: 5px 8px;
+  background: rgba(23,33,27,.82);
+  color: #e8eee8;
+  font-size: 11px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.message-markdown .md-code-copy:hover,
+.message-markdown .md-code-copy:focus-visible { background: var(--moss); color: white; }
 .message-markdown .md-code-block {
   margin: 0;
-  padding: 10px 12px;
+  padding: 36px 12px 10px;
   border-radius: 10px;
   background: #17211b;
   color: #e8eee8;

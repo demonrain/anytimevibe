@@ -1238,7 +1238,68 @@ function childrenToPlainText(children: ReactNode): string {
   if (children == null || typeof children === "boolean") return "";
   if (typeof children === "string" || typeof children === "number") return String(children);
   if (Array.isArray(children)) return children.map(childrenToPlainText).join("");
+  if (isValidElement(children)) {
+    const props = children.props as { children?: ReactNode };
+    return childrenToPlainText(props.children);
+  }
   return "";
+}
+
+function CodeBlock({ children }: { children?: ReactNode }) {
+  const { locale } = useI18n();
+  const [copied, setCopied] = useState(false);
+  const copiedLabel = locale === "en" ? "Copied" : "已复制";
+  const copyLabel = locale === "en" ? "Copy" : "复制";
+  const copiedAriaLabel = locale === "en" ? "Code copied" : "已复制代码";
+  const copyAriaLabel = locale === "en" ? "Copy code" : "复制代码";
+
+  const copy = async () => {
+    const text = childrenToPlainText(children);
+    let success = false;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        success = true;
+      }
+    } catch {
+      // Clipboard API can be unavailable on non-secure origins or denied by the browser.
+    }
+
+    if (!success && typeof document !== "undefined") {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      try {
+        success = document.execCommand("copy");
+      } finally {
+        textarea.remove();
+      }
+    }
+
+    if (success) {
+      setCopied(true);
+      if (typeof window !== "undefined") window.setTimeout(() => setCopied(false), 1600);
+    }
+  };
+
+  return (
+    <div className="md-pre">
+      <button
+        type="button"
+        className="md-code-copy"
+        aria-label={copied ? copiedAriaLabel : copyAriaLabel}
+        title={copied ? copiedLabel : copyAriaLabel}
+        onClick={() => void copy()}
+      >
+        {copied ? copiedLabel : copyLabel}
+      </button>
+      <pre className="md-code-block">{children}</pre>
+    </div>
+  );
 }
 
 /** Stable markdown config — recreating these every render forces ReactMarkdown to re-walk the tree. */
@@ -1280,7 +1341,7 @@ const MARKDOWN_COMPONENTS: any = {
   pre: ({ children }: { children?: ReactNode }) => {
     const child = singleMarkdownChild(children);
     if (isValidElement(child) && child.type === MermaidDiagram) return child;
-    return <div className="md-pre"><pre className="md-code-block">{children}</pre></div>;
+    return <CodeBlock>{children}</CodeBlock>;
   },
   table: ({ children }: { children?: ReactNode }) => (
     <div className="md-table-wrap"><table>{children}</table></div>
