@@ -335,6 +335,9 @@ let socket: WebSocket | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let pairingTimer: NodeJS.Timeout | null = null;
 let codex: CodexAdapter | null = null;
+let codexStartInFlight: Promise<void> | null = null;
+let codexStopInFlight: Promise<void> | null = null;
+let codexQuitInFlight: Promise<void> | null = null;
 /** Fingerprint of config.toml/auth.json that the running app-server last loaded. */
 let codexLoadedCredentialFingerprint: string | null = null;
 let syncKey: CryptoKey | null = null;
@@ -4702,6 +4705,23 @@ async function ensureCodexImpl(options: { maintenance?: boolean } = {}): Promise
 }
 
 async function startCodexAppServer(): Promise<void> {
+  if (codexStopInFlight) await codexStopInFlight;
+  if (quitting || installingUpdate) throw new Error("客户端正在退出，取消启动 Codex");
+  if (codexStartInFlight) {
+    await codexStartInFlight;
+    return;
+  }
+  if (codex) return;
+  const start = startCodexAppServerImpl();
+  codexStartInFlight = start;
+  try {
+    await start;
+  } finally {
+    if (codexStartInFlight === start) codexStartInFlight = null;
+  }
+}
+
+async function startCodexAppServerImpl(): Promise<void> {
   if (codex) return;
   await applyLoginPathToProcess();
   // Ensure historical Cockpit provider sections exist before app-server loads config.toml.
@@ -4730,8 +4750,9 @@ async function startCodexAppServer(): Promise<void> {
         : "未检测到 Codex CLI（可选）；可用 Claude / Grok");
     }
   }
+  if (quitting || installingUpdate) throw new Error("客户端正在退出，取消启动 Codex");
   const messageGeneration = ++codexMessageGeneration;
-  codex = new CodexAdapter(codexCommand, (message) => {
+  const adapter = new CodexAdapter(codexCommand, (message) => {
     if (quitting || installingUpdate || messageGeneration !== codexMessageGeneration) return;
     handleCodexMessage(message).catch(handleError);
   }, (detail) => {
@@ -4753,7 +4774,19 @@ async function startCodexAppServer(): Promise<void> {
     // drainTurnQueue refuses to run because isThreadTurnBusy stays true.
     void recoverAfterCodexAppServerExit(detail).catch(handleError);
   });
-  const started = await codex.start();
+  codex = adapter;
+  let started: Awaited<ReturnType<CodexAdapter["start"]>>;
+  try {
+    started = await adapter.start();
+  } catch (error) {
+    if (codex === adapter) {
+      codex = null;
+      codexMessageGeneration += 1;
+      codexLoadedCredentialFingerprint = null;
+    }
+    await adapter.stop({ intentional: true });
+    throw error;
+  }
   if (started.relayKeySource === "auth.json") {
     logInfo("Codex 进程已注入 auth.json 中的密钥", "环境变量名由 env_key 决定，默认 OPENAI_API_KEY");
   } else if (started.relayKeySource === "config-bearer") {
@@ -4763,6 +4796,25 @@ async function startCodexAppServer(): Promise<void> {
     codexLoadedCredentialFingerprint = await readCodexCredentialFingerprint();
   } catch {
     codexLoadedCredentialFingerprint = null;
+  }
+}
+
+/** Never replace the app-server until its startup and owned process tree have settled. */
+async function stopCodexAppServer(options?: { intentional?: boolean }): Promise<void> {
+  if (codexStopInFlight) return codexStopInFlight;
+  const stopping = (async () => {
+    if (codexStartInFlight) await codexStartInFlight.catch(() => undefined);
+    const adapter = codex;
+    codex = null;
+    codexMessageGeneration += 1;
+    codexLoadedCredentialFingerprint = null;
+    await adapter?.stop(options);
+  })();
+  codexStopInFlight = stopping;
+  try {
+    await stopping;
+  } finally {
+    if (codexStopInFlight === stopping) codexStopInFlight = null;
   }
 }
 
@@ -4912,13 +4964,7 @@ async function performCodexAppServerReload(reason: string, options: { maintenanc
       logWarn("切号重载前修复 Codex provider/auth 失败", String(error));
     }
     logInfo("正在重载 Codex app-server", reason);
-    try {
-      codex?.stop({ intentional: true });
-    } catch {
-      // ignore
-    }
-    codex = null;
-    codexLoadedCredentialFingerprint = null;
+    await stopCodexAppServer({ intentional: true });
     noteCodexCredentialSelfWrite();
     await ensureCodex(options);
   })();
@@ -7713,9 +7759,7 @@ function getEngineMaintenance(): EngineMaintenance {
       if (engine !== "codex") return;
       clearCodexDebugModelsCache();
       pendingCodexAppServerReload = null;
-      try { codex?.stop({ intentional: true }); } catch { /* ignore */ }
-      codex = null;
-      codexLoadedCredentialFingerprint = null;
+      await stopCodexAppServer({ intentional: true });
     },
     upgrade: async (engine, version, onOutput) => {
       await refreshAgentUpdateNetwork().catch(() => undefined);
@@ -8600,12 +8644,7 @@ async function releaseCodexThreadForHandoff(threadId: string): Promise<void> {
   } catch {
     // ignore
   }
-  try {
-    codex.stop();
-  } catch {
-    // ignore
-  }
-  codex = null;
+  await stopCodexAppServer({ intentional: true });
   pendingCodexAppServerReload = null;
   codexLoadedCredentialFingerprint = null;
 }
@@ -9080,9 +9119,10 @@ async function initializeClientUpdate(): Promise<void> {
     },
     quit: () => {
       // The helper has acknowledged readiness; only now release the relay and current process.
-      prepareForUpdateQuit();
-      app.quit();
-      setTimeout(() => app.exit(0), 5000).unref();
+      void prepareForUpdateQuit().then(() => {
+        app.quit();
+        setTimeout(() => app.exit(0), 5000).unref();
+      }).catch(handleError);
     },
     notify: async (update) => {
       updateState({ clientUpdate: update });
@@ -9282,7 +9322,7 @@ function registerUpdateListeners(): void {
 }
 
 /** Tear down sockets/codex/UI before the updater replaces the app bundle. */
-function prepareForUpdateQuit(): void {
+async function prepareForUpdateQuit(): Promise<void> {
   quitting = true;
   installingUpdate = true;
   reconnectBlockedReason = "updating";
@@ -9302,13 +9342,7 @@ function prepareForUpdateQuit(): void {
   const updateSocket = socket;
   socket = null;
   safeDisposeSocket(updateSocket);
-  try {
-    codex?.stop();
-  } catch {
-    // ignore
-  }
-  codex = null;
-  codexLoadedCredentialFingerprint = null;
+  await stopCodexAppServer({ intentional: true });
   try {
     if (tray) {
       tray.destroy();
@@ -9927,7 +9961,7 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => undefined);
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
   quitting = true;
   for (const stop of macBookmarkStoppers.splice(0)) {
     try { stop(); } catch { /* ignore */ }
@@ -9943,11 +9977,15 @@ app.on("before-quit", () => {
   const closingSocket = socket;
   socket = null;
   safeDisposeSocket(closingSocket);
-  try {
-    codex?.stop();
-  } catch {
-    // ignore
+  if (codex || codexStartInFlight || codexStopInFlight || codexQuitInFlight) {
+    // Electron does not await an async event handler: explicitly defer quitting
+    // until taskkill/process-group termination has finished.
+    event.preventDefault();
+    if (!codexQuitInFlight) {
+      codexQuitInFlight = stopCodexAppServer({ intentional: true }).finally(() => {
+        codexQuitInFlight = null;
+        app.quit();
+      });
+    }
   }
-  codex = null;
-  codexLoadedCredentialFingerprint = null;
 });

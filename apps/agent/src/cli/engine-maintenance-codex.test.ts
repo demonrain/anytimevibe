@@ -10,7 +10,7 @@ import { EngineMaintenance } from "./engine-maintenance";
 const mainSource = createSourceFile(
   "main.ts", readFileSync(path.resolve("apps/agent/src/main.ts"), "utf8"), ScriptTarget.Latest, true
 );
-const names = ["ensureCodex", "ensureCodexImpl", "reserveClientOperation", "withClientOperation", "startCodexAppServer", "reloadCodexAppServer", "performCodexAppServerReload", "reconcileCodexCredentialsIfStale", "queueCodexCredentialReload"];
+const names = ["ensureCodex", "ensureCodexImpl", "reserveClientOperation", "withClientOperation", "startCodexAppServer", "startCodexAppServerImpl", "stopCodexAppServer", "reloadCodexAppServer", "performCodexAppServerReload", "reconcileCodexCredentialsIfStale", "queueCodexCredentialReload"];
 const declarations = names.map((name) => {
   const declaration = mainSource.statements.find((node) =>
     isFunctionDeclaration(node) && node.name?.text === name
@@ -47,6 +47,10 @@ function fixture() {
   });
   const context = {
     codex: null,
+    codexStartInFlight: null,
+    codexStopInFlight: null,
+    quitting: false,
+    installingUpdate: false,
     clientUpdateController: { applying: false },
     clientOperations: 0,
     codexVersion: "1.0.0",
@@ -79,11 +83,148 @@ function fixture() {
     reconcileCodexCredentialsIfStale(reason: string): Promise<void>;
     queueCodexCredentialReload(reason: string): void;
   };
+  const quitStatement = mainSource.statements.find((node) =>
+    node.getText(mainSource).startsWith('app.on("before-quit",')
+  );
+  if (!quitStatement) throw new Error("Could not locate before-quit handler");
+  const quitHandlers: Array<(event: { preventDefault(): void }) => void> = [];
+  Object.assign(context, {
+    macBookmarkStoppers: [], stopEngineConfigWatch: null,
+    reconnectTimer: null, pairingTimer: null, socket: null,
+    codexQuitInFlight: null,
+    safeDisposeSocket: () => {},
+    app: { on: (_event: string, handler: typeof quitHandlers[number]) => { quitHandlers.push(handler); },
+      quit: () => { effects.push("quit"); } },
+    clearTimeout
+  });
+  new Script(transpileModule(quitStatement.getText(mainSource), {
+    compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.CommonJS }
+  }).outputText).runInNewContext(context);
   const update = () => manager.execute({ type: "host.engine.update", commandId: crypto.randomUUID(), cliEngine: "codex" });
-  return { upgradeEntered, upgradeGate, effects, manager, context, lifecycle, update };
+  return { upgradeEntered, upgradeGate, effects, manager, context, lifecycle, update, quit: quitHandlers[0]! };
 }
 
 describe("Codex lifecycle maintenance protection", () => {
+  it("serializes concurrent Codex bootstrap calls into one app-server", async () => {
+    const f = fixture();
+    let starts = 0;
+    let releaseStart!: () => void;
+    const startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
+    f.context.CodexAdapter = class {
+      async start() {
+        starts += 1;
+        await startGate;
+        return {};
+      }
+      stop() {}
+    };
+
+    const first = f.lifecycle.ensureCodex();
+    const second = f.lifecycle.ensureCodex();
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(starts).toBe(1);
+    } finally {
+      releaseStart();
+      await Promise.all([first, second]);
+    }
+  });
+
+  it("makes callers arriving during initialization wait until Codex is ready", async () => {
+    const f = fixture();
+    const entered = deferred();
+    const gate = deferred();
+    f.context.CodexAdapter = class {
+      async start() { entered.resolve(); await gate.promise; return {}; }
+      stop() {}
+    };
+    const first = f.lifecycle.ensureCodex();
+    await entered.promise;
+    let secondReady = false;
+    const second = f.lifecycle.ensureCodex().then(() => { secondReady = true; });
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(secondReady).toBe(false);
+    } finally {
+      gate.resolve();
+      await Promise.all([first, second]);
+    }
+    expect(secondReady).toBe(true);
+  });
+
+  it("reclaims a failed initialization before allowing a fresh startup", async () => {
+    const f = fixture();
+    let starts = 0;
+    let stops = 0;
+    f.context.CodexAdapter = class {
+      async start() {
+        starts++;
+        if (starts === 1) throw new Error("initialize rejected");
+        return {};
+      }
+      stop() { stops++; }
+    };
+    await expect(f.lifecycle.ensureCodex()).rejects.toThrow("initialize rejected");
+    expect(f.context.codex).toBeNull();
+    expect(stops).toBe(1);
+    await f.lifecycle.ensureCodex();
+    expect(starts).toBe(2);
+  });
+
+  it("waits for the old app-server to exit before reloading it", async () => {
+    const f = fixture();
+    await f.lifecycle.ensureCodex();
+    const entered = deferred();
+    const gate = deferred();
+    Object.assign(f.context.codex!, {
+      stop: async () => { entered.resolve(); await gate.promise; }
+    });
+    f.effects.length = 0;
+    const reloading = f.lifecycle.reloadCodexAppServer("test reload");
+    await entered.promise;
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(f.effects).not.toContain("start");
+    } finally {
+      gate.resolve();
+      await reloading;
+    }
+    expect(f.effects.filter((item) => item === "start")).toHaveLength(1);
+  });
+
+  it("does not spawn Codex when shutdown began during PATH discovery", async () => {
+    const f = fixture();
+    const entered = deferred();
+    const gate = deferred();
+    f.context.applyLoginPathToProcess = async () => { entered.resolve(); await gate.promise; };
+    const starting = f.lifecycle.ensureCodex();
+    const result = starting.catch((error) => error);
+    await entered.promise;
+    f.context.quitting = true;
+    gate.resolve();
+    await result;
+    expect(f.effects).not.toContain("start");
+  });
+
+  it("delays Electron quit until the Codex process tree has been stopped", async () => {
+    const f = fixture();
+    await f.lifecycle.ensureCodex();
+    const entered = deferred();
+    const gate = deferred();
+    Object.assign(f.context.codex!, { stop: async () => { entered.resolve(); await gate.promise; } });
+    let prevented = false;
+    f.quit({ preventDefault: () => { prevented = true; } });
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(prevented).toBe(true);
+      expect(f.effects).not.toContain("quit");
+    } finally {
+      gate.resolve();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    expect(f.effects.filter((effect) => effect === "quit")).toHaveLength(1);
+  });
+
   it("keeps background bootstrap from starting while the desktop client is updating", async () => {
     const f = fixture();
     f.context.clientUpdateController.applying = true;

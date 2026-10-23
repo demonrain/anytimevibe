@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "./windows-command";
 import { localGatewayChildEnv } from "./local-proxy";
 import { isCodexModelsManagerNoise } from "./cli/log-noise";
+import { killProcessTree } from "./cli/exec-file-tree-kill";
 import { assignCodexApiKeyEnv, resolveCodexOpenaiBaseUrlForEnv, resolveCodexRelayKeyMaterial, type CodexRelayKeySource } from "./cli/codex-gateway";
 import type { PermissionMode } from "@anytimevibe/protocol";
 import { PRODUCT_VERSION } from "@anytimevibe/protocol";
@@ -124,6 +125,7 @@ export function codexTurnConfigExtras(options?: {
 
 export class CodexAdapter {
   private process: ChildProcessWithoutNullStreams | null = null;
+  private stopInFlight: Promise<void> | null = null;
   private nextId = 1;
   private readonly pending = new Map<RpcId, { resolve(value: any): void; reject(error: Error): void }>();
 
@@ -164,6 +166,7 @@ export class CodexAdapter {
     const child = spawn(executable, args, {
       windowsHide: true,
       windowsVerbatimArguments: useCmd,
+      detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
       // Local Codex gateway only — never inherit Clash HTTP_PROXY.
       env: baseEnv
@@ -177,32 +180,55 @@ export class CodexAdapter {
       if (isCodexModelsManagerNoise(line)) return;
       this.onServerMessage({ method: "agent/log", params: { line } });
     });
-    child.on("exit", (code, signal) => {
+    let exitReported = false;
+    const reportExit = (detail: string) => {
+      if (exitReported || this.process !== child) return;
+      exitReported = true;
       this.process = null;
-      const detail = `Codex app-server exited (${code ?? signal ?? "unknown"})`;
       for (const pending of this.pending.values()) pending.reject(new Error(detail));
       this.pending.clear();
       this.onExit(detail);
-    });
-    child.on("error", (error) => this.onExit(error.message));
+    };
+    child.on("exit", (code, signal) => reportExit(`Codex app-server exited (${code ?? signal ?? "unknown"})`));
+    const reportFailure = (error: Error) => {
+      if (exitReported || this.process !== child) return;
+      exitReported = true;
+      // A broken pipe need not mean the native CLI exited. Keep its PID until
+      // the owned tree is reclaimed, then allow the caller to replace it.
+      void this.stop({ intentional: true }).then(() => this.onExit(error.message));
+    };
+    child.on("error", reportFailure);
+    child.stdin.on("error", reportFailure);
 
-    await this.request("initialize", {
-      clientInfo: { name: "anytimevibe-agent", title: "随码", version: PRODUCT_VERSION },
-      // approvalPolicy on thread/start is experimental. Without this capability
-      // Codex 0.158 keeps config.toml (usually on-request) and still prompts
-      // even when the web task is Full Access.
-      capabilities: { experimentalApi: true, requestAttestation: false }
-    });
-    this.notify("initialized");
-    return { relayKeySource };
+    let initializeTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const initialize = this.request("initialize", {
+        clientInfo: { name: "anytimevibe-agent", title: "随码", version: PRODUCT_VERSION },
+        // approvalPolicy on thread/start is experimental. Without this capability
+        // Codex 0.158 keeps config.toml (usually on-request) and still prompts
+        // even when the web task is Full Access.
+        capabilities: { experimentalApi: true, requestAttestation: false }
+      });
+      await Promise.race([initialize, new Promise<never>((_resolve, reject) => {
+        initializeTimer = setTimeout(() => reject(new Error("Codex initialization timed out after 30000ms")), 30_000);
+      })]);
+      this.notify("initialized");
+      return { relayKeySource };
+    } catch (error) {
+      // Even an initialize RPC rejection leaves the launcher and native CLI alive.
+      await this.stop({ intentional: true });
+      throw error;
+    } finally {
+      if (initializeTimer) clearTimeout(initializeTimer);
+    }
   }
 
-  stop(options?: { intentional?: boolean }): void {
+  async stop(options?: { intentional?: boolean }): Promise<void> {
+    if (this.stopInFlight) return this.stopInFlight;
     const child = this.process;
     this.process = null;
     if (!child) return;
     child.removeAllListeners("exit");
-    child.removeAllListeners("error");
     const detail = options?.intentional
       ? "Codex app-server reloading"
       : "Codex app-server stopped";
@@ -210,10 +236,12 @@ export class CodexAdapter {
       pending.reject(new Error(detail));
     }
     this.pending.clear();
+    const stopping = killProcessTree(child);
+    this.stopInFlight = stopping;
     try {
-      child.kill();
-    } catch {
-      // ignore
+      await stopping;
+    } finally {
+      if (this.stopInFlight === stopping) this.stopInFlight = null;
     }
   }
 

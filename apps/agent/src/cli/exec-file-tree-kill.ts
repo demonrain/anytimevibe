@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { windowsCmdArguments, windowsNeedsCmdShim } from "../windows-command";
 
-async function killProcessTree(child: ChildProcess): Promise<void> {
+export async function killProcessTree(child: ChildProcess): Promise<void> {
   const pid = child.pid;
   if (!pid) {
     try { child.kill(); } catch { /* ignore */ }
