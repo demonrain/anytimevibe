@@ -643,6 +643,8 @@ function contextUsageSummary(
 
 type HostRuntime = {
   online: boolean | null;
+  nodeInstalled?: boolean;
+  nodeVersion?: string;
   workspaces: Workspace[];
   tasks: Record<string, Task>;
   availableEngines?: CliEngineInfo[];
@@ -672,7 +674,7 @@ type HostRuntime = {
 
 type EngineMaintenanceRequest = {
   commandId: string;
-  action: "update" | "refresh";
+  action: "install" | "runtime-install" | "update" | "refresh";
   cliEngine?: CliEngine;
   state: "sending" | "waiting" | "running" | "completed" | "failed";
   error?: string;
@@ -2183,6 +2185,10 @@ export function reduceEvent(
     );
     if (incomingAt && Math.max(currentAt, clientUpdateAt) > incomingAt) return next;
     next.online = event.online;
+    if (event.nodeInstalled === undefined) delete next.nodeInstalled;
+    else next.nodeInstalled = event.nodeInstalled;
+    if (event.nodeVersion) next.nodeVersion = event.nodeVersion;
+    else delete next.nodeVersion;
     next.workspaces = event.workspaces;
     next.directoryBrowsing = event.directoryBrowsing === true;
     next.hostStatusAt = event.occurredAt;
@@ -3367,7 +3373,7 @@ export function App() {
     if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error(isClientUpdateCommand && locale === "en" ? "The live connection is not ready. Please reconnect and try again." : "实时连接尚未建立，请稍后重试。");
     const sequence = Number(localStorage.getItem(`command:${hostId}`) ?? 0) + 1;
     localStorage.setItem(`command:${hostId}`, String(sequence));
-    const isMaintenanceCommand = parsed.type === "host.engine.update" || parsed.type === "host.engine.refresh";
+    const isMaintenanceCommand = parsed.type === "host.runtime.install" || parsed.type === "host.engine.install" || parsed.type === "host.engine.update" || parsed.type === "host.engine.refresh";
     if (isMaintenanceCommand) {
       const commandIds = maintenanceCommandIdsRef.current.get(hostId) ?? new Set<string>();
       commandIds.add(parsed.commandId);
@@ -3426,7 +3432,7 @@ export function App() {
     }
   }
 
-  async function sendEngineMaintenance(action: "update" | "refresh", cliEngine?: CliEngine): Promise<void> {
+  async function sendEngineMaintenance(action: "install" | "update" | "refresh", cliEngine?: CliEngine): Promise<void> {
     if (!activeHost) return;
     const hostId = activeHost.id;
     const management = activeRuntime.engineManagement;
@@ -3447,7 +3453,7 @@ export function App() {
       }));
       return;
     }
-    if (cliEngine && !engineInfo?.ready) {
+    if (action === "update" && cliEngine && !engineInfo?.ready) {
       setEngineMaintenanceRequests((current) => ({
         ...current,
         [hostId]: { commandId: randomUuid(), action, cliEngine, state: "failed", error: t("engineMaintenanceNoEngine") }
@@ -3455,7 +3461,7 @@ export function App() {
       return;
     }
     if (management.operation && !["completed", "failed"].includes(management.operation.phase)) return;
-    if (action === "update" && cliEngine && management.busyEngines.includes(cliEngine)) {
+    if ((action === "update" || action === "install") && cliEngine && management.busyEngines.includes(cliEngine)) {
       setEngineMaintenanceRequests((current) => ({
         ...current,
         [hostId]: { commandId: randomUuid(), action, cliEngine, state: "failed", error: t("engineBusy") }
@@ -3468,7 +3474,9 @@ export function App() {
       ...current,
       [hostId]: { commandId, action, ...(cliEngine ? { cliEngine } : {}), state: "sending" }
     }));
-    const command: ClientCommand = action === "update"
+    const command: ClientCommand = action === "install"
+      ? { type: "host.engine.install", commandId, cliEngine: cliEngine! }
+      : action === "update"
       ? { type: "host.engine.update", commandId, cliEngine: cliEngine! }
       : { type: "host.engine.refresh", commandId, ...(cliEngine ? { cliEngine } : {}), ...(!cliEngine ? { checkUpdates: true } : {}) };
     try {
@@ -3499,6 +3507,32 @@ export function App() {
           }
         };
       });
+    }
+  }
+
+  async function sendRuntimeInstall(): Promise<void> {
+    if (!activeHost || activeRuntime.online !== true) return;
+    if (activeRuntime.engineManagement?.supported !== true || activeRuntime.engineManagement.operation && !["completed", "failed"].includes(activeRuntime.engineManagement.operation.phase)) return;
+    const hostId = activeHost.id;
+    const commandId = randomUuid();
+    setEngineMaintenanceRequests((current) => ({ ...current, [hostId]: { commandId, action: "runtime-install", state: "sending" } }));
+    try {
+      await sendCommand(hostId, { type: "host.runtime.install", commandId });
+      setEngineMaintenanceRequests((current) => current[hostId]?.commandId === commandId
+        ? { ...current, [hostId]: { commandId, action: "runtime-install", state: "waiting" } } : current);
+      window.setTimeout(() => {
+        setEngineMaintenanceRequests((current) => {
+          const request = current[hostId];
+          if (!request || request.commandId !== commandId || request.state !== "waiting") return current;
+          return { ...current, [hostId]: { ...request, state: "failed", error: t("engineNoConfirmation") } };
+        });
+      }, 30_000);
+    } catch (error) {
+      maintenanceCommandIdsRef.current.get(hostId)?.delete(commandId);
+      setEngineMaintenanceRequests((current) => ({ ...current, [hostId]: {
+        commandId, action: "runtime-install", state: "failed", error: error instanceof Error ? error.message : String(error)
+      } }));
+      setError(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -3966,6 +4000,8 @@ export function App() {
       host={activeHost}
       online={activeRuntime.online === true}
       supported={activeRuntime.engineManagement?.supported === true}
+      nodeInstalled={activeRuntime.nodeInstalled === true}
+      {...(activeRuntime.nodeVersion ? { nodeVersion: activeRuntime.nodeVersion } : {})}
       {...(activeRuntime.engineManagement ? { management: activeRuntime.engineManagement } : {})}
       availableEngines={activeRuntime.availableEngines ?? []}
       engineCapabilities={activeRuntime.engineCapabilities ?? []}
@@ -3976,6 +4012,8 @@ export function App() {
         return message ? { requestError: message } : {};
       })()}
       onClose={() => setEngineManagementOpen(false)}
+      onInstall={(engine) => sendEngineMaintenance("install", engine)}
+      onInstallRuntime={sendRuntimeInstall}
       onUpdate={(engine) => sendEngineMaintenance("update", engine)}
       onRefresh={(engine) => sendEngineMaintenance("refresh", engine)}
       onRefreshAll={() => sendEngineMaintenance("refresh")}
@@ -5469,12 +5507,16 @@ function EngineManagementDialog({
   host,
   online,
   supported,
+  nodeInstalled,
+  nodeVersion,
   management,
   availableEngines,
   engineCapabilities,
   request,
   requestError,
   onClose,
+  onInstallRuntime,
+  onInstall,
   onUpdate,
   onRefresh,
   onRefreshAll
@@ -5482,12 +5524,16 @@ function EngineManagementDialog({
   host: Host;
   online: boolean;
   supported: boolean;
+  nodeInstalled: boolean;
+  nodeVersion?: string;
   management?: EngineManagement;
   availableEngines: CliEngineInfo[];
   engineCapabilities: EngineCapability[];
   request?: EngineMaintenanceRequest;
   requestError?: string;
   onClose(): void;
+  onInstallRuntime(): Promise<void> | void;
+  onInstall(engine: CliEngine): Promise<void> | void;
   onUpdate(engine: CliEngine): Promise<void> | void;
   onRefresh(engine: CliEngine): Promise<void> | void;
   onRefreshAll(): Promise<void> | void;
@@ -5505,6 +5551,7 @@ function EngineManagementDialog({
     return "—";
   };
   const phaseLabel = (phase: NonNullable<EngineManagement["operation"]>["phase"]): string => {
+    if (phase === "installing") return t("engineInstalling");
     if (phase === "updating") return t("engineUpdating");
     if (phase === "syncing") return t("engineSyncing");
     if (phase === "verifying") return t("engineVerifying");
@@ -5516,7 +5563,11 @@ function EngineManagementDialog({
     ? t("engineSending")
     : request?.state === "waiting"
       ? t("engineWaiting")
-      : request?.state === "running" && request.action === "update"
+      : request?.state === "running" && request.action === "runtime-install"
+        ? t("runtimeInstalling")
+      : request?.state === "running" && request.action === "install"
+        ? t("engineInstalling")
+        : request?.state === "running" && request.action === "update"
         ? t("engineUpdating")
         : request?.state === "running"
           ? t("engineRefreshing")
@@ -5538,6 +5589,11 @@ function EngineManagementDialog({
         </div>
         <p>{operation.detail || (operation.version ? `${operation.previousVersion || "—"} → ${operation.version}` : "")}</p>
       </div>}
+      <div className="engine-management-toolbar">
+        <span>{t("nodeRuntime")}: {nodeInstalled ? (nodeVersion || t("engineReady")) : t("engineNotDetected")}</span>
+        {!nodeInstalled && <button type="button" disabled={!online || !supported || globalBusy}
+          onClick={() => void onInstallRuntime()}>{request?.action === "runtime-install" && requestActive ? t("runtimeInstalling") : t("runtimeInstall")}</button>}
+      </div>
       <div className="engine-management-toolbar">
         <span>{t("engineLiveStatus")}</span>
         <button
@@ -5573,9 +5629,9 @@ function EngineManagementDialog({
               {engineBusy && <span className="engine-row-busy">{t("engineInUse")}</span>}
               <button
                 type="button"
-                disabled={!online || !supported || !installed || upToDate || globalBusy || engineBusy}
-                onClick={() => void onUpdate(engine)}
-              >{rowBusy && request?.action === "update" ? (actionLabel || t("engineUpdating")) : upToDate ? t("engineUpToDate") : t("engineUpdate")}</button>
+                disabled={!online || !supported || globalBusy || engineBusy || (installed && (upToDate || info?.updateAvailable !== true))}
+                onClick={() => void (installed ? onUpdate(engine) : onInstall(engine))}
+              >{rowBusy && request?.action === "install" ? (actionLabel || t("engineInstalling")) : rowBusy && request?.action === "update" ? (actionLabel || t("engineUpdating")) : installed ? (upToDate ? t("engineUpToDate") : t("engineUpdate")) : t("engineInstall")}</button>
               <button
                 type="button"
                 className="secondary"

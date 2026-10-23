@@ -241,6 +241,23 @@ describe("protocol crypto", () => {
     });
   });
 
+  it("accepts a remote coding-engine install command without arbitrary execution fields", () => {
+    const command = {
+      type: "host.engine.install" as const,
+      commandId: crypto.randomUUID(),
+      cliEngine: "claude" as const
+    };
+    expect(clientCommandSchema.parse(command)).toEqual(command);
+    const parsed = clientCommandSchema.parse({ ...command, command: "npm install" });
+    expect(parsed).not.toHaveProperty("command");
+  });
+
+  it("accepts a separate Node.js runtime install command", () => {
+    const command = { type: "host.runtime.install" as const, commandId: crypto.randomUUID() };
+    expect(clientCommandSchema.parse(command)).toEqual(command);
+    expect(clientCommandSchema.parse({ ...command, url: "https://attacker.invalid" })).not.toHaveProperty("url");
+  });
+
   it("accepts targeted model refresh and update checks", () => {
     const command = {
       type: "host.engine.refresh",
@@ -261,8 +278,8 @@ describe("protocol crypto", () => {
         supported: true as const,
         busyEngines: ["pi" as const],
         operation: {
-          commandId: crypto.randomUUID(), action: "update" as const, cliEngine: "codex" as const,
-          phase: "syncing" as const, startedAt: now, updatedAt: now, previousVersion: "0.157.0"
+          commandId: crypto.randomUUID(), action: "install" as const, cliEngine: "codex" as const,
+          phase: "installing" as const, startedAt: now, updatedAt: now
         }
       },
       engineCapabilities: [{

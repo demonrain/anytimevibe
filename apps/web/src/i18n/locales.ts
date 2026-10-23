@@ -4,6 +4,11 @@ export const LOCALE_STORAGE_KEY = "anytimevibe-locale";
 
 export const messages = {
   "zh-CN": {
+    runtimeInstall: "安装 Node.js",
+    runtimeInstalling: "正在安装 Node.js…",
+    nodeRuntime: "Node.js 运行环境",
+    engineInstall: "远程安装",
+    engineInstalling: "安装中…",
     brand: "随码",
     brandTag: "随时续上你的代码",
     notify: "开启通知",
@@ -114,6 +119,11 @@ export const messages = {
     administrator: "管理员"
   },
   en: {
+    runtimeInstall: "Install Node.js",
+    runtimeInstalling: "Installing Node.js…",
+    nodeRuntime: "Node.js runtime",
+    engineInstall: "Install remotely",
+    engineInstalling: "Installing…",
     brand: "AnytimeVibe",
     brandTag: "Pick up your code anytime",
     notify: "Enable notifications",

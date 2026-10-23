@@ -11,12 +11,18 @@ function fixture() {
     effects.push("upgrade");
     engines = [{ engine: "pi", ready: true, version: "1.1.0", latestVersion: "1.1.0" }];
   };
+  let install: () => Promise<void> = async () => {
+    effects.push("install");
+    engines = [{ engine: "pi", ready: true, version: "1.1.0", latestVersion: "1.1.0" }];
+  };
   const manager = new EngineMaintenance({
     busyEngines: () => externalBusy,
     installedEngine: (engine) => engines.find((item) => item.engine === engine),
     detect: async () => { effects.push("detect"); return engines; },
     prepareUpdate: async () => { effects.push("prepare"); },
     upgrade: async (_engine, _version, onOutput) => { onOutput("download complete"); await upgrade(); },
+    install: async (_engine, onOutput) => { onOutput("install complete"); await install(); },
+    installRuntime: async () => "22.0.0",
     reload: async () => { effects.push("reload"); },
     syncModels: async () => { effects.push("sync"); },
     notify: async (operation) => { phases.push({ ...operation }); }
@@ -24,13 +30,57 @@ function fixture() {
   return {
     manager, externalBusy, phases, effects,
     setUpgrade: (value: () => Promise<void>) => { upgrade = value; },
+    setInstall: (value: () => Promise<void>) => { install = value; },
     setEngines: (value: CliEngineInfo[]) => { engines = value; }
   };
 }
 
 const update = () => ({ type: "host.engine.update" as const, commandId: crypto.randomUUID(), cliEngine: "pi" as const });
+const installCommand = () => ({ type: "host.engine.install" as const, commandId: crypto.randomUUID(), cliEngine: "pi" as const });
+const runtimeInstall = () => ({ type: "host.runtime.install" as const, commandId: crypto.randomUUID() });
 
 describe("engine maintenance", () => {
+  it("installs the Node.js runtime as a separate maintenance operation", async () => {
+    const f = fixture();
+    await f.manager.execute(runtimeInstall());
+    expect(f.effects).toEqual(["detect", "sync"]);
+    expect(f.manager.operation).toMatchObject({ action: "runtime-install", phase: "completed", version: "22.0.0" });
+  });
+  it("installs a missing engine and verifies the resulting CLI", async () => {
+    const f = fixture();
+    f.setEngines([{ engine: "pi", ready: false }]);
+    await f.manager.execute(installCommand());
+    expect(f.effects).toEqual(["install", "detect", "sync"]);
+    expect(f.manager.operation).toMatchObject({ action: "install", phase: "completed", version: "1.1.0" });
+  });
+
+  it("blocks new tasks while the remote engine installation is running", async () => {
+    const f = fixture();
+    f.setEngines([{ engine: "pi", ready: false }]);
+    let notifyInstallEntered!: () => void;
+    const installEntered = new Promise<void>((resolve) => { notifyInstallEntered = resolve; });
+    let releaseInstall!: () => void;
+    f.setInstall(() => { notifyInstallEntered(); return new Promise<void>((resolve) => { releaseInstall = resolve; }); });
+    const installing = f.manager.execute(installCommand());
+    try {
+      await installEntered;
+      expect(() => f.manager.reserveRun("pi")).toThrow(/正在升级/);
+    } finally {
+      releaseInstall();
+      f.setEngines([{ engine: "pi", ready: true, version: "1.1.0", latestVersion: "1.1.0" }]);
+      await installing;
+    }
+  });
+
+  it("re-detects after an install failure and reports failed", async () => {
+    const f = fixture();
+    f.setEngines([{ engine: "pi", ready: false }]);
+    f.setInstall(async () => { throw new Error("npm exited 17"); });
+    await expect(f.manager.execute(installCommand())).rejects.toThrow("npm exited 17");
+    expect(f.manager.operation).toMatchObject({ action: "install", phase: "failed" });
+    expect(f.effects).toContain("detect");
+    expect(f.manager.busy).toBe(false);
+  });
   it("blocks updates for an engine with a running task", async () => {
     const f = fixture();
     f.externalBusy.push("pi");

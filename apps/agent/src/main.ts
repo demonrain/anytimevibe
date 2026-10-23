@@ -15,6 +15,7 @@ import { promises as fs, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { createHash } from "node:crypto";
 import WebSocket from "ws";
 import { autoUpdater } from "electron-updater";
 import {
@@ -74,6 +75,8 @@ import { enrichEnginesWithLatestVersions, clearEngineLatestCache } from "./cli/e
 import { isUpdateAvailable, normalizeVersionLabel } from "./cli/version-compare";
 import { EngineMaintenance, sanitizeEngineMaintenanceDetail } from "./cli/engine-maintenance";
 import { buildEngineUpgradeSteps, resolveNpmEnginePrefix, resolvePiManagedInstallRoot } from "./cli/engine-upgrade";
+import { buildEngineInstallSteps } from "./cli/engine-install";
+import { nodeRuntimeArchiveName, nodeRuntimeAsset, parseNodeRuntimeChecksum } from "./cli/node-runtime-install";
 import { execFileWithTreeKill } from "./cli/exec-file-tree-kill";
 import { queryEngineQuotas, sanitizeEngineQuota } from "./cli/engine-quota";
 import { interruptHeadlessThread, isHeadlessThreadActive, runHeadlessTurn, normalizeSystemErrorText } from "./cli/headless-runner";
@@ -6068,7 +6071,7 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
     }
     return;
   }
-  if (command.type === "host.engine.update" || command.type === "host.engine.refresh") {
+  if (command.type === "host.runtime.install" || command.type === "host.engine.install" || command.type === "host.engine.update" || command.type === "host.engine.refresh") {
     try {
       await getEngineMaintenance().execute(command);
     } catch (error) {
@@ -6673,6 +6676,8 @@ async function handleCommandBody(command: ClientCommand): Promise<void> {
         name: resolvedDisplayName(),
         platform: `${process.platform} ${os.release()}`,
         codexVersion,
+        nodeInstalled: publicState.environment.nodeInstalled,
+        ...(publicState.environment.nodeVersion ? { nodeVersion: publicState.environment.nodeVersion } : {}),
         workspaces: config.workspaces,
         directoryBrowsing: true,
         cliEngine: taskStore.getDefaultEngine(),
@@ -7538,6 +7543,8 @@ async function publishHostStatus(options: { refresh?: boolean } = {}): Promise<v
   await publish({
     type: "host.status", eventId: crypto.randomUUID(), occurredAt: new Date().toISOString(), online: true,
     name: resolvedDisplayName(), platform: `${process.platform} ${os.release()}`, codexVersion,
+    nodeInstalled: publicState.environment.nodeInstalled,
+    ...(publicState.environment.nodeVersion ? { nodeVersion: publicState.environment.nodeVersion } : {}),
     workspaces: config.workspaces,
     directoryBrowsing: true,
     cliEngine: taskStore.getDefaultEngine(),
@@ -7738,6 +7745,144 @@ async function resolveEngineUpgradeTarget(engine: CliEngine, version: string | u
   return { engine, binary, platform: process.platform, installation, ...(version ? { version } : {}) };
 }
 
+async function resolveEngineInstallTarget(engine: CliEngine) {
+  if (engine === "codex" || engine === "claude" || engine === "pi") {
+    await applyLoginPathToProcess();
+    const npm = await npmExecutable();
+    if (!npm) throw new Error(`${engine} 远程安装需要先安装 Node.js 和 npm。`);
+    const proxy = await collectLocalProxyEnv();
+    const env = mergeProxyIntoEnv({ ...process.env }, proxy);
+    const result = await execFileWithTreeKill(npm, ["prefix", "-g"], {
+      timeoutMs: 15_000, env, cwd: os.homedir(), maxBuffer: 64_000
+    });
+    const prefix = result.stdout.trim().split(/\r?\n/).find(Boolean) || "";
+    const repairScript = engine === "claude" && process.platform === "win32"
+      ? path.join(prefix, "node_modules", "@anthropic-ai", "claude-code", "install.cjs")
+      : undefined;
+    const nodeCommand = repairScript ? (await resolveCommandPath("node.exe")) || undefined : undefined;
+    return { engine, platform: process.platform, npmCommand: npm, prefix,
+      ...(repairScript && nodeCommand ? { repairScript, nodeCommand } : {}),
+      ...(npmUpdateRegistryCandidates()[0] ? { registry: npmUpdateRegistryCandidates()[0] } : {}) };
+  }
+  return { engine, platform: process.platform };
+}
+
+async function executeEngineInstall(engine: CliEngine, onOutput: (text: string) => void): Promise<void> {
+  await refreshAgentUpdateNetwork().catch(() => undefined);
+  const target = await resolveEngineInstallTarget(engine);
+  const steps = buildEngineInstallSteps(target);
+  const proxy = await collectLocalProxyEnv();
+  const env = buildEngineMaintenanceNetworkEnv(mergeProxyIntoEnv({ ...process.env }, proxy));
+  for (const step of steps) {
+    let outputTail = "";
+    const redactor = createEngineUpdateOutputRedactor((chunk) => {
+      outputTail = `${outputTail}${chunk}`.slice(-64_000);
+      const detail = sanitizeEngineMaintenanceDetail(outputTail);
+      if (detail) onOutput(detail.slice(-700));
+    });
+    try {
+      const runStep = (args = step.args) => execFileWithTreeKill(step.command, args, {
+          timeoutMs: 10 * 60_000,
+          env,
+          cwd: step.cwd || os.homedir(),
+          maxBuffer: 2 * 1024 * 1024,
+          onOutput: redactor.write
+        });
+      try {
+        if (engine === "codex" && process.platform === "win32" && "prefix" in target && step.command === target.npmCommand) {
+          await withCodexWindowsNpmShimRepair(target.prefix, async () => { await runStep(); });
+        } else {
+          await runStep();
+        }
+      } catch (firstError) {
+        const registryArg = step.args.find((arg) => arg.startsWith("--registry="));
+        const mirror = "https://registry.npmmirror.com";
+        if (!registryArg || registryArg.toLowerCase().includes(mirror)) throw firstError;
+        const retryArgs = step.args.map((arg) => arg.startsWith("--registry=") ? `${mirror}/` : arg);
+        await runStep(retryArgs);
+      }
+    } catch (error) {
+      redactor.flush();
+      throw new Error(redactEngineUpdateOutput(error instanceof Error ? error.message : String(error)));
+    }
+    redactor.flush();
+  }
+}
+
+async function installNodeRuntime(onOutput: (text: string) => void): Promise<string> {
+  if (process.platform !== "win32" && process.platform !== "darwin") {
+    throw new Error("远程安装 Node.js 暂不支持此系统，请在主机上手动安装。");
+  }
+  await applyLoginPathToProcess();
+  const architecture = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : null;
+  if (!architecture) throw new Error(`不支持在 ${process.arch} 架构上远程安装 Node.js。`);
+
+  const proxy = await collectLocalProxyEnv();
+  const env = buildEngineMaintenanceNetworkEnv(mergeProxyIntoEnv({ ...process.env }, proxy));
+  let releaseDir = "";
+  try {
+    const root = path.join(app.getPath("userData"), "runtime");
+    await fs.mkdir(root, { recursive: true });
+    releaseDir = await fs.mkdtemp(path.join(root, ".install-"));
+    const curl = process.platform === "win32" ? "curl.exe" : "curl";
+    const download = async (url: string, outputPath: string): Promise<void> => {
+      await execFileWithTreeKill(curl, ["--fail", "--location", "--silent", "--show-error", "--connect-timeout", "25", "--max-time", "300", "--max-filesize", String(180 * 1024 * 1024), "--output", outputPath, url], {
+        timeoutMs: 5 * 60_000, env, cwd: releaseDir, maxBuffer: 128_000
+      });
+    };
+    const indexPath = path.join(releaseDir, "index.json");
+    await download("https://nodejs.org/dist/index.json", indexPath);
+    const entries = JSON.parse(await fs.readFile(indexPath, "utf8")) as unknown;
+    const asset = nodeRuntimeAsset(entries, process.platform, architecture);
+    const archiveName = nodeRuntimeArchiveName(asset.version, process.platform, architecture);
+    const sumsPath = path.join(releaseDir, "SHASUMS256.txt");
+    await download(`https://nodejs.org/dist/v${asset.version}/SHASUMS256.txt`, sumsPath);
+    const checksum = parseNodeRuntimeChecksum(await fs.readFile(sumsPath, "utf8"), archiveName);
+    onOutput(`Downloading Node.js ${asset.version} from nodejs.org`);
+    const archivePath = path.join(releaseDir, archiveName);
+    await download(`https://nodejs.org/dist/v${asset.version}/${archiveName}`, archivePath);
+    const archive = await fs.readFile(archivePath);
+    if (archive.length > 180 * 1024 * 1024) throw new Error("Node.js archive exceeds the allowed size");
+    const actualChecksum = createHash("sha256").update(archive).digest("hex");
+    if (actualChecksum !== checksum) throw new Error("Node.js archive checksum verification failed");
+
+    const versionRoot = path.join(root, `node-v${asset.version}`);
+    const nodeName = process.platform === "win32" ? "node.exe" : "bin/node";
+    const targetNode = path.join(versionRoot, `node-v${asset.version}-${process.platform === "win32" ? "win" : "darwin"}-${architecture}`, nodeName);
+    if (await pathExists(targetNode)) {
+      if (process.platform === "win32") extraWindowsPathDirs = [path.dirname(targetNode), ...extraWindowsPathDirs.filter((dir) => dir !== path.dirname(targetNode))];
+      else process.env.PATH = `${path.dirname(targetNode)}:${process.env.PATH || ""}`;
+      return asset.version;
+    }
+    await fs.mkdir(versionRoot, { recursive: true });
+    onOutput("Checksum verified; extracting Node.js into the current user's application data directory");
+    if (process.platform === "win32") {
+      const destination = path.join(releaseDir, "expanded");
+      const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
+      const script = `Expand-Archive -LiteralPath ${quote(archivePath)} -DestinationPath ${quote(destination)} -Force`;
+      await execFileWithTreeKill("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
+        timeoutMs: 120_000, env, cwd: releaseDir, maxBuffer: 256_000
+      });
+      const extracted = path.join(destination, `node-v${asset.version}-win-${architecture}`);
+      if (!(await pathExists(path.join(extracted, "node.exe")))) throw new Error("Extracted Node.js executable was not found");
+      await fs.rename(extracted, path.join(versionRoot, path.basename(extracted)));
+      extraWindowsPathDirs = [path.join(versionRoot, path.basename(extracted)), ...extraWindowsPathDirs];
+      await applyWindowsPathToProcess();
+    } else {
+      await execFileWithTreeKill("tar", ["-xzf", archivePath, "-C", versionRoot], {
+        timeoutMs: 120_000, env, cwd: releaseDir, maxBuffer: 256_000
+      });
+      if (!(await pathExists(targetNode))) throw new Error("Extracted Node.js executable was not found");
+      await fs.chmod(targetNode, 0o755);
+      process.env.PATH = `${path.dirname(targetNode)}:${process.env.PATH || ""}`;
+    }
+    onOutput(`Node.js ${asset.version} installed and verified`);
+    return asset.version;
+  } finally {
+    if (releaseDir) await fs.rm(releaseDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 function getEngineMaintenance(): EngineMaintenance {
   if (engineMaintenanceInstance) return engineMaintenanceInstance;
   engineMaintenanceInstance = new EngineMaintenance({
@@ -7751,6 +7896,9 @@ function getEngineMaintenance(): EngineMaintenance {
         updateState({ environment, codexVersion: environment.codexVersion || codexVersion });
       } else if (engine) {
         await resolveEngineBinary(engine);
+      } else {
+        const environment = await detectEnvironment();
+        updateState({ environment, codexVersion: environment.codexVersion || codexVersion });
       }
       await refreshAvailableEngines({ checkUpdates, forceModels: false });
       return publicState.availableEngines;
@@ -7825,6 +7973,12 @@ function getEngineMaintenance(): EngineMaintenance {
           }
         }
       }
+    },
+    install: async (engine, onOutput) => {
+      await executeEngineInstall(engine, onOutput);
+    },
+    installRuntime: async (onOutput) => {
+      return installNodeRuntime(onOutput);
     },
     reload: async (engine) => {
       clearEngineBinaryCache();

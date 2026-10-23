@@ -51,6 +51,25 @@ function errorEvent(commandId: string, threadId?: string): AgentEvent {
 }
 
 describe("engine maintenance error events", () => {
+  it("restores remote installation progress from host status", () => {
+    const next = reduceEvent(runtimeFixture(), {
+      type: "host.status", eventId, occurredAt: timestamp, online: true,
+      name: "Windows", platform: "win32", codexVersion: "unknown", workspaces: [],
+      engineManagement: {
+        supported: true,
+        busyEngines: [],
+        operation: {
+          commandId: operationId, action: "install", cliEngine: "pi", phase: "installing",
+          startedAt: timestamp, updatedAt: timestamp, detail: "Downloading package"
+        }
+      }
+    });
+
+    expect(next.engineManagement?.operation).toMatchObject({
+      commandId: operationId, action: "install", cliEngine: "pi", phase: "installing"
+    });
+  });
+
   it("detects a running maintenance request whose operation disappeared after Agent restart", () => {
     const runtime = runtimeFixture();
     runtime.hostStatusAt = timestamp;

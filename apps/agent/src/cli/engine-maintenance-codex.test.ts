@@ -43,6 +43,8 @@ function fixture() {
       await upgradeGate.promise;
       engines = [{ engine: "codex", ready: true, version: "1.1.0", latestVersion: "1.1.0" }];
     },
+    install: async () => {},
+    installRuntime: async () => "22.0.0",
     reload: async () => {}, syncModels: async () => {}, notify: async () => {}
   });
   const context = {

@@ -38,6 +38,8 @@ function fixture(blockAt: "persist" | "publish") {
     detect: async () => engines,
     prepareUpdate: async () => {},
     upgrade: async () => { engines = [{ engine: "pi", ready: true, version: "1.1.0", latestVersion: "1.1.0" }]; },
+    install: async () => {},
+    installRuntime: async () => "22.0.0",
     reload: async () => {},
     syncModels: async () => {},
     notify: async () => {}

@@ -1,13 +1,15 @@
 import type { CliEngine, CliEngineInfo, ClientCommand, EngineOperation } from "@anytimevibe/protocol";
 import { compareVersions, normalizeVersionLabel } from "./version-compare";
 
-export type EngineMaintenanceCommand = Extract<ClientCommand, { type: "host.engine.update" | "host.engine.refresh" }>;
+export type EngineMaintenanceCommand = Extract<ClientCommand, { type: "host.engine.install" | "host.runtime.install" | "host.engine.update" | "host.engine.refresh" }>;
 export type EngineMaintenanceDependencies = {
   busyEngines(): CliEngine[];
   installedEngine(engine: CliEngine): CliEngineInfo | undefined;
   detect(checkUpdates: boolean, engine?: CliEngine): Promise<CliEngineInfo[]>;
   prepareUpdate(engine: CliEngine): Promise<void>;
   upgrade(engine: CliEngine, version: string | undefined, onOutput: (text: string) => void): Promise<void>;
+  install(engine: CliEngine, onOutput: (text: string) => void): Promise<void>;
+  installRuntime(onOutput: (text: string) => void): Promise<string>;
   reload(engine: CliEngine): Promise<void>;
   syncModels(engine?: CliEngine): Promise<void>;
   notify(operation: EngineOperation): Promise<void>;
@@ -25,7 +27,7 @@ export class EngineMaintenance {
   get busy(): boolean { return this.inFlight; }
 
   isUpdating(engine: CliEngine): boolean {
-    return this.inFlight && this.current?.action === "update" && this.current.cliEngine === engine;
+    return this.inFlight && (this.current?.action === "install" || this.current?.action === "update") && this.current.cliEngine === engine;
   }
 
   busyEngines(): CliEngine[] {
@@ -58,12 +60,19 @@ export class EngineMaintenance {
 
   async execute(command: EngineMaintenanceCommand): Promise<void> {
     if (this.inFlight) throw new Error("正在升级或同步编码引擎，请等待当前操作完成。");
-    const action = command.type === "host.engine.update" ? "update" : "refresh";
-    const engine = command.cliEngine;
+    const action = command.type === "host.runtime.install" ? "runtime-install" : command.type === "host.engine.install" ? "install" : command.type === "host.engine.update" ? "update" : "refresh";
+    const engine = "cliEngine" in command ? command.cliEngine : undefined;
     const before = engine ? this.dependencies.installedEngine(engine) : undefined;
     if (action === "update") {
       if (!before?.ready) throw new Error(`${engine} 尚未安装或当前不可用，请先在客户端检查 CLI。`);
       if (this.busyEngines().includes(engine!)) throw new Error(`${engine} 有任务正在运行或等待审批，请等待任务结束后再升级。`);
+    }
+    if (action === "install") {
+      if (before?.ready) throw new Error(`${engine} CLI 已安装，请使用升级功能。`);
+      if (this.busyEngines().includes(engine!)) throw new Error(`${engine} 有任务正在运行或等待审批，请等待任务结束后再安装。`);
+    }
+    if (action === "runtime-install" && this.busyEngines().length > 0) {
+      throw new Error("当前有任务正在运行、排队或等待审批，请等待任务结束后再安装 Node.js。");
     }
     // The global maintenance lock also serializes package-manager and catalog operations.
     this.inFlight = true;
@@ -71,17 +80,32 @@ export class EngineMaintenance {
     this.current = {
       commandId: command.commandId, action,
       ...(engine ? { cliEngine: engine } : {}),
-      phase: action === "update" ? "updating" : "checking", startedAt: now, updatedAt: now,
+      phase: action === "install" || action === "runtime-install" ? "installing" : action === "update" ? "updating" : "checking", startedAt: now, updatedAt: now,
       ...(before?.version ? { previousVersion: before.version } : {})
     };
     let upgradeExecuted = false;
     try {
       await this.report({ detail: action === "update" ? "正在准备升级 CLI…" : "正在重新检测编码引擎…" });
-      if (action === "update") {
+      if (action === "runtime-install") {
+        const version = await this.dependencies.installRuntime((output) => {
+          if (this.current?.phase !== "installing") return;
+          const detail = sanitizeEngineMaintenanceDetail(output);
+          if (detail) void this.report({ detail }).catch(() => undefined);
+        });
+        await this.dependencies.detect(false);
+        await this.report({ version, phase: "syncing", detail: `Node.js ${version} 已安装，正在刷新 CLI 模型目录…` });
+      } else if (action === "install" || action === "update") {
         const current = normalizeVersionLabel(before?.version);
         const latest = normalizeVersionLabel(before?.latestVersion);
         const alreadyCurrent = Boolean(current && latest && compareVersions(current, latest) >= 0);
-        if (!alreadyCurrent) {
+        if (action === "install") {
+          await this.dependencies.install(engine!, (output) => {
+            if (this.current?.phase !== "installing") return;
+            const detail = sanitizeEngineMaintenanceDetail(output);
+            if (detail) void this.report({ detail }).catch(() => undefined);
+          });
+          upgradeExecuted = true;
+        } else if (!alreadyCurrent) {
           await this.dependencies.prepareUpdate(engine!);
           upgradeExecuted = true;
           await this.dependencies.upgrade(engine!, latest, (output) => {
@@ -101,7 +125,7 @@ export class EngineMaintenance {
         }
         if (current && compareVersions(version, current) < 0) throw new Error(`检测到版本从 ${current} 降为 ${version}，请在客户端检查安装来源。`);
         await this.report({ version, phase: "syncing", detail: "CLI 版本已验证，正在重载并同步模型目录…" });
-        if (upgradeExecuted) await this.dependencies.reload(engine!);
+        if (upgradeExecuted && action === "update") await this.dependencies.reload(engine!);
       } else {
         await this.dependencies.detect(
           command.type === "host.engine.refresh" && command.checkUpdates === true,
@@ -110,7 +134,11 @@ export class EngineMaintenance {
         await this.report({ phase: "syncing", detail: "正在读取 CLI 模型目录及本机配置…" });
       }
       await this.dependencies.syncModels(engine);
-      await this.report({ phase: "completed", detail: action === "update"
+      await this.report({ phase: "completed", detail: action === "runtime-install"
+        ? "Node.js 安装及 CLI 模型同步完成。"
+        : action === "install"
+        ? "CLI 安装验证及模型同步完成。"
+        : action === "update"
         ? "CLI 升级检查及模型同步完成；模型来源和可用范围以引擎返回结果为准。"
         : "引擎检测及模型同步完成；无法读取实时目录时会标注缓存、配置或候选列表。" });
     } catch (error) {

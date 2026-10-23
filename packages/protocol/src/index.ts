@@ -8,7 +8,7 @@ export const PROTOCOL_VERSION = 1 as const;
  * Desktop agent has its own version (host.status.agentVersion); web no longer hard-requires equality.
  * Soft update prompts use the latest GitHub client release from the relay health endpoint.
  */
-export const PRODUCT_VERSION = "0.5.33";
+export const PRODUCT_VERSION = "0.5.34";
 /**
  * @deprecated Not a hard gate. Kept for older clients; web uses health.latestClientVersion instead.
  */
@@ -196,9 +196,9 @@ export type EngineCapability = z.infer<typeof engineCapabilitySchema>;
 /** Progress is carried by host.status so older Web clients can ignore these optional fields. */
 export const engineOperationSchema = z.object({
   commandId: z.string().uuid(),
-  action: z.enum(["update", "refresh"]),
+  action: z.enum(["install", "runtime-install", "update", "refresh"]),
   cliEngine: cliEngineSchema.optional(),
-  phase: z.enum(["checking", "updating", "verifying", "syncing", "completed", "failed"]),
+  phase: z.enum(["checking", "installing", "updating", "verifying", "syncing", "completed", "failed"]),
   startedAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
   previousVersion: z.string().max(100).optional(),
@@ -383,6 +383,15 @@ export type TaskDirectoryListing = z.infer<typeof taskDirectoryListingSchema>;
 
 export const clientCommandSchema = z.discriminatedUnion("type", [
   commandBase.extend({
+    /** Install the supported Node.js LTS runtime into the current user's directory. */
+    type: z.literal("host.runtime.install")
+  }),
+  commandBase.extend({
+    /** Install a missing coding CLI using the agent's fixed platform installer. */
+    type: z.literal("host.engine.install"),
+    cliEngine: cliEngineSchema
+  }),
+  commandBase.extend({
     type: z.literal("task.create"),
     cwd: z.string().min(1),
     prompt: z.string().min(1),
@@ -534,6 +543,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     name: z.string(),
     platform: z.string(),
     codexVersion: z.string(),
+    nodeInstalled: z.boolean().optional(),
+    nodeVersion: z.string().max(100).optional(),
     workspaces: z.array(workspaceSchema),
     /** New tasks browse arbitrary local folders; no workspace allowlist setup is needed. */
     directoryBrowsing: z.boolean().optional(),
